@@ -47,9 +47,21 @@ Keep this list short; prefer moving logic into the crate.
 
 | file | edit | why | status |
 |---|---|---|---|
+| `crates/benilla-protocol/src/lib.rs` | **split build:** `CLIENT_BUILD` = 5875 (world/mangosd + login-screen), new `AUTH_BUILD` = 7272 (realmd challenge, `lib.rs` call site) | the two servers demand different builds — realmd `FindBuildInfo` needs ≥ 7272, mangosd `IsAcceptableClientBuild` needs exactly 5875 (matches the twmoa client: reports 1.18.1 to realmd, 5875 engine to world). | **LANDED** |
 | `crates/benilla-app/src/lib.rs` (`run`) | `app.add_plugins(MonkeyPlugin)` | wire our plugin in (no public plugin-group entry yet) | **planned** |
 | `crates/benilla-ui` / `assets/ui` | publish `TargetLevelText` / `PlayerLevelText` regions | MonkeyCharsheet hooks these stock globals | **planned** |
 | (register `PlayerModel` frame type) | `CreateFrame("PlayerModel", …)` | BuildUI + ObjectBrowser 3D previews | **planned** |
+| `crates/benilla-protocol/src/auth.rs` | treat proof reply `0x00`+`0x09` as version-invalid | so a build/version mismatch reads clearly, not "got 0x0" | **idea** |
+
+## Server-side requirements (Everwood realmd, not benilla edits)
+
+To let benilla (or any non-original client) authenticate against `bin/Debug/realmd.conf`:
+- **`StrictVersionCheck = 0`** (default 1) + restart realmd — otherwise realmd checks the client
+  integrity hash, which benilla (not the original binary) can't reproduce → "modified client".
+- Log in with a **non-GM account** (rank < `ForcePinAccountRank`, default 7) — GM-rank accounts are
+  forced through a PIN benilla doesn't implement.
+- benilla must present **build 7272** (the `CLIENT_BUILD` patch above), which realmd's
+  `ExpectedRealmdClientBuilds` requires.
 
 ## The ~10 functions to reimplement natively
 

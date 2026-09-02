@@ -35,8 +35,18 @@ use benilla_srp::{NormalizedString, PublicKey, SrpClientChallenge, SESSION_KEY_L
 /// The realmd (auth/login) server port — the stock one a vmangos `realmd` listens on, which our
 /// deploy maps straight through (`3724:3724` in the compose file at `vmangos-deploy`).
 pub const AUTH_PORT: u16 = 3724;
-/// The 1.12.1 client build we present to the server.
+/// The engine build we present to the WORLD server (mangosd) and show on the login screen.
+// MONKEY: the two Everwood servers demand DIFFERENT builds. mangosd's IsAcceptableClientBuild
+// (src/game/Database/DBCStores.cpp) accepts ONLY 5875, and the twmoa client itself displays
+// "1.12.1 (5875)" — so the world/engine build stays 5875 (sending 7272 here → mangosd
+// "HandleAuthSession: version mismatch"). Upstream default was 5875 (unchanged).
 pub const CLIENT_BUILD: u16 = 5875;
+/// The build we present to the AUTH server (realmd) in the logon challenge.
+// MONKEY: realmd's FindBuildInfo (src/realmd/RealmList.cpp) accepts only build >= 7272 (twmoa
+// 1.18.1). Sending 5875 to realmd → CMD_AUTH_LOGON_CHALLENGE(0x00)+WOW_FAIL_VERSION_INVALID
+// ("got 0x0"). The twmoa client reports its 1.18.1 version to realmd but the 5875 engine build to
+// the world, so these two builds MUST differ.
+pub const AUTH_BUILD: u16 = 7272;
 /// How many logon challenges [`logon`] will ask for while looking for a `B` both serialization
 /// conventions read the same way (see the redial comment there). One dial in ~137 comes back
 /// ambiguous, so eight is already a probability of about 10⁻¹⁷ of running out.
@@ -166,7 +176,8 @@ pub fn logon(host: &str, username: &str, password: &str) -> Result<Logon> {
         let mut dialed = None;
         for _ in 0..MAX_CHALLENGE_DIALS {
             let mut stream = dial(host, port)?;
-            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), CLIENT_BUILD)
+            // MONKEY: AUTH_BUILD (7272) to realmd, not CLIENT_BUILD (5875) — see the const docs.
+            auth::write_logon_challenge(&mut stream, &username.to_uppercase(), AUTH_BUILD)
                 .context("sending logon challenge")?;
             let reply =
                 auth::read_challenge_reply(&mut stream).context("reading logon challenge reply")?;
