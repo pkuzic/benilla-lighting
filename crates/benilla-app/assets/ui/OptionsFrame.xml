@@ -677,6 +677,11 @@
             .. "There is no exclusive fullscreen mode. WoW itself removed one in 8.0.1, and "
             .. "modern Classic offers these same two."
 
+        BENILLA_TOOLTIP_WORLD_SHADOWS =
+            "Renders real dynamic silhouettes for players, NPCs, creatures, and mounts. Terrain, "
+            .. "buildings, and trees keep their authored shading, matching Wrath's character-only "
+            .. "shadow tier. This uses additional GPU time and memory."
+
         OPTIONS_PAGE_ROWS = {
             Controls = {
                 "RowStickyTarget", "RowBlockTrades", "RowAutoLoot", "RowInvertMouse",
@@ -689,7 +694,7 @@
             },
             Graphics = {
                 "RowUiScale", "RowFarclip", "RowWorldDetail",
-                "RowDisplayMode", "RowVerticalSync", "RowRenderScale",
+                "RowDisplayMode", "RowVerticalSync", "RowWorldShadows", "RowRenderScale",
             },
             Nameplates = {
                 "RowEnemyPlates", "RowFriendlyPlates",
@@ -2517,10 +2522,20 @@
                                                     "OPTION_TOOLTIP_VERTICAL_SYNC")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowRenderScale" inherits="OptionsSliderRowTemplate">
+                                        <Frame name="$parentRowWorldShadows" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowVerticalSync" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowVerticalSync" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "worldShadows", "Real Character Shadows",
+                                                    "BENILLA_TOOLTIP_WORLD_SHADOWS")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowRenderScale" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowWorldShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowWorldShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- Render Scale (decision 1639) -- benilla's own

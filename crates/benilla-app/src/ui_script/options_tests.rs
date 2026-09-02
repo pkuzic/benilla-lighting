@@ -2184,6 +2184,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "BENILLA_TOOLTIP_BACKGROUND_SOUND",
                 "AudioRowBackgroundSound",
             ),
+            ("BENILLA_TOOLTIP_WORLD_SHADOWS", "GraphicsRowWorldShadows"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2228,7 +2229,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // 29th is Enable Error Speech (1815), 1.12's own fourth Sound checkbox, ditto; the 30th is
     // Enable Sound in Background (1847), the Audio page's fifth checkbox and the one row on that
     // page the reference never made settable.
-    assert_eq!(checked, 58, "every tipped row carries a live key");
+    assert_eq!(checked, 59, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2338,7 +2339,7 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // rather than 1.12 GlobalStrings — see the guard above.
     // …and Block Trades (1764), the Controls page's 28th CVar row, and Enable Error Speech
     // (1815), the Audio page's fourth checkbox and 1.12's own.
-    assert_eq!(raised, 58, "every row but Auto Loot raises a description");
+    assert_eq!(raised, 59, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

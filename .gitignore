@@ -19,3 +19,6 @@ trace-*.json
 .DS_Store
 *.swp
 /.idea/
+
+# MONKEY: per-run client state written by benilla (saved variables, camera) — not source.
+/benilla-config/

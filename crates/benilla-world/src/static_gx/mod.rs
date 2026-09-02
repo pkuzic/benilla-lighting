@@ -294,8 +294,11 @@ struct GxItem {
     owner: (i32, i32),
     texture: Option<AssetId<bevy::image::Image>>,
     /// Kept as a live handle so the render world's `GpuImage` can never be dropped from under
-    /// the baked cell (the id alone holds nothing).
-    _texture_handle: Option<Handle<bevy::image::Image>>,
+    /// the baked cell (the id alone holds nothing). Never READ (the bake keys everything off
+    /// [`Self::texture`]'s id) — its whole job is the strong reference held by its own
+    /// existence, so `dead_code` is a false positive here.
+    #[allow(dead_code)]
+    texture_handle: Option<Handle<bevy::image::Image>>,
     cutout: bool,
     two_sided: bool,
     unlit: bool,
@@ -770,7 +773,7 @@ impl StaticGx {
             local_aabb: b.aabb,
             owner: b.owner,
             texture: b.texture.as_ref().map(Handle::id),
-            _texture_handle: b.texture,
+            texture_handle: b.texture,
             cutout: b.blend == ModelBlend::AlphaTest && !crate::model_render::alphatest_disabled(),
             two_sided: b.two_sided,
             unlit: b.unlit,
