@@ -585,9 +585,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
     // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
     same("gxVSync", "1"),
-    // Benilla's opt-in Wrath-style character shadow-map path. Static world assets keep their
-    // authored shading; players, NPCs, creatures and mounts cast realtime silhouettes.
+    // Benilla's opt-in realtime shadow-map path, split into two INDEPENDENT lanes over one shared
+    // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
+    // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
+    // players/NPCs/creatures/mounts cast realtime silhouettes instead of the legacy oval blob.
     same("worldShadows", "0"),
+    same("characterShadows", "0"),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
     // two states 1627 settled on ARE that client's two (its own `Graphics.lua` builds the list from
@@ -1068,6 +1071,7 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         // watches the value and pushes it to the window; nothing else reads it.
         "gxvsync" => knobs.video.vsync = v != 0.0,
         "worldshadows" => knobs.video.world_shadows = v != 0.0,
+        "charactershadows" => knobs.video.character_shadows = v != 0.0,
         // Display mode (1627) — a flag like every other checkbox here, and the reference's own
         // polarity: `1` is WINDOWED (the row is "Windowed Mode"). `video::apply_window_mode`
         // watches the value and pushes it to the window; nothing else reads it.
@@ -1370,7 +1374,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 45] = [
+        let session: [(&str, String); 46] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1417,6 +1421,7 @@ fn sync_cvars(
             ("minimapInsideZoom", minimap.inside.to_string()),
             ("gxVSync", flag(video.vsync)),
             ("worldShadows", flag(video.world_shadows)),
+            ("characterShadows", flag(video.character_shadows)),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
                 "gxWindow",
@@ -1829,6 +1834,10 @@ mod tests {
         assert_eq!(
             d["worldShadows"] != 0.0,
             VideoConfig::default().world_shadows
+        );
+        assert_eq!(
+            d["characterShadows"] != 0.0,
+            VideoConfig::default().character_shadows
         );
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);

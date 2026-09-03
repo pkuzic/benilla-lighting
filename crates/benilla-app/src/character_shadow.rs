@@ -1,19 +1,32 @@
-//! Isolated real shadow-map support for the world.
+//! Real shadow-map support for benilla, split into two INDEPENDENT lanes over ONE shared rig.
 //!
-//! The old unit shadow is a projected oval. This path deliberately does not put a directional
-//! light on the normal world layer: that would make every existing custom WoW material enter
-//! Bevy's shadow-prepass path, which is the source of the pipeline validation/corruption failure
-//! seen during the first experiment. Instead, a private layer contains one CPU-built copy of the
-//! current world model triangles. Only that copy casts; the normal world shaders only receive the
-//! resulting shadow lookup when the option is enabled.
+//! This module owns the shared **rig** — a single directional light (the "sun") on a private render
+//! layer, that layer's membership on the world camera, and the `DirectionalLightShadowMap` — plus
+//! the **character lane**: the per-frame CPU-built caster carrying entity geometry (players, NPCs,
+//! creatures, mounts). The sibling [`super::world_shadow`] module owns the **world lane** (the
+//! static `static_gx` trees/buildings + alpha-tested foliage). The two lanes are gated by SEPARATE
+//! cvars — `characterShadows` and `worldShadows` — and either one alone lights up the shared rig.
+//!
+//! The rig deliberately does NOT put a directional light on the normal world layer: that would make
+//! every existing custom WoW material enter Bevy's shadow-prepass path, the source of the pipeline
+//! validation/corruption failure seen during the first experiment. Instead a private layer holds
+//! CPU-built copies of the caster triangles; only those copies cast, and the normal world shaders
+//! merely RECEIVE the resulting shadow lookup.
+//!
+//! Why one shared light and not one per lane: the custom receiver in `terrain.wgsl`/`wow_model.wgsl`
+//! samples a SINGLE directional light (it assigns, not accumulates, over the light loop). Two lights
+//! would double the shadow-pass cost and the last one would win the receiver. So the lanes share the
+//! rig and each simply contributes its own caster geometry into the one map.
 
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{AssetId, RenderAssetUsages};
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
+use bevy::image::Image;
 use bevy::light::{
     CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap, NotShadowReceiver,
 };
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPlugin, MeshMaterial3d};
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{
@@ -26,13 +39,14 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_formats::ModelBlend;
 use benilla_world::billboard::BillboardCard;
 use benilla_world::interact::PickMesh;
-use benilla_world::lighting::WowLighting;
+use benilla_world::lighting::{WorldShadowActive, WowLighting};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 use benilla_world::view::WorldCamera;
 
 use crate::char_select::ClientState;
 use crate::video::VideoConfig;
+use crate::world_shadow;
 
 /// Layer 31 is deliberately private to this feature. Bevy supports 32 render layers; the normal
 /// world is layer 0 and the UI/portrait layers occupy the low numbered slots.
@@ -47,7 +61,7 @@ const CASTER_RANGE: f32 = 80.0;
 
 /// How far the camera may drift before a caster-collection pass must refresh. The collection
 /// reach carries this as margin so coverage holds everywhere between refreshes.
-const STATIC_REBUILD_STEP: f32 = 16.0;
+pub(crate) const STATIC_REBUILD_STEP: f32 = 16.0;
 
 /// The tallest COMMON caster the reach law budgets for (the big Elwynn/Duskwood tree class,
 /// in world units). Not a clamp on what casts — only on how far past the resolve range the
@@ -75,8 +89,8 @@ fn shadow_reach_extension(sun_travel: Vec3) -> f32 {
 }
 
 /// The one collection law for a lane that can contribute a TALL caster (a doodad/WMO entity
-/// exile, were the character-only tier ever to admit one): resolve range + rebuild margin +
-/// the sun-dependent shadow reach.
+/// exile, or the whole static world): resolve range + rebuild margin + the sun-dependent shadow
+/// reach.
 fn static_collection_reach(sun_travel: Vec3) -> f32 {
     CASTER_RANGE + STATIC_REBUILD_STEP + shadow_reach_extension(sun_travel)
 }
@@ -86,7 +100,7 @@ fn static_collection_reach(sun_travel: Vec3) -> f32 {
 /// camera rotation means the entity lane is still being view-culled somewhere; a static
 /// rebuild logged at the same moment means the cached half swapped content; neither changing
 /// while the shadow still pops on screen exonerates the caster and indicts the map/receiver.
-fn shadow_trace() -> bool {
+pub(crate) fn shadow_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("WOW_SHADOW_TRACE").is_ok_and(|v| v != "0"))
 }
@@ -119,7 +133,7 @@ fn sun_snap_due(held: Option<Vec3>, live: Vec3) -> bool {
 }
 
 #[derive(Component)]
-struct WorldShadowCaster;
+pub(crate) struct WorldShadowCaster;
 
 #[derive(Component)]
 struct WorldShadowSun;
@@ -129,32 +143,44 @@ struct WorldShadowCameraLayer {
     had_layers: bool,
 }
 
+/// Shared state for both shadow lanes. The rig + character fields are private to this module; the
+/// world-lane fields are `pub(crate)` because [`super::world_shadow`] owns their lifecycle.
 #[derive(Resource, Default)]
-struct WorldShadowRuntime {
-    /// The PER-FRAME caster: entity parts (animated rigs, creatures) collected fresh every
-    /// frame — the character-only tier's whole caster population.
-    dynamic_caster: Option<Entity>,
+pub(crate) struct ShadowRuntime {
+    // --- shared rig ---
     sun: Option<Entity>,
-    /// The direction the sun entity was LAST GIVEN — the held shadow basis. The live
-    /// direction is compared against this each frame and written through only past
-    /// [`SUN_SNAP_RADIANS`] (see there for why); `None` until the first write, and again
-    /// after teardown, so spawn and re-enable always aim the light immediately.
+    /// The direction the sun entity was LAST GIVEN — the held shadow basis. The live direction is
+    /// compared against this each frame and written through only past [`SUN_SNAP_RADIANS`] (see
+    /// there for why); `None` until the first write, and again after teardown, so spawn and
+    /// re-enable always aim the light immediately.
     sun_written: Option<Vec3>,
-    dynamic_mesh: Option<Handle<Mesh>>,
+    /// The invisible proxy material shared by BOTH lanes' solid casters (opaque to the shadow pass,
+    /// discarded in the forward pass).
     material: Option<Handle<ShadowCasterMaterial>>,
+    // --- character lane (per-frame entity caster) ---
+    /// The PER-FRAME caster: entity parts (animated rigs, creatures, and — when `worldShadows` is
+    /// on — entity-resident environment doodads/gameobjects) collected fresh every frame.
+    dynamic_caster: Option<Entity>,
+    dynamic_mesh: Option<Handle<Mesh>>,
     /// [`shadow_trace`]'s change detector: (dynamic tris, admitted parts, rejected parts).
-    /// Triangle counts only change when the SET changes (animation moves vertices, not
-    /// counts), so any change here is a population event worth one log line.
     traced: (u32, u32, u32),
+    // --- world lane (owned by `super::world_shadow`) ---
+    /// The CACHED static caster — the retained `static_gx` world (trees + buildings), rebuilt only
+    /// on camera drift.
+    pub(crate) static_caster: Option<Entity>,
+    pub(crate) static_mesh: Option<Handle<Mesh>>,
+    pub(crate) static_rebuilt_at: Option<Vec3>,
+    /// The alpha-tested foliage casters — one per distinct leaf texture, keyed by its `AssetId`.
+    pub(crate) static_cutout: HashMap<AssetId<Image>, CutoutCaster>,
 }
 
-pub(crate) struct WorldShadowPlugin;
+pub(crate) struct ShadowPlugin;
 
 /// Opaque to Bevy's shadow pass, but discarded by the normal forward pass. This lets the
 /// private-layer proxy participate in the real shadow map without drawing a second copy of the
-/// world in the main camera.
+/// world in the main camera. Shared by both lanes' SOLID casters.
 #[derive(Asset, AsBindGroup, TypePath, Debug, Clone, Default)]
-struct ShadowCasterMaterial {}
+pub(crate) struct ShadowCasterMaterial {}
 
 impl Material for ShadowCasterMaterial {
     fn fragment_shader() -> ShaderRef {
@@ -174,23 +200,86 @@ impl Material for ShadowCasterMaterial {
     }
 }
 
-impl Plugin for WorldShadowPlugin {
-    fn build(&self, app: &mut App) {
-        app.insert_resource(DirectionalLightShadowMap { size: 2048 })
-            .add_plugins(MaterialPlugin::<ShadowCasterMaterial>::default())
-            .init_resource::<WorldShadowRuntime>()
-            .add_systems(Last, update_world_shadow);
+/// The alpha-tested twin of [`ShadowCasterMaterial`]: the same invisible-in-forward proxy, but its
+/// prepass fragment samples a leaf sheet and discards transparent texels so cutout FOLIAGE (tree
+/// canopies) casts a leaf-shaped silhouette instead of the solid box a positions-only proxy throws.
+/// One instance per distinct leaf texture — a merged caster mesh carries only one sheet. Used only
+/// by the WORLD lane ([`super::world_shadow`]).
+///
+/// `AlphaMode::Mask` sets Bevy's `MAY_DISCARD` pipeline key, and the EXPLICIT (non-`Default`)
+/// `prepass_fragment_shader` is what makes the otherwise depth-only directional-light SHADOW pass
+/// run a fragment at all — together they are the exact pair Bevy's prepass specializer requires to
+/// alpha-test in the shadow map (`prepass/mod.rs`: `MAY_DISCARD && get_shader(PrepassFragmentShader)`).
+#[derive(Asset, AsBindGroup, TypePath, Debug, Clone)]
+pub(crate) struct CutoutShadowCasterMaterial {
+    /// The leaf sheet, bound at material binding 0/1. Reusing the SAME image handle the forward
+    /// pass draws makes the sampler inherit that image's clamp/repeat address mode, so the shadow
+    /// silhouette matches the visible foliage (a cutout card's out-of-range UVs must clamp, not
+    /// wrap, or the transparent margin folds back into the opaque middle and it casts solid).
+    #[texture(0)]
+    #[sampler(1)]
+    pub(crate) leaf: Handle<Image>,
+}
+
+impl Material for CutoutShadowCasterMaterial {
+    fn fragment_shader() -> ShaderRef {
+        // Forward pass: still fully invisible — the shared proxy fragment discards every fragment.
+        "embedded://benilla_app/shaders/shadow_caster.wgsl".into()
+    }
+
+    fn prepass_fragment_shader() -> ShaderRef {
+        // EXPLICIT → the shadow pass runs this fragment for the MAY_DISCARD material and alpha-tests.
+        "embedded://benilla_app/shaders/shadow_caster_cutout_prepass.wgsl".into()
+    }
+
+    fn alpha_mode(&self) -> AlphaMode {
+        AlphaMode::Mask(benilla_assets::materials::VANILLA_ALPHA_KEY_REF)
+    }
+
+    fn specialize(
+        _pipeline: &MaterialPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &bevy::mesh::MeshVertexBufferLayoutRef,
+        _key: bevy::pbr::MaterialPipelineKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        // Two-sided like the solid caster — a canopy card seen edge-on must still occlude. Applies
+        // to the shadow (prepass) pipeline too: Bevy runs `specialize` for the prepass specializer.
+        descriptor.primitive.cull_mode = None;
+        Ok(())
     }
 }
 
-fn update_world_shadow(
+/// One live alpha-tested foliage caster: its layer-31 entity, its per-texture caster mesh, and the
+/// [`CutoutShadowCasterMaterial`] carrying that one leaf sheet. Keyed by the leaf texture's
+/// `AssetId` in [`ShadowRuntime::static_cutout`] so it persists across rebuilds.
+pub(crate) struct CutoutCaster {
+    pub(crate) entity: Entity,
+    pub(crate) mesh: Handle<Mesh>,
+    pub(crate) material: Handle<CutoutShadowCasterMaterial>,
+}
+
+impl Plugin for ShadowPlugin {
+    fn build(&self, app: &mut App) {
+        app.insert_resource(DirectionalLightShadowMap { size: 4096 }) // MONKEY: crisper shadow edges
+            .add_plugins(MaterialPlugin::<ShadowCasterMaterial>::default())
+            // MONKEY (world shadows): the alpha-tested foliage caster material (leaf-shaped canopy shadows).
+            .add_plugins(MaterialPlugin::<CutoutShadowCasterMaterial>::default())
+            .init_resource::<ShadowRuntime>()
+            .add_systems(Last, update_shadows);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_shadows(
     state: Res<State<ClientState>>,
     video: Res<VideoConfig>,
     lighting: Res<WowLighting>,
-    mut runtime: ResMut<WorldShadowRuntime>,
+    mut runtime: ResMut<ShadowRuntime>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ShadowCasterMaterial>>,
+    // MONKEY (world shadows): the per-leaf-texture alpha-tested foliage caster materials.
+    mut cutout_materials: ResMut<Assets<CutoutShadowCasterMaterial>>,
     parts: Query<
         (
             &PickMesh,
@@ -214,9 +303,24 @@ fn update_world_shadow(
     >,
     mut suns: Query<&mut Transform, With<WorldShadowSun>>,
     cameras_for_position: Query<&GlobalTransform, With<WorldCamera>>,
+    // MONKEY (world shadows): the retained static world — the source of the cached static caster.
+    // `Option` because the resource exists only when the retained pass is armed (`WOW_STATIC_GX`).
+    gx: Option<Res<benilla_world::static_gx::StaticGx>>,
+    // MONKEY (world shadows): the terrain MCSH-suppression flag — driven by the WORLD lane only.
+    mut world_active: ResMut<WorldShadowActive>,
 ) {
-    let wanted = video.world_shadows && *state.get() == ClientState::InWorld;
-    if !wanted {
+    let in_world = *state.get() == ClientState::InWorld;
+    let world_on = video.world_shadows && in_world;
+    let char_on = video.character_shadows && in_world;
+
+    // Baked MCSH terrain shadows switch off ONLY for the world lane (a character-only shadow sun
+    // must leave the world's baked shadows intact). `terrain.wgsl` reads this via `sh_c16.w`.
+    if world_active.0 != world_on {
+        world_active.0 = world_on;
+    }
+
+    if !world_on && !char_on {
+        // Both lanes dark: tear the whole rig down.
         if let Some(entity) = runtime.dynamic_caster.take() {
             commands.entity(entity).despawn();
         }
@@ -229,6 +333,7 @@ fn update_world_shadow(
         if let Some(handle) = runtime.dynamic_mesh.take() {
             meshes.remove(handle.id());
         }
+        world_shadow::teardown(&mut runtime, &mut commands, &mut meshes, &mut cutout_materials);
         if let Some(handle) = runtime.material.take() {
             materials.remove(handle.id());
         }
@@ -246,27 +351,11 @@ fn update_world_shadow(
         return;
     }
 
-    // The proxies are opaque to the shadow pass and their custom forward fragment discards
-    // every fragment. They have no texture lookup or custom WoW shader, so their shadow
-    // pipeline cannot perturb the login/character/world material pipelines.
-    if runtime.dynamic_caster.is_none() {
-        let dynamic_mesh = meshes.add(empty_shadow_mesh());
-        let material = materials.add(ShadowCasterMaterial {});
-        let spawn_caster = |commands: &mut Commands, mesh: &Handle<Mesh>| {
-            commands
-                .spawn((
-                    Mesh3d(mesh.clone()),
-                    MeshMaterial3d(material.clone()),
-                    Transform::IDENTITY,
-                    Visibility::Visible,
-                    RenderLayers::layer(PLAYER_SHADOW_LAYER),
-                    NoFrustumCulling,
-                    NotShadowReceiver,
-                    WorldShadowCaster,
-                ))
-                .id()
-        };
-        let dynamic_caster = spawn_caster(&mut commands, &dynamic_mesh);
+    // --- Shared rig: the proxy material + the sun, alive whenever EITHER lane is on ---
+    if runtime.material.is_none() {
+        runtime.material = Some(materials.add(ShadowCasterMaterial {}));
+    }
+    if runtime.sun.is_none() {
         let sun = commands
             .spawn((
                 DirectionalLight {
@@ -276,18 +365,14 @@ fn update_world_shadow(
                     shadows_enabled: true,
                     // Keep enough separation from the receiver to avoid shadow-map acne on WMO
                     // floors, while staying small enough that the silhouette remains attached.
-                    // The old 0.003/0.15 pair was below the useful texel-scale bias for Stormwind
-                    // and let the floor shadow itself, producing the broken dark patches.
                     shadow_depth_bias: 0.02,
                     shadow_normal_bias: 0.8,
                     ..default()
                 },
                 CascadeShadowConfigBuilder {
-                    // This is a short-range shadow feature, not a whole-map sun-shadow system.
-                    // Independent cascade grids were showing up as square light patches on the
-                    // cobbles when the custom receiver sampled their transition. With ONE
-                    // cascade, Bevy ignores `first_cascade_far_bound`/`overlap_proportion` and
-                    // the single 2048 map spans the full `maximum_distance`.
+                    // A short-range shadow feature, not a whole-map sun-shadow system. With ONE
+                    // cascade, Bevy ignores `first_cascade_far_bound`/`overlap_proportion` and the
+                    // single map spans the full `maximum_distance`.
                     num_cascades: 1,
                     minimum_distance: 0.1,
                     maximum_distance: CASTER_RANGE,
@@ -300,10 +385,8 @@ fn update_world_shadow(
                 WorldShadowSun,
             ))
             .id();
-        runtime.dynamic_caster = Some(dynamic_caster);
         runtime.sun = Some(sun);
-        runtime.dynamic_mesh = Some(dynamic_mesh);
-        runtime.material = Some(material);
+        runtime.sun_written = None; // aim it on the first frame
     }
 
     for (entity, layers, marker) in &mut cameras {
@@ -335,25 +418,37 @@ fn update_world_shadow(
     } else {
         Vec3::NEG_Z
     };
-    // The two gating radii: short casters (creatures/gameobjects — at most a body length
-    // tall) stop mattering just past the resolve range; a tall-caster lane (doodads/WMO)
-    // would carry the sun-dependent shadow reach on top, so a tree whose shadow lands in
-    // view casts before its trunk enters the resolve range. The character-only tier never
-    // admits that lane (`casts_realtime_shadow`), but `collect_world_geometry`'s signature
-    // still takes both reaches.
+    // The two gating radii: short casters (creatures/gameobjects) stop mattering just past the
+    // resolve range; a tall-caster lane (doodads/WMO/static world) carries the sun-dependent
+    // shadow reach on top, so a tree whose shadow lands in view casts before its trunk enters the
+    // resolve range.
     let entity_reach = CASTER_RANGE + STATIC_REBUILD_STEP;
     let tall_reach = static_collection_reach(sun_direction);
 
-    // Animated rigs re-skin every frame, and entity doodads, creatures and mounts spawn and
-    // despawn under entity lifecycles this module cannot cheaply observe — the whole caster
-    // population is collected fresh every frame.
+    // --- CHARACTER lane (+ entity-resident environment when the world lane is on) ---
+    // The per-frame entity caster always exists past the early-out; the ADMIT filter decides what
+    // rides it: Creature parts when `characterShadows`, entity-resident doodads/gameobjects when
+    // `worldShadows`. Animated rigs re-skin every frame, and entity content spawns/despawns under
+    // lifecycles this module cannot cheaply observe — so it is collected fresh every frame.
+    if runtime.dynamic_caster.is_none() {
+        let mesh = meshes.add(empty_shadow_mesh());
+        let material = runtime
+            .material
+            .clone()
+            .expect("rig material ensured above");
+        let entity = spawn_solid_caster(&mut commands, mesh.clone(), material);
+        runtime.dynamic_caster = Some(entity);
+        runtime.dynamic_mesh = Some(mesh);
+    }
     if let Some(handle) = runtime.dynamic_mesh.clone() {
         if let Some(mesh) = meshes.get_mut(&handle) {
             let (mut positions, mut indices) = take_mesh_buffers(mesh);
-            let (admitted, rejected) = collect_world_geometry(
+            let (admitted, rejected) = collect_entity_geometry(
                 &parts,
                 &rigs,
                 &palettes,
+                char_on,
+                world_on,
                 light_position,
                 entity_reach,
                 tall_reach,
@@ -375,13 +470,27 @@ fn update_world_shadow(
         }
     }
 
+    // --- WORLD lane: the cached static world (trees + buildings) + alpha-tested foliage ---
+    if world_on {
+        let solid = runtime.material.clone();
+        if let (Some(gx), Some(solid)) = (gx.as_ref(), solid) {
+            world_shadow::update(
+                &mut runtime,
+                &mut commands,
+                &mut meshes,
+                &solid,
+                &mut cutout_materials,
+                gx,
+                light_position,
+                tall_reach,
+            );
+        }
+    } else {
+        world_shadow::teardown(&mut runtime, &mut commands, &mut meshes, &mut cutout_materials);
+    }
+
+    // --- Aim the shared sun (quantised — see SUN_SNAP_RADIANS) ---
     if let Some(sun) = runtime.sun {
-        // Only the rotation matters: Bevy fits directional-light cascades to each view's
-        // frustum and ignores the light's translation entirely. The rotation is QUANTISED —
-        // written only when the live sun has drifted [`SUN_SNAP_RADIANS`] past the held
-        // basis — because a per-frame rotation defeats the cascade texel snap and crawls
-        // every shadow edge (see the constant's doc for the arithmetic). Skipping the write
-        // also keeps the light's `Transform` change detection quiet between snaps.
         if sun_snap_due(runtime.sun_written, sun_direction) {
             if let Ok(mut current) = suns.get_mut(sun) {
                 *current = Transform::IDENTITY.looking_to(sun_direction, Vec3::Y);
@@ -389,6 +498,27 @@ fn update_world_shadow(
             }
         }
     }
+}
+
+/// Spawn a SOLID caster entity on the private shadow layer with the shared proxy material. Used by
+/// both the character lane (its per-frame caster) and the world lane (its cached static caster).
+pub(crate) fn spawn_solid_caster(
+    commands: &mut Commands,
+    mesh: Handle<Mesh>,
+    material: Handle<ShadowCasterMaterial>,
+) -> Entity {
+    commands
+        .spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::IDENTITY,
+            Visibility::Visible,
+            RenderLayers::layer(PLAYER_SHADOW_LAYER),
+            NoFrustumCulling,
+            NotShadowReceiver,
+            WorldShadowCaster,
+        ))
+        .id()
 }
 
 /// Append a triangle list, dropping WHOLE triangles whose indices exceed the vertex range.
@@ -405,7 +535,7 @@ fn append_triangles(source: &[u32], vertex_count: u32, base: u32, indices: &mut 
 /// Take a caster mesh's own buffers so a rebuild reuses their allocations rather than paying
 /// a fresh `Vec` growth curve every time. The mesh is left attribute-less until
 /// [`restore_mesh_buffers`] puts them back.
-fn take_mesh_buffers(mesh: &mut Mesh) -> (Vec<[f32; 3]>, Vec<u32>) {
+pub(crate) fn take_mesh_buffers(mesh: &mut Mesh) -> (Vec<[f32; 3]>, Vec<u32>) {
     let mut positions = match mesh.remove_attribute(Mesh::ATTRIBUTE_POSITION) {
         Some(bevy::mesh::VertexAttributeValues::Float32x3(values)) => values,
         _ => Vec::new(),
@@ -419,12 +549,12 @@ fn take_mesh_buffers(mesh: &mut Mesh) -> (Vec<[f32; 3]>, Vec<u32>) {
     (positions, indices)
 }
 
-fn restore_mesh_buffers(mesh: &mut Mesh, positions: Vec<[f32; 3]>, indices: Vec<u32>) {
+pub(crate) fn restore_mesh_buffers(mesh: &mut Mesh, positions: Vec<[f32; 3]>, indices: Vec<u32>) {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_indices(Indices::U32(indices));
 }
 
-fn empty_shadow_mesh() -> Mesh {
+pub(crate) fn empty_shadow_mesh() -> Mesh {
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -434,7 +564,23 @@ fn empty_shadow_mesh() -> Mesh {
     mesh
 }
 
-fn collect_world_geometry(
+/// A cutout caster mesh: like [`empty_shadow_mesh`] but carrying a `UV_0` lane, because the
+/// alpha-tested prepass fragment samples the leaf sheet at these UVs. The mesh MUST declare UV_0
+/// (even empty) so Bevy's prepass specializer sets the `VERTEX_UVS_A` shader-def and the fragment's
+/// `in.uv` exists — without it the cutout discard is compiled out and foliage casts solid again.
+pub(crate) fn empty_cutout_mesh() -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
+    mesh.insert_indices(Indices::U32(Vec::new()));
+    mesh
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_entity_geometry(
     parts: &Query<
         (
             &PickMesh,
@@ -448,6 +594,8 @@ fn collect_world_geometry(
     >,
     rigs: &Query<&RigSkin>,
     palettes: &RigPalettes,
+    char_on: bool,
+    world_on: bool,
     light_position: Vec3,
     creature_reach: f32,
     doodad_reach: f32,
@@ -456,7 +604,7 @@ fn collect_world_geometry(
 ) -> (u32, u32) {
     let (mut admitted, mut rejected) = (0u32, 0u32);
     for (pick, part, global, rig_part, occluder, _material) in parts.iter() {
-        if !casts_realtime_shadow(part.kind, part.blend) {
+        if !casts_realtime_shadow(part.kind, part.blend, char_on, world_on) {
             continue;
         }
         // NOT `InheritedVisibility`: that folds the exterior window gate, the portal PVS and
@@ -469,10 +617,8 @@ fn collect_world_geometry(
             continue;
         }
         // The distance gate, BEFORE any vertex work: the cascade resolves to CASTER_RANGE, so
-        // a part beyond its lane's reach contributes nothing — skinning it first would be the
-        // per-frame cost this gate exists to remove (every resident creature within far clip
-        // was CPU-skinned per vertex, per frame). Creatures/gameobjects are at most a body
-        // tall; doodad/WMO exiles can be whole trees and take the tall-caster reach.
+        // a part beyond its lane's reach contributes nothing. Creatures/gameobjects are at most a
+        // body tall; doodad/WMO exiles can be whole trees and take the tall-caster reach.
         let reach = match part.kind {
             ModelKind::Creature | ModelKind::GameObject => creature_reach,
             ModelKind::Doodad | ModelKind::Wmo => doodad_reach,
@@ -509,12 +655,21 @@ fn collect_world_geometry(
     (admitted, rejected)
 }
 
-/// Wrath's character-only shadow tier. Player bodies, equipment, NPCs, creatures and mounts all
-/// use the `Creature` model lane. Static gameobjects, doodads and WMO batches keep their authored
-/// world shading and must never enter this camera-fitted realtime map.
-fn casts_realtime_shadow(kind: ModelKind, blend: ModelBlend) -> bool {
-    matches!(kind, ModelKind::Creature)
-        && matches!(blend, ModelBlend::Opaque | ModelBlend::AlphaTest)
+/// The per-frame entity caster's admit law. CHARACTERS (creatures/players/mounts) ride the
+/// `characterShadows` lane; entity-resident ENVIRONMENT (gameobjects, distance-faded doodads, WMO
+/// props) rides the `worldShadows` lane — so a chest or a fading tree casts with the world, not
+/// with characters. Only the BLEND gate additionally excludes additive/transparent geometry.
+fn casts_realtime_shadow(kind: ModelKind, blend: ModelBlend, char_on: bool, world_on: bool) -> bool {
+    match kind {
+        // Characters: opaque + alpha-test — hair/fringe cards are small, so casting them solid
+        // doesn't produce the ugly canopy-box artifact (and dropping them would lose hair shadows).
+        ModelKind::Creature => char_on && matches!(blend, ModelBlend::Opaque | ModelBlend::AlphaTest),
+        // Entity-resident environment: OPAQUE only. A foliage leaf-card cast solid becomes a box on
+        // the ground (this per-frame caster has no texture to alpha-test); cutout foliage in the
+        // retained world is cast leaf-shaped by the WORLD lane's `CutoutShadowCasterMaterial`, and
+        // entity-resident cutout (a doodad mid distance-fade) waits for that path to extend here.
+        _ => world_on && matches!(blend, ModelBlend::Opaque),
+    }
 }
 
 fn append_skinned(
@@ -567,24 +722,25 @@ mod tests {
     use bevy::prelude::Vec3;
 
     #[test]
-    fn character_only_mode_never_admits_environment_casters() {
-        assert!(casts_realtime_shadow(
-            ModelKind::Creature,
-            ModelBlend::Opaque
-        ));
-        assert!(casts_realtime_shadow(
-            ModelKind::Creature,
-            ModelBlend::AlphaTest
-        ));
-        assert!(!casts_realtime_shadow(
-            ModelKind::Creature,
-            ModelBlend::Blend
-        ));
-
+    fn the_two_lanes_admit_independently() {
+        // Characters ride the CHARACTER lane (opaque + alpha-test); entity environment rides the
+        // WORLD lane (opaque only). Nothing casts Blend on either lane, and a lane that is off
+        // admits nothing of its kind.
+        // Both lanes on:
+        assert!(casts_realtime_shadow(ModelKind::Creature, ModelBlend::Opaque, true, true));
+        assert!(casts_realtime_shadow(ModelKind::Creature, ModelBlend::AlphaTest, true, true));
+        assert!(!casts_realtime_shadow(ModelKind::Creature, ModelBlend::Blend, true, true));
         for kind in [ModelKind::GameObject, ModelKind::Doodad, ModelKind::Wmo] {
-            assert!(!casts_realtime_shadow(kind, ModelBlend::Opaque));
-            assert!(!casts_realtime_shadow(kind, ModelBlend::AlphaTest));
+            assert!(casts_realtime_shadow(kind, ModelBlend::Opaque, true, true));
+            assert!(!casts_realtime_shadow(kind, ModelBlend::AlphaTest, true, true));
+            assert!(!casts_realtime_shadow(kind, ModelBlend::Blend, true, true));
         }
+        // Character lane OFF → creatures cast nothing; the world lane still casts environment.
+        assert!(!casts_realtime_shadow(ModelKind::Creature, ModelBlend::Opaque, false, true));
+        assert!(casts_realtime_shadow(ModelKind::Doodad, ModelBlend::Opaque, false, true));
+        // World lane OFF → environment casts nothing; the character lane still casts creatures.
+        assert!(!casts_realtime_shadow(ModelKind::Doodad, ModelBlend::Opaque, true, false));
+        assert!(casts_realtime_shadow(ModelKind::Creature, ModelBlend::Opaque, true, false));
     }
 
     #[test]
@@ -620,15 +776,14 @@ mod tests {
         // 45° sun: horizontal == vertical, a shadow reaches exactly one caster height.
         let diagonal = Vec3::new(1.0, -1.0, 0.0).normalize();
         assert!((shadow_reach_extension(diagonal) - MAX_CASTER_HEIGHT).abs() < 1e-3);
-        // The night lighting sun (~20° elevation): ~2.7× height, still under the cap — the
-        // Goldshire/Duskwood long-shadow case the reach law exists for.
+        // The night lighting sun (~20° elevation): ~2.7× height, still under the cap.
         let e = 20.0f32.to_radians();
         let night = Vec3::new(e.cos(), -e.sin(), 0.0);
         let expected = MAX_CASTER_HEIGHT * e.cos() / e.sin();
         assert!((shadow_reach_extension(night) - expected).abs() < 1e-2);
         assert!(expected < SHADOW_REACH_CAP);
-        // Straight down sheds no shadow beyond the caster; a degenerate horizontal
-        // direction (the NEG_Z fallback for a zeroed sun) takes the cap, never unbounded.
+        // Straight down sheds no shadow beyond the caster; a degenerate horizontal direction
+        // (the NEG_Z fallback for a zeroed sun) takes the cap, never unbounded.
         assert_eq!(shadow_reach_extension(Vec3::NEG_Y), 0.0);
         assert_eq!(shadow_reach_extension(Vec3::NEG_Z), SHADOW_REACH_CAP);
         // The collection law always contains the resolve range plus the rebuild margin.

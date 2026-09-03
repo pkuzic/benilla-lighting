@@ -325,10 +325,15 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         let mcsh = textureSample(shadow_array, splat_samp, auv, i32(round(si))).r;
         shadow_lit = 1.0 - mcsh;
     }
-    // MCSH always remains the authored base. Realtime character coverage applies a neutral
-    // attenuation and closes the sheen gate. This makes the result monotonic and hue-preserving:
-    // a character can only darken the terrain already underneath it.
-    let shadow_lit_eff = shadow_lit;
+    // MONKEY (world shadows): when the realtime WORLD-shadow lane is active (`worldShadows` on), the
+    // BAKED MCSH terrain shadows are redundant — the realtime map now shadows the static world
+    // (trees + buildings) too — and keeping both double-shadows. So drop MCSH then. This keys on the
+    // world lane flag (`sh_c16.w`, packed by `global_light::build_light_data`), NOT on the mere
+    // presence of a directional light: the shared shadow sun ALSO exists for CHARACTER-only shadows,
+    // and those must leave the world's baked MCSH intact. With the world lane off, `shadow_lit_eff`
+    // keeps MCSH and only the realtime `character_shadow_term` adds the dynamic character shadow.
+    let world_shadow_lane = wow_light.sh_c16.w > 0.5;
+    let shadow_lit_eff = select(shadow_lit, 1.0, world_shadow_lane);
     let spec_gate = min(shadow_lit, world_shadow);
     let character_shadow_term = mix(SHADOW_SUN_FLOOR, 1.0, world_shadow);
 

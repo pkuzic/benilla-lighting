@@ -25,6 +25,7 @@ pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/ui_node_gamma.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/ui_slice_gamma.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/shadow_caster.wgsl");
+    bevy::asset::embedded_asset!(app, "shaders/shadow_caster_cutout_prepass.wgsl");
 }
 
 #[cfg(test)]
@@ -60,6 +61,6 @@ mod tests {
                  `shaders::plugin`, or was registered from a file that is not directly under src/"
             );
         }
-        assert_eq!(found, 6, "the game's shader set changed size");
+        assert_eq!(found, 7, "the game's shader set changed size");
     }
 }

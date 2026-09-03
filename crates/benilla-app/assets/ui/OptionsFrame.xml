@@ -677,10 +677,15 @@
             .. "There is no exclusive fullscreen mode. WoW itself removed one in 8.0.1, and "
             .. "modern Classic offers these same two."
 
+        BENILLA_TOOLTIP_CHARACTER_SHADOWS =
+            "Renders real dynamic silhouettes for players, NPCs, creatures, and mounts, replacing "
+            .. "the legacy oval blob. Matches Wrath's character-only shadow tier. This uses "
+            .. "additional GPU time and memory."
+
         BENILLA_TOOLTIP_WORLD_SHADOWS =
-            "Renders real dynamic silhouettes for players, NPCs, creatures, and mounts. Terrain, "
-            .. "buildings, and trees keep their authored shading, matching Wrath's character-only "
-            .. "shadow tier. This uses additional GPU time and memory."
+            "Casts real dynamic shadows from the static world (trees, buildings, and foliage) "
+            .. "following the sun, and switches off the baked terrain shadows they replace. "
+            .. "Independent of Real Character Shadows. This uses additional GPU time and memory."
 
         OPTIONS_PAGE_ROWS = {
             Controls = {
@@ -694,7 +699,7 @@
             },
             Graphics = {
                 "RowUiScale", "RowFarclip", "RowWorldDetail",
-                "RowDisplayMode", "RowVerticalSync", "RowWorldShadows", "RowRenderScale",
+                "RowDisplayMode", "RowVerticalSync", "RowCharacterShadows", "RowWorldShadows", "RowRenderScale",
             },
             Nameplates = {
                 "RowEnemyPlates", "RowFriendlyPlates",
@@ -2522,13 +2527,23 @@
                                                     "OPTION_TOOLTIP_VERTICAL_SYNC")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowWorldShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowVerticalSync" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowVerticalSync" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
-                                                OptionsRow_OnLoad(self, "worldShadows", "Real Character Shadows",
+                                                OptionsRow_OnLoad(self, "characterShadows", "Real Character Shadows",
+                                                    "BENILLA_TOOLTIP_CHARACTER_SHADOWS")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowWorldShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowCharacterShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowCharacterShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "worldShadows", "World Shadows",
                                                     "BENILLA_TOOLTIP_WORLD_SHADOWS")
                                             </OnLoad></Scripts>
                                         </Frame>

@@ -132,6 +132,8 @@ mod cull;
 mod pick;
 mod pool;
 mod render;
+mod shadow; // MONKEY (world shadows): CPU triangle collection for the static-world shadow caster
+pub use shadow::CutoutBucket; // MONKEY (world shadows): per-leaf-texture alpha-cutout caster group
 
 /// The doodad spatial cell — ¼ ADT tile, the same 133⅓-yd locality key the merge lanes use
 /// (`terrain_stream::merge::CELL`; 1413 round 2 proved the locality load-bearing).

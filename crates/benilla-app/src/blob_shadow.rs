@@ -220,12 +220,14 @@ fn update_shadows(
     // report, answerable from a log instead of a debugger.
     mut census_at: Local<f32>,
 ) {
-    // `worldShadows 1`: the realtime shadow-map path owns unit shadows — every record hides so a
-    // unit never wears the oval underneath its cast shadow. The records themselves stay (spawned
-    // by `sync_shadows` as usual) and `hide` drops each cache key, so flipping the cvar back
-    // rebuilds every projection on the next frame. With the cvar off — the shipped default —
-    // this gate is a single false branch and the lane below is the untouched reference path.
-    if video.world_shadows {
+    // `characterShadows 1`: the realtime shadow-map path owns UNIT shadows — every record hides so a
+    // unit never wears the oval underneath its cast silhouette. (This keys on the CHARACTER lane, not
+    // the world lane: the oval is a character's shadow, so `worldShadows` alone must leave it be.)
+    // The records themselves stay (spawned by `sync_shadows` as usual) and `hide` drops each cache
+    // key, so flipping the cvar back rebuilds every projection on the next frame. With the cvar off —
+    // the shipped default — this gate is a single false branch and the lane below is the untouched
+    // reference path.
+    if video.character_shadows {
         for (_, mut key, mut verts) in &mut shadows {
             if key.shown || !verts.0.is_empty() {
                 hide(&mut key, &mut verts);

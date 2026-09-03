@@ -215,8 +215,13 @@ pub(crate) fn boot_windowed_size() -> UVec2 {
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct VideoConfig {
     pub(crate) vsync: bool,
-    /// Whether characters use the isolated real shadow-map path.
+    /// Whether the STATIC WORLD (trees, buildings, foliage) casts realtime shadows and baked MCSH
+    /// terrain shadows are suppressed. Independent of [`Self::character_shadows`] — either drives
+    /// the shared shadow rig (`character_shadow` / `world_shadow`).
     pub(crate) world_shadows: bool,
+    /// Whether CHARACTERS (players, NPCs, creatures, mounts) cast realtime silhouettes instead of
+    /// the legacy oval blob. Independent of [`Self::world_shadows`].
+    pub(crate) character_shadows: bool,
     pub(crate) display: DisplayMode,
     /// The windowed size, `gxResolution`. Kept while fullscreen so leaving it can restore it.
     pub(crate) windowed: UVec2,
@@ -227,6 +232,7 @@ impl Default for VideoConfig {
         Self {
             vsync: !novsync_env(),
             world_shadows: false,
+            character_shadows: false,
             display: if windowed_env() {
                 DisplayMode::Windowed
             } else {
@@ -538,6 +544,7 @@ mod tests {
         app.insert_resource(VideoConfig {
             vsync: true,
             world_shadows: false,
+            character_shadows: false,
             display: DisplayMode::Fullscreen,
             windowed: UVec2::new(1024, 768),
         })

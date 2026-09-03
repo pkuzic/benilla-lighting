@@ -91,9 +91,9 @@ mod npc_text;
 mod pending_item_ops;
 #[cfg(feature = "dev")]
 mod perf;
+mod character_shadow;
 mod pipe_warm;
 mod player;
-mod player_shadow;
 mod poi_marker;
 mod portrait;
 #[cfg(feature = "dev")]
@@ -181,6 +181,7 @@ mod ui_world_map;
 mod video;
 mod vplates;
 mod world_backdrop;
+mod world_shadow;
 mod world_state;
 mod world_state_ui;
 
@@ -616,7 +617,7 @@ pub fn run(build: BuildId) -> AppExit {
     // The video knobs the CVar host writes into (today: `gxVSync`). Before CvarPlugin so the
     // resource exists when `load_config` applies the saved value at Startup.
     .add_plugins(video::VideoPlugin)
-    .add_plugins(player_shadow::WorldShadowPlugin)
+    .add_plugins(character_shadow::ShadowPlugin)
     // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
     // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
     .add_plugins(realmlist::RealmlistPlugin)

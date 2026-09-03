@@ -175,6 +175,15 @@ const POINT_PACK_RADIUS: f32 = 300.0;
 #[derive(Component)]
 pub struct LightRooms(pub(crate) crate::wmo_portal::WmoGroupVis);
 
+/// MONKEY (world shadows): whether the realtime WORLD-shadow lane is active this frame (the
+/// `worldShadows` cvar). Set by benilla-app's shadow rig; read by [`build_light_data`], which packs
+/// it into the free `sh_c16.w` light lane so `terrain.wgsl` can suppress the baked MCSH terrain
+/// shadows ONLY when the world is casting realtime — not merely because a shadow sun exists (the
+/// sun also exists for character-only shadows, which must leave MCSH alone). A dedicated resource
+/// rather than a `WowLighting` field because `update_time_lighting` wholesale-overwrites that.
+#[derive(Resource, Clone, Copy, Default)]
+pub struct WorldShadowActive(pub bool);
+
 /// Main-world resource holding the packed light for this frame; extracted into the render world where
 /// [`upload_light`] writes it. Rebuilt every frame by [`build_light_data`] (cheap — one std430 pack).
 #[derive(Resource, Clone, Copy, ExtractResource)]
@@ -201,6 +210,7 @@ pub struct SharedLightBuffer(pub Buffer);
 /// creation, and the render-world upload.
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
+        .init_resource::<WorldShadowActive>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
@@ -276,6 +286,8 @@ fn build_light_data(
     portals: Query<&crate::wmo_portal::WmoPortalInstance>,
     mut data: ResMut<WowLightData>,
     time: Res<Time>,
+    // MONKEY (world shadows): the `worldShadows` lane flag, packed into `sh_c16.w` for the MCSH gate.
+    world_shadow: Res<WorldShadowActive>,
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -311,6 +323,10 @@ fn build_light_data(
     // Rows 0-2, the SH block 6-12.xyz, and the sun DC (17.yzw) — the shared model-light core
     // (also the portrait booth's packer). Row 20 (point_count) is the point-table pack's below.
     pack_model_core_rows(rows, l.ambient, l.diffuse, l.sun_dir);
+    // MONKEY (world shadows): pack the world-shadow lane flag into the free `sh_c16.w` lane. The
+    // MCSH terrain-shadow suppression in `terrain.wgsl` keys on THIS — not on the mere presence of
+    // a shadow sun — so character-only shadows (sun present, world lane off) keep the baked MCSH.
+    rows[12][3] = if world_shadow.0 { 1.0 } else { 0.0 };
     // The dynamic point-light table (decision 0278): every spawned point light within
     // [`POINT_PACK_RADIUS`] of the camera, nearest-first when over capacity — the VERTEX stages of
     // `terrain.wgsl`/`wow_model.wgsl` walk it for the Gouraud point term (bevy's clusterable buffer

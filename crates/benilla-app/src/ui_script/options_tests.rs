@@ -2184,6 +2184,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "BENILLA_TOOLTIP_BACKGROUND_SOUND",
                 "AudioRowBackgroundSound",
             ),
+            ("BENILLA_TOOLTIP_CHARACTER_SHADOWS", "GraphicsRowCharacterShadows"),
             ("BENILLA_TOOLTIP_WORLD_SHADOWS", "GraphicsRowWorldShadows"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
@@ -2229,7 +2230,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // 29th is Enable Error Speech (1815), 1.12's own fourth Sound checkbox, ditto; the 30th is
     // Enable Sound in Background (1847), the Audio page's fifth checkbox and the one row on that
     // page the reference never made settable.
-    assert_eq!(checked, 59, "every tipped row carries a live key");
+    // MONKEY (world shadows): +1 for splitting the old single shadow row into Real Character
+    // Shadows + World Shadows (both benilla-owned keys, carved out in BENILLA_OWNED above).
+    assert_eq!(checked, 60, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
