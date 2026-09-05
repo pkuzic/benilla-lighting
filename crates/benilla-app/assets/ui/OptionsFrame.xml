@@ -687,6 +687,10 @@
             .. "following the sun, and switches off the baked terrain shadows they replace. "
             .. "Independent of Real Character Shadows. This uses additional GPU time and memory."
 
+        BENILLA_TOOLTIP_SHADOW_DISTANCE =
+            "How far realtime shadows are drawn, in yards. Higher covers more ground but spreads "
+            .. "the shadow map thinner (softer edges) and costs more. Applies on Okay/Apply."
+
         OPTIONS_PAGE_ROWS = {
             Controls = {
                 "RowStickyTarget", "RowBlockTrades", "RowAutoLoot", "RowInvertMouse",
@@ -699,7 +703,7 @@
             },
             Graphics = {
                 "RowUiScale", "RowFarclip", "RowWorldDetail",
-                "RowDisplayMode", "RowVerticalSync", "RowCharacterShadows", "RowWorldShadows", "RowRenderScale",
+                "RowDisplayMode", "RowVerticalSync", "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance", "RowRenderScale",
             },
             Nameplates = {
                 "RowEnemyPlates", "RowFriendlyPlates",
@@ -2547,10 +2551,27 @@
                                                     "BENILLA_TOOLTIP_WORLD_SHADOWS")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowRenderScale" inherits="OptionsSliderRowTemplate">
+                                        <Frame name="$parentRowShadowDistance" inherits="OptionsSliderRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowWorldShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowWorldShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                -- Realtime-shadow render distance (yd): the cascade
+                                                -- range + caster reach. 40-200, matching the CVar's
+                                                -- own clamp (SHADOW_DISTANCE_RANGE). DEFERRED to
+                                                -- Apply so a drag doesn't re-fit the cascade + recollect
+                                                -- casters on every tick (one rebuild on commit instead).
+                                                OptionsRow_OnLoad(self, "shadowDistance", "Shadow Distance",
+                                                    "BENILLA_TOOLTIP_SHADOW_DISTANCE")
+                                                OptionsSliderRow_Setup(self, 40, 200, 10, "yards")
+                                                self.deferred = 1
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowRenderScale" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowShadowDistance" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowShadowDistance" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- Render Scale (decision 1639) -- benilla's own

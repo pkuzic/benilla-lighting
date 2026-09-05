@@ -2186,6 +2186,7 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ),
             ("BENILLA_TOOLTIP_CHARACTER_SHADOWS", "GraphicsRowCharacterShadows"),
             ("BENILLA_TOOLTIP_WORLD_SHADOWS", "GraphicsRowWorldShadows"),
+            ("BENILLA_TOOLTIP_SHADOW_DISTANCE", "GraphicsRowShadowDistance"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2231,8 +2232,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // Enable Sound in Background (1847), the Audio page's fifth checkbox and the one row on that
     // page the reference never made settable.
     // MONKEY (world shadows): +1 for splitting the old single shadow row into Real Character
-    // Shadows + World Shadows (both benilla-owned keys, carved out in BENILLA_OWNED above).
-    assert_eq!(checked, 60, "every tipped row carries a live key");
+    // Shadows + World Shadows, +1 for the Shadow Distance slider (all benilla-owned keys, carved
+    // out in BENILLA_OWNED above).
+    assert_eq!(checked, 61, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![

@@ -44,21 +44,27 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_formats::ModelBlend;
 use benilla_world::billboard::BillboardCard;
 use benilla_world::interact::PickMesh;
-use benilla_world::lighting::WowLighting;
+use benilla_world::lighting::{ShadowDistance, WowLighting};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 use benilla_world::view::WorldCamera;
 
 use crate::char_select::ClientState;
+use crate::video::VideoConfig;
 
 /// Layer 31 is deliberately private to this feature. Bevy supports 32 render layers; the normal
 /// world is layer 0 and the UI/portrait layers occupy the low numbered slots.
 pub(crate) const PLAYER_SHADOW_LAYER: usize = 31;
 
-/// How far from the camera the shadow map RESOLVES (the single cascade's `maximum_distance`).
-/// Collection reaches farther than this: a caster's own body may stand outside the cascade
-/// while its shadow lands inside it — so an out-of-frustum tree still darkens ground in view.
-const CASTER_RANGE: f32 = 80.0;
+/// Shipped realtime-shadow render distance in yards — the `shadowDistance` default. How far from the
+/// camera the shadow map RESOLVES (the single cascade's `maximum_distance`). Collection reaches
+/// farther than this (a caster's body may stand outside the cascade while its shadow lands inside).
+pub(crate) const DEFAULT_SHADOW_DISTANCE: f32 = 80.0;
+
+/// The `shadowDistance` slider range (yd). Min keeps a useful near shadow; max is bounded because
+/// the fixed 4096 shadow map spreads thinner (softer) over a larger area and the caster-collection
+/// cost grows with distance.
+pub(crate) const SHADOW_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 40.0..=200.0;
 
 /// How far the camera may drift before a cached caster-collection pass must refresh. The collection
 /// reach carries this as margin so coverage holds everywhere between refreshes.
@@ -98,8 +104,8 @@ fn shadow_reach_extension(sun_travel: Vec3) -> f32 {
 
 /// The collection law for a lane that can contribute a TALL caster (a doodad/WMO exile, or the whole
 /// static world): resolve range + rebuild margin + the sun-dependent shadow reach.
-pub(crate) fn static_collection_reach(sun_travel: Vec3) -> f32 {
-    CASTER_RANGE + STATIC_REBUILD_STEP + shadow_reach_extension(sun_travel)
+pub(crate) fn static_collection_reach(sun_travel: Vec3, distance: f32) -> f32 {
+    distance + STATIC_REBUILD_STEP + shadow_reach_extension(sun_travel)
 }
 
 /// `WOW_SHADOW_TRACE=1` — log the caster population when it CHANGES, to attribute a vanished shadow
@@ -190,6 +196,10 @@ struct ShadowRigState {
     sun_written: Option<Vec3>,
     /// The invisible proxy material shared by every lane's SOLID caster.
     material: Option<Handle<ShadowCasterMaterial>>,
+    /// The cascade's currently-applied `maximum_distance` (the `shadowDistance` slider). The
+    /// `CascadeShadowConfig` is only re-inserted when this changes — rebuilding it every frame would
+    /// re-fit the cascade and defeat the texel snap (crawling every shadow edge).
+    cascade_distance: Option<f32>,
 }
 
 pub(crate) struct ShadowCorePlugin;
@@ -234,10 +244,14 @@ impl Plugin for ShadowCorePlugin {
 #[allow(clippy::too_many_arguments)]
 fn manage_rig(
     state: Res<State<ClientState>>,
+    video: Res<VideoConfig>,
     lighting: Res<WowLighting>,
     mut demand: ResMut<ShadowDemand>,
     mut frame: ResMut<ShadowFrame>,
     mut rig: ResMut<ShadowRigState>,
+    // MONKEY (distance slider): bridge the app-side `shadowDistance` to benilla-world so
+    // `global_light` can pack it for the receivers' edge fade (which must fade at THIS distance).
+    mut shadow_distance_out: ResMut<ShadowDistance>,
     mut commands: Commands,
     mut materials: ResMut<Assets<ShadowCasterMaterial>>,
     mut cameras: Query<
@@ -248,6 +262,12 @@ fn manage_rig(
     cameras_for_position: Query<&GlobalTransform, With<WorldCamera>>,
 ) {
     let in_world = *state.get() == ClientState::InWorld;
+    // The `shadowDistance` slider (already clamped by the cvar). Publish it to benilla-world every
+    // frame so the receiver edge fade tracks it.
+    let distance = video.shadow_distance;
+    if shadow_distance_out.0 != distance {
+        shadow_distance_out.0 = distance;
+    }
     // Read the demand the lanes accumulated LAST frame, then reset so they re-accumulate this frame
     // (they run after us, in ShadowSet::Lanes). One-frame lag on rig spawn — imperceptible.
     let wanted = demand.0 && in_world;
@@ -296,7 +316,7 @@ fn manage_rig(
                 CascadeShadowConfigBuilder {
                     num_cascades: 1,
                     minimum_distance: 0.1,
-                    maximum_distance: CASTER_RANGE,
+                    maximum_distance: distance,
                     ..default()
                 }
                 .build(),
@@ -308,6 +328,23 @@ fn manage_rig(
             .id();
         rig.sun = Some(sun);
         rig.sun_written = None;
+        rig.cascade_distance = Some(distance);
+    }
+    // Re-fit the cascade only when the slider changed (not every frame — that would defeat the
+    // texel snap and crawl every shadow edge).
+    if rig.cascade_distance != Some(distance) {
+        if let Some(sun) = rig.sun {
+            commands.entity(sun).insert(
+                CascadeShadowConfigBuilder {
+                    num_cascades: 1,
+                    minimum_distance: 0.1,
+                    maximum_distance: distance,
+                    ..default()
+                }
+                .build(),
+            );
+        }
+        rig.cascade_distance = Some(distance);
     }
 
     for (entity, layers, marker) in &mut cameras {
@@ -336,8 +373,8 @@ fn manage_rig(
 
     // MONKEY (moving sun): aim at the VISIBLE celestial sun (rises/sets), clamped in elevation.
     let sun_direction = shadow_sun_travel(lighting.celestial_dir());
-    let entity_reach = CASTER_RANGE + STATIC_REBUILD_STEP;
-    let tall_reach = static_collection_reach(sun_direction);
+    let entity_reach = distance + STATIC_REBUILD_STEP;
+    let tall_reach = static_collection_reach(sun_direction, distance);
 
     if let Some(sun) = rig.sun {
         // Only the rotation matters; QUANTISED to hold the cascade texel snap (see SUN_SNAP_RADIANS).
@@ -569,7 +606,7 @@ fn append_skinned(
 mod tests {
     use super::{
         append_triangles, casts_realtime_shadow, shadow_reach_extension, shadow_sun_travel,
-        static_collection_reach, sun_snap_due, CASTER_RANGE, MAX_CASTER_HEIGHT,
+        static_collection_reach, sun_snap_due, DEFAULT_SHADOW_DISTANCE, MAX_CASTER_HEIGHT,
         MAX_SHADOW_SUN_ELEVATION, MIN_SHADOW_SUN_ELEVATION, SHADOW_REACH_CAP, STATIC_REBUILD_STEP,
         SUN_SNAP_RADIANS,
     };
@@ -636,7 +673,10 @@ mod tests {
         assert!((shadow_reach_extension(diagonal) - MAX_CASTER_HEIGHT).abs() < 1e-3);
         assert_eq!(shadow_reach_extension(Vec3::NEG_Y), 0.0);
         assert_eq!(shadow_reach_extension(Vec3::NEG_Z), SHADOW_REACH_CAP);
-        assert!(static_collection_reach(Vec3::NEG_Y) >= CASTER_RANGE + STATIC_REBUILD_STEP);
+        assert!(
+            static_collection_reach(Vec3::NEG_Y, DEFAULT_SHADOW_DISTANCE)
+                >= DEFAULT_SHADOW_DISTANCE + STATIC_REBUILD_STEP
+        );
     }
 
     #[test]

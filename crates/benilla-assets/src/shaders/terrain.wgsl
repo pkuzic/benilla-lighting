@@ -41,9 +41,9 @@
 // A fully covered character shadow retains 45% of the authored terrain colour.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
 
-// MONKEY (edge fade): the realtime shadow lightens toward the cascade's max distance so it fades in
-// rather than popping at the resolve boundary. SHADOW_RANGE must match `shadow_core::CASTER_RANGE`.
-const SHADOW_RANGE: f32 = 80.0;
+// MONKEY (edge fade): the realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the
+// cascade's max distance so it fades in rather than popping at the resolve boundary. The distance
+// is the `shadowDistance` slider, read live from `_wmo_fog[1].z` (packed by build_light_data).
 const SHADOW_EDGE_BAND: f32 = 14.0;
 
 // Per-tile Vec4 uniforms packed into ONE buffer (binding 106) — the field order here MUST match the
@@ -323,7 +323,8 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // lighten `world_shadow` toward 1.0 (no shadow). `sun_shadow_strength` is reused for the MCSH
     // fade-back below.
     let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let edge_fade = smoothstep(SHADOW_RANGE - SHADOW_EDGE_BAND, SHADOW_RANGE, cam_dist);
+    let shadow_range = wow_light._wmo_fog[1].z; // the `shadowDistance` slider (yd)
+    let edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, cam_dist);
     let sun_shadow_strength = wow_light.fog_params.z;
     world_shadow = 1.0 - (1.0 - world_shadow) * sun_shadow_strength * (1.0 - edge_fade);
     let primary = in.primary;

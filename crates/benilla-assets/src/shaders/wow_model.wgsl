@@ -115,9 +115,9 @@ struct ModelParams {
 // A fully covered character shadow retains 45% of the authored model lighting.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
 
-// MONKEY (edge fade): the realtime shadow lightens toward the cascade's max distance so it fades in
-// rather than popping at the resolve boundary. SHADOW_RANGE must match `shadow_core::CASTER_RANGE`.
-const SHADOW_RANGE: f32 = 80.0;
+// MONKEY (edge fade): the realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the
+// cascade's max distance so it fades in rather than popping. The distance is the `shadowDistance`
+// slider, read live from `wmo_fog_params.z` (packed by build_light_data).
 const SHADOW_EDGE_BAND: f32 = 14.0;
 
 // The shared global light (lighting::global_light): ONE storage buffer every material reads, updated
@@ -1025,7 +1025,8 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // vanish at night. No effect when unshadowed (player_shadow already 1.0) — keeps the
     // `worldShadows 0` path byte-identical.
     let shadow_cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let shadow_edge_fade = smoothstep(SHADOW_RANGE - SHADOW_EDGE_BAND, SHADOW_RANGE, shadow_cam_dist);
+    let shadow_range = wow_light.wmo_fog_params.z; // the `shadowDistance` slider (yd)
+    let shadow_edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, shadow_cam_dist);
     player_shadow = 1.0 - (1.0 - player_shadow) * wow_light.fog_params.z * (1.0 - shadow_edge_fade);
     // The realtime map blocks only the directional sun. Preserve the authored ambient/probe
     // contribution instead of multiplying the whole lighting result; the latter makes interiors,

@@ -184,6 +184,19 @@ pub struct LightRooms(pub(crate) crate::wmo_portal::WmoGroupVis);
 #[derive(Resource, Clone, Copy, Default)]
 pub struct WorldShadowActive(pub bool);
 
+/// MONKEY (distance slider): the realtime-shadow render distance in yards (the `shadowDistance`
+/// slider), bridged from benilla-app's shadow rig. [`build_light_data`] packs it into a free light
+/// lane so the receivers (`terrain.wgsl`/`wow_model.wgsl`) fade the realtime shadow at THIS distance
+/// rather than a fixed one — the fade must track the cascade's actual `maximum_distance`.
+#[derive(Resource, Clone, Copy)]
+pub struct ShadowDistance(pub f32);
+
+impl Default for ShadowDistance {
+    fn default() -> Self {
+        Self(80.0)
+    }
+}
+
 /// Main-world resource holding the packed light for this frame; extracted into the render world where
 /// [`upload_light`] writes it. Rebuilt every frame by [`build_light_data`] (cheap — one std430 pack).
 #[derive(Resource, Clone, Copy, ExtractResource)]
@@ -211,6 +224,7 @@ pub struct SharedLightBuffer(pub Buffer);
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
         .init_resource::<WorldShadowActive>()
+        .init_resource::<ShadowDistance>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
@@ -296,6 +310,8 @@ fn build_light_data(
     time: Res<Time>,
     // MONKEY (world shadows): the `worldShadows` lane flag, packed into `sh_c16.w` for the MCSH gate.
     world_shadow: Res<WorldShadowActive>,
+    // MONKEY (distance slider): the realtime-shadow render distance, packed for the edge fade.
+    shadow_distance: Res<ShadowDistance>,
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -340,6 +356,10 @@ fn build_light_data(
     // so shadows soften and vanish at night; the shadow basis is separately clamped to 18° so a low
     // sun still casts the right DIRECTION.
     rows[5][2] = sun_shadow_strength(l.celestial_dir.y);
+    // MONKEY (distance slider): the realtime-shadow render distance (yd), packed into the free
+    // `_wmo_fog[1].z` / `wmo_fog_params.z` lane (row 19). The receivers' edge fade reads it so the
+    // shadow fades at the cascade's actual `maximum_distance`, whatever the slider is set to.
+    rows[19][2] = shadow_distance.0;
     // The dynamic point-light table (decision 0278): every spawned point light within
     // [`POINT_PACK_RADIUS`] of the camera, nearest-first when over capacity — the VERTEX stages of
     // `terrain.wgsl`/`wow_model.wgsl` walk it for the Gouraud point term (bevy's clusterable buffer

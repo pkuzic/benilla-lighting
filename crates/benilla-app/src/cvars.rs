@@ -54,6 +54,7 @@ use crate::ui_loot::LootConfig;
 use crate::ui_script::UiScaleCvar;
 use crate::video::VideoConfig;
 use crate::vplates::VPlateMode;
+use crate::shadow_core::SHADOW_DISTANCE_RANGE;
 use crate::world_backdrop::{RenderScale, RENDER_SCALE_RANGE};
 use benilla_ui::script::UiScript;
 use benilla_ui::widget::MINIMAP_ZOOM_LEVELS;
@@ -591,6 +592,14 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // players/NPCs/creatures/mounts cast realtime silhouettes instead of the legacy oval blob.
     same("worldShadows", "0"),
     same("characterShadows", "0"),
+    // Realtime-shadow render distance in yards (the shadow-map cascade range + caster reach).
+    // benilla's own — the reference has no realtime shadow to size. Clamped to SHADOW_DISTANCE_RANGE.
+    ours(
+        "shadowDistance",
+        "80",
+        "1900: benilla's own realtime-shadow render-distance slider; the reference bakes MCSH and \
+         has no cascade to size",
+    ),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
     // two states 1627 settled on ARE that client's two (its own `Graphics.lua` builds the list from
@@ -1072,6 +1081,10 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "gxvsync" => knobs.video.vsync = v != 0.0,
         "worldshadows" => knobs.video.world_shadows = v != 0.0,
         "charactershadows" => knobs.video.character_shadows = v != 0.0,
+        "shadowdistance" => {
+            knobs.video.shadow_distance =
+                v.clamp(*SHADOW_DISTANCE_RANGE.start(), *SHADOW_DISTANCE_RANGE.end());
+        }
         // Display mode (1627) — a flag like every other checkbox here, and the reference's own
         // polarity: `1` is WINDOWED (the row is "Windowed Mode"). `video::apply_window_mode`
         // watches the value and pushes it to the window; nothing else reads it.
@@ -1374,7 +1387,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 46] = [
+        let session: [(&str, String); 47] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1422,6 +1435,7 @@ fn sync_cvars(
             ("gxVSync", flag(video.vsync)),
             ("worldShadows", flag(video.world_shadows)),
             ("characterShadows", flag(video.character_shadows)),
+            ("shadowDistance", video.shadow_distance.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
                 "gxWindow",
