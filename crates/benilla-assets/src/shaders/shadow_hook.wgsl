@@ -15,7 +15,8 @@
 
 #import bevy_pbr::{
     shadows,
-    mesh_view_bindings::lights,
+    mesh_view_bindings::{lights, clusterable_objects},
+    mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
 }
 
 // The realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the cascade's max distance so
@@ -54,4 +55,24 @@ fn realtime_shadow(
     }
     let edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, cam_dist);
     return 1.0 - (1.0 - shadow) * night * (1.0 - edge_fade);
+}
+
+// MONKEY (torch shadows #2): the realtime POINT-light shadow factor at `sample_pos` — 1.0 = lit,
+// 0.0 = fully shadowed. Scans the view's clusterable objects for shadow-casting point lights (the
+// torch-shadow lane promotes the nearest interior fixture to one, `benilla_app::torch_shadow`) and,
+// for any whose radius covers the fragment, samples its cube shadow map. `min` over them so the
+// darkest occluder wins. A no-op indoors when no such light exists (returns 1.0). Called by the
+// INTERIOR receiver paths (the exterior sun's `realtime_shadow` is gated out of interiors).
+fn torch_shadow(sample_pos: vec4<f32>, normal: vec3<f32>) -> f32 {
+    var shadow = 1.0;
+    let count = arrayLength(&clusterable_objects.data);
+    for (var i = 0u; i < count; i = i + 1u) {
+        if ((clusterable_objects.data[i].flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
+            let pr = clusterable_objects.data[i].position_radius;
+            if (distance(pr.xyz, sample_pos.xyz) < pr.w) {
+                shadow = min(shadow, shadows::fetch_point_shadow(i, sample_pos, normal));
+            }
+        }
+    }
+    return shadow;
 }

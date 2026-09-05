@@ -291,9 +291,10 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // The retained path uses the same Bevy directional shadow map as terrain and entity models.
     // `static_gx` used to have no mesh-view shadow bindings, which made every Stormwind WMO act
     // as if shadows were disabled even though the caster map was populated.
-    // MONKEY (shadow hook): the realtime shadow (fetch + edge/night fade, via `benilla::shadow_hook`)
-    // — now with the same edge/night fade as terrain + models. Interior batches (`WORD_INTERIOR`)
-    // stay excluded (no sun reaches a sealed room); the hook is a no-op when no shadow sun exists.
+    // MONKEY (shadow hook): EXTERIOR surfaces take the directional sun shadow (fetch + edge/night
+    // fade, via `benilla::shadow_hook`) — now with the same fades as terrain + models. INTERIOR
+    // batches (`WORD_INTERIOR`) take the point-light (torch) shadow instead (#2): no sun reaches a
+    // sealed room, but a promoted torch does. Both are no-ops when their light source is absent.
     var world_shadow = 1.0;
     if ((in.word & WORD_INTERIOR) == 0u) {
         let view_z = (view.view_from_world * in.world_position).z;
@@ -306,6 +307,8 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
             wow_light.wmo_fog_params.z,
             wow_light.fog_params.z,
         );
+    } else {
+        world_shadow = shadow_hook::torch_shadow(in.world_position, n_lit);
     }
     let shadow_term = mix(SHADOW_SUN_FLOOR, 1.0, world_shadow);
     // Keep ambient energy when the realtime map blocks the sun. The retained pass also carries

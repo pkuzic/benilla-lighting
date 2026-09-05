@@ -181,6 +181,7 @@ mod ui_unit;
 mod ui_world_map;
 mod video;
 mod vplates;
+mod torch_shadow;
 mod world_backdrop;
 mod world_shadow;
 mod world_state;
@@ -623,6 +624,7 @@ pub fn run(build: BuildId) -> AppExit {
         shadow_core::ShadowCorePlugin,
         character_shadow::CharacterShadowPlugin,
         world_shadow::WorldShadowPlugin,
+        torch_shadow::TorchShadowPlugin,
     ))
     // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
     // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
