@@ -107,6 +107,7 @@ mod run_mode;
 mod screen_fade;
 mod screenshot;
 mod shaders;
+mod shadow_core;
 
 mod name_persist;
 /// Where "the client is going down" may be observed, and why that is `Last` and not `Update`
@@ -617,7 +618,12 @@ pub fn run(build: BuildId) -> AppExit {
     // The video knobs the CVar host writes into (today: `gxVSync`). Before CvarPlugin so the
     // resource exists when `load_config` applies the saved value at Startup.
     .add_plugins(video::VideoPlugin)
-    .add_plugins(character_shadow::ShadowPlugin)
+    // MONKEY (shadows): the shared rig (loads first) + the two independent lane plugins.
+    .add_plugins((
+        shadow_core::ShadowCorePlugin,
+        character_shadow::CharacterShadowPlugin,
+        world_shadow::WorldShadowPlugin,
+    ))
     // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
     // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
     .add_plugins(realmlist::RealmlistPlugin)

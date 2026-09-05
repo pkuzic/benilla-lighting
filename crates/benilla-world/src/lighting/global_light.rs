@@ -275,6 +275,14 @@ pub(super) fn per_frame_blob_bytes() -> u64 {
 /// std430 blob. The `.w` lanes carry the faithful invariants the shaders expect (Mod2x 1.0, clamp on,
 /// terrain shininess 20, fog-enable, farclip wall); the model SH coeffs and both water swatches are
 /// derived here once per frame (they used to be recomputed + pushed per-material in `apply_wow_lighting`).
+/// MONKEY (night fade): realtime-shadow day strength from the celestial sun's height
+/// (`sin(elevation)`): 0 at or below the horizon, ramping to 1 by ~12° so shadows fade out at dusk
+/// and in at dawn. A smoothstep for a soft knee rather than a hard switch at the horizon.
+fn sun_shadow_strength(sun_height: f32) -> f32 {
+    let t = (sun_height / 0.208).clamp(0.0, 1.0); // 0.208 ≈ sin(12°)
+    t * t * (3.0 - 2.0 * t)
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn build_light_data(
     light: Res<WowLighting>,
@@ -327,6 +335,11 @@ fn build_light_data(
     // MCSH terrain-shadow suppression in `terrain.wgsl` keys on THIS — not on the mere presence of
     // a shadow sun — so character-only shadows (sun present, world lane off) keep the baked MCSH.
     rows[12][3] = if world_shadow.0 { 1.0 } else { 0.0 };
+    // MONKEY (night fade): realtime-shadow strength by the REAL celestial sun height, packed into
+    // the free `fog_params.z` lane. The receivers (terrain/model) lighten their shadow term by it,
+    // so shadows soften and vanish at night; the shadow basis is separately clamped to 18° so a low
+    // sun still casts the right DIRECTION.
+    rows[5][2] = sun_shadow_strength(l.celestial_dir.y);
     // The dynamic point-light table (decision 0278): every spawned point light within
     // [`POINT_PACK_RADIUS`] of the camera, nearest-first when over capacity — the VERTEX stages of
     // `terrain.wgsl`/`wow_model.wgsl` walk it for the Gouraud point term (bevy's clusterable buffer

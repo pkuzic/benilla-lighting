@@ -166,6 +166,13 @@ pub struct WowLighting {
 }
 
 impl WowLighting {
+    /// The visible **celestial sun** direction (camera→sun, Bevy space) — the body that genuinely
+    /// rises and sets over the day. Exposed for the shadow rig, which aims its basis at this MOVING
+    /// sun (with an elevation clamp) rather than the near-fixed lighting `sun_dir`.
+    pub fn celestial_dir(&self) -> Vec3 {
+        self.celestial_dir
+    }
+
     /// Per-kind **water swatch endpoints**: `(shallow_rgb, deep_rgb, shallow_alpha, deep_alpha)`. The
     /// from-above depth swatch is a plain **2-endpoint linear lerp** of the zone's dedicated `Light.dbc`
     /// water rows — IntBand 16/17 (river/lake) or 14/15 (ocean), **RAW** (no ×0.711) — by the per-vertex

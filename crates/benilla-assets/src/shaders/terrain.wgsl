@@ -41,6 +41,11 @@
 // A fully covered character shadow retains 45% of the authored terrain colour.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
 
+// MONKEY (edge fade): the realtime shadow lightens toward the cascade's max distance so it fades in
+// rather than popping at the resolve boundary. SHADOW_RANGE must match `shadow_core::CASTER_RANGE`.
+const SHADOW_RANGE: f32 = 80.0;
+const SHADOW_EDGE_BAND: f32 = 14.0;
+
 // Per-tile Vec4 uniforms packed into ONE buffer (binding 106) — the field order here MUST match the
 // Rust `TerrainExtension` struct. Light + fog live in the shared global-light storage buffer (below);
 // what's left is just the per-tile layer tiling factor.
@@ -312,6 +317,15 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
             }
         }
     }
+    // MONKEY: soften the realtime shadow before it darkens the ground — an EDGE fade toward the
+    // cascade's max distance (no hard pop at the resolve boundary) and a NIGHT fade by the real sun
+    // height (`fog_params.z`, 1 by day → 0 at night, so shadows vanish as the sun sets). Both
+    // lighten `world_shadow` toward 1.0 (no shadow). `sun_shadow_strength` is reused for the MCSH
+    // fade-back below.
+    let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
+    let edge_fade = smoothstep(SHADOW_RANGE - SHADOW_EDGE_BAND, SHADOW_RANGE, cam_dist);
+    let sun_shadow_strength = wow_light.fog_params.z;
+    world_shadow = 1.0 - (1.0 - world_shadow) * sun_shadow_strength * (1.0 - edge_fade);
     let primary = in.primary;
 
     // STEP 4: MCSH baked shadow. On the reference path (pixelShaders+specular) terrain is ONE pass
@@ -332,8 +346,13 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // presence of a directional light: the shared shadow sun ALSO exists for CHARACTER-only shadows,
     // and those must leave the world's baked MCSH intact. With the world lane off, `shadow_lit_eff`
     // keeps MCSH and only the realtime `character_shadow_term` adds the dynamic character shadow.
+    // The world lane suppresses baked MCSH — but only by `sun_shadow_strength`, so as the realtime
+    // world shadow fades at night the baked MCSH fades back IN. By day (strength 1) MCSH is fully
+    // replaced; at night (strength 0) the authored bake returns; dusk crossfades. Character-only
+    // (lane flag off) never suppresses MCSH.
     let world_shadow_lane = wow_light.sh_c16.w > 0.5;
-    let shadow_lit_eff = select(shadow_lit, 1.0, world_shadow_lane);
+    let mcsh_suppress = select(0.0, sun_shadow_strength, world_shadow_lane);
+    let shadow_lit_eff = mix(shadow_lit, 1.0, mcsh_suppress);
     let spec_gate = min(shadow_lit, world_shadow);
     let character_shadow_term = mix(SHADOW_SUN_FLOOR, 1.0, world_shadow);
 
