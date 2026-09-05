@@ -70,6 +70,7 @@ use benilla_world::model_fade::{fade_alpha, RenderFade};
 use benilla_world::particles::buffer::{begin_effect_frame, EffectVertex};
 use benilla_world::schedule::WorldStage;
 use benilla_world::view::WorldCamera;
+use benilla_world::wmo_portal::UnitWmoRoom;
 
 /// The reference's shadow disc (`Textures\ShadowBlob.blp`, wow-re unit-blob-shadow RE): grayscale
 /// radial blob (gray-160 core → white rim) under a binary alpha disc, multiplied onto the ground.
@@ -204,6 +205,10 @@ fn update_shadows(
             // pass 2 is not in the reference's scene, so it casts nothing (decision 1277). The
             // election writes the ROOT's `Visibility`; this is that verdict after propagation.
             Option<&InheritedVisibility>,
+            // …and the unit's WMO room. `Some(room)` = indoors — the realtime SUN shadow is gated
+            // out of interiors, so an INDOOR unit keeps its oval even when `characterShadows` is on
+            // (otherwise it would have no ground shadow at all). Absent / no-room = outdoors.
+            Option<&UnitWmoRoom>,
         ),
         Without<BlobShadow>,
     >,
@@ -220,21 +225,12 @@ fn update_shadows(
     // report, answerable from a log instead of a debugger.
     mut census_at: Local<f32>,
 ) {
-    // `characterShadows 1`: the realtime shadow-map path owns UNIT shadows — every record hides so a
-    // unit never wears the oval underneath its cast silhouette. (This keys on the CHARACTER lane, not
-    // the world lane: the oval is a character's shadow, so `worldShadows` alone must leave it be.)
-    // The records themselves stay (spawned by `sync_shadows` as usual) and `hide` drops each cache
-    // key, so flipping the cvar back rebuilds every projection on the next frame. With the cvar off —
-    // the shipped default — this gate is a single false branch and the lane below is the untouched
-    // reference path.
-    if video.character_shadows {
-        for (_, mut key, mut verts) in &mut shadows {
-            if key.shown || !verts.0.is_empty() {
-                hide(&mut key, &mut verts);
-            }
-        }
-        return;
-    }
+    // `characterShadows 1`: the realtime shadow-map path owns OUTDOOR unit shadows — the per-unit
+    // gate in the loop below hides the oval for outdoor units so they don't wear both, while INDOOR
+    // units keep it (the realtime sun shadow is gated out of interiors, so an indoor unit would
+    // otherwise have no ground shadow at all). (This keys on the CHARACTER lane, not the world lane:
+    // the oval is a character's shadow, so `worldShadows` alone must leave it be.) With the cvar off
+    // — the shipped default — that gate is a single false branch and this is the reference path.
     let now = time.elapsed_secs();
     let census = now >= *census_at;
     if census {
@@ -259,12 +255,21 @@ fn update_shadows(
     let surface_count = decals.receiver_count();
     for (shadow, mut key, mut verts) in &mut shadows {
         n_total += 1;
-        let Ok((unit, anims, is_self, mount_child, drawn)) = owners.get(shadow.owner) else {
+        let Ok((unit, anims, is_self, mount_child, drawn, room)) = owners.get(shadow.owner) else {
             // sync_shadows despawns next frame; keep it cleared meanwhile.
             hide(&mut key, &mut verts);
             n_no_owner += 1;
             continue;
         };
+        // `characterShadows`: the realtime cast owns OUTDOOR units, so hide the oval there (no
+        // double shadow). INDOOR units (`UnitWmoRoom::room()` = Some) keep it — the realtime sun
+        // shadow is gated out of interiors, so without this an indoor unit has no ground shadow at
+        // all. Absent room component / no-room claim = outdoors.
+        let indoors = room.is_some_and(|r| r.room().is_some());
+        if video.character_shadows && !indoors {
+            hide(&mut key, &mut verts);
+            continue;
+        }
         // An owner that is not drawn casts nothing. The director's report from inside Caverns of
         // Time (decision 1277): the exterior election had correctly stopped drawing the Tanaris
         // mobs overhead, and their shadows carried on being projected onto the cavern floor,
