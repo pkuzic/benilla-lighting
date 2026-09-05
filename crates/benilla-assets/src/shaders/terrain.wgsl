@@ -32,6 +32,8 @@
     mesh_view_bindings::{lights, view},
     shadows,
 }
+// MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
+#import benilla::shadow_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var layer_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var alpha_array: texture_2d_array<f32>;
@@ -40,11 +42,6 @@
 
 // A fully covered character shadow retains 45% of the authored terrain colour.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
-
-// MONKEY (edge fade): the realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the
-// cascade's max distance so it fades in rather than popping at the resolve boundary. The distance
-// is the `shadowDistance` slider, read live from `_wmo_fog[1].z` (packed by build_light_data).
-const SHADOW_EDGE_BAND: f32 = 14.0;
 
 // Per-tile Vec4 uniforms packed into ONE buffer (binding 106) — the field order here MUST match the
 // Rust `TerrainExtension` struct. Light + fog live in the shared global-light storage buffer (below);
@@ -302,31 +299,21 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // Keep the raw fetch for the specular gate below. The realtime map now contains CHARACTERS
     // only; MCSH contains the static world's baked blockers. They are independent occluders, so
     // the character map must never replace (and thereby brighten) the authored terrain bake.
-    var world_shadow = 1.0;
-    if (lights.n_directional_lights > 0u) {
-        let view_z = (view.view_from_world * in.world_position).z;
-        for (var light_id = 0u; light_id < lights.n_directional_lights; light_id = light_id + 1u) {
-            if ((lights.directional_lights[light_id].flags & 1u) != 0u) {
-                world_shadow = shadows::fetch_directional_shadow(
-                    light_id,
-                    in.world_position,
-                    normalize(in.world_normal),
-                    view_z,
-                );
-                break;
-            }
-        }
-    }
-    // MONKEY: soften the realtime shadow before it darkens the ground — an EDGE fade toward the
-    // cascade's max distance (no hard pop at the resolve boundary) and a NIGHT fade by the real sun
-    // height (`fog_params.z`, 1 by day → 0 at night, so shadows vanish as the sun sets). Both
-    // lighten `world_shadow` toward 1.0 (no shadow). `sun_shadow_strength` is reused for the MCSH
-    // fade-back below.
+    // MONKEY (shadow hook): the realtime shadow — fetch + edge fade (toward the `shadowDistance`
+    // range in `_wmo_fog[1].z`) + night fade (`fog_params.z`) — is computed by `benilla::shadow_hook`.
+    // Terrain keeps only its own MCSH suppression + spec gate below; `sun_shadow_strength` feeds the
+    // MCSH fade-back.
+    let view_z = (view.view_from_world * in.world_position).z;
     let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let shadow_range = wow_light._wmo_fog[1].z; // the `shadowDistance` slider (yd)
-    let edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, cam_dist);
     let sun_shadow_strength = wow_light.fog_params.z;
-    world_shadow = 1.0 - (1.0 - world_shadow) * sun_shadow_strength * (1.0 - edge_fade);
+    let world_shadow = shadow_hook::realtime_shadow(
+        in.world_position,
+        normalize(in.world_normal),
+        view_z,
+        cam_dist,
+        wow_light._wmo_fog[1].z,
+        sun_shadow_strength,
+    );
     let primary = in.primary;
 
     // STEP 4: MCSH baked shadow. On the reference path (pixelShaders+specular) terrain is ONE pass

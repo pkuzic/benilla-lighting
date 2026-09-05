@@ -51,6 +51,8 @@
     shadows,
     mesh_functions,
 }
+// MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
+#import benilla::shadow_hook
 
 // Our own fragment output, so the SKY lane can force the far depth. Bevy's `forward_io::FragmentOutput`
 // is `@location(0) color` and nothing else (bevy_pbr 0.18.1 `forward_io.wgsl`), so this is that struct
@@ -114,11 +116,6 @@ struct ModelParams {
 
 // A fully covered character shadow retains 45% of the authored model lighting.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
-
-// MONKEY (edge fade): the realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the
-// cascade's max distance so it fades in rather than popping. The distance is the `shadowDistance`
-// slider, read live from `wmo_fog_params.z` (packed by build_light_data).
-const SHADOW_EDGE_BAND: f32 = 14.0;
 
 // The shared global light (lighting::global_light): ONE storage buffer every material reads, updated
 // once/frame in place — replaces the per-material light/fog uniforms the old apply_wow_lighting re-pushed
@@ -981,53 +978,43 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // through `point_diffuse` below like any exterior entity.
     let is_rig = m.sun_scale.x >= 1.5;
     let lit = select(select(lit_exterior, lit_interior, is_interior), lit_m2_interior, is_rig);
+    // MONKEY (shadow hook): the realtime shadow (fetch + edge/night fade) is computed by
+    // `benilla::shadow_hook`. This lane keeps only the rig-skin SAMPLE-POINT choice + the
+    // interior/rig exclusion + ambient-preserving apply below.
     var player_shadow = 1.0;
-    if (lights.n_directional_lights > 0u) {
-        let view_z = (view.view_from_world * in.world_position).z;
-        for (var light_id = 0u; light_id < lights.n_directional_lights; light_id = light_id + 1u) {
-            if ((lights.directional_lights[light_id].flags & 1u) != 0u) {
-#ifdef WOW_RIG_SKIN
-                // A skinned UNIT samples the map ONCE at its rig origin (between the feet),
-                // nudged 2.5 units TOWARD the sun, and the whole unit dims uniformly — the
-                // reference's own per-unit response. Per-fragment sampling is wrong here: the
-                // caster proxy holds a CPU-skinned copy of this very body, so a body fragment
-                // reads its own limbs/weapon as occluders (self-shadow speckle no bias fixes on
-                // animated silhouettes). Points along the sun ray share a shadow-map texel, so
-                // the nudge only excludes occluders within ~2.5 units of the feet ALONG the ray
-                // (a fence hugging the unit) — a building or canopy still lands. Gated on the
-                // directional-enable flag so an interior-lit unit never takes an exterior dim.
-                if (wow_light.light_sun.w > 0.5) {
-                    let sun_ray = normalize(wow_light.light_sun.xyz);
-                    let anchor = wow_light.rig_origin[(fade_tag >> 19u) & 0x7ffu].xyz
-                        - 2.5 * sun_ray;
-                    player_shadow = shadows::fetch_directional_shadow(
-                        light_id,
-                        vec4<f32>(anchor, 1.0),
-                        vec3<f32>(0.0, 1.0, 0.0),
-                        view_z,
-                    );
-                }
-#else
-                player_shadow = shadows::fetch_directional_shadow(
-                    light_id,
-                    in.world_position,
-                    wow_normalize(in.world_normal),
-                    view_z,
-                );
-#endif
-                break;
-            }
-        }
-    }
-    // MONKEY: soften the realtime shadow like the terrain — an EDGE fade toward the cascade's max
-    // distance + a NIGHT fade by the real sun height (`fog_params.z`, 1 by day → 0 at night). Both
-    // lighten `player_shadow` toward 1.0 (no shadow), so shadows on models fade in at range and
-    // vanish at night. No effect when unshadowed (player_shadow already 1.0) — keeps the
-    // `worldShadows 0` path byte-identical.
+    let view_z = (view.view_from_world * in.world_position).z;
     let shadow_cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let shadow_range = wow_light.wmo_fog_params.z; // the `shadowDistance` slider (yd)
-    let shadow_edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, shadow_cam_dist);
-    player_shadow = 1.0 - (1.0 - player_shadow) * wow_light.fog_params.z * (1.0 - shadow_edge_fade);
+#ifdef WOW_RIG_SKIN
+    // A skinned UNIT samples the map ONCE at its rig origin (between the feet), nudged 2.5 units
+    // TOWARD the sun, and dims uniformly — the reference's per-unit response. Per-fragment sampling
+    // is wrong here: the caster proxy holds a CPU-skinned copy of this very body, so a body fragment
+    // reads its own limbs/weapon as occluders (self-shadow speckle). Gated on the directional-enable
+    // flag so an interior-lit unit never takes an exterior dim (player_shadow stays 1.0).
+    if (wow_light.light_sun.w > 0.5) {
+        let sun_ray = normalize(wow_light.light_sun.xyz);
+        let anchor = vec4<f32>(
+            wow_light.rig_origin[(fade_tag >> 19u) & 0x7ffu].xyz - 2.5 * sun_ray,
+            1.0,
+        );
+        player_shadow = shadow_hook::realtime_shadow(
+            anchor,
+            vec3<f32>(0.0, 1.0, 0.0),
+            view_z,
+            shadow_cam_dist,
+            wow_light.wmo_fog_params.z,
+            wow_light.fog_params.z,
+        );
+    }
+#else
+    player_shadow = shadow_hook::realtime_shadow(
+        in.world_position,
+        wow_normalize(in.world_normal),
+        view_z,
+        shadow_cam_dist,
+        wow_light.wmo_fog_params.z,
+        wow_light.fog_params.z,
+    );
+#endif
     // The realtime map blocks only the directional sun. Preserve the authored ambient/probe
     // contribution instead of multiplying the whole lighting result; the latter makes interiors,
     // point-lit props, and shadow-side characters globally too dark.

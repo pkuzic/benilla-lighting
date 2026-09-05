@@ -35,9 +35,9 @@ use bevy::render::render_resource::{
     AsBindGroup, BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, ColorWrites,
     CompareFunction, RenderPipelineDescriptor, SpecializedMeshPipelineError,
 };
-use bevy::shader::ShaderRef;
+use bevy::shader::{load_shader_library, ShaderRef};
 
-/// Compile the four WGSL files into the binary and register them under
+/// Compile the WGSL files into the binary and register them under
 /// `embedded://benilla_assets/shaders/…`. Call **after** Bevy's `AssetPlugin` (it fills the
 /// registry that plugin creates); [`crate::register_asset_loaders`] already does.
 pub fn register_shaders(app: &mut App) {
@@ -45,6 +45,10 @@ pub fn register_shaders(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/wow_model.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/wdl.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/liquid.wgsl");
+    // MONKEY (shadow hook): register the importable shadow-contribution library `benilla::shadow_hook`
+    // (loaded eagerly so `#import benilla::shadow_hook` resolves in terrain/model/static_gx). This is
+    // the ONE place the realtime directional-shadow term lives; the receivers just call into it.
+    load_shader_library!(app, "shaders/shadow_hook.wgsl");
 }
 
 /// The WDL far-band shader's source, for the law tests that live beside the renderer rather than

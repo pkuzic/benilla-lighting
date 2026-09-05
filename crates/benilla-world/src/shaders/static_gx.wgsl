@@ -31,6 +31,8 @@
     mesh_view_bindings::{lights, view},
     shadows,
 }
+// MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
+#import benilla::shadow_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -289,20 +291,21 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // The retained path uses the same Bevy directional shadow map as terrain and entity models.
     // `static_gx` used to have no mesh-view shadow bindings, which made every Stormwind WMO act
     // as if shadows were disabled even though the caster map was populated.
+    // MONKEY (shadow hook): the realtime shadow (fetch + edge/night fade, via `benilla::shadow_hook`)
+    // — now with the same edge/night fade as terrain + models. Interior batches (`WORD_INTERIOR`)
+    // stay excluded (no sun reaches a sealed room); the hook is a no-op when no shadow sun exists.
     var world_shadow = 1.0;
-    if (lights.n_directional_lights > 0u && (in.word & WORD_INTERIOR) == 0u) {
+    if ((in.word & WORD_INTERIOR) == 0u) {
         let view_z = (view.view_from_world * in.world_position).z;
-        for (var light_id = 0u; light_id < lights.n_directional_lights; light_id = light_id + 1u) {
-            if ((lights.directional_lights[light_id].flags & 1u) != 0u) {
-                world_shadow = shadows::fetch_directional_shadow(
-                    light_id,
-                    in.world_position,
-                    n_lit,
-                    view_z,
-                );
-                break;
-            }
-        }
+        let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
+        world_shadow = shadow_hook::realtime_shadow(
+            in.world_position,
+            n_lit,
+            view_z,
+            cam_dist,
+            wow_light.wmo_fog_params.z,
+            wow_light.fog_params.z,
+        );
     }
     let shadow_term = mix(SHADOW_SUN_FLOOR, 1.0, world_shadow);
     // Keep ambient energy when the realtime map blocks the sun. The retained pass also carries
