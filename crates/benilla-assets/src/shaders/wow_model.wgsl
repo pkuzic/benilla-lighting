@@ -1278,14 +1278,27 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let matte_indoor = !is_interior && (fade_tag & 0x4000u) != 0u;
     if ((is_interior || matte_indoor) && !is_wmo && !is_rig && wow_light.wmo_fog_params.w > 0.5) {
         let room = interior_room_light(in.world_position.xyz, n_lit);
-        lit_rgb = albedo * inst_tint * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
+        var room_rgb = albedo * inst_tint * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
         let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
         if (idbg == 2u) {
             // The entity's OWN cube-map sampling as greyscale (the shared stub would show white).
-            lit_rgb = vec3<f32>(torch_entity_debug_factor(in.world_position.xyz, n_lit));
+            room_rgb = vec3<f32>(torch_entity_debug_factor(in.world_position.xyz, n_lit));
         } else {
-            lit_rgb = shadow_hook::interior_debug_override(idbg, lit_rgb, in.world_position, n_lit);
+            room_rgb = shadow_hook::interior_debug_override(idbg, room_rgb, in.world_position, n_lit);
         }
+        // MONKEY (portal lane fade): CROSSFADE, not a switch. `lit_rgb` still holds this part's
+        // EXTERIOR result (day/night × its ground-shade byte) — the "outside" colour — and the
+        // classifier ramps tag bits 15..=18 from 0 to 15 over ~half a second as the entity's
+        // anchor crosses the portal, so the two lanes blend the way the surfaces at the seam
+        // already do. Without it a character stepping through a doorway went from night-dark to
+        // torch-warm in ONE frame while the wall beside it faded.
+        //
+        // Forced to 1.0 in INTERIOR material mode: there those bits are the middle of the SH probe
+        // slot (`mesh_tag`'s two payload modes), so reading them as a weight would fade an indoor
+        // baked unit by its probe INDEX. The classifier only ever commits the interior material at
+        // full weight anyway — every frame of an actual blend is written in exterior mode.
+        let lane_w = select(f32((fade_tag >> 15u) & 0xfu) / 15.0, 1.0, is_interior);
+        lit_rgb = mix(lit_rgb, room_rgb, lane_w);
     }
     // The fullbright/UNLIT path takes the tint too, unlike the highlight: with GL_LIGHTING off the
     // same gx state (SetState(1)) is a plain `glColor` modulate on the texture, while GL_EMISSION is
