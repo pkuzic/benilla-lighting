@@ -133,7 +133,16 @@ mod pick;
 mod pool;
 mod render;
 mod shadow; // MONKEY (world shadows): CPU triangle collection for the static-world shadow caster
+mod torch_depth; // MONKEY (torch shadows Phase 1): the per-fixture depth-map render + its targets
 pub use shadow::CutoutBucket; // MONKEY (world shadows): per-leaf-texture alpha-cutout caster group
+pub use torch_depth::TorchShadowViews; // MONKEY (torch shadows Phase 1): the app→render publication
+// MONKEY (torch shadows Phase 3A): the shared depth image + table buffer every model material binds,
+// their startup constructor, the one-param main-world accessor, and the always-on wiring — used by
+// the asset foundation (`crate::assets`) and every material-building site; NOT gated on `enabled()`.
+pub use torch_depth::{
+    new_torch_shared, SharedTorchBuffer, TorchDepthImage, TorchShared,
+};
+pub(crate) use torch_depth::register_shared as register_torch_shared;
 
 /// The doodad spatial cell — ¼ ADT tile, the same 133⅓-yd locality key the merge lanes use
 /// (`terrain_stream::merge::CELL`; 1413 round 2 proved the locality load-bearing).

@@ -69,6 +69,9 @@ type SpawnTables<'w> = (
     // `None` only under `WOW_STATIC_GX=0` (the resource exists whenever the retained pass
     // is armed — the default since 1434).
     Option<ResMut<'w, crate::static_gx::StaticGx>>,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings every spawned material takes
+    // (nested here for the same 16-param reason as the rest of the tuple).
+    crate::static_gx::TorchShared<'w>,
 );
 
 #[allow(clippy::too_many_arguments)]
@@ -97,10 +100,15 @@ pub(super) fn spawn_loaded_placements(
     // model-forms cache (decision 0834).
     tables: SpawnTables,
 ) {
-    let (mut probes, mut activity, focus, mut forms, mut welds, mut merge, mut staticgx) = tables;
+    let (mut probes, mut activity, focus, mut forms, mut welds, mut merge, mut staticgx, torch) =
+        tables;
     let Some(shared_light) = shared_light else {
         return;
     };
+    let Some(torch) = torch.binds() else {
+        return; // created in the same startup system as the light buffer — retry like it
+    };
+    let torch = &torch;
     // Steady state is everything spawned, and the walk below still visits every placement and
     // every WMO prop to find that out — the pending count (kept by the register/handoff/release
     // sites) makes that frame free.
@@ -192,6 +200,7 @@ pub(super) fn spawn_loaded_placements(
                         mat_cache,
                         materials,
                         light,
+                        torch,
                         &m.submeshes,
                         FormSlices {
                             stat: forms.static_meshes(key).unwrap_or(&[]),
@@ -372,6 +381,7 @@ pub(super) fn spawn_loaded_placements(
                         mat_cache,
                         materials,
                         light,
+                        torch,
                         &m.submeshes,
                         FormSlices {
                             stat: forms.static_meshes(key).unwrap_or(&[]),
@@ -716,6 +726,7 @@ pub(super) fn spawn_loaded_placements(
                 mat_cache,
                 materials,
                 light,
+                torch,
                 &m.submeshes,
                 FormSlices {
                     stat: forms.static_meshes(key).unwrap_or(&[]),

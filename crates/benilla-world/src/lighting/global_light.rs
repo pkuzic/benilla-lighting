@@ -147,6 +147,16 @@ pub fn commit_raw(rgb: [f32; 3]) -> [f32; 3] {
 /// [`build_light_data`] packs the nearest-to-camera first when over capacity.
 pub(super) const MAX_POINT_LIGHTS: usize = 256;
 
+/// MONKEY (dynamic interiors): a fixture this close to the camera (yd) is packed regardless of the
+/// portal flood — see the room term in [`build_light_data`]. Sized to a WHOLE BUILDING PLUS its
+/// approach, not just the room: at 40 yd, walking around the outside of the inn kept crossing the
+/// boundary and a fixture would evict, so an interior-classified NPC by the door brightened and
+/// dimmed as the camera moved (issue A). 90 yd keeps a building's fixtures admitted the whole time
+/// you are near it; the per-fixture 48 yd range check still gates which fragments they actually
+/// light, so the wider admit only affects table MEMBERSHIP, never reach. (256-slot cap: Goldshire's
+/// buildings stay well under it at this radius.)
+const INTERIOR_NEAR_ADMIT: f32 = 90.0;
+
 /// Pack lights only within this camera distance (yd). A point light's whole visible effect lives
 /// within its ~48 yd candidacy range (`spawn::POINT_LIGHT_RANGE`, the packed `.w`); a pool farther
 /// than ~300 yd is sub-pixel and usually fogged, and the cap keeps the per-vertex selection walk
@@ -174,6 +184,15 @@ const POINT_PACK_RADIUS: f32 = 300.0;
 /// authority a second writer on an entity whose `Visibility` nothing reads (decision 0025).
 #[derive(Component)]
 pub struct LightRooms(pub(crate) crate::wmo_portal::WmoGroupVis);
+
+/// MONKEY (torch shadows, Stage B): marks a `PointLight` that exists ONLY to render a cube shadow
+/// map (`benilla_app::torch_shadow`'s promoted fixtures). Such a proxy must NOT enter the
+/// `wow_light` light table — benilla's receivers would treat it as a real fixture and its nominal
+/// intensity (~1000, committed far over gamut) would blast light onto everything near the building,
+/// blinking as the proxy repositions. [`build_light_data`]'s gather excludes it; only its Bevy cube
+/// map + clusterable entry are wanted.
+#[derive(Component)]
+pub struct ShadowProxyLight;
 
 /// MONKEY (world shadows): whether the realtime WORLD-shadow lane is active this frame (the
 /// `worldShadows` cvar). Set by benilla-app's shadow rig; read by [`build_light_data`], which packs
@@ -225,6 +244,7 @@ pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
         .init_resource::<WorldShadowActive>()
         .init_resource::<ShadowDistance>()
+        .init_resource::<DynamicInteriors>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
@@ -297,13 +317,54 @@ fn sun_shadow_strength(sun_height: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// MONKEY (dynamic interiors): the live knobs of the interior lane — WMO interior surfaces AND
+/// interior props light from the room's live fixtures (`static_gx.wgsl` `interior_room_light`)
+/// instead of the MOCV bake / the baked prop probe. Bridged every frame from the app-side cvars
+/// (`interiorLight`, `interiorAmbient`, `interiorFill`, `interiorExposure` — benilla-app's
+/// `dynamic_interior` module) the way [`ShadowDistance`] is, so the look is tunable in-game.
+/// `enabled == false` → the faithful baked path. Packed into the free `wmo_fog_params.w` (on/off)
+/// and `point_count.yzw` (the three knobs) lanes.
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+pub struct DynamicInteriors {
+    /// The lane on/off (`interiorLight`).
+    pub enabled: bool,
+    /// Base ambient every interior fragment gets, so a fixture-less nook never goes black.
+    pub ambient: f32,
+    /// Bounce gain per fixture — the normal-free "lamps everywhere" glow the bake carried.
+    pub fill: f32,
+    /// Multiplier on the whole light budget before the soft rolloff — the room's brightness.
+    pub exposure: f32,
+    /// MONKEY (interior debug): diagnostic overlay for the interior lane (`interiorDebug`). 0 = off
+    /// (normal shading). 1 = CLASSIFICATION: interior-lit fragments render solid green, so a wrongly
+    /// interior-classified OUTDOOR entity shows up. 2 = SHADOW: the torch-shadow factor as greyscale
+    /// (black = shadowed, white = lit) — shows whether cast shadows are computed at all. 3 = CASTER
+    /// COUNT: how many shadow-casting proxies the fragment sees in `clusterable_objects` (red = 0 —
+    /// the proxies never reached the shader; green = 1; blue = 2; white = 3+). Packed with the on/off
+    /// flag into `wmo_fog_params.w` as `1 + debug` (so `>0.5` still means "on").
+    pub debug: u32,
+}
+
+impl Default for DynamicInteriors {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ambient: 0.15,
+            fill: 0.12,
+            exposure: 2.5,
+            debug: 0,
+        }
+    }
+}
+
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn build_light_data(
     light: Res<WowLighting>,
     debug: Res<DebugState>,
     view: Res<ViewDistance>,
     cam: Query<&GlobalTransform, With<WorldCamera>>,
-    lights_q: Query<(&PointLight, &GlobalTransform, Option<&LightRooms>)>,
+    // `Without<ShadowProxyLight>`: the torch-shadow proxies are `PointLight`s too, but they exist
+    // only to cast a cube map — never to light benilla's receivers (see [`ShadowProxyLight`]).
+    lights_q: Query<(&PointLight, &GlobalTransform, Option<&LightRooms>), Without<ShadowProxyLight>>,
     // The per-frame portal PVS, for the room term below ([`LightRooms`]).
     portals: Query<&crate::wmo_portal::WmoPortalInstance>,
     mut data: ResMut<WowLightData>,
@@ -312,6 +373,8 @@ fn build_light_data(
     world_shadow: Res<WorldShadowActive>,
     // MONKEY (distance slider): the realtime-shadow render distance, packed for the edge fade.
     shadow_distance: Res<ShadowDistance>,
+    // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
+    dynamic_interiors: Res<DynamicInteriors>,
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -360,6 +423,15 @@ fn build_light_data(
     // `_wmo_fog[1].z` / `wmo_fog_params.z` lane (row 19). The receivers' edge fade reads it so the
     // shadow fades at the cascade's actual `maximum_distance`, whatever the slider is set to.
     rows[19][2] = shadow_distance.0;
+    // MONKEY (dynamic interiors): the lane's on/off into the free `wmo_fog_params.w` lane (1 = WMO
+    // interior surfaces + props light from the room's live fixtures, 0 = the faithful baked path).
+    // Its three knobs ride `point_count.yzw`, packed with the table below.
+    // On/off in the integer part, the debug mode added on top: 0 = off, 1 = on, 1+n = on + debug n.
+    rows[19][3] = if dynamic_interiors.enabled {
+        1.0 + dynamic_interiors.debug as f32
+    } else {
+        0.0
+    };
     // The dynamic point-light table (decision 0278): every spawned point light within
     // [`POINT_PACK_RADIUS`] of the camera, nearest-first when over capacity — the VERTEX stages of
     // `terrain.wgsl`/`wow_model.wgsl` walk it for the Gouraud point term (bevy's clusterable buffer
@@ -372,15 +444,23 @@ fn build_light_data(
     let cam_pos = cam.single().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
     let mut pts: Vec<(f32, Vec3, f32, [f32; 3])> = lights_q
         .iter()
-        .filter(|(_, _, rooms)| {
+        .filter(|(_, gt, rooms)| {
             // The ROOM term (decision 0689's law, fourth lane — see [`LightRooms`]). Not a
             // visibility test bolted onto a faithful gather: the reference's register walk has no
             // such term either, it simply never has a culled room's torch to register. Ungated for
             // every light that names no rooms, which is every light outside a building.
+            //
+            // MONKEY (dynamic interiors): a fixture NEAR the camera is admitted regardless of the
+            // flood. The PVS follows the camera, so a room's torches dropped out of the table with
+            // camera angle — outside its door, or from the next room — and a fixture-LIT interior
+            // went dark where the bake never could (the dump flipped 18↔9 packed walking the inn).
+            // The wall leak this allows is the reference's own: a drawn room's torches register.
             crate::wmo_portal::room_admits(
                 rooms.map(|r| &r.0),
                 rooms.and_then(|r| portals.get(r.0.instance).ok()),
-            )
+            ) || (dynamic_interiors.enabled
+                && gt.translation().distance_squared(cam_pos)
+                    < INTERIOR_NEAR_ADMIT * INTERIOR_NEAR_ADMIT)
         })
         .filter_map(|(pl, gt, _)| {
             let p = gt.translation();
@@ -395,7 +475,14 @@ fn build_light_data(
         .collect();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
     pts.truncate(MAX_POINT_LIGHTS);
-    data.0.rows[20] = [pts.len() as f32, 0.0, 0.0, 0.0];
+    // `.x` = the live entry count; MONKEY (dynamic interiors): `.yzw` = the interior lane's live
+    // knobs (base ambient, per-fixture fill gain, exposure) — free lanes until now.
+    data.0.rows[20] = [
+        pts.len() as f32,
+        dynamic_interiors.ambient,
+        dynamic_interiors.fill,
+        dynamic_interiors.exposure,
+    ];
     for (i, (_, p, range, rgb)) in pts.iter().enumerate() {
         data.0.points[2 * i] = [p.x, p.y, p.z, *range];
         data.0.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], 0.0];

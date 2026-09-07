@@ -47,7 +47,12 @@
 //!   `255` = fully MCSH-shadowed): the per-instance mix from the batch's lit sun level toward the
 //!   shaded one (`wow_model.wgsl`). Entities (units/players/GameObjects) ramp it per frame
 //!   ([`crate::entity_shade`]); statics (doodads/props) leave it `0` — their shade is the
-//!   per-material selector (`sun_scale.x`). Bits 14..=18 are reserved (0).
+//!   per-material selector (`sun_scale.x`). Bit 14 is the **MATTE-INDOOR flag**
+//!   ([`MATTE_INDOOR_BIT`], MONKEY torch shadows Phase 3A): the classifier's `Matte` law — an
+//!   entity standing INDOORS whose material nonetheless stays in exterior mode (day/night, no
+//!   bake). `wow_model.wgsl` routes such a part to the dynamic-interior lane on it, so a unit
+//!   whose verdict flickers `Bake`↔`Matte` at one spot keeps its lane. Bits 15..=18 are
+//!   reserved (0).
 //! - **Interior probe slot** (interior M2 props/entities — material in interior mode,
 //!   `model_flags.z` set, not a WMO): bits 6..=18 carry the SH-probe TABLE SLOT (see
 //!   [`crate::lighting::PropProbes`]; 8192 slots = 13 bits), alpha and rig ride their fixed
@@ -136,6 +141,11 @@ const ALPHA_MAX: f32 = 63.0;
 /// Bits 6..=13 of the exterior payload: the ground-shade byte.
 const SHADE_MASK: u32 = 0x0000_3fc0;
 const SHADE_SHIFT: u32 = 6;
+/// Bit 14 of the exterior payload (MONKEY, torch shadows Phase 3A): the part's anchor classified
+/// INDOORS under the `Matte` law — exterior material mode, but the room's dynamic light applies.
+/// Sits in the exterior payload's reserved bits, so [`with_shade`]/[`with_alpha`]/[`with_rig`]
+/// carry it through and the shader's 8-bit shade decode never sees it.
+pub(crate) const MATTE_INDOOR_BIT: u32 = 0x0000_4000;
 /// Bits 6..=18 of the interior payload: the SH-probe table slot (13 bits ⇔ 8192 slots).
 const PROBE_MASK: u32 = 0x0007_ffc0;
 const PROBE_SHIFT: u32 = 6;
@@ -195,6 +205,13 @@ pub(crate) fn with_interior_probe(tag: u32, slot: u16) -> u32 {
 /// ordered after).
 pub(crate) fn with_exterior_reset(tag: u32) -> u32 {
     (tag & RIG_MASK) | carried_alpha(tag)
+}
+
+/// Rewrite a tag as a fresh exterior payload flagged MATTE-INDOOR ([`MATTE_INDOOR_BIT`]),
+/// preserving the rig and alpha fields: the classifier's `Matte`-law write (MONKEY, torch shadows
+/// Phase 3A). The shade writer re-asserts its byte the same frame and carries the bit through.
+pub(crate) fn with_matte_indoor(tag: u32) -> u32 {
+    with_exterior_reset(tag) | MATTE_INDOOR_BIT
 }
 
 /// **A spawned part's initial `MeshTag`** — its rig slot and its starting render alpha, the two
@@ -453,6 +470,24 @@ mod tests {
         assert_eq!(t & ALPHA_MASK, ALPHA_MASK);
         // A probe payload keeps its slot decode with the flag set.
         assert_eq!((probe_bits(6660) & PROBE_MASK) >> PROBE_SHIFT, 6660);
+    }
+
+    /// MONKEY (torch shadows Phase 3A): the Matte-law indoor flag rides the exterior payload's
+    /// reserved bit 14 — the per-frame shade/alpha writers carry it, the shade decode never sees
+    /// it, and the exterior reclaim clears it.
+    #[test]
+    fn matte_indoor_bit_survives_the_field_writers_and_clears_on_exterior() {
+        let t = with_matte_indoor(rig_bits(9) | alpha_bits(0.5));
+        assert_eq!(t & MATTE_INDOOR_BIT, MATTE_INDOOR_BIT);
+        assert_eq!(rig_of(t), 9);
+        assert_eq!(t & ALPHA_MASK, alpha_bits(0.5));
+        assert_eq!(with_shade(t, 255) & MATTE_INDOOR_BIT, MATTE_INDOOR_BIT);
+        assert_eq!(shade_of(with_shade(t, 255)), 255);
+        assert_eq!(with_alpha(t, 0.25) & MATTE_INDOOR_BIT, MATTE_INDOOR_BIT);
+        assert_eq!(with_rig(t, 3) & MATTE_INDOOR_BIT, MATTE_INDOOR_BIT);
+        assert_eq!(with_interior_fog(t, true) & MATTE_INDOOR_BIT, MATTE_INDOOR_BIT);
+        assert_eq!(with_exterior_reset(t) & MATTE_INDOOR_BIT, 0);
+        assert_eq!(shade_of(t), 0, "the flag is outside the shade byte");
     }
 
     /// Decision 0755: the classifier's whole-payload rewrites carry the tag's ALPHA field, which

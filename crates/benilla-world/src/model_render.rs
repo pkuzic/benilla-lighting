@@ -9,7 +9,7 @@ use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Buffer, Face};
 
-use benilla_assets::materials::{WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
+use benilla_assets::materials::{TorchBinds, WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
 
 mod batch;
 mod visibility;
@@ -235,6 +235,9 @@ pub fn model_material(
     // and the skybox sort rung instead of the ordinary batch-order eps. See [`MatKey::sky_depth`].
     sky_depth: bool,
     light: &Buffer,
+    // MONKEY (torch shadows Phase 3A): the shared torch depth image + table buffer, cloned into the
+    // material beside `light` (not a key axis — one pair for the whole scene, like the light).
+    torch: &TorchBinds,
     // The ONE placement this material belongs to, or `None` for the shared batch material every
     // instance of the model reuses. `Some` only for a batch whose animated UV/tint loop depends on
     // the sequence its instance is playing (decision 1408): the animated-material registries are
@@ -484,6 +487,8 @@ pub fn model_material(
             // table slot is baked in exactly once.
             anim_slots: Vec4::ZERO,
             light_buf: light.clone(),
+            torch_depth: torch.depth.clone(),
+            torch_buf: torch.table.clone(),
         },
     });
     cache.insert(key, handle.clone());
@@ -576,6 +581,7 @@ pub fn zfill_material(
     two_sided: bool,
     cutout: bool,
     light: &Buffer,
+    torch: &TorchBinds,
 ) -> Handle<WowModelMaterial> {
     let key = MatKey {
         light: light.id(),
@@ -645,6 +651,8 @@ pub fn zfill_material(
             sidn: Vec4::ZERO,
             anim_slots: Vec4::ZERO,
             light_buf: light.clone(),
+            torch_depth: torch.depth.clone(),
+            torch_buf: torch.table.clone(),
         },
     });
     cache.insert(key, handle.clone());

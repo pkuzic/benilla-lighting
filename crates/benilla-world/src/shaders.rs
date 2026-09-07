@@ -37,6 +37,8 @@ pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/ffx_glow.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/wow_effect.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/static_gx.wgsl");
+    // MONKEY (torch shadows Phase 1): the vertex-only depth-map shader for the interior-fixture pass.
+    bevy::asset::embedded_asset!(app, "shaders/torch_depth.wgsl");
 }
 
 #[cfg(test)]
@@ -79,7 +81,8 @@ mod tests {
         }
         // 6 since decision 1264 retired `skybox.wgsl` (a WMO skybox draws on the shared
         // model lane, whose forced-far-depth branch lives in `benilla_assets`'
-        // `wow_model.wgsl`); 7 since 1429 added `static_gx.wgsl` (the B1 retained pass).
-        assert_eq!(found, 7, "the engine's shader set changed size");
+        // `wow_model.wgsl`); 7 since 1429 added `static_gx.wgsl` (the B1 retained pass);
+        // 8 since the torch-shadow Phase 1 added `torch_depth.wgsl` (the interior depth map).
+        assert_eq!(found, 8, "the engine's shader set changed size");
     }
 }

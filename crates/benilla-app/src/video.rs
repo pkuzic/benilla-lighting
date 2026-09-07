@@ -226,6 +226,20 @@ pub(crate) struct VideoConfig {
     /// Realtime-shadow render distance in yards (the `shadowDistance` slider) — the shadow-map
     /// cascade range + caster reach. Clamped to `shadow_core::SHADOW_DISTANCE_RANGE`.
     pub(crate) shadow_distance: f32,
+    /// MONKEY (dynamic interiors): WMO interiors + their props light from the room's live fixtures
+    /// (`interiorLight`) instead of the baked path. The three knobs are `interiorAmbient` (base
+    /// ambient, 0..1), `interiorFill` (per-fixture bounce gain, 0..2) and `interiorExposure`
+    /// (light-budget multiplier, 0.25..8) — bridged to benilla-world by `dynamic_interior`.
+    pub(crate) interior_light: bool,
+    pub(crate) interior_ambient: f32,
+    pub(crate) interior_fill: f32,
+    pub(crate) interior_exposure: f32,
+    /// MONKEY (torch shadows, Stage B): whether interior fixtures cast real shadows (the nearest few
+    /// promoted to cube-map casters — `torch_shadow`). Only meaningful with `interior_light` on.
+    pub(crate) interior_shadows: bool,
+    /// MONKEY (interior debug): the interior-lane diagnostic overlay (`interiorDebug`, 0..3). See
+    /// [`benilla_world::lighting::DynamicInteriors::debug`].
+    pub(crate) interior_debug: u32,
     pub(crate) display: DisplayMode,
     /// The windowed size, `gxResolution`. Kept while fullscreen so leaving it can restore it.
     pub(crate) windowed: UVec2,
@@ -238,6 +252,13 @@ impl Default for VideoConfig {
             world_shadows: false,
             character_shadows: false,
             shadow_distance: crate::shadow_core::DEFAULT_SHADOW_DISTANCE,
+            // The cvar defaults are the source of truth at load; these only stand in until then.
+            interior_light: true,
+            interior_ambient: 0.15,
+            interior_fill: 0.12,
+            interior_exposure: 2.5,
+            interior_shadows: true,
+            interior_debug: 0,
             display: if windowed_env() {
                 DisplayMode::Windowed
             } else {

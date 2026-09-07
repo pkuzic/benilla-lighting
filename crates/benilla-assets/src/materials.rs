@@ -222,6 +222,43 @@ pub struct WowModelExt {
     /// Set once, never mutated.
     #[storage(90, read_only, buffer, visibility(vertex, fragment))]
     pub light_buf: Buffer,
+    /// MONKEY (torch shadows Phase 3A): the interior torch depth-map ARRAY — the one shared
+    /// `Depth32Float` 512×512×24 `Image` (4 fixtures × 6 cube faces) the torch depth node renders
+    /// into each frame (`benilla_world::static_gx::torch_depth`, `TorchDepthImage`). Bound as a
+    /// depth 2D-array + the image's own `GreaterEqual` comparison sampler (the `Image`'s
+    /// `ImageSamplerDescriptor { compare: Some(GreaterEqual) }` — bevy builds a real comparison
+    /// sampler from it; the derive's prepare-time check requires the format's sample type to be
+    /// `Depth`, which `Depth32Float` is). The image is created ONCE at app startup regardless of
+    /// the cvars — an absent image would stall every model material's bind group on
+    /// `RetryNextUpdate` and blank every model. Fragment-only, like static_gx's group 3.
+    #[texture(91, dimension = "2d_array", sample_type = "depth", visibility(fragment))]
+    #[sampler(92, sampler_type = "comparison", visibility(fragment))]
+    pub torch_depth: Handle<Image>,
+    /// MONKEY (torch shadows Phase 3A): the ≤4-fixture torch TABLE — the same 1616-byte
+    /// `TorchTableUniform` bytes static_gx's group-3 uniform carries (count / positions[4] /
+    /// view_projs[24]), as a SEPARATE shared raw buffer (`SharedTorchBuffer`) rewritten in place
+    /// every frame from `TorchShadowViews`. A raw `Buffer` like `light_buf`, deliberately NOT a
+    /// `#[uniform]` field (a per-frame-mutated uniform re-prepares every material every frame)
+    /// and NOT a region of the shared light blob (whose `LightStd430` mirror + the booth packer
+    /// would all have to grow in lock-step). `wow_model.wgsl` reads it as
+    /// `var<storage, read> torch_table` (std430 of this struct == the std140 1616 bytes: every
+    /// member is 16-aligned). Set once, never mutated.
+    #[storage(93, read_only, buffer, visibility(fragment))]
+    pub torch_buf: Buffer,
+}
+
+/// MONKEY (torch shadows Phase 3A): the two torch-receiver bindings every [`WowModelExt`] shares —
+/// threaded into the material builders beside the shared light `Buffer`, and stored on
+/// `WorldAssets` the same way. Both come from the client's startup resources
+/// (`benilla_world::static_gx::{TorchDepthImage, SharedTorchBuffer}`); this crate only clones them
+/// into materials, which is why it takes the raw handle + buffer and not those resources (the same
+/// severing `WorldAssets::open` does for the light buffer, decision 1164).
+#[derive(Clone)]
+pub struct TorchBinds {
+    /// The shared torch depth array image (→ `WowModelExt::torch_depth`).
+    pub depth: Handle<Image>,
+    /// The shared 1616-byte torch table buffer (→ `WowModelExt::torch_buf`).
+    pub table: Buffer,
 }
 
 impl MaterialExtension for WowModelExt {

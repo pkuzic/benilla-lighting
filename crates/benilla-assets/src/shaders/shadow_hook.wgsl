@@ -15,8 +15,7 @@
 
 #import bevy_pbr::{
     shadows,
-    mesh_view_bindings::{lights, clusterable_objects},
-    mesh_view_types::POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT,
+    mesh_view_bindings::lights,
 }
 
 // The realtime shadow lightens over the last SHADOW_EDGE_BAND yards of the cascade's max distance so
@@ -57,22 +56,95 @@ fn realtime_shadow(
     return 1.0 - (1.0 - shadow) * night * (1.0 - edge_fade);
 }
 
-// MONKEY (torch shadows #2): the realtime POINT-light shadow factor at `sample_pos` — 1.0 = lit,
-// 0.0 = fully shadowed. Scans the view's clusterable objects for shadow-casting point lights (the
-// torch-shadow lane promotes the nearest interior fixture to one, `benilla_app::torch_shadow`) and,
-// for any whose radius covers the fragment, samples its cube shadow map. `min` over them so the
-// darkest occluder wins. A no-op indoors when no such light exists (returns 1.0). Called by the
-// INTERIOR receiver paths (the exterior sun's `realtime_shadow` is gated out of interiors).
+// MONKEY (torch shadows Phase 1): the point/cluster-based torch shadow is DEAD. benilla's world
+// camera sets `ClusterConfig::None`, which starves `clusterable_objects` AND the point-shadow prep,
+// so `fetch_point_shadow`/the clusterable scan can never fire. The replacement is a from-scratch
+// depth map (`benilla_world::static_gx::torch_depth` + `torch_map_shadow` below), sampled by the
+// static_gx interior lane through its own group-3 bindings, and (Phase 3A) by `wow_model.wgsl`'s
+// entity lane through its material's own bindings 91/92/93 — both call `torch_map_shadow` below.
+// These two functions are kept only so `interior_debug_override` (mode 2) compiles; they return
+// "unshadowed" and no receiver's lighting path calls them any more.
 fn torch_shadow(sample_pos: vec4<f32>, normal: vec3<f32>) -> f32 {
-    var shadow = 1.0;
-    let count = arrayLength(&clusterable_objects.data);
-    for (var i = 0u; i < count; i = i + 1u) {
-        if ((clusterable_objects.data[i].flags & POINT_LIGHT_FLAGS_SHADOWS_ENABLED_BIT) != 0u) {
-            let pr = clusterable_objects.data[i].position_radius;
-            if (distance(pr.xyz, sample_pos.xyz) < pr.w) {
-                shadow = min(shadow, shadows::fetch_point_shadow(i, sample_pos, normal));
-            }
-        }
+    return 1.0;
+}
+
+fn torch_shadow_for(light_pos: vec3<f32>, sample_pos: vec4<f32>, normal: vec3<f32>) -> f32 {
+    return 1.0;
+}
+
+// MONKEY (torch shadows Phase 1): the old clusterable-caster count diagnostic. The clustering is
+// dead (see above), so this is now a constant 0 — kept only so `interior_debug_override` compiles.
+fn torch_caster_count() -> u32 {
+    return 0u;
+}
+
+// MONKEY (torch shadows Phase 1): the depth-map projector. Because `shadow_hook` is imported by
+// receivers WITHOUT the group-3 torch bindings (wow_model, terrain), the texture + comparison
+// sampler come in AS PARAMETERS — the caller supplies them only where they are bound (static_gx).
+//   - `view_proj`  the fixture's down-looking reverse-Z matrix.
+//   - `layer`      which array layer (fixture index) to sample.
+//   - `world_pos`  the receiving fragment's world position.
+//   - `depth_tex`/`comp`  the group-3 depth array + `GreaterEqual` comparison sampler.
+//   - `bias`       reverse-Z receiver bias (nudges the compare ref up to kill self-shadow acne).
+// Returns 1.0 outside the frustum / behind the light; a 4-tap PCF factor otherwise (0 = shadowed).
+fn torch_map_shadow(
+    view_proj: mat4x4<f32>,
+    layer: i32,
+    world_pos: vec3<f32>,
+    depth_tex: texture_depth_2d_array,
+    comp: sampler_comparison,
+    bias: f32,
+) -> f32 {
+    let clip = view_proj * vec4<f32>(world_pos, 1.0);
+    if (clip.w <= 0.0) {
+        return 1.0;
     }
-    return shadow;
+    let ndc = clip.xyz / clip.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let texel = 1.0 / vec2<f32>(textureDimensions(depth_tex).xy);
+    // Reverse-Z: the fragment is lit iff its own depth is at least the stored nearest depth, so the
+    // compare ref is `ndc.z + bias` against `GreaterEqual`.
+    let ref_depth = ndc.z + bias;
+    var sum = 0.0;
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>(-0.5, -0.5) * texel, layer, ref_depth);
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.5, -0.5) * texel, layer, ref_depth);
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>(-0.5,  0.5) * texel, layer, ref_depth);
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.5,  0.5) * texel, layer, ref_depth);
+    // Phase 5: the six cube faces tile the whole sphere, so there is no cone edge to soften — a fade
+    // there would punch a lit seam along every face border. Only the far plane fades (reverse-Z:
+    // ndc.z → 0 at far), so a shadow at the fixture's range limit ends softly.
+    let far_fade = smoothstep(0.0, 0.06, ndc.z);
+    return mix(1.0, sum * 0.25, far_fade);
+}
+
+// MONKEY (interior debug): the interior lane's diagnostic overlay. `mode` is decoded from the
+// receiver's `wmo_fog_params.w` (`1 + debug`); the receivers call this at the END of their interior
+// branch so ONLY interior-lit fragments are recoloured — a wrongly-classified outdoor entity then
+// stands out against the normally-shaded world. `mode == 0` returns the real `rgb` unchanged.
+//   1 CLASSIFICATION → solid green (this fragment took the interior lane)
+//   2 SHADOW         → the torch-shadow factor as greyscale (black shadowed .. white lit)
+//   3 CASTER COUNT   → red 0 / green 1 / blue 2 / white 3+ shadow proxies visible to this view
+fn interior_debug_override(
+    mode: u32,
+    rgb: vec3<f32>,
+    sample_pos: vec4<f32>,
+    normal: vec3<f32>,
+) -> vec3<f32> {
+    if (mode == 1u) {
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    if (mode == 2u) {
+        return vec3<f32>(torch_shadow(sample_pos, normal));
+    }
+    if (mode == 3u) {
+        let n = torch_caster_count();
+        if (n == 0u) { return vec3<f32>(1.0, 0.0, 0.0); }
+        if (n == 1u) { return vec3<f32>(0.0, 1.0, 0.0); }
+        if (n == 2u) { return vec3<f32>(0.0, 0.0, 1.0); }
+        return vec3<f32>(1.0, 1.0, 1.0);
+    }
+    return rgb;
 }

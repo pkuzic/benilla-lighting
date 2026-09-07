@@ -412,6 +412,8 @@ fn run_warm_pass(
     mut gizmos: Gizmos,
     mut cache: Local<MaterialCache>,
     shared_light: Option<Res<benilla_world::lighting::SharedLightBuffer>>,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings every warmed material takes.
+    torch: benilla_world::static_gx::TorchShared,
 ) {
     // `EntryCover` already IS "a loading cover is up and we are in world", counted once for the
     // whole client (see its doc); this used to spell the pair out for itself.
@@ -447,6 +449,9 @@ fn run_warm_pass(
         let Some(light) = shared_light.as_ref() else {
             return;
         };
+        let Some(torch) = torch.binds() else {
+            return;
+        };
         if !cover.presented() {
             return;
         }
@@ -473,6 +478,7 @@ fn run_warm_pass(
             &mut lanes,
             &mut cache,
             &light.0,
+            &torch,
         );
         info!("pipeline warm: menagerie up ({count} variants, {WARM_REVEAL_PER_FRAME}/frame)");
         return;

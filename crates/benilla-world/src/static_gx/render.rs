@@ -221,6 +221,9 @@ struct GxPipelines {
     view_layout: BindGroupLayoutDescriptor,
     cell_layout: BindGroupLayoutDescriptor,
     light_layout: BindGroupLayoutDescriptor,
+    /// MONKEY (torch shadows Phase 1): group 3 — the torch depth array + comparison sampler + the
+    /// ≤4-entry `TorchTable` uniform. Present on every static_gx pipeline (the `TORCH_SHADOWS` def).
+    torch_layout: BindGroupLayoutDescriptor,
     sampler: Sampler,
     sampler_clamp: Sampler,
     /// Keyed `(cutout, two_sided)`; specialized for the world view's (samples, format) pair —
@@ -275,6 +278,25 @@ fn init_pipelines(
     // MIXED-wrap batch (repeat one axis, clamp the other) keeps the repeat sampler plus the
     // shader's half-texel inset clamp on its clamped axis — an approximation confined to that
     // class (decision 0763's silhouette concern, honoured per axis).
+    // MONKEY (torch shadows Phase 1): group 3 — the interior torch depth map (a Depth32Float
+    // 2D-array sampled through a `GreaterEqual` comparison sampler) + the ≤4-entry `TorchTable`
+    // uniform (count/positions/view_projs). Fragment-only; declared behind the shader's
+    // `TORCH_SHADOWS` def, which the specialization below always sets for this pipeline family.
+    let torch_layout = BindGroupLayoutDescriptor::new(
+        "static_gx_torch_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                // A depth 2D-array (= WGSL `texture_depth_2d_array`): no dedicated helper, so a
+                // `texture_2d_array` with the Depth sample type.
+                texture_2d_array(TextureSampleType::Depth),
+                sampler(SamplerBindingType::Comparison),
+                // TorchTable: count (u32 + pad to 16) + positions[4] (64) + view_projs[24] (1536)
+                // — six cube faces per fixture (Phase 5).
+                uniform_buffer_sized(false, Some(std::num::NonZero::new(1616).unwrap())),
+            ),
+        ),
+    );
     let filter = benilla_assets::tex_filter();
     let make = |label: &'static str, mode: AddressMode| {
         render_device.create_sampler(&SamplerDescriptor {
@@ -292,6 +314,7 @@ fn init_pipelines(
         view_layout,
         cell_layout,
         light_layout,
+        torch_layout,
         sampler: make("static_gx_repeat", AddressMode::Repeat),
         sampler_clamp: make("static_gx_clamp", AddressMode::ClampToEdge),
         pipelines: HashMap::default(),
@@ -393,6 +416,9 @@ fn prepare_static_gx(
                 // pipeline is custom, so it must opt into the same shader branch explicitly;
                 // otherwise `shadows::fetch_directional_shadow` falls back to a constant 1.0.
                 defs.push(ShaderDefVal::from("SHADOW_FILTER_METHOD_GAUSSIAN"));
+                // MONKEY (torch shadows Phase 1): arm the shader's group-3 torch-map code. Set on
+                // EVERY static_gx pipeline so the group-3 bindings (always bound by the node) match.
+                defs.push(ShaderDefVal::from("TORCH_SHADOWS"));
                 if cutout {
                     defs.push(ShaderDefVal::from("GX_CUTOUT"));
                 }
@@ -404,6 +430,7 @@ fn prepare_static_gx(
                         pipes.view_layout.clone(),
                         pipes.cell_layout.clone(),
                         pipes.light_layout.clone(),
+                        pipes.torch_layout.clone(),
                     ],
                     vertex: VertexState {
                         shader: shader.clone(),
@@ -759,6 +786,56 @@ fn prepare_view_bind(
     )));
 }
 
+/// The retained pass's group-3 bind group (MONKEY, torch shadows Phase 1): the interior torch depth
+/// array (Phase 3A: the shared [`super::torch_depth::TorchDepthImage`]'s `GpuImage` D2Array view —
+/// the same texture the entity receiver binds through its material) + static_gx's own comparison
+/// sampler (from [`super::torch_depth::TorchDepthTargets`]) and the `TorchTable` uniform packed from
+/// the extracted [`super::torch_depth::TorchShadowViews`] by the shared
+/// [`super::torch_depth::TorchTableUniform::pack`]. ALWAYS built (with `count = 0` and a zero table
+/// when the lane is off or absent) so the pipeline's group 3 is never left unbound — except while the
+/// shared image is not yet resident, when static_gx skips the frame (the node early-outs on a
+/// missing `GxTorchBind`).
+#[derive(Resource)]
+struct GxTorchBind(BindGroup);
+
+fn prepare_torch_bind(
+    mut commands: Commands,
+    pipes: Res<GxPipelines>,
+    pipeline_cache: Res<PipelineCache>,
+    render_device: Res<RenderDevice>,
+    targets: Option<Res<super::torch_depth::TorchDepthTargets>>,
+    views: Option<Res<super::torch_depth::TorchShadowViews>>,
+    image: Option<Res<super::torch_depth::TorchDepthImage>>,
+    images: Res<RenderAssets<GpuImage>>,
+) {
+    // The sampler/pipeline are created in RenderStartup; the shared image is prepared by the
+    // render-asset pass (before this set). Without either, group 3 has nothing to bind this frame.
+    let Some(targets) = targets else {
+        return;
+    };
+    let Some(gpu_image) = image.as_ref().and_then(|h| images.get(&h.0)) else {
+        return;
+    };
+    let table = super::torch_depth::TorchTableUniform::pack(views.as_deref());
+    let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("static_gx_torch_table"),
+        contents: bytemuck::bytes_of(&table),
+        usage: BufferUsages::UNIFORM,
+    });
+    let layout = pipeline_cache.get_bind_group_layout(&pipes.torch_layout);
+    commands.insert_resource(GxTorchBind(render_device.create_bind_group(
+        "static_gx_torch",
+        &layout,
+        &BindGroupEntries::sequential((
+            // The image's default view: D2Array over all 24 layers (wgpu's default for a
+            // multi-layer 2D texture; `torch_depth.rs` spells out the guarantee).
+            &gpu_image.texture_view,
+            targets.sampler(),
+            buffer.as_entire_binding(),
+        )),
+    )));
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct StaticGxLabel;
 
@@ -809,6 +886,12 @@ impl ViewNode for StaticGxNode {
         let pipes = world.resource::<GxPipelines>();
         let pipeline_cache = world.resource::<PipelineCache>();
         let Some(light_bind) = world.get_resource::<GxLightBind>() else {
+            return Ok(());
+        };
+        // MONKEY (torch shadows Phase 1): group 3 is part of every static_gx pipeline now, so it
+        // must be bound before any draw. `prepare_torch_bind` always builds it (count 0 when the
+        // lane is off); a missing one means the depth targets weren't ready — skip the frame.
+        let Some(torch_bind) = world.get_resource::<GxTorchBind>() else {
             return Ok(());
         };
         let meshes = world.resource::<RenderAssets<RenderMesh>>();
@@ -907,6 +990,7 @@ impl ViewNode for StaticGxNode {
                 pass.set_render_pipeline(ready[&(run.cutout, run.two_sided)]);
                 pass.set_bind_group(1, &gpu.bind_groups[run.slot].1, &[]);
                 pass.set_bind_group(2, &light_bind.0, &[]);
+                pass.set_bind_group(3, &torch_bind.0, &[]);
                 pass.draw_indexed(
                     (islice.range.start + run.index_range.start)
                         ..(islice.range.start + run.index_range.end),
@@ -932,6 +1016,9 @@ pub(super) fn build(app: &mut App) {
     ));
     app.init_resource::<GxWorld>();
     app.add_systems(Update, mark_world_camera);
+    // MONKEY (torch shadows Phase 1): the depth-map targets + node (its own RenderStartup + graph
+    // wiring). Built before we borrow the render app below — the two borrows are sequential.
+    super::torch_depth::build(app);
     let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
         return;
     };
@@ -944,6 +1031,7 @@ pub(super) fn build(app: &mut App) {
             (
                 prepare_static_gx.in_set(RenderSystems::PrepareResources),
                 prepare_view_bind.in_set(RenderSystems::PrepareBindGroups),
+                prepare_torch_bind.in_set(RenderSystems::PrepareBindGroups),
             ),
         )
         .add_render_graph_node::<ViewNodeRunner<StaticGxNode>>(Core3d, StaticGxLabel)

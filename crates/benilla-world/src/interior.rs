@@ -861,7 +861,11 @@ fn write_part_law(
     }
     let payload = match law {
         AppliedLaw::Bake(slot) => crate::mesh_tag::with_interior_probe(tag.0, slot),
-        AppliedLaw::Matte | AppliedLaw::Exterior => crate::mesh_tag::with_exterior_reset(tag.0),
+        // MONKEY (torch shadows Phase 3A): the Matte law keeps the exterior material but flags
+        // the part INDOORS, so the shader's dynamic-interior lane holds across a Bake↔Matte
+        // flicker (the down-ray marginally hitting the baked floor at one spot).
+        AppliedLaw::Matte => crate::mesh_tag::with_matte_indoor(tag.0),
+        AppliedLaw::Exterior => crate::mesh_tag::with_exterior_reset(tag.0),
     };
     tag.0 = crate::mesh_tag::with_interior_fog(payload, fog);
     true

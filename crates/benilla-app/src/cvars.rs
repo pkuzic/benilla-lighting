@@ -600,6 +600,41 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1900: benilla's own realtime-shadow render-distance slider; the reference bakes MCSH and \
          has no cascade to size",
     ),
+    // MONKEY (dynamic interiors): WMO interiors + their props light from the room's LIVE fixtures
+    // instead of the MOCV bake / the baked prop probe (`static_gx.wgsl` `interior_room_light`;
+    // bridged by `dynamic_interior`). The three numeric knobs are live-tunable from chat —
+    // `/script SetCVar("interiorExposure", 2)` — which is how their defaults were found.
+    ours(
+        "interiorLight",
+        "1",
+        "benilla's own: fixture-lit WMO interiors (0 = the reference's baked interior path)",
+    ),
+    ours(
+        "interiorAmbient",
+        "0.15",
+        "benilla's own: interior base ambient, 0..1",
+    ),
+    ours(
+        "interiorFill",
+        "0.12",
+        "benilla's own: interior per-fixture bounce gain, 0..2",
+    ),
+    ours(
+        "interiorExposure",
+        "2.5",
+        "benilla's own: interior light-budget multiplier before the soft rolloff, 0.25..8",
+    ),
+    ours(
+        "interiorShadows",
+        "1",
+        "benilla's own: interior fixtures cast real shadows (Stage B, the nearest few); needs \
+         interiorLight",
+    ),
+    ours(
+        "interiorDebug",
+        "0",
+        "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count",
+    ),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
     // two states 1627 settled on ARE that client's two (its own `Graphics.lua` builds the list from
@@ -1085,6 +1120,14 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
             knobs.video.shadow_distance =
                 v.clamp(*SHADOW_DISTANCE_RANGE.start(), *SHADOW_DISTANCE_RANGE.end());
         }
+        // MONKEY (dynamic interiors): the interior lane's on/off + knobs, clamped at the edge like
+        // every other numeric row. `dynamic_interior::bridge` publishes them to benilla-world.
+        "interiorlight" => knobs.video.interior_light = v != 0.0,
+        "interiorambient" => knobs.video.interior_ambient = v.clamp(0.0, 1.0),
+        "interiorfill" => knobs.video.interior_fill = v.clamp(0.0, 2.0),
+        "interiorexposure" => knobs.video.interior_exposure = v.clamp(0.25, 8.0),
+        "interiorshadows" => knobs.video.interior_shadows = v != 0.0,
+        "interiordebug" => knobs.video.interior_debug = (v.max(0.0) as u32).min(3),
         // Display mode (1627) — a flag like every other checkbox here, and the reference's own
         // polarity: `1` is WINDOWED (the row is "Windowed Mode"). `video::apply_window_mode`
         // watches the value and pushes it to the window; nothing else reads it.
@@ -1387,7 +1430,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 47] = [
+        let session: [(&str, String); 53] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1436,6 +1479,12 @@ fn sync_cvars(
             ("worldShadows", flag(video.world_shadows)),
             ("characterShadows", flag(video.character_shadows)),
             ("shadowDistance", video.shadow_distance.to_string()),
+            ("interiorLight", flag(video.interior_light)),
+            ("interiorAmbient", video.interior_ambient.to_string()),
+            ("interiorFill", video.interior_fill.to_string()),
+            ("interiorExposure", video.interior_exposure.to_string()),
+            ("interiorShadows", flag(video.interior_shadows)),
+            ("interiorDebug", video.interior_debug.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
                 "gxWindow",

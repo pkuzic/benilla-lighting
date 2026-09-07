@@ -203,6 +203,79 @@ struct WowLight {
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 
+// MONKEY (torch shadows Phase 3A): the ENTITY receiver's torch bindings — the SAME depth array
+// static_gx's group 3 samples (one shared `Image`, rendered by `static_gx::torch_depth`) and the
+// SAME 1616-byte table, riding the material's own group (`WowModelExt` bindings 91/92/93) because
+// a Bevy material draw sets groups 0/1/2 only. ALWAYS bound (the image and buffer exist from
+// startup), so no shader-def guards this block; only the fragment stage reads it. The struct is
+// std430 here and std140 in static_gx — identical bytes, every member is 16-aligned.
+struct TorchTable {
+    count: vec4<u32>,                   // .x = live fixture count
+    positions: array<vec4<f32>, 4>,     // xyz = fixture world pos, w = range
+    view_projs: array<mat4x4<f32>, 24>, // 6 cube faces per fixture: [fixture*6 + face]
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(91) var torch_depth: texture_depth_2d_array;
+@group(#{MATERIAL_BIND_GROUP}) @binding(92) var torch_samp: sampler_comparison;
+@group(#{MATERIAL_BIND_GROUP}) @binding(93) var<storage, read> torch_table: TorchTable;
+// Reverse-Z receiver bias — KEEP IN SYNC with static_gx.wgsl's TORCH_BIAS (0.001, the known-good
+// value; larger detaches every shadow far from the torch).
+const TORCH_BIAS: f32 = 0.001;
+// NORMAL-OFFSET for entity receivers (yd): sample the map a hand's width OUTSIDE the surface along
+// its normal. An entity's caster is the CPU-skinned copy of the same body; the GPU-skinned receiver
+// differs by tiny pose/interpolation deltas, so with a plain depth compare every fragment sits a
+// hair BEHIND its own caster and the body shadows itself everywhere (a solid-black NPC in
+// interiorDebug 2, flickering shadows in the real render). Pushing the sample point out of the skin
+// makes self-occlusion impossible while a pillar or another character still casts onto it.
+const TORCH_NORMAL_OFFSET: f32 = 0.15;
+
+// MONKEY (Phase 5, MIRRORED from static_gx.wgsl — keep in sync): the cube face that contains
+// direction `d` (fixture → fragment) — the major axis, signed. Face order is the contract with
+// `benilla_app::torch_shadow::cube_view_projs`: 0 +X, 1 −X, 2 +Y, 3 −Y, 4 +Z, 5 −Z.
+fn torch_face(d: vec3<f32>) -> u32 {
+    let a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) {
+        return select(1u, 0u, d.x > 0.0);
+    }
+    if (a.y >= a.z) {
+        return select(3u, 2u, d.y > 0.0);
+    }
+    return select(5u, 4u, d.z > 0.0);
+}
+
+// MONKEY (torch shadows Phase 3A): this interior fixture's OWN cast shadow on an ENTITY fragment —
+// exactly static_gx.wgsl's `torch_surface_shadow` (keep in sync): correlate the `wow_light`
+// fixture at `light_pos` to a promoted torch (position match within 1 yd), pick the cube face
+// facing the fragment, and sample that layer through the shared projector. 1.0 (unshadowed) when
+// no map matches — the lane is off, or the fixture was not among the ≤4 promoted.
+fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    // Normal-offset the sample point out of the body (see TORCH_NORMAL_OFFSET).
+    let Ps = P + N * TORCH_NORMAL_OFFSET;
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        let fixture = torch_table.positions[i].xyz;
+        if (distance(fixture, light_pos) < 1.0) {
+            let layer = i * 6u + torch_face(Ps - fixture);
+            return shadow_hook::torch_map_shadow(
+                torch_table.view_projs[layer], i32(layer), Ps, torch_depth, torch_samp, TORCH_BIAS);
+        }
+    }
+    return 1.0;
+}
+
+// MONKEY (torch debug, interiorDebug 2 on ENTITIES): the MIN raw cube-map shadow factor over every
+// promoted fixture (ignoring the fixture match) — mirrors static_gx's `torch_debug_factor`, so an
+// entity's sampling can be SEEN as greyscale: all-white = the table is empty / the projection misses;
+// shaped dark = the depth map reaches the entity and any fault is downstream of sampling.
+fn torch_entity_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
+    let Ps = P + N * TORCH_NORMAL_OFFSET;
+    var s = 1.0;
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        let layer = i * 6u + torch_face(Ps - torch_table.positions[i].xyz);
+        s = min(s, shadow_hook::torch_map_shadow(
+            torch_table.view_projs[layer], i32(layer), Ps, torch_depth, torch_samp, TORCH_BIAS));
+    }
+    return s;
+}
+
 // Vanilla M2 cutout alpha-test reference (224/255 on ≤ WotLK) — kept in sync with
 // `debug_panel::VANILLA_ALPHA_KEY_REF`. Used to re-apply the hard cutout on the distance-fade blend
 // twin so its silhouette matches the steady cutout exactly.
@@ -315,6 +388,53 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
         sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
     }
     return sum;
+}
+
+// MONKEY (dynamic interiors): the per-FRAGMENT room light — MIRRORED from `static_gx.wgsl`
+// (`interior_room_light`; keep in sync). Every in-range light of the room-gated table, no
+// nearest-3 selection: DIRECT (falloff × wrapped Lambert, so a floor-level hearth still lights
+// the floor) + FILL (normal-free, half-desaturated bounce) + the base ambient. The knobs are the
+// live cvars packed into `point_count.yzw` (`.y` ambient, `.z` fill gain, `.w` exposure — the
+// caller's multiplier before the rolloff). Here it lights INDOOR units and GameObjects (gated on the
+// camera-independent probe slot) so they match the fixture-lit room around them instead of the
+// day/night CGLight, and takes the SAME per-fixture torch shadows (Phase 3A: the shared depth
+// array through this material's own group-2 bindings) as the surfaces.
+const INTERIOR_WRAP: f32 = 0.5;
+fn interior_room_light(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    let count = u32(wow_light.point_count.x);
+    let k_fill = wow_light.point_count.z;
+    var direct = vec3<f32>(0.0);
+    var fill = vec3<f32>(0.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let pos_range = wow_light.points[2u * i];
+        let to_light = pos_range.xyz - P;
+        let d2 = dot(to_light, to_light);
+        if (d2 > pos_range.w * pos_range.w) {
+            continue;
+        }
+        let d = sqrt(d2);
+        let c = wow_light.points[2u * i + 1u].rgb;
+        // Normalised for BOTH terms (keep in sync with static_gx.wgsl): the table commits RAW
+        // over-gamut colour × intensity; a hot forge would wash the direct term to white.
+        let c_norm = c / max(1.0, max(c.r, max(c.g, c.b)));
+        let atten = 1.0 / (0.7 * d + 0.03 * d2);
+        let nl = max(
+            (dot(N, to_light / max(d, 1e-4)) + INTERIOR_WRAP) / (1.0 + INTERIOR_WRAP),
+            0.0,
+        );
+        // Phase 3A per-fixture cast shadow (keep in sync with static_gx.wgsl's
+        // `torch_surface_shadow` call): this fixture's OWN cube map, sampled through the
+        // material's group-2 torch bindings — a pillar between an NPC and torch A darkens A's
+        // term without touching torch B's, exactly as on the surfaces around it.
+        let s = torch_entity_shadow(pos_range.xyz, P, N);
+        direct += c_norm * (atten * nl) * s;
+        let reach = 1.0 - d / max(pos_range.w, 1e-4);
+        let c_fill = mix(c_norm, vec3<f32>(dot(c_norm, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
+        // DOMINANT fixture, not the sum (keep in sync with static_gx.wgsl): fill must not scale
+        // with candle count or a dense room saturates flat. Fill is indirect, so not shadowed.
+        fill = max(fill, c_fill * (k_fill * reach * reach));
+    }
+    return direct + fill + vec3<f32>(wow_light.point_count.y);
 }
 
 // The MCNK chunk cell center under a world point — the light-selection anchor for geometry merged in
@@ -1136,6 +1256,37 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     );
     lit_rgb = albedo * primary;
 #endif
+    // MONKEY (dynamic interiors, `interiorLight` on): an INDOOR unit / GameObject / WMO prop — the
+    // entity's OWN light-node classification (tag bit 30, `interior_fogged`), never a WMO surface,
+    // never the create booth's authored rig — takes the fixture-lit room light
+    // (`interior_room_light`, mirrored from `static_gx.wgsl`) instead of the day/night CGLight or
+    // the baked probe, so it matches the surfaces around it (the tavern's chairs and NPCs stayed
+    // bake-bright in a torch-lit room). The instance tint still modulates; the same soft rolloff
+    // as the surfaces; and (Phase 3A) the same per-fixture torch shadows, from the shared map.
+    // CAMERA-INDEPENDENT indoor test: `is_interior` (`model_flags.z`) — the SAME signal the WMO
+    // surface lane and the original interior-prop lane trust to route an entity to interior lighting,
+    // set from the anchor's down-ray classification, not the camera. (The earlier gates were both
+    // wrong: `interior_fogged` is the MFOG bit the camera rewrites every frame — an indoor unit went
+    // dark when the camera left; `probe != 0` is non-zero for EVERY entity, indoor or out, since an
+    // exterior entity also carries a day/night SH probe slot — so every outdoor GO/unit lit as
+    // interior, the debug-1 green everywhere.)
+    // PLUS the classifier's MATTE law (tag bit 14, `mesh_tag::MATTE_INDOOR_BIT`): the anchor
+    // stands indoors but its material stayed in exterior mode (no bake to fold) — the same room,
+    // the same lane. Without it a moving unit whose verdict flickers Bake↔Matte at one spot
+    // (the down-ray marginally hitting the baked floor) switched its lane off and on. Read only
+    // in exterior material mode: in interior mode those bits are the probe slot.
+    let matte_indoor = !is_interior && (fade_tag & 0x4000u) != 0u;
+    if ((is_interior || matte_indoor) && !is_wmo && !is_rig && wow_light.wmo_fog_params.w > 0.5) {
+        let room = interior_room_light(in.world_position.xyz, n_lit);
+        lit_rgb = albedo * inst_tint * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
+        let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
+        if (idbg == 2u) {
+            // The entity's OWN cube-map sampling as greyscale (the shared stub would show white).
+            lit_rgb = vec3<f32>(torch_entity_debug_factor(in.world_position.xyz, n_lit));
+        } else {
+            lit_rgb = shadow_hook::interior_debug_override(idbg, lit_rgb, in.world_position, n_lit);
+        }
+    }
     // The fullbright/UNLIT path takes the tint too, unlike the highlight: with GL_LIGHTING off the
     // same gx state (SetState(1)) is a plain `glColor` modulate on the texture, while GL_EMISSION is
     // dead. So a ghost's glow cards tint with its body.

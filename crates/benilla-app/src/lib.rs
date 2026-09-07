@@ -70,6 +70,8 @@ mod debug_panel;
 /// rule, in one file. Always compiled; what it *holds* is not.
 mod dev;
 mod doodad_events;
+/// MONKEY (dynamic interiors): the cvar → benilla-world bridge for the fixture-lit interior lane.
+mod dynamic_interior;
 mod entities;
 mod fishing_line;
 mod footprints;
@@ -625,6 +627,9 @@ pub fn run(build: BuildId) -> AppExit {
         character_shadow::CharacterShadowPlugin,
         world_shadow::WorldShadowPlugin,
         torch_shadow::TorchShadowPlugin,
+        // MONKEY (dynamic interiors): the fixture-lit interior lane's cvar bridge — independent
+        // of the shadow lanes, a plain drop-in.
+        dynamic_interior::DynamicInteriorPlugin,
     ))
     // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
     // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.

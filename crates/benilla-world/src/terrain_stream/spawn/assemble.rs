@@ -20,7 +20,7 @@ use crate::mesh_tag::alpha_bits;
 use crate::model_fade::DoodadFade;
 use crate::model_render::{model_material, MaterialCache, ShadeSel};
 use crate::model_render::{ModelKind, ModelPart};
-use benilla_assets::materials::WowModelMaterial;
+use benilla_assets::materials::{TorchBinds, WowModelMaterial};
 
 /// What one placement's animation host armed, for the consumers that spawn alongside its submeshes.
 /// All fields are *per placement*, not per model: the anchors are this instance's, and `arm` is
@@ -88,6 +88,8 @@ pub fn spawn_model_entities(
     mat_cache: &mut MaterialCache,
     materials: &mut Assets<WowModelMaterial>,
     light: &Buffer,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings, beside the light buffer.
+    torch: &TorchBinds,
     submeshes: &[ModelSubmesh],
     // The model's app-built render forms (decision 0834), index-parallel with `submeshes`: the
     // static handle + its build-time `Aabb` per batch, and the skinned twins when this model's
@@ -300,6 +302,7 @@ pub fn spawn_model_entities(
             sub.window,
             false, // the world streamer never spawns a skybox
             light,
+            torch,
             seq_owner,
         );
         // The blend twin for the distance-fade feather pass (reuse the cutout when already blend, or when
@@ -344,6 +347,7 @@ pub fn spawn_model_entities(
                 sub.window,
                 false, // the world streamer never spawns a skybox
                 light,
+                torch,
                 seq_owner,
             )
         };

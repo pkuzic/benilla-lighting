@@ -108,6 +108,79 @@ const WORD_MATTE: u32 = 268435456u;    // 1 << 28 — exterior MODD prop: intens
 // Vanilla cutout ref (224/255) — wow_model.wgsl's VANILLA_ALPHA_KEY.
 const VANILLA_ALPHA_KEY: f32 = 0.8784314;
 
+// MONKEY (torch shadows Phase 1): group 3 — the interior torch depth map + the ≤4-entry fixture
+// table. Declared (and sampled) ONLY under TORCH_SHADOWS, which the static_gx pipeline always sets;
+// the wow_model.wgsl copy of interior_room_light has no group 3 and must not see this block.
+#ifdef TORCH_SHADOWS
+struct TorchTable {
+    // .x = live fixture count (a vec4 so the 16-byte-aligned std140 layout matches the Rust
+    // `TorchTableUniform`: count@0, positions@16, view_projs@80 — total 1616 bytes).
+    count: vec4<u32>,
+    positions: array<vec4<f32>, 4>,    // xyz = fixture world pos, w = range
+    view_projs: array<mat4x4<f32>, 24>, // 6 cube faces per fixture: [fixture*6 + face]
+}
+@group(3) @binding(0) var torch_depth: texture_depth_2d_array;
+@group(3) @binding(1) var torch_samp: sampler_comparison;
+@group(3) @binding(2) var<uniform> torch_table: TorchTable;
+// Reverse-Z depth bias: nudges the receiver's own depth up so a surface never shadows ITSELF (the
+// striped acne). KEEP SMALL — reverse-Z compresses depth far from the torch, so a large constant
+// bias there detaches every shadow (0.004 made the whole room read "lit"). 0.001 is the known-good
+// value that gave the clean forge-cast floor shadows; the residual acne only showed in the
+// worst-case interiorDebug 2 (min over all 4 maps), not the real per-fixture render.
+const TORCH_BIAS: f32 = 0.001;
+#endif
+
+// MONKEY (Phase 5): the cube face that contains direction `d` (fixture → fragment) — the major
+// axis, signed. The face order is the contract with `benilla_app::torch_shadow::cube_view_projs`:
+// 0 +X, 1 −X, 2 +Y, 3 −Y, 4 +Z, 5 −Z. Each face is a 90°(+ε) frustum down that axis, so the face
+// holding the major axis always contains the direction.
+fn torch_face(d: vec3<f32>) -> u32 {
+    let a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) {
+        return select(1u, 0u, d.x > 0.0);
+    }
+    if (a.y >= a.z) {
+        return select(3u, 2u, d.y > 0.0);
+    }
+    return select(5u, 4u, d.z > 0.0);
+}
+
+// This interior fixture's OWN cast shadow: correlate the `wow_light` fixture at `light_pos` to a
+// promoted torch (position match within 1 yd), pick the cube face facing the fragment, and sample
+// that layer. 1.0 (unshadowed) when no map matches, or when TORCH_SHADOWS is off (wow_model's copy
+// of the caller never sets it).
+fn torch_surface_shadow(light_pos: vec3<f32>, P: vec3<f32>) -> f32 {
+#ifdef TORCH_SHADOWS
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        let fixture = torch_table.positions[i].xyz;
+        if (distance(fixture, light_pos) < 1.0) {
+            let layer = i * 6u + torch_face(P - fixture);
+            return shadow_hook::torch_map_shadow(
+                torch_table.view_projs[layer], i32(layer), P, torch_depth, torch_samp, TORCH_BIAS);
+        }
+    }
+#endif
+    return 1.0;
+}
+
+// MONKEY (torch debug, interiorDebug 2): the MIN raw depth-map shadow factor over EVERY promoted map
+// (ignores the fixture-position match), so the map's actual content is visible as greyscale on the
+// floor: all-WHITE = maps empty / projection misses the fragment; uniform GREY = self-shadow/bias;
+// SHAPED dark regions = real occlusion is being captured (then the fix is correlation/placement).
+fn torch_debug_factor(P: vec3<f32>) -> f32 {
+#ifdef TORCH_SHADOWS
+    var s = 1.0;
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        let layer = i * 6u + torch_face(P - torch_table.positions[i].xyz);
+        s = min(s, shadow_hook::torch_map_shadow(
+            torch_table.view_projs[layer], i32(layer), P, torch_depth, torch_samp, TORCH_BIAS));
+    }
+    return s;
+#else
+    return 1.0;
+#endif
+}
+
 // ---- mirrored law (wow_model.wgsl) ----
 
 fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
@@ -150,6 +223,66 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
         sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
     }
     return sum;
+}
+
+// MONKEY (dynamic interiors): the per-FRAGMENT room light for interior WMO surfaces AND interior
+// props — EVERY in-range light of the room-gated table, no nearest-3 selection (a per-fragment
+// selection swap draws a seam where the 4th light drops out). Two terms per light:
+//  · DIRECT — the reference's falloff × a WRAPPED Lambert, (N·L + wrap)/(1 + wrap): a hearth
+//    sitting at floor level is horizontal to the floor around it, and a hard max(N·L, 0) lights
+//    nothing there (the smithy only worked because its forges are raised).
+//  · FILL — a normal-free bounce, colour × K_FILL × (1 − d/range)²: the "lamps everywhere" glow
+//    Blizzard's bake carried, sourced from the room's own fixtures instead of a constant. The
+//    colour is normalised for this term (the table commits RAW over-gamut colour × intensity),
+//    so one hot forge doesn't wash a whole room.
+// `torch_shadow` (the #2 lane, 1.0 when no torch is promoted) shades the direct term only —
+// bounce is indirect. A base ambient keeps a fixture-less nook from going black. The knobs are
+// LIVE cvars packed into `point_count.yzw` — `.y` base ambient, `.z` fill gain, `.w` exposure
+// (the callers' multiplier on the whole budget before the rolloff) — so
+// `/script SetCVar("interiorExposure", 2)` retunes a room without a rebuild. The fill is
+// half-desaturated: bounce off wood and stone is not candle-orange.
+const INTERIOR_WRAP: f32 = 0.5;
+fn interior_room_light(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    let count = u32(wow_light.point_count.x);
+    let k_fill = wow_light.point_count.z;
+    var direct = vec3<f32>(0.0);
+    var fill = vec3<f32>(0.0);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let pos_range = wow_light.points[2u * i];
+        let to_light = pos_range.xyz - P;
+        let d2 = dot(to_light, to_light);
+        if (d2 > pos_range.w * pos_range.w) {
+            continue;
+        }
+        let d = sqrt(d2);
+        let c = wow_light.points[2u * i + 1u].rgb;
+        let atten = 1.0 / (0.7 * d + 0.03 * d2);
+        let nl = max(
+            (dot(N, to_light / max(d, 1e-4)) + INTERIOR_WRAP) / (1.0 + INTERIOR_WRAP),
+            0.0,
+        );
+        // Normalised for BOTH terms: the table commits RAW over-gamut colour × intensity, and the
+        // smithy's three forges (1.4, 0.87, 0.4) drove the direct term to a washed-out white while
+        // the inn's unit candles sat where they should. The hue is what survives.
+        let c_norm = c / max(1.0, max(c.r, max(c.g, c.b)));
+        // Phase 1: this fixture's OWN cast shadow, sampled from its down-looking depth map
+        // (`torch_surface_shadow` correlates the fixture to its promoted map by position; 1.0 when
+        // it was not promoted). Per-fixture, so a pillar between the fragment and torch A darkens A's
+        // term without touching torch B's — the occlusion that makes an interior read
+        // lit-and-shadowed instead of flat. (`static_gx.wgsl` only; the wow_model copy of this
+        // function keeps the 1.0 `torch_shadow_for` stub — it has no group 3.)
+        let s = torch_surface_shadow(pos_range.xyz, P);
+        direct += c_norm * (atten * nl) * s;
+        let reach = 1.0 - d / max(pos_range.w, 1e-4);
+        let c_fill = mix(c_norm, vec3<f32>(dot(c_norm, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
+        // The DOMINANT fixture's fill, not the SUM: an ambient room glow must not scale with the
+        // candle count, or a dense room (the inn's ~10 fixtures vs the smithy's 3) piles fill up
+        // until the rolloff saturates every surface to a flat white. `max` keeps the nearest/
+        // brightest fixture's glow and leaves the direct term to carry the per-fixture relief.
+        fill = max(fill, c_fill * (k_fill * reach * reach));
+    }
+    // Fill is INDIRECT bounce, so it is not shadowed; direct already carries each fixture's shadow.
+    return direct + fill + vec3<f32>(wow_light.point_count.y);
 }
 
 // ---- the pass ----
@@ -218,7 +351,11 @@ fn vertex(v: GxVertex) -> GxVsOut {
     // (wow-re trace-forensics-abbey-interior-d3d §2: zero on every observed WMO surface) —
     // and so do interior M2 props (B4): their group-MOLR point lobes are folded into the
     // per-item SH probe at spawn, the entity path's own vertex-stage zeroing.
-    if ((v.word & (WORD_WMO | WORD_INTERIOR)) != 0u) {
+    if ((v.word & WORD_WMO) != 0u) {
+        // WMO surfaces stay zero here, the reference's own vertex-stage zeroing. MONKEY (dynamic
+        // interiors): interior groups light from the live torches PER-FRAGMENT in the fragment
+        // stage (`interior_room_light`) — a per-vertex sum on a WMO's huge floor triangles is
+        // Gouraud: straight-edged wedges, and a torch mid-triangle lights nothing.
         out.point_lit = vec3<f32>(0.0);
     } else {
         out.point_lit = point_light_sum(world, v.normal, v.anchor);
@@ -404,16 +541,48 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // break the pixel-identity bar.
         let tex_rgb = folded / max(vc.rgb, vec3<f32>(1.0 / 255.0));
         rgb = tex_rgb * primary;
-        if (interior && class_int && has_vc) {
-            // INT self-illumination: tex·MOCV·(1 + 4·MOCV.a), only the final [0,1] clamp —
-            // the client's own interior pixel shader (literal 4.0). Gated on AUTHORED
-            // colours: a colour-less INT batch takes the entity path's no-COLORS combine
-            // (plain tex × lit), which the white-vc algebra above already reproduces.
-            rgb = clamp(
-                tex_rgb * vc.rgb * (1.0 + 4.0 * trans_a),
-                vec3<f32>(0.0),
-                vec3<f32>(1.0),
-            );
+        if (interior && wow_light.wmo_fog_params.w > 0.5) {
+            // MONKEY (dynamic interiors #A, `interiorLight` on): the WHOLE interior group — INT, TRANS and EXT batch
+            // classes alike — lights from the LIVE room torches instead of the MOCV bake. Gating
+            // this on `class_int` left every TRANS/EXT batch (most of a floor near a doorway) on
+            // the baked `vc.rgb × lit` path above: the "old baked light/shadow still there".
+            //
+            // Per-FRAGMENT (`interior_room_light`, every room light): a per-vertex sum on a WMO's
+            // huge floor triangles is Gouraud — straight-edged wedges, a torch mid-triangle lights
+            // nothing — the same artefact shape as Blizzard's per-vertex bake. The torch shadow
+            // (#2 lane, 1.0 when no torch is promoted) shades the torch term only.
+            //
+            // Daylight keeps the AUTHORED batch-class weight, so a doorway still takes the sun:
+            // INT = none, TRANS = the per-vertex MOCV alpha lerp, EXT = full `lit_int_base`.
+            // MOCV.rgb (the baked light + shadow) is what gets dropped; its alpha is the exterior
+            // blend weight, not a shadow, and stays.
+            //
+            // Soft rolloff instead of a hard clamp: `1 − exp(−x)` maps the ILLUMINATION into [0,1)
+            // with derivative 1 at 0 (dim nooks untouched) and a smooth asymptote — a bright forge
+            // never draws the iso-brightness contour a hard `clamp` did. `tex × illum` can't clip.
+            // SIDN rides inside as the emission it is. Ambient 0.15 fills the dark (cvar/slider
+            // once the look is confirmed).
+            let room = interior_room_light(in.world_position.xyz, n_lit);
+            var day_w = 0.0;
+            if (class_trans) {
+                day_w = trans_a;
+            } else if (!class_int) {
+                day_w = 1.0;
+            }
+            let illum = vec3<f32>(1.0) - exp(-(room + sidn_e) * wow_light.point_count.w);
+            // BLEND toward the reference's own lit result (`rgb` above — MOCV × the exterior law)
+            // by the authored batch-class weight; never ADD daylight on top of the room light,
+            // which left the interior side of every threshold brighter than the exterior floor a
+            // step away (the hard line at the smithy door). At the portal (weight 1) this IS the
+            // exterior group's law, so the seam closes by construction, day or night; deep inside
+            // (weight 0) it is pure room light. EXT-class batches (1) stay on the reference path.
+            rgb = mix(tex_rgb * illum, rgb, day_w);
+            let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
+            if (idbg == 2u) {
+                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz));
+            } else {
+                rgb = shadow_hook::interior_debug_override(idbg, rgb, in.world_position, n_lit);
+            }
         }
     } else if ((in.word & WORD_INTERIOR) != 0u) {
         // ---- the interior M2-PROP lane (B4, decision 1433) — wow_model.wgsl's
@@ -443,6 +612,21 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         );
         let primary = clamp(lit_prop + in.point_lit, vec3<f32>(0.0), vec3<f32>(1.0));
         rgb = folded * primary;
+        // MONKEY (dynamic interiors #A): interior props take the SAME live room light as the
+        // surfaces around them (`interior_room_light`) instead of the baked probe — on the probe a
+        // tavern's tables and barrels stayed bake-bright inside a torch-lit room ("the .m2s ignore
+        // the light"). Same soft rolloff as the surface lane. UNCONDITIONAL for the prove-out; the
+        // probe path above is the faithful baked result the cvar will restore.
+        if (wow_light.wmo_fog_params.w > 0.5) {
+            let room = interior_room_light(in.world_position.xyz, n_lit);
+            rgb = folded * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
+            let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
+            if (idbg == 2u) {
+                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz));
+            } else {
+                rgb = shadow_hook::interior_debug_override(idbg, rgb, in.world_position, n_lit);
+            }
+        }
     } else {
         // ---- the exterior ADT-doodad lane (slice 1) + the exterior MODD-prop family (B4) --
         // The intensity family: statics are `mat_shade` only (no per-instance ramp byte —
