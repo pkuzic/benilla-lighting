@@ -164,9 +164,16 @@ struct WowLight {
     wmo_fog_color: vec4<f32>,    // rgb interior fog (gamma); w = enable (mirrors fog_color.w)
     wmo_fog_params: vec4<f32>,   // x = start yd; y = end yd; zw = free lanes (retired A/B dials)
     // The dynamic point-light table (decision 0278), packed by `global_light::build_light_data`:
-    // row 20 `.x` = live entry count; then TWO rows per light — `[pos.xyz, range]`, `[rgb, 0]`.
+    // row 20 `.x` = live entry count; then TWO rows per light — `[pos.xyz, range]`, `[rgb, lane]`.
     // Rides this buffer (not bevy's clusterables) because the view layout exposes those to the
     // fragment stage only, and the Gouraud term is evaluated in the VERTEX stage.
+    //
+    // MONKEY (light lanes): the colour row's `.w` splits the table into two DISJOINT halves.
+    // `0` = an EXTERIOR light (nothing claims a room) — read only by `point_light_sum`. Anything
+    // `> 0.5` = an INTERIOR fixture — read only by `interior_room_light`, and the value itself is
+    // that fixture's REACH IN YARDS (its authored MOLT attenuation end, or the M2 intensity
+    // bucket, already scaled by the live `interiorAttenScale`). One float carries both because a
+    // packed reach is always ≥ 1 yd and can never be mistaken for the exterior 0.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
     // The interior-prop SH probe table (lighting::prop_probes — 7 rows per slot, 8192 slots; keep in
@@ -205,14 +212,17 @@ struct WowLight {
 
 // MONKEY (torch shadows Phase 3A): the ENTITY receiver's torch bindings — the SAME depth array
 // static_gx's group 3 samples (one shared `Image`, rendered by `static_gx::torch_depth`) and the
-// SAME 1616-byte table, riding the material's own group (`WowModelExt` bindings 91/92/93) because
+// SAME 6416-byte table, riding the material's own group (`WowModelExt` bindings 91/92/93) because
 // a Bevy material draw sets groups 0/1/2 only. ALWAYS bound (the image and buffer exist from
 // startup), so no shader-def guards this block; only the fragment stage reads it. The struct is
 // std430 here and std140 in static_gx — identical bytes, every member is 16-aligned.
 struct TorchTable {
-    count: vec4<u32>,                   // .x = live fixture count
-    positions: array<vec4<f32>, 4>,     // xyz = fixture world pos, w = range
-    view_projs: array<mat4x4<f32>, 24>, // 6 cube faces per fixture: [fixture*6 + face]
+    // MONKEY (static torch cache): byte-identical in BOTH shaders and TorchTableUniform.
+    // count@0 (16): x high-water slot count, y soft*100, z dynamic/live-bank mask, w reserved.
+    // positions@16 (256), view_projs@272 (6144): total 6416 bytes. A mismatch hides buildings.
+    count: vec4<u32>,
+    positions: array<vec4<f32>, 16>,
+    view_projs: array<mat4x4<f32>, 96>,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(91) var torch_depth: texture_depth_2d_array;
 @group(#{MATERIAL_BIND_GROUP}) @binding(92) var torch_samp: sampler_comparison;
@@ -227,6 +237,11 @@ const TORCH_BIAS: f32 = 0.001;
 // interiorDebug 2, flickering shadows in the real render). Pushing the sample point out of the skin
 // makes self-occlusion impossible while a pillar or another character still casts onto it.
 const TORCH_NORMAL_OFFSET: f32 = 0.15;
+// MONKEY (torch caster selection, MIRRORED from static_gx.wgsl): the live PCF tap-radius scale,
+// unpacked from the table's `count.y` (stored x100 — the row is `vec4<u32>`).
+fn torch_soft() -> f32 {
+    return max(f32(torch_table.count.y) * 0.01, 0.05);
+}
 
 // MONKEY (Phase 5, MIRRORED from static_gx.wgsl — keep in sync): the cube face that contains
 // direction `d` (fixture → fragment) — the major axis, signed. Face order is the contract with
@@ -251,11 +266,19 @@ fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 
     // Normal-offset the sample point out of the body (see TORCH_NORMAL_OFFSET).
     let Ps = P + N * TORCH_NORMAL_OFFSET;
     for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        // MONKEY (static torch cache): holes and pending uploads never sample stale layers.
+        if (torch_table.positions[i].w <= 0.0) { continue; }
         let fixture = torch_table.positions[i].xyz;
         if (distance(fixture, light_pos) < 1.0) {
             let layer = i * 6u + torch_face(Ps - fixture);
-            return shadow_hook::torch_map_shadow(
-                torch_table.view_projs[layer], i32(layer), Ps, torch_depth, torch_samp, TORCH_BIAS);
+            let s = shadow_hook::torch_map_shadow(
+                torch_table.view_projs[layer], i32(layer + select(0u, 96u, (torch_table.count.z & (1u << i)) != 0u)), Ps, torch_depth, torch_samp, TORCH_BIAS,
+                torch_soft());
+            // MONKEY (torch caster selection, MIRRORED from static_gx.wgsl): `.w` is the slot's
+            // FADE WEIGHT, so a promoted fixture's shadow ramps in over ~1/3 s and a demoted one
+            // ramps out. An entity and the floor under it MUST use the same weight or the NPC's
+            // shadow would pop while the floor's faded.
+            return mix(1.0, s, torch_table.positions[i].w);
         }
     }
     return 1.0;
@@ -269,9 +292,13 @@ fn torch_entity_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
     let Ps = P + N * TORCH_NORMAL_OFFSET;
     var s = 1.0;
     for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        if (torch_table.positions[i].w <= 0.0) { continue; }
         let layer = i * 6u + torch_face(Ps - torch_table.positions[i].xyz);
-        s = min(s, shadow_hook::torch_map_shadow(
-            torch_table.view_projs[layer], i32(layer), Ps, torch_depth, torch_samp, TORCH_BIAS));
+        let raw = shadow_hook::torch_map_shadow(
+            torch_table.view_projs[layer], i32(layer + select(0u, 96u, (torch_table.count.z & (1u << i)) != 0u)), Ps, torch_depth, torch_samp, TORCH_BIAS,
+            torch_soft());
+        // MONKEY (torch caster selection): the WEIGHTED factor, matching the real render.
+        s = min(s, mix(1.0, raw, torch_table.positions[i].w));
     }
     return s;
 }
@@ -358,6 +385,13 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
     var sel = array<u32, 3>(0u, 0u, 0u);
     var sd = array<f32, 3>(1e30, 1e30, 1e30);
     for (var i = 0u; i < count; i = i + 1u) {
+        // MONKEY (light lanes): skip INTERIOR fixtures (colour row `.w > 0.5`) — they light the
+        // room that claims them and nothing else. Before the split, a proximity-admitted inn
+        // fixture reached every exterior receiver near the building through its own walls. Skipped
+        // BEFORE the ≤3 ranking, so it cannot take a slot an outdoor fire should have had.
+        if (wow_light.points[2u * i + 1u].w > 0.5) {
+            continue;
+        }
         let pos_range = wow_light.points[2u * i];
         let dv = pos_range.xyz - anchor;
         let d2 = dot(dv, dv);
@@ -391,7 +425,14 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
 }
 
 // MONKEY (dynamic interiors): the per-FRAGMENT room light — MIRRORED from `static_gx.wgsl`
-// (`interior_room_light`; keep in sync). Every in-range light of the room-gated table, no
+// (`interior_room_light`; keep in sync). MONKEY (light lanes / interior attenuation): the loop is
+// over the INTERIOR half of the table only (colour row `.w > 0.5`), and that same `.w` is each
+// fixture's REACH in yards — its authored MOLT attenuation end (M2 sources bucket by intensity),
+// scaled live by `interiorAttenScale`; it bounds the loop, shapes the fill and drives the direct
+// window. `interiorAttenScale 0` packs the legacy 48 yd — under the soft profile below that is the
+// widest, flattest pool the lane can make, the nearest thing left to the pre-window flat lane (no
+// longer the byte-exact restore it was, because the window's SHAPE moved with it).
+// Every in-range light of the room-gated table, no
 // nearest-3 selection: DIRECT (falloff × wrapped Lambert, so a floor-level hearth still lights
 // the floor) + FILL (normal-free, half-desaturated bounce) + the base ambient. The knobs are the
 // live cvars packed into `point_count.yzw` (`.y` ambient, `.z` fill gain, `.w` exposure — the
@@ -400,24 +441,125 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
 // day/night CGLight, and takes the SAME per-fixture torch shadows (Phase 3A: the shared depth
 // array through this material's own group-2 bindings) as the surfaces.
 const INTERIOR_WRAP: f32 = 0.5;
-fn interior_room_light(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (soft falloff): the interior pool's PROFILE — **keep this whole block byte-identical
+// between wow_model.wgsl and static_gx.wgsl.**
+//
+// The colour row's `.w` packs each fixture's EFFECTIVE RADIUS `R`: its authored MOLT
+// `attenuation_end` (an M2 source buckets by intensity instead) already multiplied by the live
+// `interiorAttenScale` (default 1.6). MONKEY (pool energy): the EXTENT terms — the direct window
+// and the fill span — are still written as fractions of `R`, so the cvar stays a pure zoom on how
+// far every pool REACHES; the core is not, so it is no longer also a brightness dial.
+//
+// The RETIRED profile was the reference's `1/(0.7d + 0.03d²)` windowed by
+// `1 − smoothstep(0.65R, R, d)` at `R` = the authored reach. That window closed a still-BRIGHT
+// curve — 0.28 of its 1 yd value at 0.65R — over the last 35 % of the radius, i.e. a bright disc
+// with a visible rim and black beyond it. That is the abbey candelabra ring. Three changes replace
+// it, and the ring cannot come back because the curve is already dim wherever the window bites:
+//  · CORE — `1/(1 + (d/r0)²)`: inverse square with a soft core. MONKEY (pool energy): `r0` is a
+//    CONSTANT `INTERIOR_CORE_YD` **yards**, not a fraction of `R` any more. It was `0.26·R`, and
+//    that tied a fixture's BRIGHTNESS to its REACH — the pool's total ENERGY grew as `R²`. The
+//    Goldshire inn's `R ≈ 11-15` fixtures therefore ran a 2.1× (at 3 yd) to 2.9× (at 5 yd) hotter
+//    curve than Northshire abbey's `R ≈ 7`; ten of them overlap in one room, the
+//    `1 − exp(−x·exposure)` rolloff saturated, and the inn read as one flat yellow while the
+//    abbey — whose pools the owner signed off — sat exactly where it should. Reach must BOUND a
+//    pool, not fuel it. So the energy is now one curve for every fixture and only the WINDOW and
+//    the fill span still scale with `R`: two fixtures of different reach read IDENTICALLY until
+//    the shorter one's window closes. `1.75 yd` is what the abbey already had (`0.26 × 6.7` — its
+//    median authored end 4.2 at the default `interiorAttenScale` 1.6), so the under-candle level
+//    the exposure was tuned against is preserved to within ±10 % across the abbey's own reach
+//    spread (−5 % at its median fixture) and nothing about the approved look moves.
+//  · GAIN — `INTERIOR_CORE_GAIN` normalises the core against the retired hyperbolic's 1 yd value,
+//    `1/(0.7 + 0.03) = 1.3699`. With a CONSTANT `r0` that normalisation is the same for every
+//    fixture instead of holding only at the median reach, which is the whole point; it lands at
+//    `1.5/(1 + (1/1.75)²) = 1.1308`, i.e. 0.83 × the hyperbolic — the abbey's own current level.
+//    (Gain 1.817 would restore 1.3699 exactly; that is a 21 % brighter room than the approved
+//    one, so it is deliberately NOT taken. Change the GAIN, never the core radius, to re-level.)
+//  · WINDOW — `(clamp01(1 − (d/R)^p))²`, the UE4-style windowing: value AND derivative both vanish
+//    at `d = R` (C1, so no rim), ≈1 over most of the radius, and it only ever removes energy the
+//    curve has already lost.
+// MONKEY (pool energy): the direct term (before the wrapped Lambert) at d = 1 / 3 / 5 / 8 / 12 yd,
+// abbey-class `R = 7` beside inn-class `R = 13` —
+//   was   R=7  1.152 / 0.403 / 0.164 / 0     / 0       R=13  1.379 / 0.839 / 0.470 / 0.224 / 0.033
+//   now   R=7  1.131 / 0.381 / 0.153 / 0     / 0       R=13  1.131 / 0.381 / 0.164 / 0.067 / 0.009
+// The two "now" rows are the SAME curve until R=7's window bites (where it is already down to
+// 0.15); R=13 only keeps a longer, dimmer TAIL, because its window is wider. That is the fix.
+//
+// FILL keeps its EXACT form (`(1 − d/r)²`, which is `interior_window(d, r, 1.0)`) and only widens:
+// its radius is `INTERIOR_FILL_SPAN·R`, so the floor BETWEEN two pools takes a gentle wash instead
+// of the bare ambient floor. Its value at the fixture is still 1, so `interiorFill` keeps the
+// meaning it was tuned with.
+const INTERIOR_CORE_YD: f32 = 1.75;
+const INTERIOR_CORE_GAIN: f32 = 1.5;
+const INTERIOR_DIRECT_POW: f32 = 10.0;
+const INTERIOR_FILL_SPAN: f32 = 1.5;
+const INTERIOR_FILL_POW: f32 = 1.0;
+// `(clamp01(1 − (d/r)^p))²`. The inner clamp keeps `pow` off a negative base; `max(r, …)` keeps it
+// off a zero divisor (the packer floors R at 1.0, but a shader must not lean on a producer's
+// invariant). `clamp(…, 0, 1)` rather than `saturate` — nothing else in this shader set uses
+// `saturate`, and the two are the same instruction.
+fn interior_window(d: f32, r: f32, p: f32) -> f32 {
+    let w = clamp(1.0 - pow(clamp(d / max(r, 1e-4), 0.0, 1.0), p), 0.0, 1.0);
+    return w * w;
+}
+// MONKEY (room gate): the ENTITY/prop copy has no claim-table binding and no per-fragment room
+// key (`static_gx.wgsl` owns both — the claim table hangs off its own group 2), so every fixture is
+// admitted here, exactly as before this change. Follow-up: an entity already knows the room it
+// STANDS in (the interior classifier's down-ray, `carried_light`'s `WmoGroupVis::single`), so the
+// same gate could ride a per-instance key pushed through the model material.
+fn interior_room_admits(i: u32, room_inst: u32, room_group: u32) -> bool {
+    return true;
+}
+fn interior_room_light(P: vec3<f32>, N: vec3<f32>, room_inst: u32, room_group: u32) -> vec3<f32> {
     let count = u32(wow_light.point_count.x);
     let k_fill = wow_light.point_count.z;
     var direct = vec3<f32>(0.0);
     var fill = vec3<f32>(0.0);
     for (var i = 0u; i < count; i = i + 1u) {
+        let color_lane = wow_light.points[2u * i + 1u];
+        // MONKEY (light lanes): only a fixture that CLAIMS a room lights this room (keep in sync
+        // with static_gx.wgsl). `.w` is 0 on every exterior source, so a campfire burning outside
+        // the door stops reaching the floor inside it.
+        if (color_lane.w < 0.5) {
+            continue;
+        }
+        // MONKEY (room gate): and only a fixture that claims THIS ROOM lights this room's surfaces.
+        // Before this, the whole INT half of the table lit every interior fragment of every
+        // building in range and the only occlusion was the <=6 promoted cube-shadow casters — so an
+        // inn's ground-floor candles lit its basement THROUGH the floor, and an upstairs corridor
+        // wall glowed from the fixture in the room behind it. Tested here, before the distance
+        // test, because it is the term that throws away the most: a room claims one or two of the
+        // table's fixtures, not all of them.
+        if (!interior_room_admits(i, room_inst, room_group)) {
+            continue;
+        }
+        // MONKEY (soft falloff): `.w` is ALSO this fixture's EFFECTIVE RADIUS `R` in yards — the
+        // authored MOLT `attenuation_end` (or the M2 intensity bucket) already multiplied by the
+        // live `interiorAttenScale` at pack time. It replaces the flat 48 yd candidacy radius in
+        // `pos_range.w` on this lane, which is why a 10-candle inn read as one uniform wash.
+        let reach_yd = color_lane.w;
+        // Candidacy is the FILL radius, not R: the wash reaches further than the direct pool (see
+        // the profile block), and rejecting at R would cut it off exactly at the pool's own edge —
+        // putting the rim back one term down.
+        let fill_yd = INTERIOR_FILL_SPAN * reach_yd;
         let pos_range = wow_light.points[2u * i];
         let to_light = pos_range.xyz - P;
         let d2 = dot(to_light, to_light);
-        if (d2 > pos_range.w * pos_range.w) {
+        if (d2 > fill_yd * fill_yd) {
             continue;
         }
         let d = sqrt(d2);
-        let c = wow_light.points[2u * i + 1u].rgb;
+        let c = color_lane.rgb;
         // Normalised for BOTH terms (keep in sync with static_gx.wgsl): the table commits RAW
         // over-gamut colour × intensity; a hot forge would wash the direct term to white.
         let c_norm = c / max(1.0, max(c.r, max(c.g, c.b)));
-        let atten = 1.0 / (0.7 * d + 0.03 * d2);
+        // MONKEY (soft falloff): inverse square with the authored-start soft core, normalised so
+        // the 1 yd value is the retired hyperbolic's (profile block above).
+        // MONKEY (pool energy): a CONSTANT core radius in yards (profile block above) — the reach
+        // no longer scales the pool's brightness, only its window. `max` keeps the divide honest
+        // if the constant is ever tuned toward 0.
+        let r0 = max(INTERIOR_CORE_YD, 1e-3);
+        let atten = INTERIOR_CORE_GAIN / (1.0 + (d / r0) * (d / r0));
+        let window = interior_window(d, reach_yd, INTERIOR_DIRECT_POW);
         let nl = max(
             (dot(N, to_light / max(d, 1e-4)) + INTERIOR_WRAP) / (1.0 + INTERIOR_WRAP),
             0.0,
@@ -427,12 +569,16 @@ fn interior_room_light(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
         // material's group-2 torch bindings — a pillar between an NPC and torch A darkens A's
         // term without touching torch B's, exactly as on the surfaces around it.
         let s = torch_entity_shadow(pos_range.xyz, P, N);
-        direct += c_norm * (atten * nl) * s;
-        let reach = 1.0 - d / max(pos_range.w, 1e-4);
+        direct += c_norm * (atten * nl * window) * s;
+        // MONKEY (soft falloff): the fill's profile is UNCHANGED in FORM — `(1 − d/r)²`, which is
+        // exactly `interior_window(d, r, 1.0)` — and only its radius moved, from R to
+        // `INTERIOR_FILL_SPAN·R`. That is the whole "gentle wash between the pools": at the fixture
+        // it is still 1 (so `interiorFill` keeps its tuned meaning) and it decays to 0 at 2R with a
+        // vanishing derivative, so the floor half-way between two candles is dim, not black.
         let c_fill = mix(c_norm, vec3<f32>(dot(c_norm, vec3<f32>(0.299, 0.587, 0.114))), 0.5);
         // DOMINANT fixture, not the sum (keep in sync with static_gx.wgsl): fill must not scale
         // with candle count or a dense room saturates flat. Fill is indirect, so not shadowed.
-        fill = max(fill, c_fill * (k_fill * reach * reach));
+        fill = max(fill, c_fill * (k_fill * interior_window(d, fill_yd, INTERIOR_FILL_POW)));
     }
     return direct + fill + vec3<f32>(wow_light.point_count.y);
 }
@@ -449,6 +595,61 @@ fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
     let ix = floor((half + P.x) / cell);
     let iz = floor((half + P.z) / cell);
     return vec3<f32>((ix + 0.5) * cell - half, P.y, (iz + 0.5) * cell - half);
+}
+
+// MONKEY (wmo exterior points): the EXTERIOR-lane point term for a WMO's OUTDOOR-class surfaces —
+// MIRRORED VERBATIM from `static_gx.wgsl` (`wmo_exterior_point_sum`; that file owns the full
+// rationale — keep the two bodies identical). This copy exists because the retained WMO collector
+// declines a small minority of batches (env-mapped, depth-flag oddities) and they fall through to
+// this entity pipeline: a Trade District street lit on one pipeline and black on the other is
+// worse than either. It reuses this file's OWN `mcnk_cell_anchor` (identical constants to
+// static_gx's private copy) — a WMO batch's anchor is its PLACEMENT origin, one point for the whole
+// of Stormwind, so ranking from it would commit the same three lights to every street in the city;
+// the 33.33 yd MCNK cell is the unit terrain ranks by, so a street and the road it runs into rank
+// the SAME candidates and agree at the seam. Candidacy is terrain's Chebyshev box, not this file's
+// 48 yd sphere, for that same agreement reason.
+const WMO_EXT_REACH: f32 = 33.570166;
+fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    let anchor = mcnk_cell_anchor(P);
+    let count = u32(wow_light.point_count.x);
+    var sel = array<u32, 3>(0u, 0u, 0u);
+    var sd = array<f32, 3>(1e30, 1e30, 1e30);
+    for (var i = 0u; i < count; i = i + 1u) {
+        // Exterior lane only: an interior fixture's `.w` is its reach (≥ 1), an exterior source's
+        // is 0. A building's own candles must not pool on the street outside its wall.
+        if (wow_light.points[2u * i + 1u].w > 0.5) {
+            continue;
+        }
+        let dv = wow_light.points[2u * i].xyz - anchor;
+        // Terrain's hash sweep is horizontal and unbounded vertically; the ranking below is the
+        // full 3-D distance, as `0x71bf90` does.
+        if (max(abs(dv.x), abs(dv.z)) > WMO_EXT_REACH) {
+            continue;
+        }
+        let d2 = dot(dv, dv);
+        if (d2 < sd[0]) {
+            sd[2] = sd[1]; sel[2] = sel[1];
+            sd[1] = sd[0]; sel[1] = sel[0];
+            sd[0] = d2; sel[0] = i;
+        } else if (d2 < sd[1]) {
+            sd[2] = sd[1]; sel[2] = sel[1];
+            sd[1] = d2; sel[1] = i;
+        } else if (d2 < sd[2]) {
+            sd[2] = d2; sel[2] = i;
+        }
+    }
+    var sum = vec3<f32>(0.0);
+    for (var s = 0u; s < 3u; s = s + 1u) {
+        if (sd[s] > 9.9e29) {
+            break;
+        }
+        let to_light = wow_light.points[2u * sel[s]].xyz - P;
+        let d = length(to_light);
+        let atten = 1.0 / (0.7 * d + 0.03 * d * d);
+        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
+        sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
+    }
+    return sum;
 }
 
 // The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's shader locations (the
@@ -705,14 +906,24 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
 #endif
 
     // Dynamic point lights, by receiver class (wow-re trace-forensics-abbey-interior-d3d §2/§4):
-    // WMO surfaces take NONE (zero point lights on every observed WMO surface batch — the earlier
-    // "point-lit abbey wall" was a mis-identified unit draw), and interior M2 props take none HERE
-    // (their group-MOLR point lobes are folded into the per-instance SH probe). Everything else —
+    // INTERIOR WMO surfaces take NONE (zero point lights on every observed WMO surface batch —
+    // the earlier "point-lit abbey wall" was a mis-identified unit draw; they light per FRAGMENT
+    // instead, `interior_room_light`), and interior M2 props take none HERE (their group-MOLR
+    // point lobes are folded into the per-instance SH probe). Everything else —
     // exterior doodads, entities, clutter — keeps the FFP ≤3-nearest selection: clutter (merged in
     // world space) anchors at its MCNK chunk cell (the terrain draw unit it belongs to), every M2
     // at its INSTANCE origin (wow-re wmo-surface-dynamic-light §6 — the receiving unit's own
     // position, deliberately not the skinned per-vertex matrix).
-    if (m.model_flags.x > 0.5 || m.model_flags.z > 0.5) {
+    if (m.model_flags.x > 0.5 && m.model_flags.z < 0.5) {
+        // MONKEY (wmo exterior points): an EXTERIOR-class WMO group (`model_flags.z` clear = MOGP
+        // `& 0x48` set) is a street, a courtyard, a porch — drawn by the exterior law, the same law
+        // the terrain beside it is drawn by, so it takes the exterior point term terrain takes. The
+        // §2 "zero on every WMO surface" finding was measured on abbey INTERIOR rooms and reading
+        // it as a blanket zero is what left Stormwind's Trade District torches lighting nothing but
+        // the NPC beside them. Mirrors `static_gx.wgsl`'s branch (which draws the vast majority of
+        // these batches) — keep the two in step.
+        out.point_lit = wmo_exterior_point_sum(out.world_position.xyz, out.world_normal);
+    } else if (m.model_flags.x > 0.5 || m.model_flags.z > 0.5) {
         out.point_lit = vec3<f32>(0.0);
     } else {
         var anchor = mesh_world_from_local[3].xyz;
@@ -1180,9 +1391,12 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let sidn_e = m.sidn.rgb * (wow_light.grade.x * sidn_w);
     // WoW dynamic point lights (decisions 0016/0273/0278, selection 0285) — exterior doodads,
     // entities, clutter, and terrain receive their unit's committed lights: the ≤3 NEAREST to the
-    // receiving unit's own position, never the whole scene (`point_light_sum`). WMO surfaces take
-    // ZERO (observed on every WMO surface batch in the abbey capture) and interior props fold their
-    // group-MOLR lobes into the SH probe instead — both zeroed in the VERTEX stage. The term
+    // receiving unit's own position, never the whole scene (`point_light_sum`). INTERIOR WMO
+    // surfaces take ZERO (observed on every WMO surface batch in the abbey capture — an interior
+    // capture, hence the MONKEY split above) and interior props fold their group-MOLR lobes into
+    // the SH probe instead — both zeroed in the VERTEX stage; an EXTERIOR-class WMO group takes
+    // the exterior-lane term (`wmo_exterior_point_sum`) there instead, ranked from its MCNK cell
+    // like the terrain it adjoins, which is what puts a street torch on the cobbles. The term
     // arrives GOURAUD-INTERPOLATED — per-vertex like the reference FFP, whose tessellation-scale
     // smoothing is the authored look. Diffuse-only (committed ambient/specular are zero).
     let point_diffuse = in.point_lit;
@@ -1277,8 +1491,25 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // in exterior material mode: in interior mode those bits are the probe slot.
     let matte_indoor = !is_interior && (fade_tag & 0x4000u) != 0u;
     if ((is_interior || matte_indoor) && !is_wmo && !is_rig && wow_light.wmo_fog_params.w > 0.5) {
-        let room = interior_room_light(in.world_position.xyz, n_lit);
-        var room_rgb = albedo * inst_tint * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
+        let room = interior_room_light(in.world_position.xyz, n_lit, 0u, 0u);
+        // MONKEY (indoor highlight): the hover/target emissive (`highlight`, tag bit 31) rides THIS
+        // lane's light sum too. It is the same GL_EMISSION placement as the exterior branches above
+        // — added to the material's ambient+diffuse product INSIDE the [0,1] saturate, with the
+        // texture (`albedo`) modulating the clamped result — so an indoor chair lifts by exactly the
+        // +64/255 an outdoor one does. It has to be folded HERE, not left in `lit_rgb`, because this
+        // lane REPLACES the exterior result a few lines down (`mix(lit_rgb, room_rgb, lane_w)`):
+        // with `lane_w` at 1 (a settled indoor unit) the exterior sum that carried the lift was
+        // discarded wholesale, which is why hovering a chair inside a Stormwind house brightened
+        // nothing at all while the same chair on the street did.
+        // The clamp is a no-op when nothing is hovered (`highlight` 0, and both factors are already
+        // ≤1), so the un-hovered indoor look is bit-identical to before.
+        // Placed BEFORE the debug branch on purpose: modes 1/2/3 all discard `room_rgb` and return
+        // their own diagnostic colour, so `interiorDebug` is untouched by this.
+        var room_rgb = albedo * clamp(
+            inst_tint * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w)) + vec3<f32>(highlight),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
         let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
         if (idbg == 2u) {
             // The entity's OWN cube-map sampling as greyscale (the shared stub would show white).

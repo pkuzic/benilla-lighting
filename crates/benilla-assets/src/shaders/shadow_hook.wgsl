@@ -86,6 +86,12 @@ fn torch_caster_count() -> u32 {
 //   - `world_pos`  the receiving fragment's world position.
 //   - `depth_tex`/`comp`  the group-3 depth array + `GreaterEqual` comparison sampler.
 //   - `bias`       reverse-Z receiver bias (nudges the compare ref up to kill self-shadow acne).
+//   - `soft`       MONKEY (torch caster selection): the PCF tap-radius scale (`interiorShadowSoft`,
+//                  0.5..3, carried in the table's `count.y` as `soft x 100`). The four taps sit at
+//                  ±0.5 texel × this; 1 is the historical half-texel box. A candle cluster casts
+//                  many overlapping penumbra-less edges, and widening the kernel is the cheapest
+//                  softening available here (a real penumbra would need the blocker distance and a
+//                  variable kernel — not worth a second sampling pass on a 512² face).
 // Returns 1.0 outside the frustum / behind the light; a 4-tap PCF factor otherwise (0 = shadowed).
 fn torch_map_shadow(
     view_proj: mat4x4<f32>,
@@ -94,6 +100,7 @@ fn torch_map_shadow(
     depth_tex: texture_depth_2d_array,
     comp: sampler_comparison,
     bias: f32,
+    soft: f32,
 ) -> f32 {
     let clip = view_proj * vec4<f32>(world_pos, 1.0);
     if (clip.w <= 0.0) {
@@ -104,7 +111,10 @@ fn torch_map_shadow(
         return 1.0;
     }
     let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-    let texel = 1.0 / vec2<f32>(textureDimensions(depth_tex).xy);
+    // MONKEY (torch caster selection): the tap radius is `soft` texels, clamped off zero so a
+    // table that never got a scale still samples a real (hard) 4-tap box rather than four copies
+    // of one texel.
+    let texel = (1.0 / vec2<f32>(textureDimensions(depth_tex).xy)) * max(soft, 0.05);
     // Reverse-Z: the fragment is lit iff its own depth is at least the stored nearest depth, so the
     // compare ref is `ndc.z + bias` against `GreaterEqual`.
     let ref_depth = ndc.z + bias;

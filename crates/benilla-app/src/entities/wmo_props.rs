@@ -419,19 +419,24 @@ pub(super) fn spawn_wmo_gameobject_props(
                 }
                 // M2 point lights (the lantern's glow source): a CHILD at the prop-local
                 // position — propagation carries the source with the hull.
-                for l in m.lights.iter().map(|l| &l.def) {
-                    if !l.casts() {
+                for l in m.lights.iter() {
+                    if !l.def.casts() {
                         continue; // directional lights feed an ambient term; a static `0` visibility key is dark
                     }
-                    let glow = commands
-                        .spawn((
-                            point_light(l.diffuse_color, l.diffuse_intensity),
-                            Transform::from_translation(
-                                prop.local.transform_point(wow_to_bevy(l.position)),
-                            ),
-                            Visibility::default(),
-                        ))
-                        .id();
+                    let mut glow = commands.spawn((
+                        point_light(l.def.diffuse_color, l.def.diffuse_intensity),
+                        Transform::from_translation(
+                            prop.local.transform_point(wow_to_bevy(l.def.position)),
+                        ),
+                        Visibility::default(),
+                    ));
+                    // MONKEY (fire GO lights): a transport prop takes SYNTHESISED lights like the
+                    // other entity lanes (the deck braziers on a zeppelin/boat author none), tagged
+                    // so the live `fireLightGain` reaches them.
+                    if l.synthetic {
+                        glow.insert(benilla_world::lighting::SyntheticFireLight);
+                    }
+                    let glow = glow.id();
                     commands.entity(entity).add_child(glow);
                     lights += 1;
                 }

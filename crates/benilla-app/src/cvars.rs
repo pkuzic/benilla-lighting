@@ -624,16 +624,75 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2.5",
         "benilla's own: interior light-budget multiplier before the soft rolloff, 0.25..8",
     ),
+    // MONKEY (soft falloff): the live scale on every interior fixture's AUTHORED attenuation
+    // window (WMO MOLT `+0x28/+0x2c`; M2 sources bucket by intensity instead — their authored pair
+    // is a template default, not a reach). A fixture's EFFECTIVE RADIUS is `authored end × this`.
+    // The artists' own ends — Goldshire inn 6.97-9.53 yd over 10 fixtures, its blacksmith 6.0,
+    // NSabbey 4.17-5.56, Stormwind's 606 median 6.94 — are where FULL brightness ends, not where
+    // light stops, so `1` drew a hard-edged disc at exactly that radius with black beyond it (the
+    // abbey candelabra ring). **2.5** is the default: the pool now tails smoothly to 2.5× the
+    // authored end, reading ~⅓ of its 1 yd brightness AT the authored end and ~8 % at twice it.
+    // `>1.6` widens further, `<1.6` tightens, `0` switches the window off (the 48 yd lane), so the
+    // whole shape A/Bs from chat.
+    ours(
+        "interiorAttenScale",
+        "1.6",
+        "benilla's own: scale on interior fixtures' authored attenuation window = their effective \
+         radius, 0..8 (0 = no window, the old flat lane)",
+    ),
+    // MONKEY (room gate): whether an interior fixture may light only the rooms it CLAIMS — its
+    // authored MOLR groups unioned with the interior groups whose MOGI bounding box it stands
+    // inside (`LightLitRooms` carries the corpus evidence for why MOLR alone is far too sparse:
+    // the Goldshire inn authors one on 2 of its 12 groups). Off restores the pre-gate behaviour:
+    // every interior fixture in range lights every interior surface in range, so an inn's
+    // ground-floor candles light its basement through the floor. Kept as a dial because a room the
+    // gate leaves on ambient alone looks the same as a bug, and this tells the two apart in one
+    // keystroke.
+    ours(
+        "interiorRoomGate",
+        "1",
+        "benilla's own: an interior fixture lights only the WMO groups it claims (0 = the old \
+         leak-through-walls behaviour)",
+    ),
     ours(
         "interiorShadows",
         "1",
         "benilla's own: interior fixtures cast real shadows (Stage B, the nearest few); needs \
          interiorLight",
     ),
+    // MONKEY (static torch cache): residency and per-frame work have separate live budgets.
+    ours(
+        "interiorShadowCasters",
+        "12",
+        "benilla's own: resident interior fixture shadow maps, 1..16",
+    ),
+    ours(
+        "interiorShadowDynamic",
+        "4",
+        "benilla's own: nearest promoted fixtures with moving entity shadows, 0..16",
+    ),
+    // MONKEY (torch caster selection): the PCF tap radius on the torch maps. Candle clusters read
+    // very hard-edged at 1 (a half-texel box on a 512² face); 2 is a visible softening for four
+    // extra texel-neighbourhood taps' worth of cache pressure, no extra samples.
+    ours(
+        "interiorShadowSoft",
+        "1",
+        "benilla's own: torch-shadow edge softness — the PCF tap radius scale, 0.5..3",
+    ),
     ours(
         "interiorDebug",
         "0",
         "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count",
+    ),
+    // MONKEY (fire GO lights): the gain on lights SYNTHESISED from a model's flame emitter for the
+    // ~410 fire props the artists never gave a light block (campfires, wall torches, magic
+    // braziers, forges, candles). Live, like the interior knobs — and `0` is the kill switch for
+    // the whole invented-light lane, which matters because unlike everything beside it this one is
+    // a heuristic over content rather than a byte-verified mechanism.
+    ours(
+        "fireLightGain",
+        "1",
+        "benilla's own: brightness of lights synthesised from fire props' flame emitters (0 = off)",
     ),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
@@ -1126,8 +1185,23 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "interiorambient" => knobs.video.interior_ambient = v.clamp(0.0, 1.0),
         "interiorfill" => knobs.video.interior_fill = v.clamp(0.0, 2.0),
         "interiorexposure" => knobs.video.interior_exposure = v.clamp(0.25, 8.0),
+        // MONKEY (interior attenuation): the authored-window scale. `0` is a MEANINGFUL value here
+        // (the window off), so the range floors at 0 rather than at a small positive.
+        "interiorattenscale" => knobs.video.interior_atten_scale = v.clamp(0.0, 8.0),
+        "interiorroomgate" => knobs.video.interior_room_gate = v != 0.0,
         "interiorshadows" => knobs.video.interior_shadows = v != 0.0,
+        // MONKEY (torch caster selection): the working-set size and the PCF radius, clamped at the
+        // edge like every other numeric row. `casters` floors at 1, not 0 — `interiorShadows 0` is
+        // already the off switch, and a 0 here would be a second, confusing one.
+        "interiorshadowcasters" => {
+            knobs.video.interior_shadow_casters = (v.max(1.0) as u32).clamp(1, 16);
+        }
+        // MONKEY (static torch cache): zero is useful for static-only rooms.
+        "interiorshadowdynamic" => knobs.video.interior_shadow_dynamic = (v.max(0.0) as u32).min(16),
+        "interiorshadowsoft" => knobs.video.interior_shadow_soft = v.clamp(0.5, 3.0),
         "interiordebug" => knobs.video.interior_debug = (v.max(0.0) as u32).min(3),
+        // MONKEY (fire GO lights): the synthesised-fire gain, clamped at the edge like the rest.
+        "firelightgain" => knobs.video.fire_light_gain = v.clamp(0.0, 4.0),
         // Display mode (1627) — a flag like every other checkbox here, and the reference's own
         // polarity: `1` is WINDOWED (the row is "Windowed Mode"). `video::apply_window_mode`
         // watches the value and pushes it to the window; nothing else reads it.
@@ -1430,7 +1504,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 53] = [
+        let session: [(&str, String); 59] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1483,8 +1557,17 @@ fn sync_cvars(
             ("interiorAmbient", video.interior_ambient.to_string()),
             ("interiorFill", video.interior_fill.to_string()),
             ("interiorExposure", video.interior_exposure.to_string()),
+            ("interiorAttenScale", video.interior_atten_scale.to_string()),
+            ("interiorRoomGate", flag(video.interior_room_gate)),
             ("interiorShadows", flag(video.interior_shadows)),
+            (
+                "interiorShadowCasters",
+                video.interior_shadow_casters.to_string(),
+            ),
+            ("interiorShadowDynamic", video.interior_shadow_dynamic.to_string()),
+            ("interiorShadowSoft", video.interior_shadow_soft.to_string()),
             ("interiorDebug", video.interior_debug.to_string()),
+            ("fireLightGain", video.fire_light_gain.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
                 "gxWindow",

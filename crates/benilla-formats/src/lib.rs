@@ -218,6 +218,18 @@ pub use particles::{
     parse_m2_particle_emitters, CellRamp, OverLife, OverLifeSample, ParticleBlend,
     ParticleEmitterDef, ParticleShape, SplineData,
 };
+// MONKEY (fire GO lights): the SYNTHESISED-light rule for fire props that author no light block —
+// derived from the model's own flame emitter. Beside `particles` because that is its whole input.
+pub mod fire_light;
+pub use fire_light::{synthesize_fire_light, SyntheticFire};
+// MONKEY (lamp lights): the SECOND route in that same module — an emissive lamp/lantern
+// GEOSET rather than a flame emitter (a lamppost authors no particles at all).
+pub use fire_light::{synthesize_lamp_light, EmissiveBatch, LightRoute, SyntheticLamp};
+// MONKEY (portal claims): which ROOMS one fixture may light -- containment, MOLR, and one portal
+// hop. Shared by the runtime spawner and the `wmolights`/`wmolamps` audits so the gate the shader
+// enforces and the gate the instrument prints can never be two different rules.
+pub mod room_claim;
+pub use room_claim::{claim_groups, room_claims, Claim, ClaimHow, PortalGraph};
 mod ribbons;
 pub use ribbons::{parse_m2_ribbon_emitters, RibbonEmitterDef, RibbonVisibility};
 mod value_track;

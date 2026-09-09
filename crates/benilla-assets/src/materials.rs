@@ -234,14 +234,14 @@ pub struct WowModelExt {
     #[texture(91, dimension = "2d_array", sample_type = "depth", visibility(fragment))]
     #[sampler(92, sampler_type = "comparison", visibility(fragment))]
     pub torch_depth: Handle<Image>,
-    /// MONKEY (torch shadows Phase 3A): the ≤4-fixture torch TABLE — the same 1616-byte
-    /// `TorchTableUniform` bytes static_gx's group-3 uniform carries (count / positions[4] /
-    /// view_projs[24]), as a SEPARATE shared raw buffer (`SharedTorchBuffer`) rewritten in place
+    /// MONKEY (static torch cache): the ≤16-fixture torch TABLE — the same 6416-byte
+    /// `TorchTableUniform` bytes static_gx's group-3 uniform carries (count / positions[16] /
+    /// view_projs[96]), as a SEPARATE shared raw buffer (`SharedTorchBuffer`) rewritten in place
     /// every frame from `TorchShadowViews`. A raw `Buffer` like `light_buf`, deliberately NOT a
     /// `#[uniform]` field (a per-frame-mutated uniform re-prepares every material every frame)
     /// and NOT a region of the shared light blob (whose `LightStd430` mirror + the booth packer
     /// would all have to grow in lock-step). `wow_model.wgsl` reads it as
-    /// `var<storage, read> torch_table` (std430 of this struct == the std140 1616 bytes: every
+    /// `var<storage, read> torch_table` (std430 of this struct == the std140 6416 bytes: every
     /// member is 16-aligned). Set once, never mutated.
     #[storage(93, read_only, buffer, visibility(fragment))]
     pub torch_buf: Buffer,
@@ -257,7 +257,7 @@ pub struct WowModelExt {
 pub struct TorchBinds {
     /// The shared torch depth array image (→ `WowModelExt::torch_depth`).
     pub depth: Handle<Image>,
-    /// The shared 1616-byte torch table buffer (→ `WowModelExt::torch_buf`).
+    /// The shared 6416-byte torch table buffer (→ `WowModelExt::torch_buf`).
     pub table: Buffer,
 }
 

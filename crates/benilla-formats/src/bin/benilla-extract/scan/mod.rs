@@ -30,7 +30,7 @@ mod skeleton;
 mod world;
 
 pub use geometry::{animboundscan, bbfacescan, bbscan, geosetscan, groundscan, normalscan};
-pub use lighting::{darkpropscan, m2lightscan, shadeat};
+pub use lighting::{darkpropscan, m2firescan, m2lightscan, shadeat, wmolamps, wmolights};
 pub use material::{alphascan, blendscan, envmapscan, texmodescan, uvslotscan, uvwrapscan};
 pub use particles::{
     cellscan, fxordercensus, partcensus, partscan, partslotscan, ribbonscan, shardcensus,

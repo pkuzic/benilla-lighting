@@ -91,7 +91,11 @@ impl WmoResidency {
     /// The change counter — bumped whenever the resident set actually changes. Read by the per-unit
     /// room claim (`wmo_portal::track_unit_interiors`), whose re-test gate is otherwise movement
     /// alone: a building streaming in under a STANDING unit must still re-claim it.
-    pub(crate) fn generation(&self) -> u32 {
+    ///
+    /// MONKEY (GO room claims): `pub` — a CARRIED light's room-claim set is keyed to a resident
+    /// placement, so it must be rebuilt on the same tick a building streams in or out
+    /// (`benilla_app::entities::carried_light`). Same generation, same gate, one counter.
+    pub fn generation(&self) -> u32 {
         self.generation
     }
 
@@ -311,6 +315,34 @@ impl InteriorAnchor {
     /// The weight as the tag's 4-bit field ([`crate::mesh_tag::LANE_MAX`] steps).
     fn lane_bits(&self) -> u8 {
         lane_bits(self.lane)
+    }
+
+    /// MONKEY (fire GO lights): the room this anchor's own attach ray claimed — `None` outdoors.
+    ///
+    /// Exposed so the app can hand a GameObject's/creature's CARRIED lights the same room its
+    /// meshes were classified into (`benilla_app::entities::carried_light`'s room claim). Two
+    /// things need it: the faithful gate (a torch in a culled room lights nothing —
+    /// [`crate::lighting::LightRooms`], decision 0689), and cube-shadow eligibility, since
+    /// `torch_shadow`'s candidate query is `With<PointLight>, With<LightRooms>` and a light with no
+    /// room can never be promoted to a caster however indoors it stands.
+    pub fn room(&self) -> Option<crate::wmo_portal::WmoRoom> {
+        self.room
+    }
+
+    /// MONKEY (carried light stability): the anchor's own crossfade weight - `0` fully exterior,
+    /// `1` fully in [`Self::room`], ramping at [`LANE_RAMP_PER_SEC`] (a half-second full travel).
+    ///
+    /// Exposed because it is the ONE already-smoothed interior/exterior signal a bearer carries,
+    /// and a CARRIED light's lane must be read off it rather than off the raw per-frame law. The
+    /// law itself is known to alternate frame to frame at a threshold - `WOW_INTERIOR_LOG` from
+    /// the 2026-09-09 run shows anchor `320v2` flipping `matte`<->`bake` on ten consecutive
+    /// resolves between t 73.75 and t 74.14 - and a light that re-decided its lane on that raw
+    /// verdict would swap consumer families (the exterior `point_light_sum` <-> the interior room
+    /// lane) at the same rate, i.e. strobe. One frame of a wrong verdict moves this weight by
+    /// `dt * LANE_RAMP_PER_SEC`, so a blip can never cross the `0.5` midpoint a consumer keys on;
+    /// only a verdict that HOLDS for ~0.25 s does.
+    pub fn lane(&self) -> f32 {
+        self.lane
     }
 
     /// One line naming the lane this anchor's parts render under — the inspect card's light

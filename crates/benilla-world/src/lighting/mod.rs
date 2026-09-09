@@ -18,8 +18,13 @@ mod resolve; // the per-frame time-of-day sample into WowLighting + the WMO inte
 mod sh; // the model SH light-probe coefficient math
 pub use blob::LightBlob;
 pub use global_light::{
-    new_shared_light_buffer, DynamicInteriors, LightRooms, SharedLightBuffer, ShadowDistance,
-    ShadowProxyLight, WorldShadowActive,
+    interior_reach, m2_light_reach, new_shared_light_buffer, DynamicInteriors, FireLightGain,
+    ClaimFade, LightLane, LightLitRooms, LightReach, LightRooms, RoomClaimTable,
+    SharedLightBuffer,
+    ShadowDistance, ShadowProxyLight, SyntheticFireLight, WorldShadowActive,
+};
+pub use global_light::{
+    room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,
 };
 pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
 // The std430 layout itself — row indices, byte sizes, region offsets and the folds that fill them

@@ -522,6 +522,15 @@ enum Command {
         /// models if omitted.
         prefix: Option<String>,
     },
+    /// MONKEY (fire GO lights): the twin of `m2lightscan` for the models that author NO light —
+    /// which ones would take a **synthesised** one from their flame particle emitter, and what
+    /// colour/intensity the heuristic derives (`benilla_formats::fire_light`). The offline audit
+    /// of a rule that is applied to ~430 fire props at load, none of which the reference lights.
+    M2firescan {
+        /// Internal-path prefix filter (e.g. `world\generic`), case-insensitive; all models if
+        /// omitted.
+        prefix: Option<String>,
+    },
     /// Sweep every WMO ROOT and cross-tab the two halves of the skybox mechanism: the root's
     /// **MOSB** skybox model against its groups' `0x40000` flag. `0x40000` is undocumented, so this
     /// is what *identifies* it — across all 815 roots the bit never appears without a MOSB. Note
@@ -626,6 +635,26 @@ enum Command {
         internal_path: String,
         /// Case-insensitive substring of the prop's model path (e.g. `lightray`); all if omitted.
         filter: Option<String>,
+    },
+    /// MONKEY (interior attenuation): dump one WMO root's **MOLT fixture table** — type,
+    /// `useAtten`, colour × intensity, the authored attenuation start/end (yd), model-space
+    /// position, and the groups whose MOLR names each fixture (its rooms). Closes with what our
+    /// fixed falloff `1/(0.7d + 0.03d²)` is still worth at each fixture's own authored end: the
+    /// number behind "why does a 20-candle room read uniform".
+    Wmolights {
+        /// Internal path to the WMO **root** (forward or back slashes accepted).
+        internal_path: String,
+    },
+    /// MONKEY (interior prop lights): sweep every WMO **root** and audit whether its rooms have
+    /// any light at all — MOLT omni fixtures, MODD props that would SYNTHESISE one (the
+    /// `fire_light` flame/lamp routes), how many of those the 2.5 yd MOLT dedupe drops, and how
+    /// many INTERIOR groups no source claims, before and after the prop lane is admitted indoors.
+    Wmolamps {
+        /// Only roots whose internal path starts with this (e.g. `world\wmo\azeroth`).
+        prefix: Option<String>,
+        /// Also name the still-unlit interior groups of every root whose path contains this.
+        #[arg(long)]
+        detail: Option<String>,
     },
     /// Sweep every WMO **root** (optionally under a path prefix) and list the placed MODD props
     /// the INTERIOR lighting lane commits as **literal black**. That lane's entire base light is
@@ -870,6 +899,7 @@ fn main() -> Result<()> {
             scan::partscan(&mut chain, mask, prefix.as_deref())?;
         }
         Command::M2lightscan { prefix } => scan::m2lightscan(&mut chain, prefix.as_deref())?,
+        Command::M2firescan { prefix } => scan::m2firescan(&mut chain, prefix.as_deref())?,
         Command::Skyboxscan => scan::skyboxscan(&mut chain)?,
         Command::Lightbands {
             map,
@@ -910,6 +940,10 @@ fn main() -> Result<()> {
             internal_path,
             filter,
         } => scan::wmodoodads(&mut chain, &internal_path, filter.as_deref())?,
+        Command::Wmolights { internal_path } => scan::wmolights(&mut chain, &internal_path)?,
+        Command::Wmolamps { prefix, detail } => {
+            scan::wmolamps(&mut chain, prefix.as_deref(), detail.as_deref())?
+        }
         Command::Darkpropscan { prefix } => scan::darkpropscan(&mut chain, prefix.as_deref())?,
         Command::Placescan {
             map,

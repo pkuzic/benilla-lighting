@@ -234,12 +234,47 @@ pub(crate) struct VideoConfig {
     pub(crate) interior_ambient: f32,
     pub(crate) interior_fill: f32,
     pub(crate) interior_exposure: f32,
+    /// MONKEY (soft falloff): live scale on every interior fixture's AUTHORED attenuation window
+    /// (`interiorAttenScale`, 0..8) — the fixture's EFFECTIVE RADIUS is `authored end × this`. A
+    /// WMO MOLT record's `+0x2c` (an M2 source buckets by intensity, its authored pair being a
+    /// template default rather than a reach) is a "full brightness ends here" number, not a
+    /// "nothing past here" one, so `1` gave a hard-edged disc at exactly the authored end. The
+    /// default is **2.5**: a 5 yd candle now tails smoothly out to 12.5, reading ~⅓ of its 1 yd
+    /// brightness at the authored 5 and ~8 % at 10. `0` still means "no window" (the 48 yd lane).
+    /// Bridged to benilla-world's `DynamicInteriors::atten_scale`, which the light packer folds
+    /// into each interior entry's packed radius, so the dial moves the frame it changes.
+    pub(crate) interior_atten_scale: f32,
     /// MONKEY (torch shadows, Stage B): whether interior fixtures cast real shadows (the nearest few
     /// promoted to cube-map casters — `torch_shadow`). Only meaningful with `interior_light` on.
     pub(crate) interior_shadows: bool,
+    /// MONKEY (static torch cache): resident fixture budget (1..16, default 12). Static
+    /// geometry renders only on promotion/residency changes; lowering this fades extra slots out.
+    pub(crate) interior_shadow_casters: u32,
+    /// MONKEY (static torch cache): nearest promoted fixtures with per-frame entity overlays
+    /// (0..16, default 4). Zero keeps all static shadows and disables only the moving casters.
+    pub(crate) interior_shadow_dynamic: u32,
+    /// MONKEY (torch caster selection): the PCF tap-radius scale for the torch maps
+    /// (`interiorShadowSoft`, 0.5..3, default 1). A candle cluster casts many hard-edged
+    /// overlapping shadows; widening the 4-tap kernel is the cheap softening. Rides the torch
+    /// table's `count.y` (as `x100`) rather than a `DynamicInteriors` field, because it belongs
+    /// to the shadow table's own bytes.
+    pub(crate) interior_shadow_soft: f32,
+    /// MONKEY (room gate): whether an interior fixture may only light the ROOMS IT CLAIMS
+    /// (`interiorRoomGate`, default on). Off = the pre-gate behaviour, where every interior fixture
+    /// in range lights every interior surface in range and the only occlusion is the handful of
+    /// promoted cube-shadow casters — the live A/B for "did the gate darken this room, or was it
+    /// always unlit?". Bridged to benilla-world's `DynamicInteriors::room_gate`, which the light
+    /// packer applies at PACK time (an ungated pack is one `count = 0` head per light), so it moves
+    /// the frame it changes and costs the shader nothing.
+    pub(crate) interior_room_gate: bool,
     /// MONKEY (interior debug): the interior-lane diagnostic overlay (`interiorDebug`, 0..3). See
     /// [`benilla_world::lighting::DynamicInteriors::debug`].
     pub(crate) interior_debug: u32,
+    /// MONKEY (fire GO lights): gain on every light SYNTHESISED from a fire prop's flame emitter
+    /// (`fireLightGain`, 0..4; `0` = the invented-light lane off). Bridged to benilla-world's
+    /// [`benilla_world::lighting::FireLightGain`] by `dynamic_interior`, and applied at PACK time
+    /// so it is live.
+    pub(crate) fire_light_gain: f32,
     pub(crate) display: DisplayMode,
     /// The windowed size, `gxResolution`. Kept while fullscreen so leaving it can restore it.
     pub(crate) windowed: UVec2,
@@ -257,8 +292,18 @@ impl Default for VideoConfig {
             interior_ambient: 0.15,
             interior_fill: 0.12,
             interior_exposure: 2.5,
+            // MONKEY (soft falloff): 2.5, not 1 — see the field doc.
+            interior_atten_scale: 1.6,
             interior_shadows: true,
+            // MONKEY (static torch cache): 12 resident maps, four moving-caster overlays.
+            interior_shadow_casters: 12,
+            interior_shadow_dynamic: 4,
+            interior_shadow_soft: 1.0,
+            // MONKEY (room gate): on — without it a building's fixtures light through its own
+            // floors and walls.
+            interior_room_gate: true,
             interior_debug: 0,
+            fire_light_gain: 1.0,
             display: if windowed_env() {
                 DisplayMode::Windowed
             } else {
@@ -574,6 +619,8 @@ mod tests {
             shadow_distance: 80.0,
             display: DisplayMode::Fullscreen,
             windowed: UVec2::new(1024, 768),
+            // MONKEY (review fixes): this window test inherits unrelated lighting defaults.
+            ..Default::default()
         })
         .add_systems(Update, apply_window_mode);
         let win = app

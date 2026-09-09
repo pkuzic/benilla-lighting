@@ -168,6 +168,33 @@ use super::pool::GxTexturePool;
 /// and bits 1..=13 the interior-prop probe slot, so 14 is the first free bit.
 const RECORD_FOG_BIT: u32 = 1 << 14;
 
+/// MONKEY (room gate): record column `w` bits 15..=26 — the item's ROOM KEY, `group + 1` so that
+/// **0 means "this item names no room"** and the shader's gate lets every fixture through (a
+/// terrain-cell item; a WMO prop whose referrer set is not exactly one group). Bit 14 is the fog
+/// lane, so 15 is the first free bit, and 12 bits covers every shipped WMO (the largest,
+/// Stratholme, has 92 groups). **Keep in sync with `static_gx.wgsl`'s `RECORD_ROOM_SHIFT` /
+/// `RECORD_ROOM_MASK`.**
+const RECORD_ROOM_SHIFT: u32 = 15;
+const RECORD_ROOM_MASK: u32 = 0xfff;
+
+/// The room key for one baked item: `group + 1` for a WMO surface batch, and for a PROP batch whose
+/// referrer set names exactly one group (a prop in one room — the common case); 0 for a terrain
+/// cell, and for a multi-room prop, which stays ungated because a single key cannot express it.
+fn room_key(item: &GxItemDraw, sets: &[std::sync::Arc<[u16]>]) -> u32 {
+    let Some(sel) = item.group else {
+        return 0; // a cell item: no building, no room
+    };
+    let group = if sets.is_empty() {
+        sel // a WMO region's selection grain IS the group
+    } else {
+        match sets.get(usize::from(sel)).map(|s| &s[..]) {
+            Some([g]) => *g,
+            _ => return 0, // unnamed or multi-room prop
+        }
+    };
+    (u32::from(group) + 1).min(RECORD_ROOM_MASK) << RECORD_ROOM_SHIFT
+}
+
 /// One coalesced draw run: adjacent live bake items sharing (bind-group slot, pipeline
 /// bucket, group). Killed items are SKIPPED at build time (B3): a run never carries an exiled
 /// or gone item, so a far cell of fully-faded faders submits no vertex work at all (the WGSL
@@ -222,7 +249,7 @@ struct GxPipelines {
     cell_layout: BindGroupLayoutDescriptor,
     light_layout: BindGroupLayoutDescriptor,
     /// MONKEY (torch shadows Phase 1): group 3 — the torch depth array + comparison sampler + the
-    /// ≤4-entry `TorchTable` uniform. Present on every static_gx pipeline (the `TORCH_SHADOWS` def).
+    /// ≤16-entry `TorchTable` uniform. Present on every static_gx pipeline (`TORCH_SHADOWS` def).
     torch_layout: BindGroupLayoutDescriptor,
     sampler: Sampler,
     sampler_clamp: Sampler,
@@ -246,11 +273,18 @@ fn init_pipelines(
         .main_layout
         .clone();
     // The pass's own extra (group 2): the shared light storage.
+    // MONKEY (room gate): binding 1 is the per-fixture ROOM CLAIM table — which WMO groups each
+    // packed interior fixture may light. Its own buffer, never a `WowLight` extension: that struct
+    // is mirrored by three shaders plus the portrait booth and a resize there vanishes every
+    // building in the world.
     let light_layout = BindGroupLayoutDescriptor::new(
         "static_gx_light_layout",
         &BindGroupLayoutEntries::sequential(
             ShaderStages::VERTEX_FRAGMENT,
-            (storage_buffer_read_only_sized(false, None),),
+            (
+                storage_buffer_read_only_sized(false, None),
+                storage_buffer_read_only_sized(false, None),
+            ),
         ),
     );
     let cell_layout = BindGroupLayoutDescriptor::new(
@@ -279,7 +313,7 @@ fn init_pipelines(
     // shader's half-texel inset clamp on its clamped axis — an approximation confined to that
     // class (decision 0763's silhouette concern, honoured per axis).
     // MONKEY (torch shadows Phase 1): group 3 — the interior torch depth map (a Depth32Float
-    // 2D-array sampled through a `GreaterEqual` comparison sampler) + the ≤4-entry `TorchTable`
+    // 2D-array sampled through a `GreaterEqual` comparison sampler) + the ≤16-entry `TorchTable`
     // uniform (count/positions/view_projs). Fragment-only; declared behind the shader's
     // `TORCH_SHADOWS` def, which the specialization below always sets for this pipeline family.
     let torch_layout = BindGroupLayoutDescriptor::new(
@@ -291,9 +325,16 @@ fn init_pipelines(
                 // `texture_2d_array` with the Depth sample type.
                 texture_2d_array(TextureSampleType::Depth),
                 sampler(SamplerBindingType::Comparison),
-                // TorchTable: count (u32 + pad to 16) + positions[4] (64) + view_projs[24] (1536)
-                // — six cube faces per fixture (Phase 5).
-                uniform_buffer_sized(false, Some(std::num::NonZero::new(1616).unwrap())),
+                // MONKEY (static torch cache): count@0 (16), positions[16]@16 (256),
+                // view_projs[96]@272 (6144) = 6416 bytes. Both shader copies and the shared
+                // material storage buffer use these same bytes; a drift hides every building.
+                uniform_buffer_sized(
+                    false,
+                    Some(
+                        std::num::NonZero::new(super::torch_depth::TORCH_TABLE_BYTES)
+                            .expect("TORCH_TABLE_BYTES is non-zero"),
+                    ),
+                ),
             ),
         ),
     );
@@ -310,6 +351,15 @@ fn init_pipelines(
             ..Default::default()
         })
     };
+    // MONKEY (room gate): the claim table's persistent GPU buffer, written every frame by
+    // `prepare_room_claims`. Created here (RenderStartup) rather than beside the shared light
+    // buffer so the whole binding — layout, buffer, upload — lives with its one reader.
+    commands.insert_resource(GxRoomClaims(render_device.create_buffer(&BufferDescriptor {
+        label: Some("static_gx_room_claims"),
+        size: crate::lighting::room_claim_bytes(),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })));
     commands.insert_resource(GxPipelines {
         view_layout,
         cell_layout,
@@ -506,6 +556,7 @@ fn prepare_static_gx(
                 };
                 if let Some(gpu) = assemble_region(
                     draw,
+                    0, // a terrain cell belongs to no building (MONKEY, room gate)
                     &mut pool,
                     &pipes,
                     &pipeline_cache,
@@ -525,6 +576,7 @@ fn prepare_static_gx(
                 };
                 if let Some(gpu) = assemble_region(
                     draw,
+                    entity.index().index(),
                     &mut pool,
                     &pipes,
                     &pipeline_cache,
@@ -546,6 +598,7 @@ fn prepare_static_gx(
         };
         if let Some(gpu) = assemble_region(
             draw,
+            entity.index().index(),
             &mut pool,
             &pipes,
             &pipeline_cache,
@@ -576,7 +629,8 @@ fn prepare_static_gx(
             continue;
         }
         for (i, rec) in gpu.records.iter_mut().enumerate() {
-            // Column w carries the probe slot in the high bits (B4) — rewrite only bit 0.
+            // Column w carries the probe slot (B4) and the room key (MONKEY, room gate) in the
+            // high bits — rewrite only bit 0.
             rec[3] = (rec[3] & !1) | kill_bit(&draw.killed, i);
         }
         render_queue.write_buffer(&gpu.record_table, 0, bytemuck::cast_slice(&gpu.records));
@@ -625,6 +679,9 @@ fn prepare_static_gx(
 /// assigned stay assigned, so the retry finishes cheaper).
 fn assemble_region(
     draw: &GxCellDraw,
+    // MONKEY (room gate): this region's WMO placement instance (entity index), or 0 for a terrain
+    // cell — half of the surface room key the interior lane gates on.
+    room_instance: u32,
     pool: &mut GxTexturePool,
     pipes: &GxPipelines,
     pipeline_cache: &PipelineCache,
@@ -637,6 +694,9 @@ fn assemble_region(
     // distinct BLPs, and neighbouring cells repeat most of them; per-item layers blew the
     // D2-array limit the moment a city root baked, and per-CELL arrays paid the driver churn
     // 1431 measured). Untextured items ride the white class (never sampled — TEXTURED clear).
+    // MONKEY (room gate): whether this region can carry a room key at all (see the cell uniform
+    // below for the 2^24 bound and why both halves of the key must fail open together).
+    let gated = room_instance > 0 && room_instance < (1 << 24);
     let mut white: Option<u16> = None;
     let mut item_class_layer: Vec<(u16, u16)> = Vec::with_capacity(draw.draws.len());
     for item in &draw.draws {
@@ -664,7 +724,9 @@ fn assemble_region(
                 u32::from(item.sidn[0])
                     | (u32::from(item.sidn[1]) << 8)
                     | (u32::from(item.sidn[2]) << 16),
-                kill_bit(&draw.killed, i) | (u32::from(item.slot) << 1),
+                kill_bit(&draw.killed, i)
+                    | (u32::from(item.slot) << 1)
+                    | if gated { room_key(item, &draw.sets) } else { 0 },
             ]
         })
         .collect();
@@ -673,9 +735,27 @@ fn assemble_region(
         contents: bytemuck::cast_slice(&records),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
+    // MONKEY (room gate): the uniform's fourth lane was a hard 0.0 pad and now carries this
+    // REGION's building identity — the WMO placement instance's entity index — so the declared
+    // 16-byte size (and every bind-group layout built against it) does not move. Per REGION rather
+    // than per item, because a region is exactly one placement; that is what keeps the per-item key
+    // down to the group alone.
+    //
+    // As a NUMBER, not as bits: an entity index is a small integer and `f32::from_bits(12345)` is a
+    // DENORMAL, which a driver flushing denormals to zero would collapse to 0 — every building
+    // sharing identity 0, and every gate then a coin toss. An f32 holds every integer below 2^24
+    // exactly, which no live entity index approaches, so `as f32` / `u32()` is lossless. At or above
+    // that bound (and for a terrain cell, index 0) the region is packed UNGATED on BOTH lanes —
+    // identity AND per-item key — because half a key would fail CLOSED and black the building out.
+    let room_instance = if gated { room_instance } else { 0 };
     let cell_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("static_gx_cell"),
-        contents: bytemuck::cast_slice(&[draw.origin.x, draw.origin.y, draw.origin.z, 0.0f32]),
+        contents: bytemuck::cast_slice(&[
+            draw.origin.x,
+            draw.origin.y,
+            draw.origin.z,
+            room_instance as f32,
+        ]),
         usage: BufferUsages::UNIFORM,
     });
     // One bind group per DISTINCT pool class this region touches; items collapse to slots.
@@ -768,21 +848,44 @@ fn kill_bit(killed: &[u64], i: usize) -> u32 {
 #[derive(Resource)]
 struct GxLightBind(BindGroup);
 
+/// MONKEY (room gate): the persistent room-claim storage buffer (group 2, binding 1). Written whole
+/// every frame from the extracted [`crate::lighting::RoomClaimTable`] — 32 KB since MONKEY (soft
+/// portal claims) widened the record from 8 to 32 words (the per-claim fade), one `write_buffer`,
+/// and the table is rebuilt from scratch by the packer anyway, so there is nothing cheaper to
+/// diff against. Persistent so the per-region bind groups that reference it never need rebuilding.
+#[derive(Resource)]
+struct GxRoomClaims(Buffer);
+
+fn prepare_room_claims(
+    queue: Res<RenderQueue>,
+    buffer: Option<Res<GxRoomClaims>>,
+    claims: Option<Res<crate::lighting::RoomClaimTable>>,
+) {
+    let (Some(buffer), Some(claims)) = (buffer, claims) else {
+        return;
+    };
+    queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&claims.0[..]));
+}
+
 fn prepare_view_bind(
     mut commands: Commands,
     pipes: Res<GxPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
     light: Option<Res<crate::lighting::SharedLightBuffer>>,
+    claims: Option<Res<GxRoomClaims>>,
 ) {
-    let Some(light) = light else {
+    let (Some(light), Some(claims)) = (light, claims) else {
         return;
     };
     let layout = pipeline_cache.get_bind_group_layout(&pipes.light_layout);
     commands.insert_resource(GxLightBind(render_device.create_bind_group(
         "static_gx_light",
         &layout,
-        &BindGroupEntries::sequential((light.0.as_entire_binding(),)),
+        &BindGroupEntries::sequential((
+            light.0.as_entire_binding(),
+            claims.0.as_entire_binding(),
+        )),
     )));
 }
 
@@ -827,7 +930,9 @@ fn prepare_torch_bind(
         "static_gx_torch",
         &layout,
         &BindGroupEntries::sequential((
-            // The image's default view: D2Array over all 24 layers (wgpu's default for a
+            // The image's default view: D2Array over all 192 layers — the 96 STATIC faces the
+            // table's matrices address plus the 96 LIVE copies (MONKEY, static torch cache); the
+            // shader picks the bank per slot from `count.z`. (wgpu's default view for a
             // multi-layer 2D texture; `torch_depth.rs` spells out the guarantee).
             &gpu_image.texture_view,
             targets.sampler(),
@@ -1030,6 +1135,8 @@ pub(super) fn build(app: &mut App) {
             Render,
             (
                 prepare_static_gx.in_set(RenderSystems::PrepareResources),
+                // MONKEY (room gate): before the bind groups, beside the shared light's upload.
+                prepare_room_claims.in_set(RenderSystems::PrepareResources),
                 prepare_view_bind.in_set(RenderSystems::PrepareBindGroups),
                 prepare_torch_bind.in_set(RenderSystems::PrepareBindGroups),
             ),

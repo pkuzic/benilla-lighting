@@ -43,9 +43,23 @@ use crate::view::WorldCamera;
 ///      camera-in-WMO MFOG crossfade; == the scene fog outdoors). Read only by `wow_model.wgsl`'s
 ///      interior lanes (round-6 Q-I consumer map); terrain mirrors the rows for layout only ·
 ///   20 point_count (x = live entries) · 21+ the point-light table, TWO rows per light:
-///      `[pos.xyz, range]`, `[rgb, 0]` (decision 0278 — the Gouraud point term reads this in the
+///      `[pos.xyz, range]`, `[rgb, lane]` (decision 0278 — the Gouraud point term reads this in the
 ///      VERTEX stage; bevy's own clusterable buffer is fragment-only in the view bind-group layout,
 ///      so the lights ride our buffer instead).
+///      MONKEY (light lanes): the colour row's `.w` — free until now — is the **lane discriminator
+///      AND the interior EFFECTIVE RADIUS in one float**: `0.0` = an EXTERIOR light, anything
+///      `> 0.5` = an INTERIOR fixture whose value IS its radius `R` in yards ([`interior_reach`] —
+///      the authored MOLT end × `interiorAttenScale`, always clamped ≥ 1.0, so the two cases can
+///      never be confused; the shader derives the whole soft profile from `R`, out to a `2R` fill
+///      dome). MONKEY (light lane by position): which side a light falls on is decided by WHERE IT
+///      STANDS ([`LightLane`] / [`classify_light_lanes`]), not by whether it claims a room — that
+///      is what lets Stormwind's street torches light the cobbles while the Goldshire inn's
+///      fixtures still stay off the lawn. The two consumer families are DISJOINT: the exterior
+///      `point_light_sum` / `wmo_exterior_point_sum` (terrain/wow_model/static_gx) skip `> 0.5`
+///      and the interior `interior_room_light` (wow_model/static_gx) skips `< 0.5`, which is what
+///      stops an inn's candles pooling on the grass outside its wall and an outdoor campfire
+///      lighting the floor through a closed door. `[pos.xyz, range]`'s `range` is UNTOUCHED
+///      (still the 48 yd candidacy constant), so the exterior lanes are byte-identical.
 ///
 /// The GPU buffer is LARGER than this per-frame blob: the interior-prop probe table
 /// (`lighting::prop_probes`, 7 rows per slot) lives at its tail — [`light_blob_bytes`] sizes the
@@ -185,6 +199,314 @@ const POINT_PACK_RADIUS: f32 = 300.0;
 #[derive(Component)]
 pub struct LightRooms(pub(crate) crate::wmo_portal::WmoGroupVis);
 
+impl LightRooms {
+    /// MONKEY (fire GO lights): claim a room for a light spawned OUTSIDE this crate — the app-side
+    /// carried lights (`benilla_app::entities::carried_light`), whose owner's room comes from the
+    /// interior classifier rather than from a WMO's own MODD/MOLR tables. Without a constructor the
+    /// tuple field's `pub(crate)` made the component unbuildable in benilla-app, so a GameObject's
+    /// torch could never carry a room — and therefore could never be promoted to a cube-map shadow
+    /// caster (`torch_shadow`'s candidate query is `With<PointLight>, With<LightRooms>`).
+    pub fn new(rooms: crate::wmo_portal::WmoGroupVis) -> Self {
+        Self(rooms)
+    }
+}
+
+/// MONKEY (room gate): the rooms a fixture may **LIGHT** — deliberately a different question from
+/// [`LightRooms`], which answers "which rooms must be VISIBLE for this light to exist at all".
+///
+/// The gate needs a set that covers every room the fixture actually stands in the middle of, and
+/// the authored MOLR relation alone does not supply one. Measured on the shipped 1.12 corpus
+/// (`benilla-extract wmolights` + the group flags):
+///   * **Goldshire inn** — 12 groups, and only TWO author a MOLR at all (MOGP `0x200`). Nine of its
+///     ten fixtures are claimed by `g4 "upstairs"`, which is the EXTERIOR-flagged shell spanning
+///     the whole building (`z -0.2 .. 23.3`); the tenth by `g3 "entry"`. Its kitchen, common room,
+///     hall, guest rooms and basement claim NOTHING.
+///   * **NSabbey** — 42 fixtures over 14 groups, but `Main Hall`, `LftWng`, `RtWng`, `Library`,
+///     `Library2`, `Library Wing` and `Stairs2` are named by no MOLR either.
+/// Gating purely on MOLR would therefore black out most of both buildings — the abbey's look is
+/// the one the owner signed off, so that is a regression, not a fix. MOLR is authored for the
+/// reference's own purpose (register GL lights while drawing a VISIBLE group's doodads and units),
+/// not to describe which walls a fixture lights, which the reference took from the MOCV bake.
+///
+/// So the claim set is the UNION of MOLR with the interior groups whose authored MOGI **bounding
+/// box contains the fixture** — dense, authored, static, and resolved once at spawn. On the inn
+/// that gives every room its own fixtures back while leaving the basement (`z <= 0.45`, no fixture
+/// inside) and the far guest room claimed by nobody, which is exactly the reported leak; on the
+/// abbey every interior group gets at least one fixture, so its look is preserved.
+///
+/// MONKEY (portal claims): the set is now built by [`benilla_formats::room_claims`] and is the
+/// COMPLETE, ordered claim list — MOLR folded in, plus the containment above, plus the groups one
+/// open PORTAL away within the fixture's reach (the "light crosses a doorway" rule that stops a
+/// continuous floor changing brightness in a straight line at a group boundary). Because it already
+/// contains MOLR, [`RoomClaim::build`] takes it INSTEAD of the MOLR list rather than unioning the
+/// two: re-adding MOLR there would re-admit exactly the district-scale shells the rule deliberately
+/// marks exterior-lane-ineligible.
+///
+/// Each entry is `group | `[`LIT_ROOM_EXT_DENY`]: bit 15 marks a claim that gates the fixture but
+/// must not be honoured by the exterior batch lane (see the constant).
+///
+/// The WMO MOLT lane inserts this, and since MONKEY (interior prop lights) so does the WMO MODD
+/// PROP lane — a hanging lantern whose flame light we synthesise needs the same room claim an
+/// authored fixture gets, or the gate would refuse it in the very room it hangs in. A
+/// carried/GameObject light already carries the single room the interior classifier put it in,
+/// through [`LightRooms`], and needs no supplement.
+#[derive(Component)]
+// MONKEY (review fixes): the placement belongs to the lighting claims themselves. A fixture
+// contained by a room can have NO MOLR/MODR visibility membership; it still needs a GPU room key.
+pub struct LightLitRooms {
+    pub(crate) rooms: crate::wmo_portal::WmoGroupVis,
+    /// MONKEY (soft portal claims): index-parallel with `rooms.groups` — each claim's softness.
+    /// A separate array rather than more bits in the `u16` id because a fade is 4 floats and a
+    /// group id has 15 spare BITS; index-parallel rather than a map because the packer walks the
+    /// two together and the GPU record interleaves them at a fixed stride, so a length mismatch is
+    /// a claim gated by another claim's doorway. Built by the one producer
+    /// (`terrain_stream::spawn::fx`'s `pack_claims`), which is why the invariant holds by
+    /// construction; a legacy/fallback path that has no fades supplies an EMPTY slice, read as
+    /// "every claim is hard", i.e. exactly the binary gate this replaced.
+    pub(crate) fades: std::sync::Arc<[ClaimFade]>,
+}
+
+/// MONKEY (soft portal claims): the softness of ONE claim — the doorway the fixture's light came
+/// through and how far past it the light still reaches.
+///
+/// `radius == 0` is the HARD claim (containment/MOLR): weight 1 everywhere in the group, which is
+/// what the gate did for every claim before this — and it is [`ClaimFade::default`], so every path
+/// that has no fade to give (a carried light's raw MOLR rooms) gates exactly as it always did. A
+/// portal claim carries the real numbers, and the shader turns them into
+/// `w = entry * (1 − smoothstep(0, radius, max(|P − center| − slack, 0)))`.
+///
+/// **`center` is in BEVY WORLD space**, not the WMO model space `benilla_formats::room_claims`
+/// measured it in: the shader has only the fragment's world position, and converting there would
+/// need the placement's matrix per fragment. The producer holds that matrix already, so the
+/// conversion happens once, at claim time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClaimFade {
+    /// The portal's centre, BEVY WORLD space.
+    pub center: Vec3,
+    /// The portal polygon's bounding-sphere radius (yd) — distance inside it counts as zero, so
+    /// the doorway itself is weight 1 on both sides of the group plane.
+    pub slack: f32,
+    /// The fade length (yd): the fixture's reach still unspent at the doorway. **0 = hard claim.**
+    pub radius: f32,
+    /// The weight the claim already carries AT `center` — 1 for a first hop, and for a second hop
+    /// whatever the first hop's fade had decayed to by that door. Multiplies the smoothstep, which
+    /// is what keeps a two-hop chain continuous (and monotone) at every threshold.
+    pub entry: f32,
+}
+
+/// MONKEY (portal claims): bit 15 of a [`LightLitRooms`] entry — "this claim gates the fixture, but
+/// the EXTERIOR batch lane must ignore it". A group index cannot reach it (the record's room key is
+/// 12 bits), so it rides for free in the id.
+///
+/// It exists for one population: a city's district-scale EXTERIOR shell, whose MOGI box swallows
+/// the interiors inside it (`Stormwind.wmo`: 470 of its 606 fixtures stand inside one). Such a
+/// claim must stay in the set, because a fixture stripped of its only claim is packed UNGATED and
+/// the ungated arm fails OPEN — one candle lighting every room of the building. But it must not
+/// reach the exterior lane, which would put that candle's pool on the cobbles outside the wall.
+/// A building-scale exterior group (the Goldshire inn's shell, `57.7 x 32.2 yd`) carries no deny
+/// bit and IS lit — that is bug B's second half.
+pub const LIT_ROOM_EXT_DENY: u16 = 0x8000;
+
+/// MONKEY (room gate): u32 per packed light in the claim table — `[instance, count, g0..g5]`,
+/// MONKEY (soft portal claims) followed by one 4-word FADE record per claim slot
+/// (`[center.x, center.y, center.z, radius|slack]`) at [`ROOM_CLAIM_FADE`].
+/// **Must equal `ROOM_CLAIM_STRIDE` in `static_gx.wgsl`** — a mismatch reads every fixture's
+/// claims out of another fixture's record, which blanks (or floods) every building at once.
+pub const ROOM_CLAIM_STRIDE: usize = 32;
+/// MONKEY (soft portal claims): the first FADE word of a claim record, i.e. `2 + ROOM_CLAIM_MAX`.
+/// Slot `k`'s fade is `[ROOM_CLAIM_FADE + 4k .. +4]`. **Must equal `ROOM_CLAIM_FADE` in
+/// `static_gx.wgsl`.**
+pub const ROOM_CLAIM_FADE: usize = 8;
+/// MONKEY (soft portal claims): the fixed-point scale of the packed radius/slack pair — both ride
+/// one u32 as `u16` yards x 256 (low half radius, high half slack). 1/256 yd is far below anything
+/// a smoothstep over 2..48 yd can show, and the range tops out at 255.99 yd, which is five times
+/// the widest reach the packer will ever hand out (`CLAIM_REACH_MAX` = 48). Fixed point rather
+/// than two f32 lanes because the alternative is a 40-word stride for two numbers that are already
+/// coarse; fixed point rather than f16 because both sides are three arithmetic ops with no
+/// bit-twiddling to get wrong. **Must equal `CLAIM_FADE_SCALE` in `static_gx.wgsl`.**
+pub const CLAIM_FADE_SCALE: f32 = 256.0;
+/// MONKEY (room gate): claims a fixture can carry before it is packed UNGATED instead (fail-open —
+/// a truncated list would black out the rooms that fell off the end). **Must equal
+/// `ROOM_CLAIM_MAX` in `static_gx.wgsl`.**
+pub const ROOM_CLAIM_MAX: usize = 6;
+
+/// MONKEY (portal claims): bit 16 of a packed GPU claim word — "the EXTERIOR batch lane may honour
+/// this claim". The CPU side of the same fact is [`LIT_ROOM_EXT_DENY`] (inverted, see
+/// [`RoomClaim::write`]). **Must equal `CLAIM_EXT_OK` in `static_gx.wgsl`**, and must stay clear of
+/// the 12-bit `+1` group id below it.
+pub const CLAIM_EXT_OK: u32 = 1 << 16;
+
+/// MONKEY (soft portal claims): bits 17..=24 of a packed GPU claim word — [`ClaimFade::entry`] as
+/// a byte (`round(entry * 255)`). It rides the id word rather than the fade record because the id
+/// word has 15 bits going spare above [`CLAIM_EXT_OK`] (a group index is 12) while the fade record
+/// is four words of exact f32 centre plus a full u16/u16 pair, and widening the stride for one
+/// byte would cost 256 x 4 more bytes of buffer for nothing. A HARD claim writes 0 here and the
+/// shader never reads it (it returns 1.0 the moment it sees `radius == 0`), so the zero padding
+/// cannot be mistaken for "contributes nothing". **Must equal `CLAIM_ENTRY_SHIFT` in
+/// `static_gx.wgsl`.**
+pub const CLAIM_ENTRY_SHIFT: u32 = 17;
+
+/// MONKEY (room gate): this frame's claim table, index-parallel with [`WowLightData`]'s point
+/// entries. Its own resource and its own GPU buffer on purpose: [`LightStd430`] is mirrored by
+/// three shaders plus the portrait booth and must never be resized, and only `static_gx` reads
+/// this. `static_gx::render` owns the buffer and the binding.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct RoomClaimTable(pub Box<[u32; ROOM_CLAIM_STRIDE * MAX_POINT_LIGHTS]>);
+
+/// MONKEY (room gate): the claim table's byte size — the one place `static_gx::render` sizes its
+/// GPU buffer from, so the table cannot grow here and leave the binding short (a bound storage
+/// buffer smaller than the shader's runtime-sized array fails validation at draw time, which
+/// vanishes every building).
+pub fn room_claim_bytes() -> u64 {
+    (ROOM_CLAIM_STRIDE * MAX_POINT_LIGHTS * std::mem::size_of::<u32>()) as u64
+}
+
+impl Default for RoomClaimTable {
+    fn default() -> Self {
+        Self(Box::new([0; ROOM_CLAIM_STRIDE * MAX_POINT_LIGHTS]))
+    }
+}
+
+/// MONKEY (interior attenuation): a fixture's **authored attenuation end** in yards — the WMO
+/// MOLT record's `attenuation_end` (`+0x2c`), carried from the spawn to the packer because
+/// `PointLight` has nowhere to put it and `PointLight::range` means something else entirely (the
+/// 48 yd *candidacy* constant, which the exterior lanes still read).
+///
+/// Only [`crate::terrain_stream::spawn`]'s MOLT lane inserts it. Every other source is an **M2**
+/// light, whose authored attenuation pair is demonstrably NOT a reach in this corpus — a Karazhan
+/// BONFIRE authors `end = 0.97` yd and the whole orc brazier/firepit family `0.33/0.97`, while
+/// `2.22/5.56` is a template default stamped on half the weapons and glue models.
+/// `benilla_formats::M2Light`'s own doc says it: "the GL curve is fixed and ignores these" — the
+/// fields are parsed as a cull hint no consumer reads. So M2 sources get the bucketed
+/// [`m2_light_reach`] instead, derived in the packer from the intensity they already carry — which
+/// also means the app-side spawners (carried torches, transport props) need no change at all.
+///
+/// MOLT is the opposite case and the reason this exists: the reference really does fold a MOLT
+/// fixture through its authored window (wow-re `trace-forensics-abbey-interior-d3d` §4 fitted the
+/// fold at exactly the `+0x28/+0x2c` values), and the vanilla numbers are sane — Goldshire inn
+/// 6.97-9.53 yd over 10 fixtures, its blacksmith 6.0 over 3, NSabbey 4.17-5.56 over 42.
+#[derive(Component)]
+pub struct LightReach(pub f32);
+
+/// MONKEY (light lane by position): which consumer family a point light belongs to — decided by
+/// WHERE THE LIGHT PHYSICALLY IS, not by whether it claims a room.
+///
+/// [`build_light_data`] used `Has<LightRooms>` for this, and that conflated two different
+/// questions. `LightRooms` answers "which rooms must be visible for this light to exist" (the
+/// portal gate + the torch-shadow eligibility, decision 0689) — a MODR/MOLR *reference*. The lane
+/// answers "is this light inside a sealed room, or out on the street", which is a fact about
+/// geometry. In vanilla content the two disagree constantly, in both directions:
+///
+/// - **Stormwind.** 235 of its 606 MOLT fixtures are named ONLY by EXTERIOR-class groups (MOGP
+///   `& 0x48`) — the Trade District's street torches and hanging lanterns — and 45 more are named
+///   by no group at all. Under the old rule every one of the 235 was filed INTERIOR, so the
+///   exterior consumers skipped it and the interior consumer never runs on a street: they lit
+///   *nothing at all*. That is bug B's first cause.
+/// - **The Goldshire inn.** Its 10 MOLT fixtures claim group 4, which IS exterior-flagged, yet
+///   they physically stand inside the inn's rooms. A rule keyed on the claimed group's FLAGS would
+///   file them EXTERIOR and put a warm pool on the lawn outside the wall — precisely the leak the
+///   lane split was introduced to stop. A rule keyed on POSITION files them interior, because the
+///   classifier's down-ray from each fixture lands on the inn's own interior-class floor.
+///
+/// So the verdict is the client's own light-attach ray ([`crate::wmo_portal::indoor_verdict_at`]
+/// with `LightAttach::DownRay` — the same predicate that classifies a standing NPC), run ONCE per
+/// static light in [`classify_light_lanes`] and refreshed only when the resident WMO set changes.
+/// A CARRIED light takes its lane from its owner's already-resolved room instead
+/// (`benilla_app::entities::carried_light`): the classifier has run for the bearer, and re-raying
+/// from a swinging torch would be one ray per light per frame for an answer we already hold.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LightLane {
+    /// `true` ⇒ the packer writes the interior reach into the colour row's `.w`; `false` ⇒ `0`.
+    pub interior: bool,
+    /// The [`WmoResidency`](crate::interior::WmoResidency) generation this verdict was taken at —
+    /// a light classified before its building streamed in reads `Outdoors`, and must be re-asked
+    /// once the building is there. [`SETTLED`](Self::SETTLED) means "never re-ask".
+    pub generation: u32,
+}
+
+impl LightLane {
+    /// A generation that never goes stale — the carried lane's stamp (see the type doc).
+    pub const SETTLED: u32 = u32::MAX;
+
+    /// The carried lane's constructor: interior iff the bearer is standing in a room.
+    pub fn carried(interior: bool) -> Self {
+        Self {
+            interior,
+            generation: Self::SETTLED,
+        }
+    }
+}
+
+/// MONKEY (interior attenuation): the interior reach (yd) of an **M2** point light of committed
+/// intensity `i`, bucketed on the same ladder [`benilla_formats::fire_intensity`] buckets a
+/// synthesised flame onto (candle 0.6 · torch 1.5 · brazier 2.0 · bonfire 3.0), so a synthesised
+/// source lands on its own bucket exactly and an authored one is filed by how bright it is.
+///
+/// Bucketing rather than reading the record is the finding, not a shortcut — see [`LightReach`]:
+/// the authored M2 attenuation pair does not describe a reach in this corpus. The yard figures are
+/// sized so the pool matches the flame you can see: a table candle lights its table, a wall torch
+/// its corner, a brazier the end of a hall, a bonfire the clearing around it.
+pub fn m2_light_reach(intensity: f32) -> f32 {
+    // MONKEY (portal claims): the ladder itself lives in `benilla_formats::room_claim` — the spawner
+    // needs it to size a synthesised prop light's PORTAL HOP, and the offline `wmolamps` audit needs
+    // the identical rungs to predict what the runtime will claim. One ladder, both readers.
+    benilla_formats::room_claim::m2_light_reach(intensity)
+}
+
+/// MONKEY (soft falloff): the **effective radius** packed into an interior entry's lane — the
+/// authored reach after the live `interiorAttenScale` ([`DynamicInteriors::atten_scale`], default
+/// 1.6). The shader derives its whole profile from this one number as a fraction of it (soft core
+/// at `0.26 R`, window vanishing at `R`, fill dome out to `1.5 R` — see `interior_room_light`), so
+/// the cvar is a pure zoom on every pool at once rather than three separate knobs.
+///
+/// `scale == 0` is the A/B **off** switch and maps to [`INTERIOR_LEGACY_REACH`] — the 48 yd the
+/// lane used before there was a window at all. Under the soft profile that is the widest, flattest
+/// pool the lane can make (the core alone is ~12.5 yd wide), i.e. the nearest thing left to the
+/// pre-window flat lane; it is no longer the byte-exact restore it was, because the window's SHAPE
+/// moved with the change. The `max(…, 1.0)` floor keeps the value clear of the `0.5` lane
+/// threshold at any scale.
+///
+/// MONKEY (torch caster selection): `pub` so `benilla_app::torch_shadow` can rank fixtures by the
+/// SAME effective radius the shader windows them with. Recomputing it there would be a second
+/// copy of a value the packer already owns, and a drift between them would rank a fixture the
+/// shader has already faded to black.
+pub fn interior_reach(reach: f32, scale: f32) -> f32 {
+    if scale <= 0.0 {
+        return INTERIOR_LEGACY_REACH;
+    }
+    (reach * scale).clamp(1.0, INTERIOR_LEGACY_REACH)
+}
+
+/// The reach an interior fixture had before the authored window existed: `spawn::POINT_LIGHT_RANGE`.
+/// Mirrored as a plain constant because it is now a *legacy* value — the A/B's off arm — rather
+/// than the lane's working range, and also the cap on a widened one (past it the packed table's own
+/// membership rules, not the window, decide what a fragment sees).
+const INTERIOR_LEGACY_REACH: f32 = 48.0;
+
+/// MONKEY (fire GO lights): marks a `PointLight` whose colour/intensity were SYNTHESISED from a
+/// model's flame particle emitter rather than authored ([`benilla_assets::ModelLight::synthetic`]).
+///
+/// Two lanes read it, both in [`build_light_data`]: the `fireLightGain` cvar multiplies the
+/// intensity of exactly these entries (so the dial is live — retuning it does not respawn a single
+/// prop, which is the whole point of packing it here rather than folding it in at spawn), and the
+/// `WOW_POINTS_DUMP` census counts them, so "is that light in the table one we invented?" is a
+/// number rather than a guess.
+#[derive(Component)]
+pub struct SyntheticFireLight;
+
+/// MONKEY (fire GO lights): the live gain on every SYNTHESISED fire light (`fireLightGain`, default
+/// 1.0), bridged from benilla-app's cvars the way [`DynamicInteriors`] is. `0` turns the whole
+/// invented-light lane off without touching the authored ones — the kill switch for a heuristic
+/// that, unlike everything around it, is not byte-verified against anything.
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+pub struct FireLightGain(pub f32);
+
+impl Default for FireLightGain {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
 /// MONKEY (torch shadows, Stage B): marks a `PointLight` that exists ONLY to render a cube shadow
 /// map (`benilla_app::torch_shadow`'s promoted fixtures). Such a proxy must NOT enter the
 /// `wow_light` light table — benilla's receivers would treat it as a real fixture and its nominal
@@ -242,11 +564,16 @@ pub struct SharedLightBuffer(pub Buffer);
 /// creation, and the render-world upload.
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
+        // MONKEY (room gate): the per-fixture room claims, packed beside the point table.
+        .init_resource::<RoomClaimTable>()
         .init_resource::<WorldShadowActive>()
         .init_resource::<ShadowDistance>()
         .init_resource::<DynamicInteriors>()
+        // MONKEY (fire GO lights): the live gain on synthesised fire lights.
+        .init_resource::<FireLightGain>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
+        .add_plugins(ExtractResourcePlugin::<RoomClaimTable>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
         .add_plugins(ExtractResourcePlugin::<super::prop_probes::PropProbeExtract>::default())
         // PostUpdate, **after transform propagation**: the point table is packed from each light's
@@ -257,7 +584,12 @@ pub(super) fn register(app: &mut App) {
         // never moves, which is why this was invisible until entities started carrying lights.
         .add_systems(
             PostUpdate,
-            build_light_data
+            // MONKEY (light lane by position): the lane classifier is chained BEFORE the packer, so
+            // a light that has stood for a frame is packed on this frame's verdict. Its writes go
+            // through `Commands`, so a NEWLY spawned light is still packed on the fail-safe
+            // fallback for one frame — see that fallback's note in `build_light_data`.
+            (classify_light_lanes, build_light_data)
+                .chain()
                 .after(bevy::transform::TransformSystems::Propagate)
                 .after(super::update_time_lighting),
         )
@@ -334,6 +666,18 @@ pub struct DynamicInteriors {
     pub fill: f32,
     /// Multiplier on the whole light budget before the soft rolloff — the room's brightness.
     pub exposure: f32,
+    /// MONKEY (soft falloff): live scale on every interior fixture's authored attenuation window
+    /// (`interiorAttenScale`) — the fixture's EFFECTIVE RADIUS is `authored end × this`. Default
+    /// **2.5**: the artists' end is where FULL brightness stops, not where light does, so `1` drew
+    /// a hard-edged disc at exactly that radius. `>2.5` widens the pools, `<2.5` tightens them,
+    /// **`0` disables the window** ([`interior_reach`]). Folded into the packed lane rather than a header lane: the
+    /// window is per-fixture anyway, the header's 21 rows are fully claimed, and the fold keeps the
+    /// shader from carrying a second knob it would have to combine per light.
+    pub atten_scale: f32,
+    /// MONKEY (room gate): the per-room fixture gate (`interiorRoomGate`). `false` packs every
+    /// fixture UNGATED, i.e. the pre-gate behaviour where every INT fixture lights every interior
+    /// surface in range — the live A/B for "is the gate what darkened this room?".
+    pub room_gate: bool,
     /// MONKEY (interior debug): diagnostic overlay for the interior lane (`interiorDebug`). 0 = off
     /// (normal shading). 1 = CLASSIFICATION: interior-lit fragments render solid green, so a wrongly
     /// interior-classified OUTDOOR entity shows up. 2 = SHADOW: the torch-shadow factor as greyscale
@@ -351,8 +695,163 @@ impl Default for DynamicInteriors {
             ambient: 0.15,
             fill: 0.12,
             exposure: 2.5,
+            // MONKEY (soft falloff): 1.6, matching the `interiorAttenScale` cvar default (2.5 read oversaturated — the soft core `0.26·R` widens with it too).
+            atten_scale: 1.6,
+            // MONKEY (room gate): on by default — without it a building's fixtures light through
+            // its own floors and walls.
+            room_gate: true,
             debug: 0,
         }
+    }
+}
+
+/// MONKEY (room gate): one packed fixture's room claim — the CPU form of the eight u32
+/// `static_gx.wgsl` reads (`[instance, count, g0..g5]`). `count == 0` is the UNGATED head every
+/// fail-open arm packs: an exterior-lane light, a fixture that names no room, and every light
+/// while `interiorRoomGate` is off. MONKEY (GO room claims): an OVERFLOWING list no longer fails
+/// open — it keeps its [`ROOM_CLAIM_MAX`] highest-priority claims (the spawner orders them
+/// tightest-containment → MOLR → nearest portal hop, so the dropped tail is the outermost shells /
+/// farthest rooms). Failing open here lit every room of the building through its walls, and a
+/// carried light inside nested MOGI shells can now reach the cap where a MOLT fixture never did.
+#[derive(Clone, Copy)]
+struct RoomClaim {
+    instance: u32,
+    n: u8,
+    groups: [u16; ROOM_CLAIM_MAX],
+    /// MONKEY (soft portal claims): index-parallel with `groups`. A default (`radius == 0`) is the
+    /// HARD claim every pre-fade path produces, so a fixture whose claims arrived without fades
+    /// gates exactly as it did before.
+    fades: [ClaimFade; ROOM_CLAIM_MAX],
+}
+
+impl Default for ClaimFade {
+    /// The HARD claim: no doorway, no fade, full weight. Spelled out rather than derived because
+    /// `entry` must default to **1**, not 0 — a derived zero would mean "this claim contributes
+    /// nothing", i.e. every fallback path would silently black out its rooms.
+    fn default() -> Self {
+        Self {
+            center: Vec3::ZERO,
+            slack: 0.0,
+            radius: 0.0,
+            entry: 1.0,
+        }
+    }
+}
+
+impl RoomClaim {
+    const UNGATED: Self = Self {
+        instance: 0,
+        n: 0,
+        groups: [0; ROOM_CLAIM_MAX],
+        fades: [ClaimFade {
+            center: Vec3::ZERO,
+            slack: 0.0,
+            radius: 0.0,
+            entry: 1.0,
+        }; ROOM_CLAIM_MAX],
+    };
+
+    /// The fixture's claim list. MONKEY (portal claims): when the spawner built one
+    /// ([`LightLitRooms`]) it IS the answer — it already folds the MOLR rooms in, in priority order,
+    /// with each claim's exterior-lane eligibility resolved. Only a light that carries no such list
+    /// (a carried torch, a transport prop) falls back to its raw MOLR rooms. MONKEY (review fixes):
+    /// each list carries its own placement, independently of whether MOLR names the fixture.
+    fn build(rooms: Option<&LightRooms>, lit: Option<&LightLitRooms>) -> Self {
+        // MONKEY (soft portal claims): the fades ride the SAME arm the groups came from — the
+        // MOLR fallback has none, and reading them off `lit` while the groups came off `rooms`
+        // would fade one room by another room's doorway.
+        let lit = lit.filter(|l| !l.rooms.groups.is_empty());
+        let fades: &[ClaimFade] = lit.map_or(&[], |l| &l.fades[..]);
+        let Some(claims) = lit.map(|l| &l.rooms).or_else(|| rooms.map(|r| &r.0)) else {
+            return Self::UNGATED; // nothing claims this light: it lights everything, as before
+        };
+        let instance = claims.instance.index().index();
+        // The identity travels to the shader through an f32 lane (`static_gx::render`'s cell
+        // uniform), which is exact only below 2^24 — and index 0 is the "terrain cell / no
+        // building" sentinel there. Outside that range the receiving side packs no key at all, so
+        // this side must not gate either, or the building would go black.
+        if instance == 0 || instance >= (1 << 24) {
+            return Self::UNGATED;
+        }
+        let mut out = Self {
+            instance,
+            ..Self::UNGATED
+        };
+        for (i, &g) in claims.groups.iter().enumerate() {
+            if out.groups[..usize::from(out.n)].contains(&g) {
+                continue;
+            }
+            if usize::from(out.n) == ROOM_CLAIM_MAX {
+                break; // overflow keeps the six highest-priority claims (see the struct doc)
+            }
+            out.groups[usize::from(out.n)] = g;
+            // A missing fade is a HARD claim, not a dropped one: the fallback paths (a carried
+            // light's raw MOLR rooms) legitimately have none, and the pre-fade behaviour is
+            // exactly "weight 1 wherever the group matches".
+            out.fades[usize::from(out.n)] = fades.get(i).copied().unwrap_or_default();
+            out.n += 1;
+        }
+        out
+    }
+
+    /// Write the eight-u32 GPU form. Groups are stored `+ 1` so the shader can keep 0 for "empty"
+    /// (and for "this fragment names no room") — group 0 is a real, common group id.
+    ///
+    /// MONKEY (portal claims): [`LIT_ROOM_EXT_DENY`] (bit 15 of the CPU id) is re-encoded as
+    /// [`CLAIM_EXT_OK`] (bit 16 of the GPU word), positively: the exterior batch lane takes a claim
+    /// only with that bit set, so every legacy/fallback path that never learned about the flag
+    /// (a carried light's raw MOLR rooms) reads as "not eligible" rather than as a leak.
+    fn write(&self, dst: &mut [u32]) {
+        dst[0] = self.instance;
+        dst[1] = u32::from(self.n);
+        for (i, slot) in dst[2..2 + ROOM_CLAIM_MAX].iter_mut().enumerate() {
+            // Past the count the shader never looks, but a `+1` on a padding zero would read as a
+            // claim on group 0 to anything that ever did — so the padding stays literally empty.
+            *slot = match self.groups.get(i).filter(|_| i < usize::from(self.n)) {
+                Some(g) => {
+                    // MONKEY (soft portal claims): the entry weight rides the spare high bits.
+                    let entry = self.fades[i].entry.clamp(0.0, 1.0);
+                    u32::from(*g & !LIT_ROOM_EXT_DENY) + 1
+                        | if *g & LIT_ROOM_EXT_DENY == 0 {
+                            CLAIM_EXT_OK
+                        } else {
+                            0
+                        }
+                        | ((entry * 255.0).round() as u32) << CLAIM_ENTRY_SHIFT
+                }
+                None => 0,
+            };
+        }
+        // MONKEY (soft portal claims): the fade records. Centre as raw f32 bits (the shader
+        // `bitcast`s them straight back — a world coordinate reaches +-17000 yd, which no fixed
+        // point or f16 lane could carry); radius and slack as `u16` yards x `CLAIM_FADE_SCALE` in
+        // one word. A padded slot writes zeros, and `radius == 0` IS the hard claim, so the padding
+        // can never be read as a fade even by a reader that ignores the count.
+        let q = |v: f32| ((v.max(0.0) * CLAIM_FADE_SCALE).round() as u32).min(0xffff);
+        for i in 0..ROOM_CLAIM_MAX {
+            let f = &mut dst[ROOM_CLAIM_FADE + 4 * i..][..4];
+            let Some(fade) = self.fades.get(i).filter(|_| i < usize::from(self.n)) else {
+                f.fill(0);
+                continue;
+            };
+            f[0] = fade.center.x.to_bits();
+            f[1] = fade.center.y.to_bits();
+            f[2] = fade.center.z.to_bits();
+            f[3] = q(fade.radius) | (q(fade.slack) << 16);
+        }
+    }
+}
+
+impl std::fmt::Display for RoomClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.n == 0 {
+            return write!(f, "UNGATED");
+        }
+        write!(f, "inst {} g", self.instance)?;
+        for (i, g) in self.groups[..usize::from(self.n)].iter().enumerate() {
+            write!(f, "{}{g}", if i == 0 { "" } else { "," })?;
+        }
+        Ok(())
     }
 }
 
@@ -364,10 +863,32 @@ fn build_light_data(
     cam: Query<&GlobalTransform, With<WorldCamera>>,
     // `Without<ShadowProxyLight>`: the torch-shadow proxies are `PointLight`s too, but they exist
     // only to cast a cube map — never to light benilla's receivers (see [`ShadowProxyLight`]).
-    lights_q: Query<(&PointLight, &GlobalTransform, Option<&LightRooms>), Without<ShadowProxyLight>>,
+    // MONKEY (fire GO lights): `Has<SyntheticFireLight>` rides along so the live `fireLightGain`
+    // can scale exactly the invented sources at PACK time — no respawn, no per-spawn bake.
+    // MONKEY (interior attenuation): `Option<&LightReach>` too — a MOLT fixture's authored
+    // attenuation end, `None` on every M2 source (which is bucketed below instead).
+    // MONKEY (light lane by position): `Option<&LightLane>` decides the interior/exterior split —
+    // `LightRooms` stays in the tuple, but only for the portal ROOM gate below (and as the
+    // fail-safe lane for the frame or two before the classifier has answered).
+    lights_q: Query<
+        (
+            &PointLight,
+            &GlobalTransform,
+            Option<&LightRooms>,
+            Has<SyntheticFireLight>,
+            Option<&LightReach>,
+            Option<&LightLane>,
+            // MONKEY (room gate): the bbox-derived supplement to the MOLR claim set.
+            Option<&LightLitRooms>,
+        ),
+        Without<ShadowProxyLight>,
+    >,
     // The per-frame portal PVS, for the room term below ([`LightRooms`]).
     portals: Query<&crate::wmo_portal::WmoPortalInstance>,
     mut data: ResMut<WowLightData>,
+    // MONKEY (room gate): packed in the same walk as the point table, so the two can never
+    // disagree about which entry is which.
+    mut claims: ResMut<RoomClaimTable>,
     time: Res<Time>,
     // MONKEY (world shadows): the `worldShadows` lane flag, packed into `sh_c16.w` for the MCSH gate.
     world_shadow: Res<WorldShadowActive>,
@@ -375,6 +896,8 @@ fn build_light_data(
     shadow_distance: Res<ShadowDistance>,
     // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
     dynamic_interiors: Res<DynamicInteriors>,
+    // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
+    fire_gain: Res<FireLightGain>,
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -442,9 +965,20 @@ fn build_light_data(
     // identity, over-gamut preserved). Entries past `count` stay stale in the blob — the count row
     // guards every reader.
     let cam_pos = cam.single().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
-    let mut pts: Vec<(f32, Vec3, f32, [f32; 3])> = lights_q
+    // MONKEY (fire GO lights): `(…, synthetic)` rides the tuple so the census below can count the
+    // invented entries without a second query.
+    // MONKEY (light lanes): the tuple's last member is the packed COLOUR-ROW `.w` — 0 for an
+    // exterior light, the interior reach in yards for a fixture that claims a room (see the layout
+    // doc). It is resolved here, in the one place that already knows both the rooms and the
+    // recovered intensity, so neither shader has to reconstruct either.
+    // MONKEY (GO room claims): the trailing `usize` is the RAW `LightLitRooms` claim count —
+    // what the spawner (or the app's carried-light claimer) built, before the lane/`room_gate`
+    // filter below decides whether it is packed at all. Printed by `WOW_POINTS_DUMP` so an
+    // EXTERIOR-lane entry that HAS claims is visible as such: the shader reads claims only on
+    // the interior lane, so `claims 4` beside `EXT` is the readout of exactly that trade.
+    let mut pts: Vec<(f32, Vec3, f32, [f32; 3], bool, f32, RoomClaim, usize)> = lights_q
         .iter()
-        .filter(|(_, gt, rooms)| {
+        .filter(|(_, gt, rooms, _, _, _, _)| {
             // The ROOM term (decision 0689's law, fourth lane — see [`LightRooms`]). Not a
             // visibility test bolted onto a faithful gather: the reference's register walk has no
             // such term either, it simply never has a culled room's torch to register. Ungated for
@@ -462,14 +996,55 @@ fn build_light_data(
                 && gt.translation().distance_squared(cam_pos)
                     < INTERIOR_NEAR_ADMIT * INTERIOR_NEAR_ADMIT)
         })
-        .filter_map(|(pl, gt, _)| {
+        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms)| {
             let p = gt.translation();
             let d2 = p.distance_squared(cam_pos);
             (d2 < POINT_PACK_RADIUS * POINT_PACK_RADIUS).then(|| {
                 let c = pl.color.to_linear();
-                let s = pl.intensity / (4.0 * std::f32::consts::PI);
+                // The authored intensity, BEFORE the fire gain: the pool's geometry must not move
+                // when the user dims the invented lights, only its brightness.
+                let base = pl.intensity / (4.0 * std::f32::consts::PI);
+                // MONKEY (fire GO lights): the live `fireLightGain` folds in HERE, over the
+                // recovered colour×intensity, and only for a synthesised source. At spawn it
+                // would need a world respawn to retune; here the dial moves the frame it changes.
+                let s = base * if synthetic { fire_gain.0.max(0.0) } else { 1.0 };
                 let rgb = commit_raw([c.red * s, c.green * s, c.blue * s]);
-                (d2, p, pl.range, rgb)
+                // MONKEY (light lane by position): a light is INTERIOR iff it PHYSICALLY STANDS in
+                // an interior-class WMO group — the verdict [`classify_light_lanes`] (static) or
+                // the carried-light claim (entities) wrote onto it. Claiming a room is no longer
+                // the test: Stormwind's street torches claim exterior-class groups and must light
+                // the cobbles, while the Goldshire inn's fixtures claim an exterior-flagged group
+                // from inside the building and must NOT light the lawn (see [`LightLane`]).
+                //
+                // No lane yet ⇒ fall back to the OLD `LightRooms` rule rather than to "exterior".
+                // A light lives one or two frames before the classifier's first pass (it spawns in
+                // the stream stage, the classifier runs the frame after), and the conservative
+                // arm of that gap is the pre-change behaviour: a MOLT fixture starts interior and
+                // is corrected outward, never the reverse — so the gap can never flash a pool onto
+                // an inn's lawn.
+                let interior = lane_of.map_or_else(|| rooms.is_some(), |l| l.interior);
+                // A fixture's reach is its authored MOLT end where there is one and the M2 bucket
+                // otherwise, with a fail-open default for a MOLT record whose end is absent or
+                // degenerate (a few author 0 with `useAtten` clear).
+                let lane = if interior {
+                    let r = reach
+                        .map(|r| r.0)
+                        .filter(|r| *r > 0.5)
+                        .unwrap_or_else(|| m2_light_reach(base));
+                    interior_reach(r, dynamic_interiors.atten_scale)
+                } else {
+                    0.0
+                };
+                // MONKEY (room gate): the fixture's claim set, resolved HERE because this is the
+                // one place that already knows both the rooms and the interior verdict. An
+                // EXTERIOR-lane light is never read by the gate, so it packs the ungated head.
+                let claim = if interior && dynamic_interiors.room_gate {
+                    RoomClaim::build(rooms, lit_rooms)
+                } else {
+                    RoomClaim::UNGATED
+                };
+                let lit_n = lit_rooms.map_or(0, |l| l.rooms.groups.len());
+                (d2, p, pl.range, rgb, synthetic, lane, claim, lit_n)
             })
         })
         .collect();
@@ -483,9 +1058,16 @@ fn build_light_data(
         dynamic_interiors.fill,
         dynamic_interiors.exposure,
     ];
-    for (i, (_, p, range, rgb)) in pts.iter().enumerate() {
+    for (i, (_, p, range, rgb, _, lane, claim, _)) in pts.iter().enumerate() {
         data.0.points[2 * i] = [p.x, p.y, p.z, *range];
-        data.0.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], 0.0];
+        data.0.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], *lane];
+        claim.write(&mut claims.0[i * ROOM_CLAIM_STRIDE..][..ROOM_CLAIM_STRIDE]);
+    }
+    // Entries past the count are stale in the point table by design (the count row guards every
+    // reader) — but the claim table is read at the SAME index, so a stale head there would gate a
+    // live light with a dead building's identity. Clear the tail instead of trusting the count.
+    for slot in claims.0[pts.len() * ROOM_CLAIM_STRIDE..].iter_mut() {
+        *slot = 0;
     }
     // `WOW_POINTS_DUMP=1`: print the committed point table once a second — the numeric probe for
     // "what is actually lighting this ground". A pool that reads wrong is one of a small set of
@@ -512,26 +1094,56 @@ fn build_light_data(
             let snap = |v: f32| (((half + v) / cell).floor() + 0.5) * cell - half;
             let anchor = Vec3::new(snap(cam_pos.x), cam_pos.y, snap(cam_pos.z));
             let (mut boxed, mut sphere) = (0usize, 0usize);
-            for (_, p, _, _) in &pts {
+            for (_, p, _, _, _, _, _, _) in &pts {
                 let dv = *p - anchor;
                 boxed += usize::from(dv.x.abs().max(dv.z.abs()) <= 33.570_166);
                 sphere += usize::from(dv.length() <= 48.0);
             }
+            // MONKEY (fire GO lights): how many of the packed entries we INVENTED. The whole
+            // feature is a heuristic over content, so "the inn is too bright" has to be separable
+            // into "too many synthetic sources" and "the authored ones changed" without a rebuild.
+            let synth = pts.iter().filter(|(.., s, _, _, _)| *s).count();
+            // MONKEY (light lanes): how the table splits between the two now-disjoint consumer
+            // families. "The inn's candles are lighting the lawn" is an INT count on a row the
+            // exterior lane should never have seen — a number, printed per row below as INT/EXT.
+            let interior = pts.iter().filter(|(.., lane, _, _)| *lane > 0.5).count();
             eprintln!(
-                "[points] {} packed, cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
-                pts.len()
+                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, gain {:.2}, atten x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
+                pts.len(),
+                pts.len() - interior,
+                fire_gain.0,
+                dynamic_interiors.atten_scale,
             );
-            for (d2, p, _, rgb) in pts.iter().take(8) {
+            for (d2, p, _, rgb, synthetic, lane, claim, lit_n) in pts.iter().take(8) {
                 eprintln!(
-                    "  d {:6.2}  at [{:8.2},{:7.2},{:8.2}]  rgb [{:.3},{:.3},{:.3}]",
+                    "  d {:6.2}  at [{:8.2},{:7.2},{:8.2}]  rgb [{:.3},{:.3},{:.3}]  {}{}",
                     d2.sqrt(),
                     p.x,
                     p.y,
                     p.z,
                     rgb[0],
                     rgb[1],
-                    rgb[2]
+                    rgb[2],
+                    if *lane > 0.5 {
+                        format!("INT reach {lane:5.2}")
+                    } else {
+                        "EXT".to_string()
+                    },
+                    if *synthetic { "  SYNTH" } else { "" },
                 );
+                // MONKEY (GO room claims): how many rooms this entry CLAIMS, whether or not the
+                // lane lets the shader read them. A carried light (a brazier GameObject) now builds
+                // its claims from its own world position through the placed lanes' rule, so "why is
+                // the shop next door still dark" is `claims 1` vs `claims 3` here rather than a
+                // guess — and on an `EXT` row it says the claims exist but are not being read.
+                if *lit_n > 0 {
+                    eprintln!("      claims {lit_n}");
+                }
+                // MONKEY (room gate): which rooms this entry is allowed to light — the number
+                // behind "why is this room dark" / "why does that wall still glow".
+                if *lane > 0.5 {
+                    eprintln!("      rooms {claim}");
+                }
             }
         }
     }
@@ -574,6 +1186,102 @@ fn build_light_data(
     }
 }
 
+/// MONKEY (light lane by position): decide each STATIC point light's [`LightLane`] from where it
+/// physically stands, using the client's own light-attach down-ray
+/// ([`crate::wmo_portal::indoor_verdict_at`], `LightAttach::DownRay` — the predicate that
+/// classifies a standing NPC). See [`LightLane`] for WHY the lane cannot be read off `LightRooms`.
+///
+/// The verdict maps straight across:
+/// - [`IndoorVerdict::DayNight`] / [`IndoorVerdict::Baked`] — the nearest face under the light is
+///   an interior-class one (MOGP `& 0x48 == 0`). INTERIOR. This is what keeps the Goldshire inn's
+///   ten fixtures interior even though the group that NAMES them is exterior-flagged: the ray from
+///   each fixture lands on the inn's own room floor, one storey down at most, and the answer is a
+///   fact about that floor rather than about the MOLR list.
+/// - [`IndoorVerdict::OutdoorsOnWmo`] — a definite claim by an EXTERIOR-class face: a street, a
+///   courtyard, a porch, a deck. EXTERIOR. Stormwind's 235 street fixtures land here.
+/// - MONKEY (review fixes): [`IndoorVerdict::Outdoors`] with a terrain hit is resolved EXTERIOR,
+///   even if MOLR/MODR names the fixture — a courtyard torch must still light its ground. Only
+///   an empty ray (no WMO and no terrain) keeps the old `LightRooms` fallback: a streaming gap
+///   supplies no evidence that a previously interior fixture should move outdoors.
+///
+/// **Cost.** One ray per static light per [`WmoResidency`](crate::interior::WmoResidency)
+/// generation, and nothing at all once a neighbourhood is settled: a world-baked light never
+/// moves, so the verdict is stable, and the generation only ticks when a building streams in or
+/// out. `Without<ChildOf>` keeps the carried lights out — they are children of a bone joint and
+/// take their lane from their bearer's already-resolved room instead.
+#[allow(clippy::type_complexity)]
+pub fn classify_light_lanes(
+    mut commands: Commands,
+    residency: Res<crate::interior::WmoResidency>,
+    wmos: Res<Assets<benilla_assets::WmoModel>>,
+    instances: Query<&crate::wmo_portal::WmoPortalInstance>,
+    streamer: Res<crate::terrain_stream::TerrainStreamer>,
+    adt_tiles: Res<Assets<benilla_assets::AdtTile>>,
+    lights: Query<
+        (Entity, &GlobalTransform, Option<&LightRooms>, Option<&LightLane>),
+        (
+            With<PointLight>,
+            Without<ShadowProxyLight>,
+            Without<ChildOf>,
+        ),
+    >,
+) {
+    let generation = residency.generation();
+    // Collected once per frame that has work; the ray walk borrows it per light. An empty world
+    // (no placement yet) still short-circuits below on the `settled` check for every light.
+    let mut instance_list: Option<Vec<&crate::wmo_portal::WmoPortalInstance>> = None;
+    for (light, gt, rooms, lane) in &lights {
+        if lane.is_some_and(|l| l.generation == generation || l.generation == LightLane::SETTLED) {
+            continue; // settled — no ray, no archetype write
+        }
+        let instances = instance_list.get_or_insert_with(|| instances.iter().collect());
+        let (verdict, _) = crate::wmo_portal::indoor_verdict_at(
+            &wmos,
+            instances.iter().map(|i| ((), *i)),
+            &streamer,
+            &adt_tiles,
+            gt.translation(),
+            crate::wmo_portal::LightAttach::DownRay,
+        );
+        // MONKEY (review fixes): `Outdoors` alone conflates terrain winning the ray with no
+        // resident surface at all. Reuse its terrain probe only on that ambiguous arm; the
+        // winning WMO verdicts already carry all the information the lane needs. Terrain above
+        // the anchor is not a DOWN-ray hit (the same buried-terrain rule as down_ray_claim).
+        let probe = gt.translation() + Vec3::Y * crate::wmo_portal::POSITION_PROBE_LIFT;
+        let terrain_hit = matches!(verdict, crate::wmo_portal::IndoorVerdict::Outdoors)
+            && crate::terrain_stream::terrain_height_under(
+                &streamer,
+                &adt_tiles,
+                probe,
+            ).is_some_and(|height| height <= probe.y);
+        let interior = light_verdict_interior(&verdict, terrain_hit, rooms.is_some());
+        let want = LightLane {
+            interior,
+            generation,
+        };
+        // Always re-stamped when the generation moved, even if the verdict didn't — the stamp is
+        // what stops the next frame re-raying the same light.
+        if lane != Some(&want) {
+            commands.entity(light).insert(want);
+        }
+    }
+}
+
+// MONKEY (review fixes): room references are a fallback for an unresolved ray, never a veto on
+// resolved outdoor geometry. Keep this decision explicit so both outdoor arms stay covered.
+fn light_verdict_interior(
+    verdict: &crate::wmo_portal::IndoorVerdict,
+    terrain_hit: bool,
+    has_rooms: bool,
+) -> bool {
+    use crate::wmo_portal::IndoorVerdict;
+    match verdict {
+        IndoorVerdict::DayNight | IndoorVerdict::Baked { .. } => true,
+        IndoorVerdict::OutdoorsOnWmo => false,
+        IndoorVerdict::Outdoors => !terrain_hit && has_rooms,
+    }
+}
+
 /// Render-world: write the packed light into the shared buffer in place, before any draw reads it
 /// (`RenderSystems::PrepareResources`). One small upload per frame, independent of material count.
 fn upload_light(
@@ -590,6 +1298,22 @@ fn upload_light(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // MONKEY (review fixes): a reference cannot override resolved terrain or an outdoor WMO
+    // face. An empty ray still preserves the old rule until residency supplies real evidence.
+    #[test]
+    fn light_lanes_distinguish_resolved_outdoors_from_an_empty_ray() {
+        use crate::wmo_portal::IndoorVerdict;
+        for has_rooms in [false, true] {
+            assert!(!light_verdict_interior(&IndoorVerdict::Outdoors, true, has_rooms));
+            assert!(!light_verdict_interior(&IndoorVerdict::OutdoorsOnWmo, false, has_rooms));
+            assert!(light_verdict_interior(&IndoorVerdict::DayNight, true, has_rooms));
+            assert!(light_verdict_interior(
+                &IndoorVerdict::Baked { mocv: [0; 3], lobes: Vec::new() }, false, has_rooms,
+            ));
+            assert_eq!(light_verdict_interior(&IndoorVerdict::Outdoors, false, has_rooms), has_rooms);
+        }
+    }
 
     /// GOLDEN — the **live exterior M2 response** (0803): `wow_model.wgsl`'s doodad/entity lane must
     /// reproduce `E = A + I·D·(4/17)(0.375 + 2μ + 1.875μ²)` off the rows [`pack_model_core_rows`]
@@ -688,15 +1412,7 @@ mod tests {
     /// reference and the ground pool read white instead of flame-orange.
     #[test]
     fn the_torch_commits_the_raw_authored_product() {
-        let mut app = App::new();
-        app.init_resource::<WowLighting>()
-            .init_resource::<crate::dev_state::DebugState>()
-            .init_resource::<crate::view::ViewDistance>()
-            .init_resource::<WowLightData>()
-            .init_resource::<Time>()
-            .add_systems(Update, build_light_data);
-        app.world_mut()
-            .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY));
+        let mut app = packer_app();
         // The real authored torch light, through the real spawn recipe.
         app.world_mut().spawn((
             crate::terrain_stream::point_light([0.466_666_7, 0.290_196_1, 0.133_333_34], 3.0),
@@ -721,6 +1437,405 @@ mod tests {
             "green commits raw: {rgb:?}"
         );
         assert!((rgb[2] - 0.4).abs() < 1e-4, "blue commits raw: {rgb:?}");
+    }
+
+    /// A minimal app around the real [`build_light_data`]: every resource the system takes, plus a
+    /// world camera at the origin. Was inline in the torch golden and short three resources — the
+    /// system had grown `WorldShadowActive`/`ShadowDistance`/`DynamicInteriors` params since, and
+    /// the test had been failing param validation rather than asserting anything. One builder now,
+    /// so a fourth param can't silently red the same way twice.
+    fn packer_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<WowLighting>()
+            .init_resource::<crate::dev_state::DebugState>()
+            .init_resource::<crate::view::ViewDistance>()
+            .init_resource::<WowLightData>()
+            // MONKEY (room gate): the packer writes the claim table in the same walk.
+            .init_resource::<RoomClaimTable>()
+            .init_resource::<Time>()
+            .init_resource::<WorldShadowActive>()
+            .init_resource::<ShadowDistance>()
+            .init_resource::<DynamicInteriors>()
+            .init_resource::<FireLightGain>()
+            .add_systems(Update, build_light_data);
+        app.world_mut()
+            .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY));
+        app
+    }
+
+    /// MONKEY (room gate): the claim a fixture is packed with is the SPAWNER'S OWN claim list when
+    /// it built one, and it fails OPEN on every ambiguous arm.
+    ///
+    /// That the set is wider than MOLR is a data fact rather than a preference: the shipped
+    /// Goldshire inn authors a MOLR on 2 of its 12 groups (nine of its ten fixtures claimed by the
+    /// exterior-flagged whole-building shell) and NSabbey leaves seven of its rooms unnamed, so a
+    /// MOLR-only claim set would black most of both buildings out.
+    ///
+    /// MONKEY (portal claims): the list REPLACES the MOLR union rather than being merged with it —
+    /// `benilla_formats::room_claims` already folds MOLR in, in priority order, and re-adding it
+    /// here would re-admit the district-scale shells that rule deliberately marks
+    /// exterior-lane-ineligible. Only a light with no list (a carried torch) falls back to MOLR.
+    #[test]
+    fn the_room_claim_takes_the_spawners_list_and_falls_back_to_molr() {
+        let mut world = World::new();
+        // Entity index 0 is the "terrain cell / no building" sentinel in the shader's identity
+        // lane, so the packer fails OPEN on it — burn it, then take a real index.
+        let zeroth = world.spawn_empty().id();
+        assert_eq!(zeroth.index().index(), 0, "the first index really is the sentinel");
+        let inst = world.spawn_empty().id();
+        let rooms = LightRooms(crate::wmo_portal::WmoGroupVis {
+            instance: inst,
+            groups: std::sync::Arc::from([4u16]),
+        });
+        // The spawner's list: the room it stands in (g5), the MOLR group it re-found (g4), and one
+        // more its box holds (g7) — its own order, which the packer must not reshuffle.
+        let lit = LightLitRooms {
+            rooms: crate::wmo_portal::WmoGroupVis {
+            instance: inst,
+                groups: std::sync::Arc::from([5u16, 4, 7]),
+            },
+            // MONKEY (soft portal claims): no fades — every claim is HARD, which is the packer's
+            // pre-fade behaviour and what every fallback path still produces.
+            fades: std::sync::Arc::from([]),
+        };
+
+        let claim = RoomClaim::build(Some(&rooms), Some(&lit));
+        assert_eq!(claim.instance, inst.index().index(), "keyed to the placement");
+        assert_eq!(claim.n, 3, "the spawner's list, verbatim: {claim}");
+        assert_eq!(&claim.groups[..3], &[5, 4, 7], "in the spawner's priority order");
+
+        let mut gpu = [0u32; ROOM_CLAIM_STRIDE];
+        claim.write(&mut gpu);
+        assert_eq!(gpu[1], 3, "the count the shader loops to");
+        assert_eq!(ROOM_CLAIM_FADE, 2 + ROOM_CLAIM_MAX, "the fades start after the id block");
+        // `group + 1`, so the shader can keep 0 for "empty" / "this fragment names no room" —
+        // group 0 is a real, common group id and could not be its own sentinel. MONKEY (portal
+        // claims): plus the positive exterior-lane bit, since none of these carries the deny flag.
+        assert_eq!(
+            &gpu[2..5],
+            &[
+                6 | CLAIM_EXT_OK | (255 << CLAIM_ENTRY_SHIFT),
+                5 | CLAIM_EXT_OK | (255 << CLAIM_ENTRY_SHIFT),
+                8 | CLAIM_EXT_OK | (255 << CLAIM_ENTRY_SHIFT),
+            ],
+            "claims stored + 1, exterior-lane eligible, at full entry weight"
+        );
+        assert_eq!(&gpu[5..ROOM_CLAIM_FADE], &[0, 0, 0], "padding stays empty, not a claim on g0");
+        // MONKEY (soft portal claims): no fades supplied ⇒ every record is zero, and `radius == 0`
+        // is the HARD claim the shader reads as weight 1 everywhere.
+        assert!(gpu[ROOM_CLAIM_FADE..].iter().all(|w| *w == 0), "hard claims write no fade");
+
+        // MONKEY (review fixes): containment claims must pack identically with NO MOLR. This
+        // used to discard the whole list and let one fixture light every room in the building.
+        let mut no_molr_gpu = [0u32; ROOM_CLAIM_STRIDE];
+        RoomClaim::build(None, Some(&lit)).write(&mut no_molr_gpu);
+        assert_eq!(no_molr_gpu, gpu);
+
+        // MONKEY (portal claims): a district-scale shell still gates the fixture (it is in the
+        // count, so the fixture is NOT ungated) but reaches the exterior lane with no eligibility
+        // bit — the one thing that keeps a tavern candle off the street outside.
+        let shell = LightLitRooms {
+            rooms: crate::wmo_portal::WmoGroupVis {
+            instance: inst,
+                groups: std::sync::Arc::from([5u16, 9 | LIT_ROOM_EXT_DENY]),
+            },
+            fades: std::sync::Arc::from([]),
+        };
+        let mut gpu = [0u32; ROOM_CLAIM_STRIDE];
+        RoomClaim::build(Some(&rooms), Some(&shell)).write(&mut gpu);
+        assert_eq!(gpu[1], 2);
+        assert_eq!(
+            &gpu[2..4],
+            &[
+                6 | CLAIM_EXT_OK | (255 << CLAIM_ENTRY_SHIFT),
+                10 | (255 << CLAIM_ENTRY_SHIFT),
+            ],
+            "the shell claims, but not outdoors"
+        );
+
+        // No list at all (a carried torch): the MOLR rooms, as before.
+        assert_eq!(
+            RoomClaim::build(Some(&rooms), None).groups[0],
+            4,
+            "the fallback is the authored relation"
+        );
+
+        // The sentinel index fails OPEN rather than gating against a key no region can carry.
+        assert_eq!(
+            RoomClaim::build(
+                Some(&LightRooms(crate::wmo_portal::WmoGroupVis {
+                    instance: zeroth,
+                    groups: std::sync::Arc::from([4u16]),
+                })),
+                None,
+            )
+            .n,
+            0,
+            "an instance the identity lane cannot express packs UNGATED"
+        );
+
+        // A light nothing claims lights everything, exactly as before the gate existed.
+        assert_eq!(RoomClaim::build(None, None).n, 0, "unclaimed = ungated");
+
+        // MONKEY (GO room claims): an overflow keeps the six highest-priority claims, in order —
+        // never ungated (that lit the whole building through its walls).
+        let many: Vec<u16> = (0..ROOM_CLAIM_MAX as u16 + 1).collect();
+        let big = LightLitRooms {
+            rooms: crate::wmo_portal::WmoGroupVis {
+            instance: inst,
+                groups: std::sync::Arc::from(&many[..]),
+            },
+            fades: std::sync::Arc::from([]),
+        };
+        let packed = RoomClaim::build(Some(&rooms), Some(&big));
+        assert_eq!(usize::from(packed.n), ROOM_CLAIM_MAX, "overflow truncates to the cap");
+        assert_eq!(&packed.groups[..], &many[..ROOM_CLAIM_MAX], "keeps the head, drops the tail");
+    }
+
+    /// GOLDEN — MONKEY (soft portal claims): the fade half of the GPU record, by byte offset.
+    ///
+    /// The layout is the one contract the CPU and `static_gx.wgsl` cannot negotiate at runtime: a
+    /// stride or offset that disagrees reads every fixture's claims out of a neighbour's record,
+    /// which blanks or floods every building at once. So it is asserted as literal indices here,
+    /// beside the constants the shader mirrors.
+    #[test]
+    fn the_fade_record_packs_at_a_fixed_offset_per_claim() {
+        let mut world = World::new();
+        world.spawn_empty(); // burn the 0 sentinel
+        let inst = world.spawn_empty().id();
+        // Claim 0 HARD (the room the fixture stands in), claim 1 SOFT (one doorway away).
+        let lit = LightLitRooms {
+            rooms: crate::wmo_portal::WmoGroupVis {
+                instance: inst,
+                groups: std::sync::Arc::from([5u16, 6]),
+            },
+            fades: std::sync::Arc::from([
+                ClaimFade::default(),
+                ClaimFade {
+                    center: Vec3::new(-1234.5, 60.25, 7000.0),
+                    slack: 1.5,
+                    radius: 6.25,
+                    entry: 0.4,
+                },
+            ]),
+        };
+        let mut gpu = [0u32; ROOM_CLAIM_STRIDE];
+        RoomClaim::build(None, Some(&lit)).write(&mut gpu);
+        assert_eq!(gpu[1], 2);
+        // Slot 0: hard ⇒ all four words zero, so `radius == 0` and the shader weights it 1.
+        assert_eq!(&gpu[ROOM_CLAIM_FADE..ROOM_CLAIM_FADE + 4], &[0, 0, 0, 0]);
+        // Slot 1: centre as raw f32 bits (world coordinates reach +-17000 yd — nothing narrower
+        // carries them), radius and slack as u16 yards x 256 in one word, radius in the low half.
+        let f = ROOM_CLAIM_FADE + 4;
+        assert_eq!(f32::from_bits(gpu[f]), -1234.5);
+        assert_eq!(f32::from_bits(gpu[f + 1]), 60.25);
+        assert_eq!(f32::from_bits(gpu[f + 2]), 7000.0);
+        assert_eq!(gpu[f + 3] & 0xffff, (6.25 * CLAIM_FADE_SCALE) as u32, "radius, low half");
+        assert_eq!(gpu[f + 3] >> 16, (1.5 * CLAIM_FADE_SCALE) as u32, "slack, high half");
+        // The entry weight rides the ID word's spare bits, not the fade record.
+        assert_eq!((gpu[3] >> CLAIM_ENTRY_SHIFT) & 0xff, 102, "0.4 x 255, on the soft claim");
+        assert_eq!((gpu[2] >> CLAIM_ENTRY_SHIFT) & 0xff, 255, "full, on the hard one");
+        // Every slot past the count is literally empty — a stale fade would follow a live light.
+        assert!(gpu[ROOM_CLAIM_FADE + 8..].iter().all(|w| *w == 0));
+        assert_eq!(gpu.len(), ROOM_CLAIM_STRIDE, "2 head + 6 ids + 6 x 4 fade");
+    }
+
+    /// GOLDEN — MONKEY (fire GO lights): `fireLightGain` scales SYNTHESISED sources and **only**
+    /// them, at pack time.
+    ///
+    /// Pack time is the whole design: the dial has to be live (`/script SetCVar("fireLightGain",
+    /// 0)` must darken the invented lights on the next frame, with no world respawn), and it has
+    /// to be a kill switch for a heuristic that — unlike every mechanism around it — is derived
+    /// from content rather than byte-verified. Both properties are exactly this assertion: the
+    /// tagged light moves with the gain, the authored one beside it does not.
+    #[test]
+    fn the_fire_gain_scales_only_synthesised_lights() {
+        let mut app = packer_app();
+        // Same colour and intensity for both, so the only thing that can separate them is the tag.
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.5, 0.25], 2.0);
+        app.world_mut()
+            .spawn((recipe(), GlobalTransform::from_translation(Vec3::X)));
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            SyntheticFireLight,
+        ));
+        app.world_mut().insert_resource(FireLightGain(0.5));
+        app.update();
+
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.rows[20][0], 2.0, "both packed");
+        // Nearest-first: the authored one at x=1 is entry 0, the synthetic at x=2 is entry 1.
+        let authored = data.points[1];
+        let synthetic = data.points[3];
+        assert!(
+            (authored[0] - 2.0).abs() < 1e-4,
+            "the authored light is untouched by the fire gain: {authored:?}"
+        );
+        assert!(
+            (synthetic[0] - 1.0).abs() < 1e-4,
+            "the synthesised light takes the gain: {synthetic:?}"
+        );
+
+        // Zero is the kill switch: the invented light commits black, the authored one is unmoved.
+        app.world_mut().insert_resource(FireLightGain(0.0));
+        app.update();
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "gain 0 = lane off");
+        assert!((data.points[1][0] - 2.0).abs() < 1e-4, "authored unaffected");
+    }
+
+    /// GOLDEN — MONKEY (light lanes / interior attenuation): the colour row's `.w` separates the
+    /// two consumer families AND carries the interior reach, and `[pos.xyz, range]` is untouched.
+    ///
+    /// Three properties, one assertion each, because each is a bug that shipped or nearly did:
+    /// a light that claims NO room packs lane `0` (so the exterior shaders keep reading it and the
+    /// outdoor-fire lane is unchanged); a light that DOES packs its reach (so an inn's candles stop
+    /// pooling on the lawn — the exterior loops skip `> 0.5`); and the reach is always ≥ 1 yd, so
+    /// the "0 means exterior" test can never be confused by a degenerate authored end.
+    ///
+    /// MONKEY (light lane by position): none of these lights carries a [`LightLane`], so what this
+    /// pins is the packer's **fail-safe fallback** — the pre-classifier rule, which is what a
+    /// freshly spawned light is packed on for its first frame. The lane override itself is pinned
+    /// by [`the_position_lane_overrides_the_room_claim`].
+    ///
+    /// `pos_range.w` is asserted at 48 on BOTH: the exterior lanes rank and cut on it, so packing
+    /// the (much smaller) authored reach there instead — the obvious first design — would have
+    /// silently shrunk every outdoor fire's candidacy radius by 5-7x.
+    #[test]
+    fn the_lane_flag_splits_interior_from_exterior_and_carries_the_reach() {
+        let mut app = packer_app();
+        // Same recipe both times: only the room claim can separate them.
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.8, 0.5], 1.0);
+        app.world_mut()
+            .spawn((recipe(), GlobalTransform::from_translation(Vec3::X)));
+        let instance = app.world_mut().spawn(()).id();
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            LightRooms::new(crate::wmo_portal::WmoGroupVis::single(instance, 4)),
+            LightReach(6.972), // the Goldshire inn's own authored MOLT end
+        ));
+        app.update();
+
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.rows[20][0], 2.0, "both packed");
+        // Nearest-first: the roomless light at x=1 is entry 0, the fixture at x=2 is entry 1.
+        assert_eq!(data.points[1][3], 0.0, "no rooms ⇒ the EXTERIOR lane");
+        // MONKEY (soft falloff): the packed value is the EFFECTIVE RADIUS — the authored end times
+        // the default `interiorAttenScale` (1.6), which is where the pool's soft profile now ends.
+        assert!(
+            (data.points[3][3] - 6.972 * 1.6).abs() < 1e-3,
+            "a fixture packs its authored reach × the default scale: {:?}",
+            data.points[3],
+        );
+        // The candidacy radius the exterior shaders rank on is untouched on both entries.
+        assert_eq!(data.points[0][3], 48.0);
+        assert_eq!(data.points[2][3], 48.0);
+
+        // `interiorAttenScale` is live and folds in at pack time; 0 restores the legacy reach so
+        // the window can be A/B'd from chat without a rebuild.
+        for (scale, want) in [(2.0f32, 13.944f32), (0.0, INTERIOR_LEGACY_REACH)] {
+            let mut di = *app.world().resource::<DynamicInteriors>();
+            di.atten_scale = scale;
+            app.world_mut().insert_resource(di);
+            app.update();
+            let data = app.world().resource::<WowLightData>().0;
+            assert!(
+                (data.points[3][3] - want).abs() < 1e-3,
+                "scale {scale}: got {} want {want}",
+                data.points[3][3],
+            );
+            assert_eq!(data.points[1][3], 0.0, "scale {scale}: exterior stays 0");
+        }
+
+        // A degenerate authored end must never land near the 0.5 lane threshold — it would read as
+        // an EXTERIOR light and start lighting the hillside the fixture is inside.
+        let e = app
+            .world_mut()
+            .spawn((
+                recipe(),
+                GlobalTransform::from_translation(Vec3::new(3.0, 0.0, 0.0)),
+                LightRooms::new(crate::wmo_portal::WmoGroupVis::single(instance, 4)),
+                LightReach(0.001),
+            ))
+            .id();
+        let mut di = *app.world().resource::<DynamicInteriors>();
+        di.atten_scale = 1.0;
+        app.world_mut().insert_resource(di);
+        app.update();
+        let data = app.world().resource::<WowLightData>().0;
+        assert!(
+            data.points[5][3] >= 1.0,
+            "a degenerate reach still packs as INTERIOR: {:?}",
+            data.points[5],
+        );
+        app.world_mut().despawn(e);
+    }
+
+    /// GOLDEN — MONKEY (light lane by position): a [`LightLane`] OVERRIDES the room claim, in both
+    /// directions. This is the whole of bug B's first cause and its regression guard in one test.
+    ///
+    /// - A fixture that CLAIMS a room but stands outdoors packs lane `0` — Stormwind's 235
+    ///   street-only MOLT fixtures, which the old `Has<LightRooms>` rule filed interior and which
+    ///   therefore lit nothing at all (no exterior consumer would read them, and the interior
+    ///   consumer never runs on a street).
+    /// - A light that claims NO room but stands indoors packs a reach — a GM-placed brazier in the
+    ///   Lion's Pride Inn, and the M2 bucket (12 yd at intensity 1) × the default scale.
+    ///
+    /// The room claim itself is untouched by either: it still gates the portal PVS and the
+    /// torch-shadow promotion, which is why the two facts have to be separate components.
+    #[test]
+    fn the_position_lane_overrides_the_room_claim() {
+        let mut app = packer_app();
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.8, 0.5], 1.0);
+        let instance = app.world_mut().spawn(()).id();
+        // A street torch: named by an exterior-class group, so it has rooms — and stands outdoors.
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::X),
+            LightRooms::new(crate::wmo_portal::WmoGroupVis::single(instance, 4)),
+            LightReach(9.889),
+            LightLane {
+                interior: false,
+                generation: 0,
+            },
+        ));
+        // A brazier carried into a room: no MOLT/MODR claim at all, but physically inside one.
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            LightLane::carried(true),
+        ));
+        app.update();
+
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.rows[20][0], 2.0, "both packed");
+        assert_eq!(
+            data.points[1][3], 0.0,
+            "a room-claiming fixture that stands OUTDOORS is exterior: {:?}",
+            data.points[1],
+        );
+        assert!(
+            (data.points[3][3] - 12.0 * 1.6).abs() < 1e-3,
+            "a roomless light that stands INDOORS is interior, at the M2 bucket × scale: {:?}",
+            data.points[3],
+        );
+    }
+
+    /// GOLDEN — MONKEY (interior attenuation): the M2 reach ladder lands each SYNTHESISED bucket on
+    /// its own rung. The four intensities are `fire_light::fire_intensity`'s exact outputs, so a
+    /// change to either ladder that desynchronises them fails here rather than in a dark tavern.
+    #[test]
+    fn the_m2_reach_ladder_matches_the_fire_intensity_buckets() {
+        assert_eq!(m2_light_reach(0.6), 6.0, "candle");
+        assert_eq!(m2_light_reach(1.5), 12.0, "torch / campfire");
+        assert_eq!(m2_light_reach(2.0), 16.0, "brazier");
+        assert_eq!(m2_light_reach(3.0), 24.0, "bonfire / forge");
+        // The authored corpus rides the same ladder: a lantern (1.0) reads as a torch, the held
+        // Club_1H_Torch (3.0, committed 1.4 red) as a bonfire.
+        assert_eq!(m2_light_reach(1.0), 12.0);
+        assert_eq!(m2_light_reach(16.0), 24.0, "the ladder has no upper hole");
     }
 
     /// GOLDEN — the PACKER's SH block: evaluating the rows this packer writes (DC lane +

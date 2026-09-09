@@ -70,7 +70,9 @@ struct WowLight {
     grade: vec4<f32>,         // reserved (the 0282 interior A/B retired; 0163). Layout only.
     _wmo_fog: array<vec4<f32>, 2>, // rows 18-19: the interior fog triple — unread by terrain.
     // The dynamic point-light table (decision 0278), packed by `global_light::build_light_data`:
-    // row 20 `.x` = live entry count; then TWO rows per light — `[pos.xyz, range]`, `[rgb, 0]`.
+    // row 20 `.x` = live entry count; then TWO rows per light — `[pos.xyz, range]`, `[rgb, lane]`.
+    // MONKEY (light lanes): `lane` = 0 for an EXTERIOR light, > 0.5 (and equal to the fixture's
+    // reach in yards) for an INTERIOR one. Terrain consumes only the exterior half.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
 };
@@ -138,6 +140,16 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
     var sel = array<u32, 3>(0u, 0u, 0u);
     var sd = array<f32, 3>(1e30, 1e30, 1e30);
     for (var i = 0u; i < count; i = i + 1u) {
+        // MONKEY (light lanes): skip INTERIOR fixtures. The colour row's `.w` is `0` on an exterior
+        // source and the fixture's reach in yards (always ≥ 1) on one that claims a room, so
+        // `> 0.5` is the lane test. Terrain is exterior by definition: an inn's candles reaching
+        // the grass at the base of its wall — a warm pool on the lawn at night — is the whole bug,
+        // and it is here rather than in the pack because the fixtures MUST stay packed for the
+        // interior lane to light the room they belong to. Skipped BEFORE the ≤3 ranking, so an
+        // interior fixture cannot even occupy a slot an outdoor fire should have had.
+        if (wow_light.points[2u * i + 1u].w > 0.5) {
+            continue;
+        }
         let pos_range = wow_light.points[2u * i];
         let dv = pos_range.xyz - anchor;
         let d2 = dot(dv, dv);
