@@ -301,6 +301,18 @@ pub struct ModelLight {
     /// prop would double-light exactly the interiors that are already correct. Every other lane —
     /// ADT map doodads, GameObjects/creatures, transport props — takes it like an authored one.
     pub synthetic: bool,
+    /// MONKEY (flame flicker): `true` when the synthesis took the **FLAME** route — an additive
+    /// fire particle emitter ([`benilla_formats::synthesize_fire_light`]) — as opposed to the LAMP
+    /// route ([`benilla_formats::synthesize_lamp_light`]: a lamppost's unlit glass geoset). Always
+    /// `false` on an authored block.
+    ///
+    /// `synthetic` alone cannot answer this, and the difference is exactly what decides whether the
+    /// light FLICKERS: an open flame does, and a flame of any colour does (the ogre's purple wall
+    /// torch and `HumanBrazierMagic`'s green fire are fires with odd chemistry); a lamp behind
+    /// glass does not, and a street lamp that breathed would read as a fault in the city rather
+    /// than as fire. Keying on the ROUTE rather than on the hue is what gets both right — see
+    /// `benilla_world::lighting::flame_kind_for`.
+    pub flame: bool,
 }
 
 /// Bevy [`AssetLoader`] decoding `*.m2` → [`M2Model`].
@@ -489,6 +501,7 @@ impl AssetLoader for M2ModelLoader {
                     .map_or([0.0; 3], |b| b.pivot),
                 def,
                 synthetic: false,
+                flame: false,
             })
             .collect();
         // MONKEY (fire GO lights) / MONKEY (lamp lights): a prop that authors NO casting light gets
@@ -508,14 +521,16 @@ impl AssetLoader for M2ModelLoader {
             // carries a REAL colour (read off the artist's own over-life ramp) where the lamp route
             // can only pick a plausible one from a name; a model with both a flame and lamp glass
             // (`OrcBrazierStreetLamp`) should take the measured hue, not the guessed one. Each
-            // yields the same four things: model-space position, host bone, colour, intensity.
+            // yields the same four things: model-space position, host bone, colour, intensity —
+            // plus, MONKEY (flame flicker), WHICH route won, because that is what decides whether
+            // the light burns (flickers) or merely shines (see [`ModelLight::flame`]).
             let synth = benilla_formats::synthesize_fire_light(
                 &path,
                 emitters.iter().map(|e| &e.def),
             )
             .map(|fire| {
                 let src = &emitters[fire.emitter].def;
-                (src.position, src.bone, fire.color, fire.intensity)
+                (src.position, src.bone, fire.color, fire.intensity, true)
             })
             .or_else(|| {
                 // MONKEY (lamp lights): a lamppost/lantern/chandelier authors NO particle emitter
@@ -530,9 +545,9 @@ impl AssetLoader for M2ModelLoader {
                     .collect();
                 let bbox = bounds.as_ref().map(|b| (b.bbox_min, b.bbox_max));
                 benilla_formats::synthesize_lamp_light(&path, &batches, bbox)
-                    .map(|l| (l.position, l.bone, l.color, l.intensity))
+                    .map(|l| (l.position, l.bone, l.color, l.intensity, false))
             });
-            if let Some((position, src_bone, color, intensity)) = synth {
+            if let Some((position, src_bone, color, intensity, flame)) = synth {
                 // The light sits at the FLAME (or the lamp glass), not the model origin: a brazier's
                 // origin is under its bowl, and a light there back-lights the bowl into every
                 // surface it should be lighting (and self-shadows through the prop's own caster
@@ -566,6 +581,7 @@ impl AssetLoader for M2ModelLoader {
                         .get(src_bone as usize)
                         .map_or([0.0; 3], |b| b.pivot),
                     synthetic: true,
+                    flame,
                 });
             }
         }

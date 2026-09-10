@@ -21,6 +21,8 @@ use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages};
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{Render, RenderApp, RenderSystems};
 
+// MONKEY (flame flicker): the wobble's component + evaluator, folded into the packed colour below.
+use super::flicker::{FlameFlicker, FlickerMod};
 use super::prop_probes::MAX_PROP_PROBES;
 use super::{sh, WowLighting};
 use crate::dev_state::DebugState;
@@ -538,6 +540,26 @@ impl Default for ShadowDistance {
     }
 }
 
+/// MONKEY (sun shadow perf): the live `shadowFilter` choice, bridged from benilla-app's shadow rig
+/// and extracted into the RENDER world.
+///
+/// Every other realtime-shadow receiver benilla has is a Bevy `Material` (terrain, `wow_model`), so
+/// its pipeline picks the PCF branch up automatically from the view's `ShadowFilteringMethod`. The
+/// retained `static_gx` pass is specialized BY HAND, so it has to be told: `static_gx::render`
+/// folds this into its pipeline key and pushes the matching `SHADOW_FILTER_METHOD_*` shader def.
+/// Without it the two halves of the frame would disagree — the ground filtered one way and the
+/// buildings standing on it the other.
+///
+/// `true` = Gaussian (9 taps, the default look); `false` = Hardware2x2 (1 tap).
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, ExtractResource)]
+pub struct ShadowFilterGaussian(pub bool);
+
+impl Default for ShadowFilterGaussian {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 /// Main-world resource holding the packed light for this frame; extracted into the render world where
 /// [`upload_light`] writes it. Rebuilt every frame by [`build_light_data`] (cheap — one std430 pack).
 #[derive(Resource, Clone, Copy, ExtractResource)]
@@ -568,6 +590,10 @@ pub(super) fn register(app: &mut App) {
         .init_resource::<RoomClaimTable>()
         .init_resource::<WorldShadowActive>()
         .init_resource::<ShadowDistance>()
+        // MONKEY (sun shadow perf): the live PCF choice, extracted for `static_gx`'s hand-rolled
+        // pipeline (every Bevy-material receiver keys off the view component instead).
+        .init_resource::<ShadowFilterGaussian>()
+        .add_plugins(ExtractResourcePlugin::<ShadowFilterGaussian>::default())
         .init_resource::<DynamicInteriors>()
         // MONKEY (fire GO lights): the live gain on synthesised fire lights.
         .init_resource::<FireLightGain>()
@@ -683,9 +709,24 @@ pub struct DynamicInteriors {
     /// interior-classified OUTDOOR entity shows up. 2 = SHADOW: the torch-shadow factor as greyscale
     /// (black = shadowed, white = lit) — shows whether cast shadows are computed at all. 3 = CASTER
     /// COUNT: how many shadow-casting proxies the fragment sees in `clusterable_objects` (red = 0 —
-    /// the proxies never reached the shader; green = 1; blue = 2; white = 3+). Packed with the on/off
-    /// flag into `wmo_fog_params.w` as `1 + debug` (so `>0.5` still means "on").
+    /// the proxies never reached the shader; green = 1; blue = 2; white = 3+).
+    /// MONKEY (ext-class night law): 4 = WMO LANE MAP — every WMO fragment painted by the lighting
+    /// law its GROUP falls under (green interior-class, blue exterior-class at building scale, red
+    /// exterior-class shell/district), terrain and models untouched. The instrument for "is this
+    /// seam a LAW mismatch (two colours) or a CLAIM mismatch (one colour)?".
+    /// Packed with the on/off flag into `wmo_fog_params.w` as `1 + debug` (so `>0.5` still means
+    /// "on").
     pub debug: u32,
+    /// MONKEY (flame flicker): live gain on every flame's brightness wobble (`fireFlicker`, 0..2).
+    /// `1` = the authored per-kind amplitudes ([`FlameKind::amplitude`]), `0` = steady constants
+    /// (the pre-feature look, and the escape hatch if a flicker ever reads wrong), `2` = doubled.
+    ///
+    /// It rides THIS resource rather than a header lane because it is consumed entirely on the CPU:
+    /// [`build_light_data`] folds the multiplier into the packed colour, so the shader never learns
+    /// the feature exists and `LightStd430` gains no lane. Also why it is not on
+    /// [`FireLightGain`]: that one scales the SYNTHESISED lane only, while a flicker belongs to
+    /// authored wall torches just as much.
+    pub flicker: f32,
 }
 
 impl Default for DynamicInteriors {
@@ -701,6 +742,8 @@ impl Default for DynamicInteriors {
             // its own floors and walls.
             room_gate: true,
             debug: 0,
+            // MONKEY (flame flicker): on at the authored amplitudes.
+            flicker: 1.0,
         }
     }
 }
@@ -880,6 +923,10 @@ fn build_light_data(
             Option<&LightLane>,
             // MONKEY (room gate): the bbox-derived supplement to the MOLR claim set.
             Option<&LightLitRooms>,
+            // MONKEY (flame flicker): present iff this light BURNS ([`flame_kind_for`] decided so
+            // at spawn). Read-only, never written — the wobble is a pure function of it plus the
+            // clock, so it adds no `Changed` traffic and no archetype churn to the frame.
+            Option<&FlameFlicker>,
         ),
         Without<ShadowProxyLight>,
     >,
@@ -965,6 +1012,10 @@ fn build_light_data(
     // identity, over-gamut preserved). Entries past `count` stay stale in the blob — the count row
     // guards every reader.
     let cam_pos = cam.single().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    // MONKEY (flame flicker): the one clock read for the whole table — every flame's phase is a
+    // function of this absolute second and its own seed, so the frame is internally consistent and
+    // the result does not depend on how long the frame took.
+    let now_secs = time.elapsed_secs();
     // MONKEY (fire GO lights): `(…, synthetic)` rides the tuple so the census below can count the
     // invented entries without a second query.
     // MONKEY (light lanes): the tuple's last member is the packed COLOUR-ROW `.w` — 0 for an
@@ -978,7 +1029,7 @@ fn build_light_data(
     // the interior lane, so `claims 4` beside `EXT` is the readout of exactly that trade.
     let mut pts: Vec<(f32, Vec3, f32, [f32; 3], bool, f32, RoomClaim, usize)> = lights_q
         .iter()
-        .filter(|(_, gt, rooms, _, _, _, _)| {
+        .filter(|(_, gt, rooms, _, _, _, _, _)| {
             // The ROOM term (decision 0689's law, fourth lane — see [`LightRooms`]). Not a
             // visibility test bolted onto a faithful gather: the reference's register walk has no
             // such term either, it simply never has a culled room's torch to register. Ungated for
@@ -996,7 +1047,7 @@ fn build_light_data(
                 && gt.translation().distance_squared(cam_pos)
                     < INTERIOR_NEAR_ADMIT * INTERIOR_NEAR_ADMIT)
         })
-        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms)| {
+        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms, flicker)| {
             let p = gt.translation();
             let d2 = p.distance_squared(cam_pos);
             (d2 < POINT_PACK_RADIUS * POINT_PACK_RADIUS).then(|| {
@@ -1008,7 +1059,20 @@ fn build_light_data(
                 // recovered colour×intensity, and only for a synthesised source. At spawn it
                 // would need a world respawn to retune; here the dial moves the frame it changes.
                 let s = base * if synthetic { fire_gain.0.max(0.0) } else { 1.0 };
-                let rgb = commit_raw([c.red * s, c.green * s, c.blue * s]);
+                // MONKEY (flame flicker): the fire wobble, folded in at the very last moment — over
+                // the committed colour and NOWHERE else. Deliberately downstream of `base`, which
+                // still feeds the reach/lane below unmodulated: a breathing REACH would move the
+                // interior window, re-decide the room gate's portal hop and re-rank the torch
+                // shadow casters every frame, i.e. exactly the frame-rate thrash this feature
+                // exists to avoid. Only the brightness moves; the pool's geometry is frozen.
+                //
+                // `elapsed_secs` (absolute, never a delta) is what makes it frame-rate independent:
+                // the same instant gives the same brightness whatever the frame took.
+                let fm = flicker.map_or(FlickerMod::STEADY, |f| {
+                    f.at(now_secs, dynamic_interiors.flicker)
+                });
+                let s = s * fm.intensity;
+                let rgb = commit_raw([c.red * s, c.green * s, c.blue * s * fm.blue]);
                 // MONKEY (light lane by position): a light is INTERIOR iff it PHYSICALLY STANDS in
                 // an interior-class WMO group — the verdict [`classify_light_lanes`] (static) or
                 // the carried-light claim (entities) wrote onto it. Claiming a room is no longer
@@ -1103,16 +1167,29 @@ fn build_light_data(
             // feature is a heuristic over content, so "the inn is too bright" has to be separable
             // into "too many synthetic sources" and "the authored ones changed" without a rebuild.
             let synth = pts.iter().filter(|(.., s, _, _, _)| *s).count();
+            // MONKEY (flame flicker): how many of the nearby sources BURN — the census that answers
+            // "did the route rule file this room's fixtures as flames at all?" without a rebuild.
+            // Counted over the same radius the pack gathers from rather than off `pts`, so it does
+            // not have to ride the packing tuple through five destructurings for a diagnostic.
+            let flames = lights_q
+                .iter()
+                .filter(|(_, gt, ..)| {
+                    gt.translation().distance_squared(cam_pos)
+                        < POINT_PACK_RADIUS * POINT_PACK_RADIUS
+                })
+                .filter(|t| t.7.is_some())
+                .count();
             // MONKEY (light lanes): how the table splits between the two now-disjoint consumer
             // families. "The inn's candles are lighting the lawn" is an INT count on a row the
             // exterior lane should never have seen — a number, printed per row below as INT/EXT.
             let interior = pts.iter().filter(|(.., lane, _, _)| *lane > 0.5).count();
             eprintln!(
-                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, gain {:.2}, atten x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
+                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, {flames} flickering, gain {:.2}, atten x{:.2}, flicker x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
                 pts.len(),
                 pts.len() - interior,
                 fire_gain.0,
                 dynamic_interiors.atten_scale,
+                dynamic_interiors.flicker,
             );
             for (d2, p, _, rgb, synthetic, lane, claim, lit_n) in pts.iter().take(8) {
                 eprintln!(
@@ -1683,6 +1760,68 @@ mod tests {
         let data = app.world().resource::<WowLightData>().0;
         assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "gain 0 = lane off");
         assert!((data.points[1][0] - 2.0).abs() < 1e-4, "authored unaffected");
+    }
+
+    /// GOLDEN — MONKEY (flame flicker): the wobble reaches the packed COLOUR and nothing else.
+    ///
+    /// Three properties, and each one is a bug if it inverts. (1) A flame's committed colour MOVES
+    /// with the clock while an identical light without the component beside it does not — the
+    /// feature exists at all. (2) The move stays inside the kind's authored amplitude, which is the
+    /// anti-strobe guarantee measured where it actually lands (after the `4π` round trip and
+    /// `commit_raw`), not just in the waveform's own unit test. (3) The colour row's `.w` — the
+    /// interior REACH — is byte-identical across those frames. That is the one thing that must not
+    /// breathe: a moving reach would re-window the interior pool, re-decide the room gate's portal
+    /// hop and re-rank the torch-shadow casters every single frame, which is the frame-rate thrash
+    /// ("the epileptic imp") this feature is built to stay clear of.
+    #[test]
+    fn the_flicker_moves_the_packed_colour_and_never_the_reach() {
+        use super::super::flicker::FlameKind;
+        let at = |app: &mut App, ms: u64| {
+            let mut t = Time::<()>::default();
+            t.advance_by(std::time::Duration::from_millis(ms));
+            app.world_mut().insert_resource(t);
+            app.update();
+            app.world().resource::<WowLightData>().0
+        };
+        let mut app = packer_app();
+        // Same recipe, same lane, same intensity: only the component can separate them.
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.5, 0.25], 1.5);
+        let lane = LightLane { interior: true, generation: LightLane::SETTLED };
+        app.world_mut()
+            .spawn((recipe(), GlobalTransform::from_translation(Vec3::X), lane));
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            lane,
+            FlameFlicker::new(FlameKind::Torch, 0x51ee_d105),
+        ));
+
+        let (mut moved, mut steady_moved) = (0.0f32, 0.0f32);
+        let first = at(&mut app, 0);
+        let (base_steady, base_flame, reach) = (first.points[1][0], first.points[3][0], first.points[3][3]);
+        assert!(reach > 0.5, "the flame is on the interior lane, so `.w` carries its reach");
+        for ms in (40..4000).step_by(37) {
+            let d = at(&mut app, ms);
+            steady_moved = steady_moved.max((d.points[1][0] - base_steady).abs());
+            moved = moved.max((d.points[3][0] - base_flame).abs() / base_flame.max(1e-6));
+            assert_eq!(d.points[3][3], reach, "the packed reach never moves with the flicker");
+            assert_eq!(d.points[2], first.points[2], "nor does the position/range row");
+        }
+        assert_eq!(steady_moved, 0.0, "a light with no FlameFlicker is a constant, as before");
+        assert!(moved > 0.02, "the flame barely moved at all: {moved}");
+        // Both endpoints of the excursion are inside the torch rung's authored +-10%, doubled by
+        // the two-sided base sample (the reference frame is t=0, itself off the mean).
+        assert!(moved < 2.0 * FlameKind::Torch.amplitude(), "over amplitude: {moved}");
+
+        // `fireFlicker 0` is the off switch: the flame commits the same bytes on every frame.
+        app.world_mut().insert_resource(DynamicInteriors {
+            flicker: 0.0,
+            ..DynamicInteriors::default()
+        });
+        let off = at(&mut app, 5000).points[3];
+        for ms in [5100u64, 5250, 5600] {
+            assert_eq!(at(&mut app, ms).points[3], off, "gain 0 = the pre-feature constant");
+        }
     }
 
     /// GOLDEN — MONKEY (light lanes / interior attenuation): the colour row's `.w` separates the

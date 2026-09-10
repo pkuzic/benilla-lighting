@@ -565,6 +565,39 @@ impl RootRooms {
     }
 }
 
+/// MONKEY (ext-class night law): the authored MOGN group names, indexed by absolute group index.
+/// Not on [`benilla_formats::WmoRoot`] — nothing in the renderer needs them — but an audit that has
+/// to say WHICH room seamed reads very differently with `kitchen`/`upstairs` beside the boxes than
+/// with `g3`/`g4`. A raw chunk walk: MOGI is 32-byte records whose last i32 is a byte offset into
+/// the MOGN string block (`-1` = unnamed, which vanilla uses freely).
+fn group_names(bytes: &[u8]) -> Vec<Option<String>> {
+    let (mut mogn, mut mogi) = (None, None);
+    let mut o = 0usize;
+    while o + 8 <= bytes.len() {
+        let tag = [bytes[o + 3], bytes[o + 2], bytes[o + 1], bytes[o]];
+        let n = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().unwrap()) as usize;
+        let body = bytes.get(o + 8..o + 8 + n);
+        match (&tag, body) {
+            (b"MOGN", Some(b)) => mogn = Some(b),
+            (b"MOGI", Some(b)) => mogi = Some(b),
+            _ => {}
+        }
+        o += 8 + n;
+    }
+    let (Some(mogn), Some(mogi)) = (mogn, mogi) else {
+        return Vec::new();
+    };
+    mogi.chunks_exact(32)
+        .map(|r| {
+            let off = i32::from_le_bytes(r[28..32].try_into().unwrap());
+            let off = usize::try_from(off).ok()?;
+            let rest = mogn.get(off..)?;
+            let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+            Some(String::from_utf8_lossy(&rest[..end]).into_owned()).filter(|s| !s.is_empty())
+        })
+        .collect()
+}
+
 fn root_rooms(
     chain: &mut Chain,
     root: &benilla_formats::WmoRoot,
@@ -675,17 +708,51 @@ pub fn wmolights(chain: &mut Chain, raw_path: &str) -> Result<()> {
     // (an inn's basement stairwell, a covered porch) is drawn by the EXTERIOR law and takes the
     // night sky unless an interior fixture claims it — that is bug B's second cause, and this is
     // where you read which groups are in that population.
-    println!("=== groups (class, MOGP flags, MOGI box, portals, MOLR fixtures) ===");
+    // MONKEY (ext-class night law): the class column now says WHICH of the three lanes the group
+    // is on, because that is the question a seam asks. `INT` = the room lane always; `ext*` = an
+    // exterior-class group at BUILDING scale, which takes the room lane after dark (and which
+    // `interiorDebug 4` paints BLUE); `ext` = a district-scale shell, sky-lit always (RED).
+    println!("=== groups (name, lane, MOGP flags, MOGI box, portals, MOLR fixtures) ===");
+    let names = group_names(&bytes);
     for gi in 0..root.group_count() as usize {
         let Some(g) = infos.get(gi) else { continue };
         let (_, pc) = rr.slices.get(gi).copied().unwrap_or((0, 0));
         println!(
-            "  g{gi:<3} {}  flags {:#010x}  box ({:>8.2},{:>8.2},{:>7.2})..({:>8.2},{:>8.2},{:>7.2})  portals {pc:<3} molr {:?}",
-            if g.interior { "INT" } else { "ext" },
+            "  g{gi:<3} {:<12} {:<4} flags {:#010x}  box ({:>8.2},{:>8.2},{:>7.2})..({:>8.2},{:>8.2},{:>7.2})  portals {pc:<3} molr {:?}",
+            names.get(gi).and_then(|n| n.as_deref()).unwrap_or("-"),
+            match (g.interior, benilla_formats::room_claim::ext_building_scale(g)) {
+                (true, _) => "INT",
+                (_, true) => "ext*",
+                _ => "ext",
+            },
             rr.flags.get(gi).copied().unwrap_or(0),
             g.bbox_min[0], g.bbox_min[1], g.bbox_min[2],
             g.bbox_max[0], g.bbox_max[1], g.bbox_max[2],
             rr.light_refs.get(gi).map(|v| v.len()).unwrap_or(0),
+        );
+    }
+    println!();
+    // MONKEY (split-floor claims): the portal table. AREA is the measurement the split rule turns
+    // on ([`benilla_formats::room_claim::SPLIT_PORTAL_MIN_AREA`]) — a doorway is small, a room the
+    // artist cut in half is not — so it prints beside the groups each portal joins and a `SPLIT`
+    // marker for the ones a containment claim now crosses at full weight instead of fading.
+    println!("=== portals (polygon area vs SPLIT_PORTAL_MIN_AREA = {:.0} yd^2) ===",
+        benilla_formats::room_claim::SPLIT_PORTAL_MIN_AREA);
+    let graph = rr.graph();
+    for pi in 0..rr.portals.infos.len() {
+        let area = benilla_formats::room_claim::portal_area(&graph, pi as u16).unwrap_or(0.0);
+        let plane = rr.portals.infos[pi].plane;
+        let joins: Vec<u16> = rr
+            .portals
+            .refs
+            .iter()
+            .filter(|r| usize::from(r.portal) == pi)
+            .map(|r| r.group)
+            .collect();
+        println!(
+            "  p{pi:<3} area {area:>7.2} yd^2  |n.z| {:.2}  joins {joins:?}{}",
+            plane[2].abs(),
+            if area >= benilla_formats::room_claim::SPLIT_PORTAL_MIN_AREA { "   SPLIT" } else { "" },
         );
     }
     println!();

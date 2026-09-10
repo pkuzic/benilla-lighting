@@ -14,6 +14,10 @@
 //! 2. **MOLR** — the groups whose authored light-ref list names the fixture. Authored for the
 //!    reference's own purpose (register a GL light while drawing a visible group's doodads), which
 //!    is why it cannot carry the gate alone, but it is the artist speaking and it is never wrong.
+//! 2b. **SPLIT-FLOOR SIBLINGS** (MONKEY (split-floor claims)) — the group across a portal too
+//!    LARGE to be a doorway ([`SPLIT_PORTAL_MIN_AREA`]): one room the artist cut in two for
+//!    rendering. It joins the base at weight 1, because there is no threshold between the halves
+//!    to fade across — see [`ClaimHow::Split`].
 //! 3. **PORTAL-ADJACENT** — the groups up to [`ROOM_CLAIM_HOPS`] portal hops from a claimed group,
 //!    when the doorways lie within the fixture's effective radius. This is the "light crosses an
 //!    open doorway" rule: without it a fixture stops dead at its room's edge and a continuous floor
@@ -65,6 +69,11 @@ pub enum ClaimHow {
     Molr,
     /// One portal hop from a claimed group, the portal within the fixture's reach.
     Portal,
+    /// MONKEY (split-floor claims): the group on the far side of a portal too LARGE to be a
+    /// doorway ([`SPLIT_PORTAL_MIN_AREA`]) — one half of a room the artist SPLIT for rendering.
+    /// Ranks and behaves as a BASE claim: hard (weight 1 everywhere), hop 0, and part of the
+    /// wavefront the portal walk seeds from.
+    Split,
 }
 
 impl ClaimHow {
@@ -73,6 +82,7 @@ impl ClaimHow {
             ClaimHow::Contains => "in",
             ClaimHow::Molr => "molr",
             ClaimHow::Portal => "portal",
+            ClaimHow::Split => "split",
         }
     }
 }
@@ -188,6 +198,29 @@ fn portal_box(portals: &PortalGraph, portal: u16) -> Option<([f32; 3], [f32; 3])
     Some((lo, hi))
 }
 
+/// MONKEY (split-floor claims): the AREA of one portal's polygon (yd²), fan-triangulated over the
+/// MOPV vertices in authored order. The measure that separates a DOORWAY from a room the artist cut
+/// in half: see [`SPLIT_PORTAL_MIN_AREA`] for the two populations it sits between.
+pub fn portal_area(portals: &PortalGraph, portal: u16) -> Option<f32> {
+    let info = portals.infos.get(usize::from(portal))?;
+    let start = usize::from(info.start_vertex);
+    let end = start.checked_add(usize::from(info.count))?;
+    let verts = portals.vertices.get(start..end)?;
+    let (first, rest) = verts.split_first()?;
+    let sub = |a: &[f32; 3], b: &[f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let mut area = 0.0f32;
+    for pair in rest.windows(2) {
+        let (u, v) = (sub(&pair[0], first), sub(&pair[1], first));
+        let c = [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ];
+        area += 0.5 * (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+    }
+    Some(area)
+}
+
 /// A portal as the claim rule measures it, from `pos`: `(distance, centre, slack)`.
 ///
 /// **distance** — yards from `pos` to the portal's polygon, approximated by its AABB (the closest
@@ -242,6 +275,34 @@ pub const CLAIM_FADE_MIN_YD: f32 = 2.0;
 /// this dim there too, so both sides read ~0 and the boundary stays continuous.
 pub const CLAIM_FADE_MIN_ENTRY: f32 = 0.02;
 
+/// MONKEY (split-floor claims): the polygon area (yd²) at or above which a portal is read as a
+/// ROOM SPLIT rather than a doorway, so containment claims cross it at FULL weight instead of
+/// fading (see [`ClaimHow::Split`]).
+///
+/// The soft portal fade is continuous only at the door it came THROUGH — `fade_center` is that
+/// doorway, and the weight decays away from it. A room the artist cut in two (the Lion's Pride
+/// Inn's gallery, split from the common room below it by a 10.5 x 9.1 yd opening; its cellar,
+/// reached through a 10.2 x 3.4 yd hole in the kitchen floor) therefore reads the SAME fixture at
+/// weight 1 on the near half (containment) and at whatever the fade has decayed to on the far half
+/// — a straight brightness line across one continuous floor, at a plane that is not a wall. Worse,
+/// the far half then re-seeds its own portal hops at that decayed weight, so every real doorway off
+/// it inherits the step (the inn's upstairs rooms took the gallery's fixtures at 0.2–0.5 while the
+/// gallery took them at 1.0, and the boundary between them is DIAGONAL — the reported scar).
+///
+/// **28 yd², from the corpus's own bimodal split.** Measured over the two buildings the seam was
+/// reported in, sorted: the Goldshire inn's ten portals run 9.9, 10.8, 11.9, 11.9, 15.6, 17.3,
+/// 17.3, 20.5 (every one of them a door or an arch) and then 35.1 (the cellar floor hole) and 95.9
+/// (the gallery opening); Northshire abbey's fourteen run 14.3 … 16.5 for nine doorways and then
+/// 40.3, 47.1, 50.7, 50.9, 252.6 for its nave splits. The union gap is 20.5 → 35.1 and 28 sits in
+/// the middle of it, so no doorway in either building is merged and every split is.
+///
+/// AREA alone, deliberately — not "horizontal-ish", which is the shape a floor split usually has:
+/// the abbey authors a HORIZONTAL portal of 14.3 yd² (g10↔g5, a hatch), and merging a real hatch
+/// would light a closed room from the one below it. The two horizontal portals that ARE splits (the
+/// inn's 35.1, the abbey's 252.6) both clear the area bar on their own, so the extra criterion buys
+/// nothing and costs a false positive.
+pub const SPLIT_PORTAL_MIN_AREA: f32 = 28.0;
+
 /// `smoothstep(0, edge, x)` — the shader's own curve, so the entry weight this rule bakes and the
 /// weight `static_gx.wgsl` evaluates are the same function sampled at the same point. (Rust has no
 /// `smoothstep`; WGSL's is the Hermite `t*t*(3 - 2t)` on the clamped ratio.)
@@ -271,9 +332,21 @@ pub const CLAIM_EXT_SHELL_YD: f32 = 96.0;
 /// Is a BOX claim (containment or MOLR) on this group eligible for the exterior lane? Interior
 /// groups trivially are (the exterior lane never draws them); an exterior group only at building
 /// scale (see [`CLAIM_EXT_SHELL_YD`]).
-fn claimable_by_box(g: &WmoGroupInfo) -> bool {
+pub fn claimable_by_box(g: &WmoGroupInfo) -> bool {
     g.interior
         || (0..2).all(|a| (g.bbox_max[a] - g.bbox_min[a]) <= CLAIM_EXT_SHELL_YD)
+}
+
+/// MONKEY (ext-class night law): is this group EXTERIOR-class but at BUILDING scale — an inn's
+/// shell, a basement stairwell, a covered porch, as opposed to a city district's shell?
+///
+/// The same cut [`claimable_by_box`] makes, read from the other side, and deliberately the SAME
+/// one: a group the exterior lane will honour a candle's claim on is a group that ought to render
+/// by candle-light at night, and a group whose claims that lane refuses (a district shell) must
+/// keep the sky. Two thresholds here would put a group in the gap between them — lit by fixtures
+/// but still sky-based, or sky-less with no fixtures allowed to reach it.
+pub fn ext_building_scale(g: &WmoGroupInfo) -> bool {
+    !g.interior && claimable_by_box(g)
 }
 
 /// `pos` inside a group's authored MOGI box.
@@ -350,6 +423,68 @@ pub fn room_claims(
     // 2. MOLR.
     for &g in molr {
         push(&mut out, g, ClaimHow::Molr, 0.0, 0, None);
+    }
+    // 2b. SPLIT-FLOOR SIBLINGS — MONKEY (split-floor claims). A portal too big to be a doorway
+    //     ([`SPLIT_PORTAL_MIN_AREA`]) is the artist cutting ONE room in two for rendering, and the
+    //     two halves must light as one: the far half takes this fixture at weight 1, exactly as the
+    //     half it physically stands in does. Pushed HERE — after the base, before the hop — because
+    //     it is base-equivalent in every way that matters downstream:
+    //
+    //     * HARD (`fade = None`): the fade exists to make a THRESHOLD continuous, and a split has
+    //       no threshold. Fading across it is what put the step on the continuous floor.
+    //     * hop 0, and therefore in the wavefront the portal walk seeds from below at spend 0. That
+    //       is the half of this rule that closes the *second-order* seam: the inn's upstairs rooms
+    //       used to reach their gallery fixtures as hop-TWO claims (through the gallery opening
+    //       first), entering at the 0.2–0.5 the first fade had already decayed to, while the
+    //       gallery itself held them at 1.0 — a step at every one of those doorways, the wrong way
+    //       round. Re-seeded from the merged half they are hop-ONE claims entering at 1.0, which is
+    //       exactly the weight the gallery side reads there.
+    //     * ranked above portal claims when the six slots are contested, for the same reason
+    //       containment is: this is the room the fixture is in, spelt with two group ids.
+    //
+    //     Transitive (the queue below re-walks each merged group), so a room cut into three merges
+    //     whole. Both ends must be [`claimable_by_box`] — a district-scale shell is never one half
+    //     of a room — and the opening must be within the fixture's own reach, so a split it cannot
+    //     light is not merged into its set at the cost of a slot.
+    if reach > 0.0 && !portals.infos.is_empty() && out.len() < ROOM_CLAIM_MAX {
+        let mut queue: Vec<u16> = out.iter().map(|c| c.group).collect();
+        let mut head = 0usize;
+        while head < queue.len() && out.len() < ROOM_CLAIM_MAX {
+            let g = queue[head];
+            head += 1;
+            if groups
+                .get(usize::from(g))
+                .is_none_or(|gi| !claimable_by_box(gi))
+            {
+                continue;
+            }
+            let Some(&(start, count)) = portals.slices.get(usize::from(g)) else {
+                continue;
+            };
+            let from = usize::from(start);
+            let to = from.saturating_add(usize::from(count));
+            for r in portals.refs.get(from..to).unwrap_or(&[]) {
+                if out.len() >= ROOM_CLAIM_MAX {
+                    break;
+                }
+                if out.iter().any(|c| c.group == r.group)
+                    || groups
+                        .get(usize::from(r.group))
+                        .is_none_or(|gi| !claimable_by_box(gi))
+                    || portal_area(&portals, r.portal).unwrap_or(0.0) < SPLIT_PORTAL_MIN_AREA
+                {
+                    continue;
+                }
+                let Some((d, ..)) = portal_reach(&portals, r.portal, pos) else {
+                    continue;
+                };
+                if d > reach {
+                    continue;
+                }
+                push(&mut out, r.group, ClaimHow::Split, d, 0, None);
+                queue.push(r.group);
+            }
+        }
     }
     // 3. PORTAL-ADJACENT — up to [`ROOM_CLAIM_HOPS`] doorways off the base, nearest portal first
     //    within each hop, and every hop's claim carries the fade that makes it SOFT.
@@ -609,6 +744,64 @@ mod tests {
         // there, not step. Reach 3.0 leaves 0 yd, and a 0-yard smoothstep is the hard edge again.
         let c = room_claims(&groups, portals, [2.0, 1.0, 1.0], 3.0, &[]);
         assert_eq!(c[1].fade_radius, CLAIM_FADE_MIN_YD, "clamped, never zero");
+    }
+
+    /// MONKEY (split-floor claims): a portal too LARGE to be a doorway merges the two halves of the
+    /// room it cuts — the far half takes the fixture HARD (weight 1), and the walk re-seeds from it
+    /// so a real doorway off that half is a FIRST hop at full entry, not a decayed second one.
+    #[test]
+    fn a_split_portal_merges_both_halves_and_reseeds_the_walk() {
+        // g0 holds the fixture, g1 is the other half of the same room (a 5 x 6 = 30 yd² opening,
+        // over SPLIT_PORTAL_MIN_AREA), g2 is a real room off g1 through a 2 x 3 = 6 yd² door.
+        let groups = [
+            g(true, [-5.0, -5.0, 0.0], [5.0, 5.0, 6.0]),
+            g(true, [5.0, -5.0, 0.0], [15.0, 5.0, 6.0]),
+            g(true, [15.0, -5.0, 0.0], [25.0, 5.0, 6.0]),
+        ];
+        let verts = vec![
+            [5.0, -2.5, 0.0], [5.0, 2.5, 0.0], [5.0, 2.5, 6.0], [5.0, -2.5, 6.0],
+            [15.0, 0.0, 0.0], [15.0, 2.0, 0.0], [15.0, 2.0, 3.0], [15.0, 0.0, 3.0],
+        ];
+        let infos = vec![
+            WmoPortalInfo { start_vertex: 0, count: 4, plane: [1.0, 0.0, 0.0, -5.0] },
+            WmoPortalInfo { start_vertex: 4, count: 4, plane: [1.0, 0.0, 0.0, -15.0] },
+        ];
+        let refs = [
+            WmoPortalRef { portal: 0, group: 1, side: 1 },
+            WmoPortalRef { portal: 0, group: 0, side: -1 },
+            WmoPortalRef { portal: 1, group: 2, side: 1 },
+            WmoPortalRef { portal: 1, group: 1, side: -1 },
+        ];
+        let slices = [(0u16, 1u16), (1u16, 2u16), (3u16, 1u16)];
+        let portals = PortalGraph { vertices: &verts, infos: &infos, refs: &refs, slices: &slices };
+        assert!((portal_area(&portals, 0).unwrap() - 30.0).abs() < 1e-3);
+        assert!((portal_area(&portals, 1).unwrap() - 6.0).abs() < 1e-3);
+        let c = room_claims(&groups, portals, [2.0, 0.0, 1.0], 20.0, &[]);
+        assert_eq!(
+            c.iter().map(|c| (c.group, c.how, c.hops)).collect::<Vec<_>>(),
+            vec![
+                (0, ClaimHow::Contains, 0),
+                (1, ClaimHow::Split, 0),
+                (2, ClaimHow::Portal, 1),
+            ],
+        );
+        assert_eq!(c[1].fade_radius, 0.0, "a split is HARD — weight 1 across the far half");
+        assert_eq!(c[2].fade_entry, 1.0, "…so the door off it is a FIRST hop at full entry");
+        // Under the bar the same portal is an ordinary doorway again: g1 fades, g2 is hop TWO.
+        let small = vec![
+            [5.0, -1.0, 0.0], [5.0, 1.0, 0.0], [5.0, 1.0, 3.0], [5.0, -1.0, 3.0],
+            [15.0, 0.0, 0.0], [15.0, 2.0, 0.0], [15.0, 2.0, 3.0], [15.0, 0.0, 3.0],
+        ];
+        let portals = PortalGraph { vertices: &small, ..portals };
+        let c = room_claims(&groups, portals, [2.0, 0.0, 1.0], 20.0, &[]);
+        assert_eq!(
+            c.iter().map(|c| (c.group, c.how, c.hops)).collect::<Vec<_>>(),
+            vec![
+                (0, ClaimHow::Contains, 0),
+                (1, ClaimHow::Portal, 1),
+                (2, ClaimHow::Portal, 2),
+            ],
+        );
     }
 
     /// MONKEY (soft portal claims): TWO hops. A fixture two rooms away has to be claimed on BOTH

@@ -71,6 +71,10 @@ pub(crate) struct GxItemDraw {
     /// The interior prop's SH-probe slot (B4; 0 elsewhere — read only under the word's
     /// INTERIOR-without-WMO lane). Rides the record table's w column, bits 1..14.
     pub slot: u16,
+    /// MONKEY (ext-class night law): this is an EXTERIOR-class WMO batch at BUILDING scale — the
+    /// record table's bit 27 (see [`RECORD_EXT_NIGHT_BIT`]). False on cells, props and interior
+    /// batches.
+    pub ext_night: bool,
 }
 
 /// One baked cell (or WMO region), published by the main-world flush.
@@ -177,6 +181,13 @@ const RECORD_FOG_BIT: u32 = 1 << 14;
 const RECORD_ROOM_SHIFT: u32 = 15;
 const RECORD_ROOM_MASK: u32 = 0xfff;
 
+/// MONKEY (ext-class night law): record column `w`, bit 27 — this batch's group is EXTERIOR-class
+/// but at BUILDING scale (an inn's shell, a basement stairwell), so after dark `static_gx.wgsl`
+/// blends it off the sky-lit exterior law and onto the interior room law. The room key occupies
+/// bits 15..=26, so 27 is the first free bit. **Keep in sync with `static_gx.wgsl`'s
+/// `RECORD_EXT_NIGHT`.**
+const RECORD_EXT_NIGHT_BIT: u32 = 1 << 27;
+
 /// The room key for one baked item: `group + 1` for a WMO surface batch, and for a PROP batch whose
 /// referrer set names exactly one group (a prop in one room — the common case); 0 for a terrain
 /// cell, and for a multi-room prop, which stays ungated because a single key cannot express it.
@@ -256,7 +267,12 @@ struct GxPipelines {
     /// Keyed `(cutout, two_sided)`; specialized for the world view's (samples, format) pair —
     /// re-specialized if that pair ever changes (a window move across displays).
     pipelines: HashMap<(bool, bool), CachedRenderPipelineId>,
-    specialized_for: Option<(u32, TextureFormat)>,
+    /// MONKEY (sun shadow perf): the key now carries the live `shadowFilter` too — the PCF branch
+    /// is a shader DEF, so a change has to re-specialize the family. Once per CHANGE, not per
+    /// frame: exactly the posture the (samples, format) pair beside it already has, and the same
+    /// caveat (a flip re-queues four pipelines rather than reviving the previous four — a cvar
+    /// A/B costs a shader build, a rendered frame costs nothing).
+    specialized_for: Option<(u32, TextureFormat, bool)>,
 }
 
 fn init_pipelines(
@@ -439,7 +455,12 @@ fn prepare_static_gx(
     mesh_pipeline: Res<MeshPipeline>,
     images: Res<RenderAssets<GpuImage>>,
     views: Query<GxViewKey>,
+    // MONKEY (sun shadow perf): the live `shadowFilter`, extracted from the main world. `Option`
+    // because `ExtractResourcePlugin` only publishes it while the lighting plugin is in the app
+    // (a bare static_gx harness has no lighting) — absent reads as the shipped Gaussian.
+    shadow_filter: Option<Res<crate::lighting::ShadowFilterGaussian>>,
 ) {
+    let shadow_gaussian = shadow_filter.map_or(true, |f| f.0);
     let _t = super::gx_perf_guard(3);
     // The world view's pipeline key (the marker keeps booth views out of it).
     let Some((view, msaa, _, _)) = views.iter().next() else {
@@ -450,7 +471,7 @@ fn prepare_static_gx(
     } else {
         TextureFormat::bevy_default()
     };
-    let key = (msaa.samples(), format);
+    let key = (msaa.samples(), format, shadow_gaussian);
     if pipes.specialized_for != Some(key) {
         pipes.view_layout = mesh_pipeline
             .get_view_layout(MeshPipelineViewLayoutKey::from(*msaa))
@@ -462,10 +483,16 @@ fn prepare_static_gx(
         for cutout in [false, true] {
             for two_sided in [false, true] {
                 let mut defs = vec![];
-                // The world camera uses Bevy's default Gaussian shadow filtering. The retained
-                // pipeline is custom, so it must opt into the same shader branch explicitly;
+                // The retained pipeline is custom, so it must opt into the same PCF branch the
+                // world camera's `ShadowFilteringMethod` gives every Bevy-material receiver;
                 // otherwise `shadows::fetch_directional_shadow` falls back to a constant 1.0.
-                defs.push(ShaderDefVal::from("SHADOW_FILTER_METHOD_GAUSSIAN"));
+                // MONKEY (sun shadow perf): that method is now the live `shadowFilter` cvar, so the
+                // def follows it — the ground and the buildings standing on it must filter alike.
+                defs.push(ShaderDefVal::from(if shadow_gaussian {
+                    "SHADOW_FILTER_METHOD_GAUSSIAN"
+                } else {
+                    "SHADOW_FILTER_METHOD_HARDWARE_2X2"
+                }));
                 // MONKEY (torch shadows Phase 1): arm the shader's group-3 torch-map code. Set on
                 // EVERY static_gx pipeline so the group-3 bindings (always bound by the node) match.
                 defs.push(ShaderDefVal::from("TORCH_SHADOWS"));
@@ -726,7 +753,13 @@ fn assemble_region(
                     | (u32::from(item.sidn[2]) << 16),
                 kill_bit(&draw.killed, i)
                     | (u32::from(item.slot) << 1)
-                    | if gated { room_key(item, &draw.sets) } else { 0 },
+                    | if gated { room_key(item, &draw.sets) } else { 0 }
+                    // MONKEY (ext-class night law): unconditional on `gated` — the night law is a
+                    // property of the GROUP's authored class and box, not of whether this region
+                    // could carry a room key. An ungated region's ext-class group still must not
+                    // read as night sky; its `interior_room_light` simply falls open, exactly as an
+                    // ungated interior group's already does.
+                    | if item.ext_night { RECORD_EXT_NIGHT_BIT } else { 0 },
             ]
         })
         .collect();
@@ -860,11 +893,32 @@ fn prepare_room_claims(
     queue: Res<RenderQueue>,
     buffer: Option<Res<GxRoomClaims>>,
     claims: Option<Res<crate::lighting::RoomClaimTable>>,
+    // MONKEY (torch lane perf): the words last actually uploaded, keyed by the buffer they went to.
+    mut last: Local<Option<(BufferId, Vec<u32>)>>,
 ) {
     let (Some(buffer), Some(claims)) = (buffer, claims) else {
         return;
     };
+    // MONKEY (torch lane perf): skip the write when the table is bit-identical to what is already
+    // in the buffer. The packer does rebuild it from scratch every frame, but the RESULT is
+    // unchanged for as long as the player stands in one room with the same fixtures claiming it —
+    // which is most of the time indoors. A 32 KB `memcmp` costs a fraction of the 32 KB staging
+    // copy it saves, and the comparison is against what we WROTE, so it cannot disagree with the
+    // buffer's real contents.
+    let id = buffer.0.id();
+    if last.as_ref().is_some_and(|(b, w)| *b == id && w[..] == claims.0[..]) {
+        return;
+    }
     queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&claims.0[..]));
+    // Reuse the cache's allocation where there is one — this runs on a frame where the claims
+    // genuinely changed, and a fresh 32 KB `Vec` per such frame would be churn for nothing.
+    if let Some((b, w)) = last.as_mut() {
+        if *b == id {
+            w.copy_from_slice(&claims.0[..]);
+            return;
+        }
+    }
+    *last = Some((id, claims.0.to_vec()));
 }
 
 fn prepare_view_bind(
@@ -898,8 +952,18 @@ fn prepare_view_bind(
 /// when the lane is off or absent) so the pipeline's group 3 is never left unbound — except while the
 /// shared image is not yet resident, when static_gx skips the frame (the node early-outs on a
 /// missing `GxTorchBind`).
+/// MONKEY (torch lane perf): the bind group is CACHED with the exact table bytes and the depth
+/// texture it was built over. Both used to be rebuilt from scratch every frame — a fresh 6416-byte
+/// uniform buffer plus a fresh `BindGroup` object, for contents that are identical on every frame
+/// the player stands still. Nothing else about the group can change while those two match: the
+/// sampler and the layout are `RenderStartup` singletons, and the texture id covers the one case
+/// where the shared image is ever re-prepared.
 #[derive(Resource)]
-struct GxTorchBind(BindGroup);
+struct GxTorchBind {
+    group: BindGroup,
+    table: super::torch_depth::TorchTableUniform,
+    texture: TextureId,
+}
 
 fn prepare_torch_bind(
     mut commands: Commands,
@@ -910,6 +974,7 @@ fn prepare_torch_bind(
     views: Option<Res<super::torch_depth::TorchShadowViews>>,
     image: Option<Res<super::torch_depth::TorchDepthImage>>,
     images: Res<RenderAssets<GpuImage>>,
+    cached: Option<ResMut<GxTorchBind>>,
 ) {
     // The sampler/pipeline are created in RenderStartup; the shared image is prepared by the
     // render-asset pass (before this set). Without either, group 3 has nothing to bind this frame.
@@ -920,25 +985,62 @@ fn prepare_torch_bind(
         return;
     };
     let table = super::torch_depth::TorchTableUniform::pack(views.as_deref());
+    let texture = gpu_image.texture.id();
+    // The compare is on the BYTES, not on the source resource's change tick: `TorchShadowViews` is
+    // republished every frame by the app lane whether or not anything in it moved, so a change
+    // detector here would never fire negative.
+    if let Some(mut cached) = cached {
+        if cached.texture == texture
+            && bytemuck::bytes_of(&cached.table) == bytemuck::bytes_of(&table)
+        {
+            return;
+        }
+        // Rebuild in place — one `Res` write instead of a deferred `insert_resource` per frame.
+        *cached = GxTorchBind {
+            group: build_torch_bind(&pipes, &pipeline_cache, &render_device, gpu_image,
+                targets.sampler(), &table),
+            table,
+            texture,
+        };
+        return;
+    }
+    commands.insert_resource(GxTorchBind {
+        group: build_torch_bind(&pipes, &pipeline_cache, &render_device, gpu_image,
+            targets.sampler(), &table),
+        table,
+        texture,
+    });
+}
+
+/// The group-3 bind group itself (see [`GxTorchBind`]) — the uniform buffer is created here because
+/// its contents ARE the cache key, so a new buffer is only ever made on a frame the table moved.
+fn build_torch_bind(
+    pipes: &GxPipelines,
+    pipeline_cache: &PipelineCache,
+    render_device: &RenderDevice,
+    gpu_image: &GpuImage,
+    sampler: &Sampler,
+    table: &super::torch_depth::TorchTableUniform,
+) -> BindGroup {
     let buffer = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("static_gx_torch_table"),
-        contents: bytemuck::bytes_of(&table),
+        contents: bytemuck::bytes_of(table),
         usage: BufferUsages::UNIFORM,
     });
     let layout = pipeline_cache.get_bind_group_layout(&pipes.torch_layout);
-    commands.insert_resource(GxTorchBind(render_device.create_bind_group(
+    render_device.create_bind_group(
         "static_gx_torch",
         &layout,
         &BindGroupEntries::sequential((
-            // The image's default view: D2Array over all 192 layers — the 96 STATIC faces the
-            // table's matrices address plus the 96 LIVE copies (MONKEY, static torch cache); the
-            // shader picks the bank per slot from `count.z`. (wgpu's default view for a
+            // MONKEY (live bank rank): the image's default D2Array view spans all 144 layers:
+            // 96 STATIC faces addressed by matrices plus 48 LIVE copies addressed by the
+            // ascending set-bit rank in `count.z`. (wgpu's default view for a
             // multi-layer 2D texture; `torch_depth.rs` spells out the guarantee).
             &gpu_image.texture_view,
-            targets.sampler(),
+            sampler,
             buffer.as_entire_binding(),
         )),
-    )));
+    )
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -1095,7 +1197,7 @@ impl ViewNode for StaticGxNode {
                 pass.set_render_pipeline(ready[&(run.cutout, run.two_sided)]);
                 pass.set_bind_group(1, &gpu.bind_groups[run.slot].1, &[]);
                 pass.set_bind_group(2, &light_bind.0, &[]);
-                pass.set_bind_group(3, &torch_bind.0, &[]);
+                pass.set_bind_group(3, &torch_bind.group, &[]);
                 pass.draw_indexed(
                     (islice.range.start + run.index_range.start)
                         ..(islice.range.start + run.index_range.end),
@@ -1177,6 +1279,7 @@ mod tests {
             order: 0,
             sidn: [0; 3],
             slot: 0,
+            ext_night: false,
         }
     }
 

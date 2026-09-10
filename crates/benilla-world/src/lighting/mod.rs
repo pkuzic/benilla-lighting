@@ -12,16 +12,21 @@ use benilla_formats::{LightCatalog, LiquidKind};
 
 mod blob; // the off-world light-blob builder (booth studio, body pane, glue scene)
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
+mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
 mod resolve; // the per-frame time-of-day sample into WowLighting + the WMO interior-fog crossfade
 mod sh; // the model SH light-probe coefficient math
 pub use blob::LightBlob;
+// MONKEY (flame flicker): the component + the one route rule, so every spawn lane files a flame
+// the same way and the packer has a single function to evaluate.
+pub use flicker::{flame_kind_for, flicker_seed, FlameFlicker, FlameKind, FlickerMod};
 pub use global_light::{
     interior_reach, m2_light_reach, new_shared_light_buffer, DynamicInteriors, FireLightGain,
     ClaimFade, LightLane, LightLitRooms, LightReach, LightRooms, RoomClaimTable,
     SharedLightBuffer,
-    ShadowDistance, ShadowProxyLight, SyntheticFireLight, WorldShadowActive,
+    ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
+    WorldShadowActive,
 };
 pub use global_light::{
     room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,

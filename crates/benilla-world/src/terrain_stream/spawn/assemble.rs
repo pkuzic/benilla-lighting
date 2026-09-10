@@ -428,8 +428,11 @@ pub fn spawn_model_entities(
                         // entity path).
                         (class.never_fade || fade.is_some()).then_some((*owner, None, None, fade))
                     }
-                    crate::static_gx::GxSite::Wmo { instance, groups }
-                        if is_wmo && class.merges() =>
+                    crate::static_gx::GxSite::Wmo {
+                        instance,
+                        groups,
+                        bounds,
+                    } if is_wmo && class.merges() =>
                     {
                         groups.get(batch_idx).map(|&g| {
                             (
@@ -438,6 +441,13 @@ pub fn spawn_model_entities(
                                     instance: *instance,
                                     group: g,
                                     interior,
+                                    // MONKEY (ext-class night law): EXTERIOR-class at BUILDING
+                                    // scale — the same eligibility the exterior lane's strict
+                                    // claim term uses, so a group that may be lit by a room's
+                                    // fixtures is exactly the group that stops reading as sky.
+                                    ext_night: bounds
+                                        .get(usize::from(g))
+                                        .is_some_and(benilla_formats::room_claim::ext_building_scale),
                                     class: sub.wmo_batch,
                                     sidn: sub.sidn,
                                     window: sub.window,

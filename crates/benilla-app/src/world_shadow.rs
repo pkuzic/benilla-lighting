@@ -38,8 +38,8 @@ use benilla_world::static_gx::StaticGx;
 
 use crate::shadow_core::{
     collect_entity_geometry, empty_cutout_mesh, empty_shadow_mesh, restore_mesh_buffers,
-    shadow_trace, spawn_solid_caster, take_mesh_buffers, ShadowCaster, ShadowDemand, ShadowFrame,
-    ShadowSet, PLAYER_SHADOW_LAYER, STATIC_REBUILD_STEP,
+    shadow_trace, spawn_solid_caster, take_mesh_buffers, RebuildRate, ShadowCaster, ShadowDemand,
+    ShadowFrame, ShadowSet, PLAYER_SHADOW_LAYER, STATIC_REBUILD_STEP,
 };
 use crate::video::VideoConfig;
 
@@ -117,11 +117,15 @@ struct WorldLane {
     env_caster: Option<Entity>,
     env_mesh: Option<Handle<Mesh>>,
     env_traced: (u32, u32, u32),
+    /// MONKEY (sun shadow perf): the `worldShadowRate` cadence gate on the ENVIRONMENT caster only.
+    /// The static solid + cutout casters keep their own, much coarser cadence (16 yd camera drift).
+    env_rate: RebuildRate,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn update_world_shadows(
     video: Res<VideoConfig>,
+    time: Res<Time>,
     mut demand: ResMut<ShadowDemand>,
     frame: Res<ShadowFrame>,
     mut lane: ResMut<WorldLane>,
@@ -169,8 +173,20 @@ fn update_world_shadows(
         let entity = spawn_solid_caster(&mut commands, mesh.clone(), material.clone());
         lane.env_caster = Some(entity);
         lane.env_mesh = Some(mesh);
+        // A brand-new caster is an EMPTY mesh; make sure this frame fills it.
+        lane.env_rate.reset();
     }
-    if let Some(handle) = lane.env_mesh.clone() {
+    // MONKEY (sun shadow perf): the `worldShadowRate` gate — the world lane's twin of the character
+    // lane's. Only THIS caster is paced: the static solid + cutout casters below already rebuild on
+    // 16 yd of camera drift and cost nothing on a standing frame. Skipping leaves the previous
+    // environment proxy in place (the map is still rendered from it every frame), so the only
+    // visible effect is a swinging lamp's or a fading doodad's shadow lagging by up to 1/rate s.
+    //
+    // Its own cvar rather than sharing `characterShadowRate`: this population barely moves, so it
+    // tolerates a far lower rate than an animated crowd does, and a dial named for characters that
+    // silently also governs the world is a trap for whoever reads this next.
+    let env_due = lane.env_rate.due(time.elapsed_secs(), video.world_shadow_rate);
+    if let Some(handle) = lane.env_mesh.clone().filter(|_| env_due) {
         if let Some(mesh) = meshes.get_mut(&handle) {
             let (mut positions, mut indices) = take_mesh_buffers(mesh);
             let (admitted, rejected) = collect_entity_geometry(
@@ -323,4 +339,6 @@ fn teardown(
     if let Some(handle) = lane.env_mesh.take() {
         meshes.remove(handle.id());
     }
+    // The mesh the gate was pacing is gone — re-arm so a re-enable builds on its first frame.
+    lane.env_rate.reset();
 }

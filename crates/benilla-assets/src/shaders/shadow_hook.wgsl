@@ -92,6 +92,20 @@ fn torch_caster_count() -> u32 {
 //                  many overlapping penumbra-less edges, and widening the kernel is the cheapest
 //                  softening available here (a real penumbra would need the blocker distance and a
 //                  variable kernel — not worth a second sampling pass on a 512² face).
+//   - `fade`       MONKEY (outdoor torch shadows): WHICH far fade ends the shadow.
+//                  **Negative = the interior/legacy behaviour, bit-for-bit** — the reverse-Z
+//                  far-plane fade computed from `ndc.z` below. Zero-or-positive = the CALLER's own
+//                  fade weight, used verbatim (0 = no shadow left, 1 = full strength).
+//
+//                  Why an override at all: the projection is near/far `0.1/48`
+//                  (`torch_shadow::cube_view_projs`), so under reverse-Z `ndc.z` is
+//                  `near·(far−t)/((far−near)·t)` = **0.0079 at t = 10 yd**, which
+//                  `smoothstep(0, 0.06, ·)` turns into a 5 % shadow. For a candle whose pool is
+//                  3-4 yd that is a correct soft end; for a campfire whose pool is 15-25 yd it
+//                  erases the shadow exactly where the shadow IS the effect. The fix cannot live
+//                  in here — it wants to be a function of WORLD distance from the fixture, and
+//                  this function is deliberately a pure projector that never sees the fixture — so
+//                  the exterior lane computes `1 − smoothstep(0.8R, R, d)` at its call site.
 // Returns 1.0 outside the frustum / behind the light; a 4-tap PCF factor otherwise (0 = shadowed).
 fn torch_map_shadow(
     view_proj: mat4x4<f32>,
@@ -101,6 +115,7 @@ fn torch_map_shadow(
     comp: sampler_comparison,
     bias: f32,
     soft: f32,
+    fade: f32,
 ) -> f32 {
     let clip = view_proj * vec4<f32>(world_pos, 1.0);
     if (clip.w <= 0.0) {
@@ -126,8 +141,11 @@ fn torch_map_shadow(
     // Phase 5: the six cube faces tile the whole sphere, so there is no cone edge to soften — a fade
     // there would punch a lit seam along every face border. Only the far plane fades (reverse-Z:
     // ndc.z → 0 at far), so a shadow at the fixture's range limit ends softly.
-    let far_fade = smoothstep(0.0, 0.06, ndc.z);
-    return mix(1.0, sum * 0.25, far_fade);
+    // MONKEY (outdoor torch shadows): …unless the caller supplied its own (see `fade`). `select`
+    // rather than a branch so both arms cost the same and the interior arm is the identical
+    // expression it always was.
+    let ndc_fade = smoothstep(0.0, 0.06, ndc.z);
+    return mix(1.0, sum * 0.25, select(fade, ndc_fade, fade < 0.0));
 }
 
 // MONKEY (interior debug): the interior lane's diagnostic overlay. `mode` is decoded from the

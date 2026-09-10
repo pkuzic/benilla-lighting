@@ -30,7 +30,19 @@
 //! 1.5x hysteresis and fades choose up to twelve of sixteen resident slots; this is still a finite
 //! budget, not a promise that a room with forty eligible candles can give all forty cube maps.
 //! Rigid furniture joins the cached static geometry. Only the nearest interiorShadowDynamic
-//! promoted fixtures (default four, measured from the player) overlay creatures/animated parts.
+//! promoted fixtures (default four, maximum eight, measured from the player) overlay creatures/animated parts.
+//!
+//! MONKEY (torch lane perf): what the lane costs when nothing is happening. Three fixed per-frame
+//! charges were paid regardless of every count dial — which is why `interiorShadowCasters 8` and
+//! `interiorShadowDynamic 2` measured identically to the defaults — and each now has a gate:
+//! the static-cache FINGERPRINT walks one slot a frame instead of four AND skips even that while
+//! the scene census is unchanged ([`TORCH_SCAN_PER_FRAME`], [`PartCensus`]); the moving-caster
+//! gather runs at `interiorShadowEntityRate` Hz (default 30, `0` = every frame) over each dynamic
+//! fixture's OWN reach rather than the cube's 48 yd ([`entity_gather_due`],
+//! [`entity_gather_radius`]); and the receivers skip the table scan where the fixture's direct term
+//! is already nothing (`TORCH_SKIP_EPS`, both shaders). None of it changes what is drawn: the
+//! overlay passes still run every frame from the last mesh, so a lower rate ages a POSE and never
+//! removes a shadow. `WOW_TORCH_TRACE=1` prints the three counters as `torch-perf:` lines.
 
 use std::hash::{Hash, Hasher};
 
@@ -47,10 +59,11 @@ use benilla_world::billboard::BillboardCard;
 use benilla_world::interact::PickMesh;
 use benilla_world::lighting::{
     interior_reach, m2_light_reach, DynamicInteriors, FireLightGain, LightLane, LightLitRooms,
-    LightReach, LightRooms, ShadowDistance, SyntheticFireLight,
+    LightReach, LightRooms, ShadowDistance, ShadowProxyLight, SyntheticFireLight, WowLighting,
 };
 // MONKEY (carried light stability): the settle verdict a carried light earns by standing still.
-use crate::entities::CarriedLightMotion;
+// MONKEY (outdoor torch shadows): …and the marker that says a light is CARRIED BY A BODY.
+use crate::entities::{CarriedLightMotion, HeldLight};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 use benilla_world::static_gx::{StaticGx, TorchShadowViews};
@@ -68,6 +81,8 @@ use crate::video::VideoConfig;
 /// `torch_depth::MAX_TORCH_MAPS`; the number actually filled is the live `interiorShadowCasters`
 /// cvar (default 12), so raising the cap does not by itself cost a frame.
 const MAX_TORCH_CASTERS: usize = 16;
+/// MONKEY (live bank rank): the cvar and resource consumer share the render allocation's cap.
+pub(crate) const MAX_TORCH_DYNAMIC: usize = TorchShadowViews::MAX_TORCH_DYNAMIC;
 /// MONKEY (torch caster reach): promote out to FOUR times the fixture's effective reach. Its
 /// pool still needs shadows when viewed across the room, long before it lights the player's body.
 const TORCH_ELIGIBLE_REACH_MULT: f32 = 4.0;
@@ -105,9 +120,28 @@ const CUBE_FACES: usize = 6;
 /// per frame. Hashing one fixture's 48 yd source set walks every resident `GxItem` and every model
 /// part; doing that for all twelve residents every frame hands the CPU back the cost the GPU cache
 /// just saved (~12 full scene scans per frame, and it is a per-frame cost even in a room where
-/// nothing ever changes). Four slots, cursor-rotated, still notices any streaming change within
-/// three frames — under a tenth of a second, and the map it then rebuilds is the same one.
-const TORCH_SCAN_PER_FRAME: usize = 4;
+/// nothing ever changes).
+///
+/// MONKEY (torch lane perf): ONE, not four. Four was already the "don't scan them all" compromise,
+/// but it is still four full walks of the resident static scene AND of every model part, every
+/// frame, forever — measured as the bulk of the ~3 ms the whole lane costs at the Lion's Pride Inn,
+/// which is exactly why neither `interiorShadowCasters` nor `interiorShadowDynamic` moved the frame
+/// time: the cost was never per map. One slot a frame is a 12-frame (~0.26 s) sweep of a full
+/// resident set, which is the same order as the cross-fade a newly promoted slot ramps in over, so
+/// nothing the eye can catch waits on it. Two further things keep that honest: a slot that has
+/// never been fingerprinted JUMPS the queue (see `scan_start`), so a promotion still builds at
+/// once, and the walk itself is skipped whenever neither the retained scene nor the entity-part
+/// census has changed since that slot last looked ([`PartCensus`]).
+const TORCH_SCAN_PER_FRAME: usize = 1;
+/// MONKEY (torch lane perf): slack (yd) added to a fixture's own reach when gathering MOVING
+/// casters for it. The receivers' direct term is `interior_window(d, reach, ..)`, which is exactly
+/// zero at `d >= reach`, so a caster further than `reach` from the fixture can only shadow
+/// fragments the fixture does not light — it is invisible by construction. The margin covers the
+/// part's own extent, because the admission test is on the part's ORIGIN and a body is a couple of
+/// yards tall: without it a unit standing just inside the pool with its origin just outside would
+/// lose its shadow. (The STATIC gather is untouched at the full [`TORCH_RANGE`]: it is cached, so
+/// its radius is not a per-frame cost, and shrinking it would invalidate every cached map.)
+const TORCH_ENTITY_REACH_MARGIN: f32 = 4.0;
 /// MONKEY (static torch cache): how far (yd²) a fixture may drift from the position its cached map
 /// was rendered at before that map is WITHDRAWN. A cached map that is merely STALE (the room
 /// streamed a chair in since it was baked) keeps being published — the shadow is a few frames out
@@ -117,6 +151,23 @@ const TORCH_SCAN_PER_FRAME: usize = 4;
 /// blink: an unready slot's `positions[i].w` is forced to 0 with no fade — precisely the pop the
 /// whole cross-fade exists to prevent — for however many frames the rebuild budget takes to reach it.
 const TORCH_STALE_DRIFT_SQ: f32 = 0.01;
+/// MONKEY (outdoor torch shadows): how far from the PLAYER an exterior fire may still be promoted
+/// (yd). The interior lane's `4R + slack` window has no meaning out here — an exterior entry packs
+/// no reach at all (`lane == 0`, the colour row's reach lane is the interior half's), and the
+/// receivers apply the un-windowed `1/(0.7d + 0.03d²)` to it. So the window is the CUBE MAP's own
+/// range: past [`TORCH_RANGE`] a fixture's whole shadow volume is outside the projection anyway,
+/// and the world fade in the shaders has already ended by then.
+const TORCH_EXT_ELIGIBLE_YD: f32 = TORCH_RANGE;
+/// MONKEY (outdoor torch shadows): EMITTER-OWNER EXCLUSION radius for an exterior slot (yd) — any
+/// retained item whose whole bounding sphere sits inside this of the flame is the fire's OWN body
+/// and is dropped from its caster gather (`StaticGx::append_torch_triangles`). Indoors this is 0
+/// (the interior gather is untouched): an authored MOLT fixture stands clear of its bracket, so
+/// nothing was ever wrong there. Outdoors the light sits INSIDE the campfire prop's opaque logs, and
+/// left in they are the nearest occluder on all six faces — the fire blacks out its own pool.
+/// 2.5 yd covers a campfire/brazier prop whole; a crate or fence post two yards away has its centre
+/// inside that but not its sphere, so it still casts (containment, not centre distance — see
+/// `torch_item_is_emitter`).
+const TORCH_EXT_SELF_EXCLUDE: f32 = 2.5;
 /// Each cube face's FOV: 90° plus a hair, so a direction exactly on a face border still lands
 /// inside the face the shader picks for it (the projector returns "lit" outside its frustum).
 const TORCH_FACE_FOV: f32 = std::f32::consts::FRAC_PI_2 + 0.02;
@@ -154,6 +205,24 @@ struct TorchSlot {
     pos: Vec3,
     /// Its contribution score at the player this frame (see [`fixture_score`]).
     score: f32,
+    /// MONKEY (torch lane perf): the fixture's EFFECTIVE reach in yards — the same `R` the light
+    /// packer writes into the receivers' colour row and the same one [`fixture_score`] ranks with.
+    /// Carried on the slot so the moving-caster gather can be sized off the light that will
+    /// actually be sampled, instead of the cube projection's flat 48 yd far plane. Exterior slots
+    /// hold [`TORCH_RANGE`]: an exterior entry packs no reach, and its receivers apply an
+    /// un-windowed falloff, so there is no smaller honest number out there.
+    reach: f32,
+    /// MONKEY (torch lane perf): the `(retained-scene generation, static-part census, position)`
+    /// this slot last FINGERPRINTED at. While all three are unchanged the source set cannot have
+    /// changed either, so the expensive walk (every resident `GxItem` in 48 yd, then every model
+    /// part) is skipped outright. `None` = never fingerprinted, which also jumps the scan queue.
+    checked: Option<(u64, u64, Vec3)>,
+    /// MONKEY (outdoor torch shadows): which LANE promoted it. Drives the exterior half of the
+    /// budget split, the emitter-owner exclusion radius its caster gather uses, and the published
+    /// `exterior` bit the receivers gate on. A slot never changes lane: a fixture is interior or
+    /// exterior by where it physically stands ([`LightLane`]), and if that verdict ever flipped the
+    /// fixture would leave `cands` and be cross-faded out like any other loss.
+    exterior: bool,
     /// The cross-fade weight, published as `positions[i].w` and applied as `mix(1, shadow, w)` by
     /// both receivers.
     w: f32,
@@ -177,6 +246,38 @@ struct TorchLane {
     slots: Vec<TorchSlot>,
     /// When the last CONTESTED swap was started (seconds of `Time::elapsed`), for the cooldown.
     last_swap: f64,
+    /// MONKEY (torch lane perf): when the moving-caster mesh was last REGATHERED, and for which
+    /// dynamic set. The mesh is retained between regathers — the six overlay passes still run every
+    /// frame from it — so this is a staleness dial on the POSE, never an on/off for the shadow.
+    /// The mask rides along because a gather is only valid for the fixtures it was gathered
+    /// around: when the dynamic set changes the cadence is overridden and the mesh rebuilt at once.
+    entity_at: f64,
+    entity_mask: u32,
+    /// MONKEY (torch lane perf): `WOW_TORCH_TRACE` accounting for the second in progress — how many
+    /// fingerprint walks actually ran, how many regathers, and the last gather's admitted-part
+    /// count and radius. Counters, not timings: they are what tells the user whether a cadence or
+    /// a gate is doing anything at all.
+    trace_scans: u32,
+    trace_gathers: u32,
+    trace_parts: u32,
+    trace_reach: f32,
+}
+
+/// MONKEY (torch lane perf): the per-frame "has anything a fingerprint would hash MOVED?" summary,
+/// computed ONCE for the whole lane instead of once per scanned slot.
+///
+/// The fingerprint it guards is order-independent and covers (a) the retained static scene and (b)
+/// every rigid opaque model part. This pair reproduces both halves cheaply: `gx` folds the retained
+/// regions' own change stamps and populations (O(regions), not O(items) — see
+/// `StaticGx::torch_residency_generation`), and `parts` folds one branch-free mix per part over its
+/// entity id, its geometry `Arc` identity, its translation AND one basis column, so an arrival, a
+/// despawn, a geometry swap, a move and a rotation each change it. It is deliberately NOT a
+/// substitute for the fingerprint — it is scene-wide where the fingerprint is fixture-local, so it
+/// can only ever say "nothing changed anywhere, don't bother looking".
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct PartCensus {
+    gx: u64,
+    parts: u64,
 }
 
 /// MONKEY (torch caster selection): the interior direct term this fixture delivers at distance `d`
@@ -186,6 +287,11 @@ struct TorchLane {
 /// only the second one is stable as you walk, because a fixture's contribution changes smoothly
 /// with distance while its RANK by distance changes in steps.
 ///
+/// MONKEY (torch caster selection): one scored candidate — `(fixture, position, score, exterior,
+/// reach)`. Named because MONKEY (torch lane perf) added the trailing REACH lane, and a `(.., x)`
+/// pattern over a bare tuple would silently have re-bound to it.
+type Candidate = (Entity, Vec3, f32, bool, f32);
+
 /// MONKEY (torch caster reach): retain the intensity and soft inverse-square core at the player's
 /// distance, but stretch the selection window to 4R (including eligibility slack). This is a
 /// ranking extension, not a lighting change: at 3R the score is small, positive and still falling.
@@ -210,6 +316,82 @@ fn candidate_score(
         return 0.0;
     }
     fixture_score(intensity, d, r) * if synthetic { fire_gain.max(0.0) } else { 1.0 }
+}
+
+/// MONKEY (outdoor torch shadows): the EXTERIOR direct term this fixture delivers at distance `d`
+/// — the exterior receivers' OWN profile (`point_light_sum` / `wmo_exterior_point_sum`:
+/// `1/(0.7d + 0.03d²)`, no soft core, no authored window), times the fixture's luminous intensity.
+/// A separate function rather than a flag on [`fixture_score`] because the two lanes genuinely
+/// light differently, and the whole point of scoring by CONTRIBUTION is that the ranking key is the
+/// number the receiver will actually compute.
+///
+/// `d` is floored at 1 yd for the ATTENUATION only: the exterior falloff has a pole at 0 and the
+/// receivers live with it (no surface is ever at the light), but a ranking key that goes to
+/// infinity would let a fixture the player is standing on outrank the entire village for one frame
+/// and then hand the slot back. The window is unfloored and reaches zero at the eligibility edge,
+/// so a candidate's score falls off smoothly instead of stepping to 0 the frame it drops out.
+fn exterior_fixture_score(intensity: f32, d: f32) -> f32 {
+    let dd = d.max(1.0);
+    let atten = 1.0 / (0.7 * dd + 0.03 * dd * dd);
+    // `INTERIOR_DIRECT_POW` only for the WINDOW's shape — the C1 shoulder that takes a candidate's
+    // score to exactly zero at the edge instead of stepping it there. It is the interior lane's
+    // constant because it is the same shoulder, not because this is an interior term; the
+    // attenuation above is the exterior receivers' own and shares nothing with that lane.
+    let w = (1.0 - (d / TORCH_EXT_ELIGIBLE_YD).clamp(0.0, 1.0).powf(INTERIOR_DIRECT_POW))
+        .clamp(0.0, 1.0);
+    intensity * atten * w * w
+}
+
+/// MONKEY (outdoor torch shadows): may an EXTERIOR fire be promoted at all? Same two camera tests
+/// as [`fixture_eligible`] (it is the same cube-map budget and the same `shadowDistance` dial);
+/// the player-distance window is the flat [`TORCH_EXT_ELIGIBLE_YD`] instead of `4R + slack`,
+/// because an exterior entry has no packed reach to take four of.
+fn exterior_eligible(player_d: f32, camera_d: f32, distance: f32) -> bool {
+    camera_d <= TORCH_SEARCH_RADIUS.max(distance)
+        && camera_d <= distance
+        && player_d <= TORCH_EXT_ELIGIBLE_YD
+}
+
+/// MONKEY (outdoor torch shadows): how many of the `interiorShadowCasters` resident slots an
+/// exterior fire may take. HALF, rounded up: a village square at night can easily author more
+/// campfires than the whole budget, and without a cap the first night in Goldshire would evict
+/// every indoor candle in the inn a step away — the interior lane's look is shipped and tuned, and
+/// this feature must not be able to take it away. Rounded UP so the smallest budgets
+/// (`interiorShadowCasters 1`) still get one outdoor shadow rather than none.
+fn exterior_budget(want: usize) -> usize {
+    want.div_ceil(2)
+}
+
+/// MONKEY (outdoor torch shadows): apply the budget split, by TRUNCATING the sorted candidate list
+/// rather than by teaching the slot machinery about lanes. Everything downstream — the incumbent
+/// refresh, the fade-out, the promotion, the contested swap — reads `cands`, so dropping the
+/// exterior tail here means an exterior incumbent that falls past the cap cross-fades out exactly
+/// like a fixture that walked away ("fade, not switch" holds for this eviction too), and no
+/// exterior fixture can ever be promoted into slot `cap + 1`. Interior candidates are untouched:
+/// the cap is a ceiling on the outdoor lane, never a floor under it, so a night indoors still fills
+/// all twelve slots with candles.
+///
+/// `cands` must already be sorted best-first — the survivors are then the BEST `cap` exterior
+/// fires, which is the same ranking rule the whole lane runs on.
+fn cap_exterior_candidates(cands: &mut Vec<Candidate>, cap: usize) {
+    let mut seen = 0usize;
+    cands.retain(|(_, _, _, exterior, _)| {
+        if !*exterior {
+            return true;
+        }
+        seen += 1;
+        seen <= cap
+    });
+}
+
+/// MONKEY (outdoor torch shadows): the realtime-shadow day strength — a three-line mirror of
+/// `benilla_world::lighting::global_light`'s private `sun_shadow_strength` (`blob_shadow.rs` keeps
+/// the same mirror, for the same reason: it is three lines and a `pub` on it would be a wider API
+/// than the number deserves). **Exactly 1.0 above ~12° of sun elevation**, which is what makes
+/// `night_w = 1 - this` exactly 0 by day in the receivers — the daylight-is-untouched guarantee.
+fn sun_shadow_strength(sun_height: f32) -> f32 {
+    let t = (sun_height / 0.208).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// MONKEY (static torch cache): camera distance uses the world-shadow resource's Bevy-yard
@@ -237,7 +419,37 @@ fn dynamic_set(fixtures: &[(usize, Vec3)], anchor: Vec3, budget: usize) -> u32 {
     let mut nearest = fixtures.to_vec();
     nearest.sort_by(|a, b| a.1.distance_squared(anchor).total_cmp(&b.1.distance_squared(anchor))
         .then(a.0.cmp(&b.0)));
-    nearest.iter().take(budget.min(MAX_TORCH_CASTERS)).fold(0, |mask, (i, _)| mask | (1 << i))
+    // MONKEY (live bank rank): also clamp resource values that bypass the cvar setter.
+    nearest.iter().take(budget.clamp(1, MAX_TORCH_DYNAMIC)).fold(0, |mask, (i, _)| mask | (1 << i))
+}
+
+/// MONKEY (torch lane perf): the radius the MOVING-caster gather admits parts inside, for a
+/// fixture of effective reach `reach`. See [`TORCH_ENTITY_REACH_MARGIN`] for why `reach + margin`
+/// is the honest bound and not a tightening of the effect; clamped to [`TORCH_RANGE`] because
+/// nothing outside the cube projection can be recorded anyway.
+fn entity_gather_radius(reach: f32) -> f32 {
+    if !reach.is_finite() {
+        return TORCH_RANGE;
+    }
+    (reach + TORCH_ENTITY_REACH_MARGIN).clamp(TORCH_ENTITY_REACH_MARGIN, TORCH_RANGE)
+}
+
+/// MONKEY (torch lane perf): is `origin` inside ANY of the gather's fixtures' own radii — the
+/// UNION that replaced "48 yd of every dynamic fixture". Split out as a pure function because it is
+/// the whole admission rule of the gather and the one part of it worth a test.
+fn within_any_reach(fixtures: &[(usize, Vec3, f32)], origin: Vec3) -> bool {
+    fixtures.iter().any(|(_, p, r)| p.distance_squared(origin) <= r * r)
+}
+
+/// MONKEY (torch lane perf): is a REGATHER of the moving-caster mesh due this frame?
+///
+/// `rate == 0` is the pre-feature every-frame behaviour, kept as the live A/B. A changed dynamic
+/// SET always forces one — the mesh is only valid for the fixtures it was gathered around, and
+/// keeping a stale one there would put a shadow in a room the overlay no longer serves. `elapsed`
+/// is compared against `1/rate` with a small tolerance so a 30 Hz cadence on a 60 fps frame lands
+/// on every other frame rather than alternating 1 and 3 frames as the two clocks beat.
+fn entity_gather_due(rate: u32, elapsed: f64, mask: u32, last_mask: u32) -> bool {
+    rate == 0 || mask != last_mask || elapsed >= 1.0 / f64::from(rate) - 1e-4
 }
 
 /// MONKEY (torch caster selection): the entity-caster query trio, bundled as ONE `SystemParam`.
@@ -264,11 +476,31 @@ struct EntityCasters<'w, 's> {
     rigs: Query<'w, 's, &'static RigSkin>,
     palettes: Res<'w, RigPalettes>,
     distance: Res<'w, ShadowDistance>,
+    /// MONKEY (outdoor torch shadows): the live celestial sun, for the night gate. It rides THIS
+    /// bundle rather than being a 17th system param because `update_torch_shadows` already sits at
+    /// Bevy's 16-param ceiling — the same reason `distance` is here.
+    lighting: Res<'w, WowLighting>,
 }
 
-/// The lane is active when the dynamic-interior lane is on AND its shadow toggle is on.
+/// The INTERIOR lane is active when the dynamic-interior lane is on AND its shadow toggle is on.
 fn interior_shadows_on(video: &VideoConfig) -> bool {
     video.interior_light && video.interior_shadows
+}
+
+/// MONKEY (outdoor torch shadows): the EXTERIOR lane's gate — its own cvar AND night.
+///
+/// Deliberately independent of `interiorLight`: the exterior receivers (`wmo_exterior_point_sum`
+/// on a WMO's outdoor-class surfaces, `point_light_sum` on doodads/entities) have never been part
+/// of the dynamic-interior feature and are drawn with `interiorLight 0` exactly as with it, so
+/// tying their shadows to that dial would be surprising in both directions.
+///
+/// Night is a HARD gate, not a fade to zero, because it is what buys the "daytime is bit-identical"
+/// claim on the CPU side as well as in the shaders: with the sun up there are no exterior
+/// candidates, so no exterior slot, so no exterior caster mesh, no depth render, and the published
+/// `exterior` bit is 0. `sun_shadow_strength` saturates at exactly 1.0 above ~12° of elevation, so
+/// the test is the same threshold the receivers' own `night_w` crosses — the two cannot disagree.
+fn exterior_shadows_on(video: &VideoConfig, sun_strength: f32) -> bool {
+    video.exterior_shadows && sun_strength < 1.0
 }
 
 /// A reverse-Z perspective (near → 1, far → 0; wgpu clip, RH, looking down −Z) — matches the whole
@@ -331,11 +563,19 @@ fn update_torch_shadows(
     // MONKEY (carried light stability): `Has<ChildOf>` + `Option<&CarriedLightMotion>` ride the
     // tuple so the filter below can refuse a MOVING carried light a slot. Both are cheap table
     // reads on a query that already walks these entities.
+    // MONKEY (outdoor torch shadows): the FILTER moved into the closure. It used to be
+    // `Or<(With<LightRooms>, With<LightLitRooms>)>` — "has a room claim" — which is exactly the set
+    // of fixtures that can be interior, and therefore excluded every outdoor campfire from the
+    // query outright. The filter is now the packer's own (`Without<ShadowProxyLight>`: a proxy is a
+    // `PointLight` that exists only to cast, never to light), and the room-claim test is applied
+    // per-candidate on the INTERIOR arm below, so the interior candidate set is unchanged
+    // member-for-member. `Has<LightLitRooms>` rides the tuple to reproduce the other half of the
+    // retired `Or`, and `Has<HeldLight>` to refuse a body-carried torch an EXTERIOR slot.
     torches: Query<
         (Entity, &GlobalTransform, &PointLight, Option<&LightReach>, Option<&LightLane>,
-         Has<LightRooms>, Has<SyntheticFireLight>, Has<ChildOf>,
-         Option<&crate::entities::CarriedLightMotion>),
-        Or<(With<LightRooms>, With<LightLitRooms>)>,
+         Has<LightRooms>, Has<LightLitRooms>, Has<SyntheticFireLight>, Has<ChildOf>,
+         Has<HeldLight>, Option<&crate::entities::CarriedLightMotion>),
+        Without<ShadowProxyLight>,
     >,
     // MONKEY (torch caster selection): `atten_scale` — a fixture's EFFECTIVE radius is its authored
     // end times this live cvar, and the score's window is a fraction of that radius. Reading the
@@ -349,7 +589,12 @@ fn update_torch_shadows(
     mut last_trace: Local<f64>,
 ) {
     // Declare demand so the shared rig stays up while on.
-    let on = interior_shadows_on(&video) && *state.get() == ClientState::InWorld;
+    // MONKEY (outdoor torch shadows): EITHER lane keeps the lane alive — they share the sixteen
+    // cube slots, the rebuild budget and the depth bank, so there is one system, not two.
+    let sun_w = sun_shadow_strength(ents.lighting.celestial_dir().y);
+    let interior_on = interior_shadows_on(&video);
+    let exterior_on = exterior_shadows_on(&video, sun_w);
+    let on = (interior_on || exterior_on) && *state.get() == ClientState::InWorld;
     demand.0 = demand.0 || on;
 
     if !(frame.active && on) {
@@ -389,9 +634,11 @@ fn update_torch_shadows(
 
     // (1a) MONKEY (torch caster reach): each pool is eligible from 4R + slack away. Rank with the
     // same soft core/intensity so nearby contributors still win over pools seen across the room.
-    let mut cands: Vec<(Entity, Vec3, f32)> = torches
+    // MONKEY (outdoor torch shadows): the candidate tuple carries its LANE (`true` = exterior).
+    let mut cands: Vec<Candidate> = torches
         .iter()
-        .filter_map(|(e, gt, pl, reach, light_lane, has_rooms, synthetic, carried, motion)| {
+        .filter_map(|(e, gt, pl, reach, light_lane, has_rooms, has_lit, synthetic, carried,
+                      held, motion)| {
             // MONKEY (carried light stability): a CARRIED light (`ChildOf` — a pet's hand flame,
             // an NPC's torch, a transport's deck brazier) casts only while it is STANDING STILL.
             //
@@ -426,28 +673,68 @@ fn update_torch_shadows(
                 .filter(|r| *r > 0.5)
                 .unwrap_or_else(|| m2_light_reach(base));
             let r = interior_reach(authored, interiors.atten_scale);
-            if !fixture_eligible(d, p.distance(cam), r, ents.distance.0) {
-                return None;
-            }
+            // MONKEY (outdoor torch shadows): the `4R + slack` eligibility test moved DOWN into the
+            // interior arm (unchanged there). It cannot be shared: `r` is an INTERIOR reach — the
+            // authored MOLT end or the M2 intensity bucket times `interiorAttenScale` — and an
+            // exterior entry packs no reach at all, so applying it out here would size an outdoor
+            // campfire's promotion window off a number no exterior receiver ever reads.
             let c = pl.color.to_linear();
             // Rec.709 luminance of the committed colour: ONE scalar for "how much light is this",
             // so a dim blue magic brazier cannot outrank a bright hearth on channel count.
             let lum = (0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue).max(0.0) * base.max(0.0);
-            let score = candidate_score(lum, d, r, light_lane, has_rooms, synthetic, fire_gain.0);
-            (score > 0.0).then_some((e, p, score))
+            // MONKEY (outdoor torch shadows): the lane split. It is the SAME verdict the light
+            // packer writes into the colour row's `.w` (`LightLane` — a light is interior iff it
+            // physically stands in an interior-class WMO group, with the old `LightRooms` rule as
+            // the pre-classification fallback), because that is what decides which receiver family
+            // reads it and therefore which shadow lane can ever be sampled for it.
+            let interior = light_lane.map_or(has_rooms, |l| l.interior);
+            if interior {
+                // The interior arm, unchanged — including the retired query filter's own
+                // membership test, so this candidate set is identical member-for-member to the one
+                // `Or<(With<LightRooms>, With<LightLitRooms>)>` produced.
+                if !interior_on || !(has_rooms || has_lit) {
+                    return None;
+                }
+                if !fixture_eligible(d, p.distance(cam), r, ents.distance.0) {
+                    return None;
+                }
+                let score =
+                    candidate_score(lum, d, r, light_lane, has_rooms, synthetic, fire_gain.0);
+                // MONKEY (torch lane perf): `r` rides along — the moving-caster gather sizes its
+                // radius off the light that will be sampled, not off the cube's 48 yd far plane.
+                return (score > 0.0).then_some((e, p, score, false, r));
+            }
+            // The EXTERIOR arm — a campfire, a brazier, a lamppost, a bonfire.
+            if !exterior_on || held {
+                return None;
+            }
+            if !exterior_eligible(d, p.distance(cam), ents.distance.0) {
+                return None;
+            }
+            // Same synthetic-gain fold as the interior arm (and as the packer): dimming the
+            // invented lights with `fireLightGain 0` must take their shadows with them, or a fire
+            // that lights nothing would still carve a black wedge across the ground.
+            let gain = if synthetic { fire_gain.0.max(0.0) } else { 1.0 };
+            let score = exterior_fixture_score(lum * gain, d);
+            // MONKEY (torch lane perf): an exterior entry packs no reach and its receivers apply an
+            // un-windowed falloff, so the cube's own range is the only honest gather radius here.
+            (score > 0.0).then_some((e, p, score, true, TORCH_RANGE))
         })
         .collect();
     cands.sort_by(|a, b| b.2.total_cmp(&a.2));
+    let ext_cap = exterior_budget(want);
+    cap_exterior_candidates(&mut cands, ext_cap);
 
     // (1b) Refresh the incumbents against this frame's candidates. A fixture that dropped out of
     // the set (it moved away, despawned, its room streamed out) starts fading rather than
     // vanishing. A slot past the live budget does the same, so lowering `interiorShadowCasters`
     // fades its extra shadows out instead of cutting them.
     for (i, slot) in lane.slots.iter_mut().enumerate() {
-        match cands.iter().find(|(e, _, _)| *e == slot.fixture) {
-            Some((_, p, sc)) => {
+        match cands.iter().find(|(e, ..)| *e == slot.fixture) {
+            Some((_, p, sc, _, r)) => {
                 slot.pos = *p;
                 slot.score = *sc;
+                slot.reach = *r;
             }
             None => {
                 slot.score = 0.0;
@@ -482,9 +769,9 @@ fn update_torch_shadows(
     // MONKEY (static torch cache): at most two new residents per frame, including startup.
     let mut promotions = 0;
     while lane.slots.len() < want && promotions < 2 {
-        let Some(&(e, p, sc)) = cands
+        let Some(&(e, p, sc, exterior, reach)) = cands
             .iter()
-            .find(|(e, _, _)| !lane.slots.iter().any(|s| s.fixture == *e))
+            .find(|(e, ..)| !lane.slots.iter().any(|s| s.fixture == *e))
         else {
             break;
         };
@@ -499,6 +786,9 @@ fn update_torch_shadows(
             fixture: e,
             pos: p,
             score: sc,
+            reach,
+            checked: None,
+            exterior,
             w: 0.0,
             evicting: false,
         });
@@ -518,8 +808,8 @@ fn update_torch_shadows(
             .map(|(i, s)| (i, s.score));
         let challenger = cands
             .iter()
-            .find(|(e, _, _)| !lane.slots.iter().any(|s| s.fixture == *e))
-            .map(|(_, _, sc)| *sc);
+            .find(|(e, ..)| !lane.slots.iter().any(|s| s.fixture == *e))
+            .map(|(_, _, sc, ..)| *sc);
         if let (Some((idx, weak)), Some(best)) = (weakest, challenger) {
             if best > weak * TORCH_SWAP_RATIO {
                 lane.slots[idx].evicting = true;
@@ -530,25 +820,36 @@ fn update_torch_shadows(
 
     // The published set, in slot order: fixture, position, score (trace only) and fade weight,
     // capped at the table's allocation.
-    let promoted: Vec<(usize, Entity, Vec3, f32, f32)> = lane
+    // MONKEY (outdoor torch shadows): …and each slot's LANE, for the caster gather's self-exclusion
+    // radius, the published `exterior` bit and the trace.
+    let promoted: Vec<(usize, Entity, Vec3, f32, f32, bool)> = lane
         .slots
         .iter()
         .take(MAX_TORCH_CASTERS)
-        .map(|s| (s.cache_slot, s.fixture, s.pos, s.score, s.w))
+        .map(|s| (s.cache_slot, s.fixture, s.pos, s.score, s.w, s.exterior))
         .collect();
 
     // (2) MONKEY (static torch cache): fingerprint resident SOURCE geometry per fixture, not
     // StaticGx's change tick (frame bookkeeping changes it continuously). This catches arrivals,
     // removals and replacements even with a stationary camera. Entity-resident rigid furniture
     // joins the static mesh; creatures and skinned/animated parts belong to the dynamic overlay.
-    let fixture_positions: Vec<_> = promoted.iter().map(|(i, _, p, _, _)| (*i, *p)).collect();
+    let fixture_positions: Vec<_> = promoted.iter().map(|(i, _, p, ..)| (*i, *p)).collect();
     let dynamic = dynamic_set(&fixture_positions, anchor, video.interior_shadow_dynamic as usize);
     let mut rebuilt = 0;
     let mut static_rebuilt = 0u32;
+    // MONKEY (torch lane perf): how many fingerprint walks the gate actually let through this
+    // frame, folded into the lane's per-second trace below (`lane` is mutably borrowed inside the
+    // loop, so the counter cannot live on it until the loop has finished).
+    let mut lane_scans = 0u32;
     let mut published = TorchShadowViews {
         count: promoted.iter().map(|(i, ..)| *i as u32 + 1).max().unwrap_or(0),
         soft: video.interior_shadow_soft,
         dynamic_mask: dynamic,
+        // MONKEY (outdoor torch shadows): the receivers' one-bit gate — the cvar, the sun AND an
+        // actual exterior slot to sample. Keyed on the SLOTS rather than on `exterior_on` alone so
+        // that a night with the cvar on but nothing promoted (no fires in range) costs the
+        // receivers nothing at all, which is most of the outdoor world.
+        exterior: exterior_on && promoted.iter().any(|(.., ext)| *ext),
         ..Default::default()
     };
     // MONKEY (static torch cache): rotate service order so two moving/carried fixtures cannot
@@ -558,16 +859,51 @@ fn update_torch_shadows(
     // for every slot every frame would be the new cost ceiling — and at most two of those slots
     // could act on the answer anyway.
     let slot_count = lane.slots.len();
-    let start = lane.rebuild_cursor;
+    // MONKEY (torch lane perf): the scene-wide census, computed ONCE for the whole lane rather
+    // than implicitly once per scanned slot. Everything a fingerprint hashes lives in exactly two
+    // places, and both are summarised here far more cheaply than they are hashed: the retained
+    // regions' change stamps and populations, and one branch-free mix per rigid opaque model part.
+    // While this pair is unchanged the fixture-local source set cannot have changed either, so the
+    // slot's walk is skipped outright — which is what turns "a full scene scan every frame,
+    // forever, in a room where nothing ever moves" into "a scan the frame something does".
+    let census = (slot_count > 0)
+        .then(|| PartCensus {
+            gx: gx.as_ref().map_or(0, |gx| gx.torch_residency_generation()),
+            parts: static_part_census(&ents),
+        })
+        .unwrap_or_default();
+    // A slot that has NEVER been fingerprinted jumps the queue: with one scan a frame a fresh
+    // promotion would otherwise wait a whole sweep for its first map, and a slot with no map
+    // publishes none (`map_publishable`), so that wait is a shadow that is simply missing. There
+    // are at most two promotions a frame, so this can never crowd the rotation out for long.
+    let start = lane
+        .slots
+        .iter()
+        .position(|s| s.checked.is_none())
+        .unwrap_or_else(|| if slot_count == 0 { 0 } else { lane.rebuild_cursor % slot_count });
     let scan = slot_count.min(TORCH_SCAN_PER_FRAME);
     for offset in 0..scan {
         let index = (start + offset) % slot_count;
         let slot = &mut lane.slots[index];
         let i = slot.cache_slot;
+        // MONKEY (torch lane perf): the skip. The fixture's own position joins the census because
+        // it is hashed INTO the fingerprint (a carried torch moves without the world changing),
+        // and a slot is only ever stamped once its key is actually committed below — a rebuild
+        // deferred by the budget must come back and try again, not be certified as looked at.
+        if slot.checked == Some((census.gx, census.parts, slot.pos)) {
+            continue;
+        }
+        lane_scans += 1;
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         slot.fixture.hash(&mut hash);
         slot.pos.to_array().map(f32::to_bits).hash(&mut hash);
-        gx.as_ref().map(|gx| gx.torch_geometry_key(slot.pos, TORCH_RANGE)).hash(&mut hash);
+        // MONKEY (outdoor torch shadows): the exclusion radius is part of the ADMISSION, so it
+        // must be part of the FINGERPRINT — a key computed over a different source set than the
+        // mesh would certify the wrong geometry as current.
+        let self_exclude = if slot.exterior { TORCH_EXT_SELF_EXCLUDE } else { 0.0 };
+        gx.as_ref()
+            .map(|gx| gx.torch_geometry_key(slot.pos, TORCH_RANGE, self_exclude))
+            .hash(&mut hash);
         let mut entity_key = 0u64;
         for (entity, pick, part, global, rig, occluder, _) in &ents.parts {
             if !static_part(part, rig.is_some()) || !occluder.0 { continue; }
@@ -583,18 +919,24 @@ fn update_torch_shadows(
         entity_key.hash(&mut hash);
         let key = hash.finish();
         let dirty = slot.geometry_key != Some(key);
+        if !dirty {
+            slot.checked = Some((census.gx, census.parts, slot.pos));
+        }
         if dirty && rebuilt < 2 {
             let mut positions = Vec::new();
             let mut indices = Vec::new();
             if let Some(gx) = &gx {
-                gx.append_torch_triangles(slot.pos, TORCH_RANGE, &mut positions, &mut indices);
+                gx.append_torch_triangles(
+                    slot.pos, TORCH_RANGE, self_exclude, &mut positions, &mut indices);
             }
-            collect_torch_entities(&ents, true, &[(i, slot.pos)], &mut positions, &mut indices);
+            collect_torch_entities(
+                &ents, true, &[(i, slot.pos, TORCH_RANGE)], &mut positions, &mut indices);
             let mut mesh = empty_shadow_mesh();
             restore_mesh_buffers(&mut mesh, positions, indices);
             if let Some(old) = slot.mesh.replace(meshes.add(mesh)) { meshes.remove(old.id()); }
             slot.geometry_key = Some(key);
             slot.built_at = Some(slot.pos);
+            slot.checked = Some((census.gx, census.parts, slot.pos));
             rebuilt += 1;
             static_rebuilt |= 1 << i;
         }
@@ -636,18 +978,51 @@ fn update_torch_shadows(
     }
     // MONKEY (static torch cache): gather only around the dynamic subset, not every promoted
     // fixture. A single mesh serves those N maps and contains no rigid furniture already cached.
-    let dynamic_positions: Vec<_> = fixture_positions.iter().copied()
-        .filter(|(i, _)| dynamic & (1 << i) != 0).collect();
-    let mut ent_admitted = 0;
+    //
+    // MONKEY (torch lane perf): …and only within each of those fixtures' OWN reach, not within the
+    // cube projection's flat 48 yd. The receivers' direct term is exactly zero past `reach`
+    // (`interior_window`), so a caster admitted beyond it could only ever shadow fragments this
+    // fixture does not light — it was pure cost. A candle's ~12 yd pool is a twentieth of the
+    // volume the 48 yd radius swept, and this gather CPU-SKINS every part it admits.
+    let dynamic_positions: Vec<(usize, Vec3, f32)> = lane
+        .slots
+        .iter()
+        .take(MAX_TORCH_CASTERS)
+        .filter(|s| dynamic & (1 << s.cache_slot) != 0)
+        .map(|s| (s.cache_slot, s.pos, entity_gather_radius(s.reach)))
+        .collect();
+    // MONKEY (torch lane perf): and only at `interiorShadowEntityRate` Hz. The gather + the
+    // `Mesh` mutation it feeds (a full vertex/index re-extraction, a GPU re-upload and an
+    // `AssetChanged<Mesh3d>` fan-out through material specialisation) were paid EVERY frame
+    // regardless of every count dial — the fixed charge that made `interiorShadowCasters 8` and
+    // `interiorShadowDynamic 2` measure identically to the defaults. The mesh is RETAINED between
+    // regathers and the six overlay passes still draw it every frame, so this ages the pose the
+    // casters were skinned at; it never removes a shadow.
     if dynamic != 0 {
-        if lane.entity_mesh.is_none() { lane.entity_mesh = Some(meshes.add(empty_shadow_mesh())); }
-        if let Some(mesh) = lane.entity_mesh.as_ref().and_then(|h| meshes.get_mut(h)) {
-            let (mut positions, mut indices) = take_mesh_buffers(mesh);
-            ent_admitted = collect_torch_entities(&ents, false, &dynamic_positions, &mut positions, &mut indices);
-            restore_mesh_buffers(mesh, positions, indices);
+        let fresh = lane.entity_mesh.is_none();
+        if fresh { lane.entity_mesh = Some(meshes.add(empty_shadow_mesh())); }
+        let due = fresh
+            || entity_gather_due(
+                video.interior_shadow_entity_rate,
+                now - lane.entity_at,
+                dynamic,
+                lane.entity_mask,
+            );
+        if due {
+            if let Some(mesh) = lane.entity_mesh.as_ref().and_then(|h| meshes.get_mut(h)) {
+                let (mut positions, mut indices) = take_mesh_buffers(mesh);
+                lane.trace_parts = collect_torch_entities(
+                    &ents, false, &dynamic_positions, &mut positions, &mut indices);
+                restore_mesh_buffers(mesh, positions, indices);
+            }
+            lane.trace_gathers += 1;
+            lane.entity_at = now;
+            lane.entity_mask = dynamic;
         }
         published.entity_mesh = lane.entity_mesh.as_ref().map(Handle::id);
     }
+    lane.trace_scans += lane_scans;
+    lane.trace_reach = dynamic_positions.iter().map(|(.., r)| *r).fold(0.0, f32::max);
     *views = published;
 
     // `WOW_TORCH_TRACE=1` — once a second, what the lane published: fixture distances + whether a
@@ -655,28 +1030,54 @@ fn update_torch_shadows(
     if std::env::var_os("WOW_TORCH_TRACE").is_some() {
         if now - *last_trace >= 1.0 {
             *last_trace = now;
+            // MONKEY (outdoor torch shadows): the header carries the lane budget too — "6 of the
+            // 12 slots may be exterior, 3 currently are, the sun is at 0.00" is the whole state of
+            // the split in one line, and it is the first thing to read when an outdoor shadow is
+            // missing (no EXT slots at sun 1.00 is correct; no EXT slots at sun 0.00 is a bug).
             info!(
-                "torch-trace: {}/{} slots of {} ({} candidates, caster {}, {} entity casters)",
+                "torch-trace: {}/{} slots of {} (ext {}/{}, sun {:.2}, {} candidates, caster {}, {} entity casters)",
                 promoted.len(),
                 want,
                 MAX_TORCH_CASTERS,
+                promoted.iter().filter(|(.., ext)| *ext).count(),
+                ext_cap,
+                sun_w,
                 cands.len(),
                 if lane.slots.iter().any(|s| s.mesh.is_some()) {
                     "built"
                 } else {
                     "none"
                 },
-                ent_admitted,
+                lane.trace_parts,
             );
+            // MONKEY (torch lane perf): the FIXED per-frame cost, in the two counters that bound
+            // it. `gather parts N (rate R Hz, reach X yd)` is the CPU-skinned moving-caster set and
+            // the cadence + union radius it was taken at; `fingerprint scans S` is how many full
+            // resident-scene walks the census gate actually let through in the last second (a
+            // still room should read 0, a streaming one a handful). Both are per SECOND, so they
+            // are directly comparable to the frame rate beside them: `gathers` equal to the fps is
+            // `interiorShadowEntityRate 0`, and `scans` equal to the fps is the old behaviour with
+            // the gate defeated.
+            info!(
+                "torch-perf: gather parts {} (rate {} Hz, {} gathers/s, reach {:.0} yd), fingerprint scans {}/s",
+                lane.trace_parts,
+                video.interior_shadow_entity_rate,
+                lane.trace_gathers,
+                lane.trace_reach,
+                lane.trace_scans,
+            );
+            lane.trace_gathers = 0;
+            lane.trace_scans = 0;
             // MONKEY (torch caster selection): per SLOT, the three numbers the selection is made
             // of — which fixture, what it scores at the player, and how far its cross-fade has
             // ramped. A shadow that pops is a `w` that jumped; a shadow that should be there and
             // is not is a fixture missing from this list (then read `cands`, above).
             // MONKEY (torch caster reach): scientific scores expose the small distant tail;
             // distance is still from the player, and eligibility now extends to 4R + 3 yd.
-            for (i, e, p, sc, w) in &promoted {
+            for (i, e, p, sc, w, ext) in &promoted {
                 info!(
-                    "  slot {i}: {e} at [{:.1},{:.1},{:.1}] d(player) {:.1} score {:.4e} w {:.2} (camera <= shadowDistance AND player <= 4R+3) static {} dynamic {}",
+                    "  slot {i}: lane {} {e} at [{:.1},{:.1},{:.1}] d(player) {:.1} score {:.4e} w {:.2} (camera <= shadowDistance AND player <= 4R+3) static {} dynamic {} requested_live_rank {:?}",
+                    if *ext { "EXT" } else { "INT" },
                     p.x,
                     p.y,
                     p.z,
@@ -685,6 +1086,7 @@ fn update_torch_shadows(
                     w,
                     if static_rebuilt & (1 << i) != 0 { "rebuilt (GPU pending)" } else { "cached/requested" },
                     if dynamic & (1 << i) != 0 { "yes" } else { "no" },
+                    (dynamic & (1 << i) != 0).then(|| TorchShadowViews::live_rank(dynamic, *i)),
                 );
             }
         }
@@ -697,8 +1099,12 @@ fn static_part(part: &ModelPart, rigged: bool) -> bool {
     part.kind != ModelKind::Creature && !rigged && part.blend == ModelBlend::Opaque
 }
 
+/// MONKEY (torch lane perf): `fixtures` is `(slot, position, RADIUS)` — each fixture carries the
+/// radius it admits casters inside, instead of the whole gather sharing [`TORCH_RANGE`]. The static
+/// (cached) caller passes `TORCH_RANGE` and is therefore byte-for-byte the gather it always was;
+/// only the per-frame MOVING gather narrows, to `entity_gather_radius(reach)`.
 fn collect_torch_entities(
-    ents: &EntityCasters, want_static: bool, fixtures: &[(usize, Vec3)],
+    ents: &EntityCasters, want_static: bool, fixtures: &[(usize, Vec3, f32)],
     positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>,
 ) -> u32 {
     let mut admitted = 0;
@@ -711,7 +1117,7 @@ fn collect_torch_entities(
         let origin = global.map(GlobalTransform::translation)
             .or_else(|| rig.and_then(|r| ents.palettes.slot_origin(r.slot)));
         let Some(origin) = origin else { continue };
-        if !fixtures.iter().any(|(_, p)| p.distance_squared(origin) <= TORCH_RANGE * TORCH_RANGE) { continue; }
+        if !within_any_reach(fixtures, origin) { continue; }
         let base = positions.len() as u32;
         if let Some(rig) = rig {
             let Some(palette) = ents.palettes.world_palette(rig.slot, rig.bones() as usize) else { continue };
@@ -746,6 +1152,34 @@ fn collect_torch_entities(
     admitted
 }
 
+/// MONKEY (torch lane perf): the entity half of [`PartCensus`] — one branch-free mix per RIGID
+/// OPAQUE model part (the exact set the fingerprint's own entity walk hashes), folded
+/// order-independently so archetype reordering is invisible.
+///
+/// Deliberately much cheaper than the thing it guards: no `DefaultHasher` per part and no
+/// `to_matrix()`, just the entity id, the geometry `Arc`'s identity, the affine's translation and
+/// ONE basis column. Translation catches a moved prop, the basis column catches a rotated one (a
+/// door on its hinge barely moves its origin), the `Arc` catches a geometry swap, and the id sum
+/// catches an arrival or a despawn. What it cannot see — a part rotating exactly about the axis of
+/// the column sampled — has no bearing on a shadow's silhouette to the precision this lane renders.
+fn static_part_census(ents: &EntityCasters) -> u64 {
+    let mut census = 0u64;
+    for (entity, pick, part, global, rig, occluder, _) in &ents.parts {
+        if !occluder.0 || !static_part(part, rig.is_some()) { continue; }
+        let Some(global) = global else { continue };
+        let a = global.affine();
+        let mut mix = entity.to_bits() ^ (std::sync::Arc::as_ptr(&pick.0) as usize as u64);
+        for v in [
+            a.translation.x, a.translation.y, a.translation.z,
+            a.matrix3.x_axis.x, a.matrix3.x_axis.y, a.matrix3.x_axis.z,
+        ] {
+            mix = mix.rotate_left(11) ^ u64::from(v.to_bits());
+        }
+        census = census.wrapping_add(mix);
+    }
+    census
+}
+
 /// Tear down the caster mesh and clear the published views (the lane went off, or we left the world).
 fn teardown(lane: &mut TorchLane, meshes: &mut Assets<Mesh>, views: &mut TorchShadowViews) {
     for slot in &mut lane.slots {
@@ -755,6 +1189,11 @@ fn teardown(lane: &mut TorchLane, meshes: &mut Assets<Mesh>, views: &mut TorchSh
     // MONKEY (torch caster selection): the slot table goes with them — an incumbent kept across a
     // teardown would come back at full weight in a room it is no longer in.
     lane.slots.clear();
+    // MONKEY (torch lane perf): the gather bookkeeping goes with them. A lane that comes back up in
+    // a different room must regather on its first frame, not wait out a cadence tick against a
+    // timestamp from before the teardown.
+    lane.entity_at = 0.0;
+    lane.entity_mask = 0;
     *views = TorchShadowViews::default();
 }
 
@@ -796,14 +1235,17 @@ mod tests {
         assert!(!fixture_eligible(1.0, f32::NAN, 48.0, 80.0));
     }
 
-    // MONKEY (static torch cache): sparse physical slots, tie stability and live shrink/off.
+    // MONKEY (live bank rank): sparse slots, tie stability and both ends of the live budget.
     #[test]
     fn dynamic_subset_is_nearest_and_deterministic() {
         let fixtures = [(15, Vec3::X), (8, -Vec3::X), (2, Vec3::X * 20.0), (4, Vec3::ZERO)];
         assert_eq!(dynamic_set(&fixtures, Vec3::ZERO, 2), (1 << 4) | (1 << 8));
         assert_eq!(dynamic_set(&fixtures, Vec3::X * 20.0, 1), 1 << 2);
-        assert_eq!(dynamic_set(&fixtures, Vec3::ZERO, 0), 0);
+        assert_eq!(dynamic_set(&fixtures, Vec3::ZERO, 0), 1 << 4);
         assert_eq!(dynamic_set(&fixtures, Vec3::ZERO, 16).count_ones(), 4);
+        let all: Vec<_> = (0..MAX_TORCH_CASTERS).map(|i| (i, Vec3::X * i as f32)).collect();
+        assert_eq!(dynamic_set(&all, Vec3::ZERO, 16), 0xff);
+        assert_eq!(dynamic_set(&[], Vec3::ZERO, 1), 0);
     }
 
     // MONKEY (static torch cache): a never-built slot publishes nothing; a merely STALE map keeps
@@ -816,6 +1258,138 @@ mod tests {
         assert!(map_publishable(Some(Vec3::ZERO), Vec3::X * 0.09));
         assert!(!map_publishable(Some(Vec3::ZERO), Vec3::X * 0.2));
         assert!(!map_publishable(Some(Vec3::ZERO), Vec3::splat(10.0)));
+    }
+
+    // MONKEY (outdoor torch shadows): the exterior ranking key is the EXTERIOR receivers' own
+    // profile, not the interior soft core — monotone in distance, linear in intensity, floored off
+    // the falloff's pole at 0, and reaching exactly zero at the eligibility edge so a candidate
+    // never steps out of the list at a finite score.
+    #[test]
+    fn exterior_scores_follow_the_outdoor_falloff() {
+        let near = exterior_fixture_score(1.0, 5.0);
+        let mid = exterior_fixture_score(1.0, 15.0);
+        let far = exterior_fixture_score(1.0, 40.0);
+        assert!(near > mid && mid > far && far > 0.0);
+        assert_eq!(exterior_fixture_score(1.0, TORCH_EXT_ELIGIBLE_YD), 0.0);
+        assert_eq!(exterior_fixture_score(0.0, 5.0), 0.0);
+        assert!(exterior_fixture_score(2.0, 15.0) > mid);
+        // The falloff's pole at d = 0 is floored, so a fixture the player is standing on cannot
+        // score infinity, take a slot for one frame and hand it straight back.
+        let at_zero = exterior_fixture_score(1.0, 0.0);
+        assert!(at_zero.is_finite() && at_zero <= 1.0 / 0.73 + 1e-3, "{at_zero}");
+        // …and inside the window it IS the receivers' falloff: 1/(0.7d + 0.03d^2) at 1 yd.
+        assert!((exterior_fixture_score(1.0, 1.0) - 1.0 / 0.73).abs() < 1e-2);
+    }
+
+    // MONKEY (outdoor torch shadows): the camera tests are shared with the interior lane (same
+    // budget, same `shadowDistance` dial); the player window is flat, because an exterior entry
+    // packs no reach for a `4R` window to be four of.
+    #[test]
+    fn exterior_eligibility_is_the_cube_range_at_the_player() {
+        assert!(exterior_eligible(0.0, 0.0, 80.0));
+        assert!(exterior_eligible(TORCH_EXT_ELIGIBLE_YD, 10.0, 80.0));
+        assert!(!exterior_eligible(TORCH_EXT_ELIGIBLE_YD + 0.1, 10.0, 80.0));
+        assert!(!exterior_eligible(1.0, 80.01, 80.0));
+        assert!(exterior_eligible(1.0, 250.0, 300.0));
+        assert!(!exterior_eligible(1.0, f32::NAN, 80.0));
+    }
+
+    // MONKEY (outdoor torch shadows): the lane gate is the cvar AND night, and "night" is the
+    // receivers' own threshold — `sun_shadow_strength` saturates at exactly 1.0 in daylight, so the
+    // CPU lane and the shaders' `night_w` can never disagree about which it is.
+    #[test]
+    fn the_exterior_lane_is_night_only_and_cvar_gated() {
+        let mut video = VideoConfig::default();
+        assert!(video.exterior_shadows, "shipped on");
+        assert!(exterior_shadows_on(&video, 0.0), "midnight");
+        assert!(exterior_shadows_on(&video, 0.99), "dusk still counts");
+        assert!(!exterior_shadows_on(&video, 1.0), "full daylight never");
+        video.exterior_shadows = false;
+        assert!(!exterior_shadows_on(&video, 0.0));
+        // The receivers' threshold, verbatim: 1.0 the moment the sun clears ~12 degrees.
+        assert_eq!(sun_shadow_strength(0.208), 1.0);
+        assert_eq!(sun_shadow_strength(0.9), 1.0);
+        assert_eq!(sun_shadow_strength(-0.3), 0.0);
+        assert!(sun_shadow_strength(0.1) > 0.0 && sun_shadow_strength(0.1) < 1.0);
+    }
+
+    // MONKEY (outdoor torch shadows): half the budget, rounded up — and the cap only ever removes
+    // EXTERIOR candidates, keeping the best ones (the list is score-sorted).
+    #[test]
+    fn the_exterior_budget_is_half_and_caps_only_its_own_lane() {
+        assert_eq!(exterior_budget(12), 6);
+        assert_eq!(exterior_budget(16), 8);
+        assert_eq!(exterior_budget(1), 1, "the smallest budget still gets one outdoor shadow");
+        let mut cands: Vec<Candidate> = (0..8)
+            .map(|i| {
+                (Entity::from_raw_u32(i).unwrap(), Vec3::ZERO, 8.0 - i as f32, i % 2 == 0, 10.0)
+            })
+            .collect();
+        cap_exterior_candidates(&mut cands, 2);
+        // Identified by score, which is also their rank: 8,7,6,5,4,3,2,1 with the even ranks
+        // exterior. Capped at two, ranks 8 and 6 (the best two fires) survive; 4 and 2 do not.
+        let kept: Vec<(u32, bool)> =
+            cands.iter().map(|(_, _, sc, x, _)| (*sc as u32, *x)).collect();
+        assert_eq!(
+            kept,
+            vec![(8, true), (7, false), (6, true), (5, false), (3, false), (1, false)],
+            "the two best exterior fires survive; every interior candidate does"
+        );
+        // A cap of zero is a lane switched off, and it takes nothing else with it.
+        let mut all_ext: Vec<Candidate> =
+            vec![(Entity::from_raw_u32(0).unwrap(), Vec3::ZERO, 1.0, true, 10.0)];
+        cap_exterior_candidates(&mut all_ext, 0);
+        assert!(all_ext.is_empty());
+    }
+
+    // MONKEY (torch lane perf): the moving-caster gather is sized off each fixture's OWN reach.
+    // The margin covers the part's extent (the test is on its ORIGIN), the clamp keeps the radius
+    // inside the cube projection that has to record it, and a degenerate reach can only ever widen
+    // the window — losing a caster must never be the failure direction here.
+    #[test]
+    fn the_entity_gather_radius_is_the_fixtures_own_reach() {
+        assert_eq!(entity_gather_radius(12.0), 12.0 + TORCH_ENTITY_REACH_MARGIN);
+        assert!(entity_gather_radius(12.0) < TORCH_RANGE, "a candle sweeps far less than 48 yd");
+        assert_eq!(entity_gather_radius(TORCH_RANGE), TORCH_RANGE, "clamped to the cube range");
+        assert_eq!(entity_gather_radius(1e9), TORCH_RANGE);
+        assert_eq!(entity_gather_radius(0.0), TORCH_ENTITY_REACH_MARGIN);
+        assert_eq!(entity_gather_radius(-5.0), TORCH_ENTITY_REACH_MARGIN);
+        assert_eq!(entity_gather_radius(f32::NAN), TORCH_RANGE, "never a silent zero radius");
+    }
+
+    // …and the gather admits the UNION of those radii, not one shared radius: a tight candle and a
+    // wide hearth in the same dynamic set each keep their own window, and a part inside either is
+    // in. The reach that matters is the fixture's, so a body 20 yd from the candle and 20 yd from
+    // the hearth is a caster for the hearth alone.
+    #[test]
+    fn the_gather_admits_the_union_of_the_fixture_reaches() {
+        let candle = entity_gather_radius(8.0);
+        let hearth = entity_gather_radius(30.0);
+        let set = [(0usize, Vec3::ZERO, candle), (1usize, Vec3::X * 60.0, hearth)];
+        assert!(within_any_reach(&set, Vec3::X * 5.0), "inside the candle");
+        assert!(within_any_reach(&set, Vec3::X * 40.0), "inside the hearth, not the candle");
+        assert!(!within_any_reach(&set, Vec3::X * 20.0), "between the two, lit by neither");
+        assert!(!within_any_reach(&[], Vec3::ZERO), "an empty dynamic set admits nothing");
+        // The margin is what keeps a body whose ORIGIN sits just outside the pool casting.
+        assert!(within_any_reach(&set, Vec3::X * (8.0 + 1.0)));
+    }
+
+    // MONKEY (torch lane perf): the regather cadence. `0` is the every-frame escape hatch, a
+    // changed dynamic set always overrides the clock (the mesh is only valid for the fixtures it
+    // was gathered around), and the tolerance stops a 30 Hz cadence from beating against a 60 fps
+    // frame into an alternating 1/3-frame stutter.
+    #[test]
+    fn the_entity_gather_cadence_is_a_rate_not_a_gate() {
+        assert!(entity_gather_due(0, 0.0, 1, 1), "rate 0 = every frame");
+        assert!(!entity_gather_due(30, 0.0, 1, 1), "same set, no time passed");
+        assert!(!entity_gather_due(30, 0.02, 1, 1), "still inside 1/30 s");
+        assert!(entity_gather_due(30, 1.0 / 30.0, 1, 1), "exactly on the tick");
+        assert!(entity_gather_due(30, 1.0 / 60.0 * 2.0, 1, 1), "two 60 fps frames make the tick");
+        assert!(entity_gather_due(30, 0.0, 0b11, 0b01), "a changed dynamic set overrides the clock");
+        assert!(entity_gather_due(15, 0.07, 1, 1));
+        assert!(!entity_gather_due(15, 0.05, 1, 1));
+        // A rate at or above the frame rate is "every frame" without being a special case.
+        assert!(entity_gather_due(240, 1.0 / 46.0, 1, 1));
     }
 
     #[test]

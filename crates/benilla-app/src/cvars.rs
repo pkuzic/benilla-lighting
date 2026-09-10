@@ -600,6 +600,35 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1900: benilla's own realtime-shadow render-distance slider; the reference bakes MCSH and \
          has no cascade to size",
     ),
+    // MONKEY (sun shadow perf): the five live dials over the sun lanes' ~5 ms/frame (RTX 3070,
+    // 1080p, both lanes on: 45-47 fps, and 68-73 with both off). All benilla's own — the reference
+    // bakes MCSH and has no realtime shadow to tune. `shadow_core`'s constants block holds the cost
+    // split each one takes; every row is LIVE, so the whole set A/Bs from one chat line.
+    ours(
+        "shadowMapSize",
+        "2048",
+        "benilla's own: directional shadow-map edge in texels, 1024/2048/4096 (cost is quadratic)",
+    ),
+    ours(
+        "shadowFilter",
+        "1",
+        "benilla's own: shadow PCF kernel: 0 hardware-2x2 (1 sample), 1 gaussian (9, the look)",
+    ),
+    ours(
+        "characterShadowRate",
+        "30",
+        "benilla's own: Hz cap on the character shadow proxy re-skin+upload, 0..120 (0 = per frame)",
+    ),
+    ours(
+        "worldShadowRate",
+        "30",
+        "benilla's own: Hz cap on the world lane's environment caster, 0..120 (0 = per frame)",
+    ),
+    ours(
+        "shadowCasterReach",
+        "1",
+        "benilla's own: multiplier on the shadow caster-collection reach, 0.25..2 (1 = unchanged)",
+    ),
     // MONKEY (dynamic interiors): WMO interiors + their props light from the room's LIVE fixtures
     // instead of the MOCV bake / the baked prop probe (`static_gx.wgsl` `interior_room_light`;
     // bridged by `dynamic_interior`). The three numeric knobs are live-tunable from chat —
@@ -660,6 +689,14 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "benilla's own: interior fixtures cast real shadows (Stage B, the nearest few); needs \
          interiorLight",
     ),
+    // MONKEY (outdoor torch shadows): the outdoor half of the same cube-map lane. Its own row
+    // because it is its own audience (a night camp, a lit village) and its own cost profile — and
+    // because "turn the outdoor shadows off" must not also turn the inn's candles' shadows off.
+    ours(
+        "exteriorShadows",
+        "1",
+        "benilla's own: outdoor fire lights (campfires, braziers, lampposts) cast real shadows at          night; no effect by day",
+    ),
     // MONKEY (static torch cache): residency and per-frame work have separate live budgets.
     ours(
         "interiorShadowCasters",
@@ -670,6 +707,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "interiorShadowDynamic",
         "4",
         "benilla's own: nearest promoted fixtures with moving entity shadows, 0..16",
+    ),
+    // MONKEY (torch lane perf): the moving-caster REGATHER cadence. Its own row (and not folded
+    // into `interiorShadowDynamic`) because it trades a different currency: `Dynamic` buys how
+    // MANY fixtures overlay moving casters, this buys how OFTEN the one shared overlay mesh is
+    // rebuilt. Neither of the count dials moved the frame time at all, so the cost was never per
+    // map -- it was this gather + mesh mutation, paid once a frame no matter what the counts said.
+    // `0` is the pre-feature every-frame behaviour, kept as the live A/B.
+    ours(
+        "interiorShadowEntityRate",
+        "30",
+        "benilla's own: how often (Hz) moving torch-shadow casters are regathered; 0 = every frame",
     ),
     // MONKEY (torch caster selection): the PCF tap radius on the torch maps. Candle clusters read
     // very hard-edged at 1 (a half-texel box on a 512² face); 2 is a visible softening for four
@@ -682,7 +730,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours(
         "interiorDebug",
         "0",
-        "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count",
+        "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count, 4 WMO lane map",
     ),
     // MONKEY (fire GO lights): the gain on lights SYNTHESISED from a model's flame emitter for the
     // ~410 fire props the artists never gave a light block (campfires, wall torches, magic
@@ -693,6 +741,16 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "fireLightGain",
         "1",
         "benilla's own: brightness of lights synthesised from fire props' flame emitters (0 = off)",
+    ),
+    // MONKEY (flame flicker): how hard every FLAME breathes — candles fast and shallow, bonfires
+    // slow and shallower still (`benilla_world::lighting::FlameKind`). Live like the gain beside
+    // it, and `0` restores the steady constants every fire had before the feature, which is the
+    // escape hatch this needs precisely because "subtle" is a judgement call and a flicker that
+    // reads as a strobe is worse than none.
+    ours(
+        "fireFlicker",
+        "1",
+        "benilla's own: how strongly fire lights flicker — 0 steady, 1 default, 2 pronounced",
     ),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
@@ -1179,6 +1237,34 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
             knobs.video.shadow_distance =
                 v.clamp(*SHADOW_DISTANCE_RANGE.start(), *SHADOW_DISTANCE_RANGE.end());
         }
+        // MONKEY (sun shadow perf): the five cost dials, clamped at the edge like every numeric row
+        // here. `shadowMapSize` SNAPS onto the power-of-two ladder rather than clamping into a
+        // range — an off-ladder value is not a weaker setting, it is one Bevy silently rounds UP
+        // into a bigger and slower map than the one that was typed.
+        "shadowmapsize" => {
+            knobs.video.shadow_map_size =
+                crate::shadow_core::clamp_shadow_map_size(v.max(0.0) as u32);
+        }
+        "shadowfilter" => {
+            knobs.video.shadow_filter =
+                (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_FILTER);
+        }
+        // `0` is MEANINGFUL on both rate rows (the pre-cvar every-frame rebuild), so they floor at
+        // 0 rather than at 1 — the shadow off-switches are `characterShadows` / `worldShadows`.
+        "charactershadowrate" => {
+            knobs.video.character_shadow_rate =
+                (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_RATE);
+        }
+        "worldshadowrate" => {
+            knobs.video.world_shadow_rate =
+                (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_RATE);
+        }
+        "shadowcasterreach" => {
+            knobs.video.shadow_caster_reach = v.clamp(
+                *crate::shadow_core::CASTER_REACH_RANGE.start(),
+                *crate::shadow_core::CASTER_REACH_RANGE.end(),
+            );
+        }
         // MONKEY (dynamic interiors): the interior lane's on/off + knobs, clamped at the edge like
         // every other numeric row. `dynamic_interior::bridge` publishes them to benilla-world.
         "interiorlight" => knobs.video.interior_light = v != 0.0,
@@ -1190,6 +1276,10 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "interiorattenscale" => knobs.video.interior_atten_scale = v.clamp(0.0, 8.0),
         "interiorroomgate" => knobs.video.interior_room_gate = v != 0.0,
         "interiorshadows" => knobs.video.interior_shadows = v != 0.0,
+        // MONKEY (outdoor torch shadows): a flag like every other checkbox here. Live — the lane
+        // reads `VideoConfig` every frame, so `0` fades the outdoor shadows out (the slots evict
+        // through the same cross-fade a walked-away fixture does) and `1` fades them back in.
+        "exteriorshadows" => knobs.video.exterior_shadows = v != 0.0,
         // MONKEY (torch caster selection): the working-set size and the PCF radius, clamped at the
         // edge like every other numeric row. `casters` floors at 1, not 0 — `interiorShadows 0` is
         // already the off switch, and a 0 here would be a second, confusing one.
@@ -1197,11 +1287,21 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
             knobs.video.interior_shadow_casters = (v.max(1.0) as u32).clamp(1, 16);
         }
         // MONKEY (static torch cache): zero is useful for static-only rooms.
-        "interiorshadowdynamic" => knobs.video.interior_shadow_dynamic = (v.max(0.0) as u32).min(16),
+        "interiorshadowdynamic" => knobs.video.interior_shadow_dynamic = (v.max(1.0) as u32).clamp(1, crate::torch_shadow::MAX_TORCH_DYNAMIC as u32), // MONKEY (live bank rank): 1..8.
+        // MONKEY (torch lane perf): the moving-caster regather cadence in Hz. `0` is MEANINGFUL
+        // here (every frame -- the behaviour before the gate), so unlike `casters` this floors at
+        // 0 rather than at 1. Ceiling 240 so a typo cannot ask for a per-frame rebuild AND a
+        // divide by a huge number; anything at or above the frame rate is already "every frame".
+        "interiorshadowentityrate" => {
+            knobs.video.interior_shadow_entity_rate = (v.max(0.0) as u32).min(240);
+        }
         "interiorshadowsoft" => knobs.video.interior_shadow_soft = v.clamp(0.5, 3.0),
-        "interiordebug" => knobs.video.interior_debug = (v.max(0.0) as u32).min(3),
+        "interiordebug" => knobs.video.interior_debug = (v.max(0.0) as u32).min(4),
         // MONKEY (fire GO lights): the synthesised-fire gain, clamped at the edge like the rest.
         "firelightgain" => knobs.video.fire_light_gain = v.clamp(0.0, 4.0),
+        // MONKEY (flame flicker): 0..2 — the amplitudes are authored at 1, and 2 is the deliberate
+        // over-drive for judging the shape. Clamped at the edge like every knob here.
+        "fireflicker" => knobs.video.fire_flicker = v.clamp(0.0, 2.0),
         // Display mode (1627) — a flag like every other checkbox here, and the reference's own
         // polarity: `1` is WINDOWED (the row is "Windowed Mode"). `video::apply_window_mode`
         // watches the value and pushes it to the window; nothing else reads it.
@@ -1504,7 +1604,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 59] = [
+        let session: [(&str, String); 67] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1553,6 +1653,11 @@ fn sync_cvars(
             ("worldShadows", flag(video.world_shadows)),
             ("characterShadows", flag(video.character_shadows)),
             ("shadowDistance", video.shadow_distance.to_string()),
+            ("shadowMapSize", video.shadow_map_size.to_string()),
+            ("shadowFilter", video.shadow_filter.to_string()),
+            ("characterShadowRate", video.character_shadow_rate.to_string()),
+            ("worldShadowRate", video.world_shadow_rate.to_string()),
+            ("shadowCasterReach", video.shadow_caster_reach.to_string()),
             ("interiorLight", flag(video.interior_light)),
             ("interiorAmbient", video.interior_ambient.to_string()),
             ("interiorFill", video.interior_fill.to_string()),
@@ -1560,14 +1665,20 @@ fn sync_cvars(
             ("interiorAttenScale", video.interior_atten_scale.to_string()),
             ("interiorRoomGate", flag(video.interior_room_gate)),
             ("interiorShadows", flag(video.interior_shadows)),
+            ("exteriorShadows", flag(video.exterior_shadows)),
             (
                 "interiorShadowCasters",
                 video.interior_shadow_casters.to_string(),
             ),
             ("interiorShadowDynamic", video.interior_shadow_dynamic.to_string()),
+            (
+                "interiorShadowEntityRate",
+                video.interior_shadow_entity_rate.to_string(),
+            ),
             ("interiorShadowSoft", video.interior_shadow_soft.to_string()),
             ("interiorDebug", video.interior_debug.to_string()),
             ("fireLightGain", video.fire_light_gain.to_string()),
+            ("fireFlicker", video.fire_flicker.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
                 "gxWindow",
@@ -1985,6 +2096,15 @@ mod tests {
             d["characterShadows"] != 0.0,
             VideoConfig::default().character_shadows
         );
+        // MONKEY (sun shadow perf): the five cost dials weld to the video knob's shipped defaults
+        // exactly like the two flags above — a registered row that drifts from what the rig
+        // actually runs is a setting that reads one way in the config and behaves another.
+        let shadows = VideoConfig::default();
+        assert_eq!(d["shadowMapSize"], shadows.shadow_map_size as f32);
+        assert_eq!(d["shadowFilter"], shadows.shadow_filter as f32);
+        assert_eq!(d["characterShadowRate"], shadows.character_shadow_rate as f32);
+        assert_eq!(d["worldShadowRate"], shadows.world_shadow_rate as f32);
+        assert_eq!(d["shadowCasterReach"], shadows.shadow_caster_reach);
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Render scale (1639) welds to OFF. Not a taste default: the whole tree of visual

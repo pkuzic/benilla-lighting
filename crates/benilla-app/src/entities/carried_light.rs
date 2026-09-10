@@ -44,10 +44,32 @@ use benilla_world::wmo_portal::{WmoGroupVis, WmoPortalInstance, WmoRoom};
 ///
 /// Children, not free entities: the light's lifecycle and its frame both come from the hierarchy, so
 /// a gear change, a despawn, or a mount transition takes its lights with it.
+/// MONKEY (outdoor torch shadows): this light is carried BY A BODY — a held torch, a creature's
+/// own glow (an imp's hand flame, a fire elemental), a player's lantern. It is a marker, not a
+/// gate: the light still lights the world exactly as it did, and it is still eligible for an
+/// INTERIOR cube-shadow slot (that lane's behaviour is unchanged by this feature).
+///
+/// What it refuses is the EXTERIOR shadow lane. Three separate reasons, any one of which is enough:
+///  · the caster gather cannot exclude the owner's own body from its own map (the emitter-owner
+///    exclusion below works on retained `GxItem` bounds; a skinned creature is not one), so a
+///    torch-bearing guard would stand in his own shadow, at full outdoor strength;
+///  · a body walks, and this lane caches a depth cube per fixture and withdraws it the moment the
+///    fixture leaves the 0.1 yd it was baked at ([`super::super::torch_shadow`]'s
+///    `map_publishable`) — indoors a held torch is one of twelve resident candles and its churn is
+///    hidden, outdoors it would be one of six casters for a whole village;
+///  · the effect being built is "the CAMPFIRE throws the fence's shadow", and a shadow that walks
+///    with the light source is the one thing that reads as a bug rather than as lighting.
+/// Placed GameObject braziers and campfires are NOT held — they keep their slot (the
+/// [`CarriedLightMotion::settled`] gate is what covers a brazier riding a moving transport).
+#[derive(Component, Clone, Copy)]
+pub(crate) struct HeldLight;
+
 pub(super) fn spawn_carried_lights(
     commands: &mut Commands,
     lights: &[ModelLight],
     frame: Entity,
+    // MONKEY (outdoor torch shadows): does a BODY carry these lights? See [`HeldLight`].
+    held: bool,
     joint: impl Fn(i16) -> Option<Entity>,
 ) {
     for l in lights {
@@ -99,6 +121,30 @@ pub(super) fn spawn_carried_lights(
         // no MOLT fixture standing beside them the way a WMO's own wall torches do.
         if l.synthetic {
             glow.insert(SyntheticFireLight);
+        }
+        // MONKEY (outdoor torch shadows): the exterior shadow lane's refusal marker (see
+        // [`HeldLight`]). Tagged at the SPAWN site because that is the only place that knows who
+        // owns the light — downstream all a query sees is a `PointLight` with a `ChildOf`, which a
+        // placed brazier GameObject has just as much as a guard's torch does.
+        if held {
+            glow.insert(HeldLight);
+        }
+        // MONKEY (flame flicker): a carried flame breathes like any other — the imp's hand fire, a
+        // held torch, a brazier GameObject. It is safe on THIS lane specifically because the
+        // modulation touches neither position nor reach: the settle/claim logic
+        // ([`CarriedLightMotion`], `carried_light_claims`) and the shadow slot's staleness test all
+        // key on where the light IS, and none of them can see a brightness change. The seed mixes
+        // the light's model-space offset with its PARENT, so two imps in one room never burn in
+        // step (position alone would give every copy of a model the same phase).
+        if let Some(kind) = benilla_world::lighting::flame_kind_for(
+            l.flame,
+            l.synthetic,
+            l.def.diffuse_color,
+            l.def.diffuse_intensity,
+        ) {
+            let seed = benilla_world::lighting::flicker_seed(wow_to_bevy(local))
+                ^ parent.to_bits().rotate_left(11) as u32;
+            glow.insert(benilla_world::lighting::FlameFlicker::new(kind, seed));
         }
         let glow = glow.id();
         commands.entity(parent).add_child(glow);
@@ -593,6 +639,7 @@ mod tests {
             },
             bone_pivot: [1.0, 0.0, 0.5],
             synthetic: false,
+            flame: false,
         }
     }
 
@@ -615,7 +662,7 @@ mod tests {
         ];
         app.world_mut().commands().queue(move |world: &mut World| {
             let mut q = world.commands();
-            spawn_carried_lights(&mut q, &lights, frame, move |bone| {
+            spawn_carried_lights(&mut q, &lights, frame, true, move |bone| {
                 (bone == 3).then_some(joint)
             });
         });
@@ -656,6 +703,33 @@ mod tests {
         );
     }
 
+    /// MONKEY (outdoor torch shadows). The [`HeldLight`] marker is written at the SPAWN site and
+    /// nowhere else, because the spawn site is the only place that knows who owns the light: after
+    /// this, a guard's torch and a placed brazier are both just a `PointLight` under a `ChildOf`.
+    /// It is a pure ADDITION — the light's own components (colour, intensity, flicker, synthetic
+    /// tag) and its parenting are identical either way, so nothing about how it LIGHTS the world
+    /// moves; only the exterior shadow lane reads it.
+    #[test]
+    fn a_body_carried_light_is_marked_and_a_placed_one_is_not() {
+        for held in [true, false] {
+            let mut app = App::new();
+            let frame = app.world_mut().spawn(Transform::IDENTITY).id();
+            let lights = [light(1, -1, [0.0, 0.0, 4.0], false)];
+            app.world_mut().commands().queue(move |world: &mut World| {
+                let mut q = world.commands();
+                spawn_carried_lights(&mut q, &lights, frame, held, |_| None);
+            });
+            app.world_mut().flush();
+            let marked = app
+                .world_mut()
+                .query::<(&PointLight, Has<HeldLight>)>()
+                .iter(app.world())
+                .map(|(_, h)| h)
+                .collect::<Vec<_>>();
+            assert_eq!(marked, vec![held], "held = {held}");
+        }
+    }
+
     /// GOLDEN — MONKEY (carried light stability). A SYNTHESISED light does NOT ride its host
     /// bone even when the instance carries that joint: it hangs off the model FRAME at the raw
     /// model-space position, i.e. exactly where the bone ride would put it in the REST pose. The
@@ -669,10 +743,11 @@ mod tests {
         let joint = app.world_mut().spawn(Transform::IDENTITY).id();
         let mut synth = light(1, 3, [2.0, 0.0, 1.5], false);
         synth.synthetic = true;
+        synth.flame = true; // MONKEY (flame flicker): the flame route — the imp's hand fire
         let lights = [synth];
         app.world_mut().commands().queue(move |world: &mut World| {
             let mut q = world.commands();
-            spawn_carried_lights(&mut q, &lights, frame, move |bone| {
+            spawn_carried_lights(&mut q, &lights, frame, true, move |bone| {
                 (bone == 3).then_some(joint)
             });
         });

@@ -53,6 +53,10 @@ fn bridge(
         // `SetCVar("interiorRoomGate", 0)` restores the ungated look on the very next frame.
         room_gate: video.interior_room_gate,
         debug: video.interior_debug,
+        // MONKEY (flame flicker): the wobble gain rides the same bridge — it is consumed entirely
+        // on the CPU in `build_light_data`, so `SetCVar("fireFlicker", 0)` freezes every flame on
+        // the very next frame with no respawn and no shader change.
+        flicker: video.fire_flicker,
     };
     if *out != want {
         *out = want;

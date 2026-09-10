@@ -67,6 +67,12 @@ fn spawn_point_light(
     // `fireLightGain` cvar over it without respawning the world
     // ([`crate::lighting::SyntheticFireLight`]).
     synthetic: bool,
+    // MONKEY (flame flicker): the fire this source IS, or `None` for anything that merely shines
+    // (a lamp behind glass, a neutral fill light). Decided once by
+    // [`crate::lighting::flame_kind_for`] — one rule, every lane — and the phase SEED is taken here
+    // from the light's own world position, so two candles on one table are never in step and a
+    // fixture keeps its phase across a stream-out/stream-in.
+    flame: Option<crate::lighting::FlameKind>,
     // MONKEY (interior attenuation): the source's AUTHORED attenuation end (yd) where the record
     // carries a usable one — i.e. a WMO MOLT fixture, and nothing else. `None` for every M2 light,
     // whose authored pair is a template default rather than a reach; the packer buckets those from
@@ -93,6 +99,12 @@ fn spawn_point_light(
     }
     if synthetic {
         e.insert(crate::lighting::SyntheticFireLight);
+    }
+    if let Some(kind) = flame {
+        e.insert(crate::lighting::FlameFlicker::new(
+            kind,
+            crate::lighting::flicker_seed(world),
+        ));
     }
     if let Some(reach) = reach.filter(|r| *r > 0.5) {
         e.insert(crate::lighting::LightReach(reach));
@@ -166,6 +178,14 @@ pub(super) fn spawn_lights_for(
             def.diffuse_intensity,
             room.cloned(),
             l.synthetic,
+            // MONKEY (flame flicker): the flame route burns whatever colour it is; the lamp route
+            // never does; an authored block burns iff it was authored warm.
+            crate::lighting::flame_kind_for(
+                l.flame,
+                l.synthetic,
+                def.diffuse_color,
+                def.diffuse_intensity,
+            ),
             None, // an M2 light authors no usable reach — the packer buckets it
             // MONKEY (portal claims): the same claim set a MOLT fixture gets, measured at the
             // FLAME. An M2 source's reach is the intensity bucket (`room_claim::m2_light_reach`,
@@ -490,6 +510,11 @@ pub(super) fn spawn_wmo_lights_for(
                     groups: molr.clone(),
                 }),
             false, // a MOLT fixture is authored, never synthesised
+            // MONKEY (flame flicker): an authored fixture burns iff it was authored WARM. The MOLT
+            // corpus is overwhelmingly candles and wall torches at that hue; what the warmth test
+            // holds back is the neutral-white fill lights artists park in halls (which must stay
+            // dead steady) and the cold magic sources.
+            crate::lighting::flame_kind_for(false, false, l.color, l.intensity),
             // MONKEY (interior attenuation): the fixture's authored `attenuation_end` (`+0x2c`) —
             // the reference's own fold window (wow-re `trace-forensics-abbey-interior-d3d` §4), and
             // the number that turns a 10-candle inn from a uniform warm wash into ten pools. The

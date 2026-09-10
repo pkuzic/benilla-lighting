@@ -744,7 +744,9 @@ fn spawn_slot(
     // the emitters and for the same reason (the item poses at rest, so its model space IS
     // the bone-local frame), which walks it through the hand's swing; the fence rails and
     // grass around the bearer then gather it like any other scene point light.
-    spawn_carried_lights(commands, &dm.lights, root, |_| None);
+    // MONKEY (outdoor torch shadows): `held = true` — this is THE held torch, the canonical
+    // body-carried light (see `carried_light::HeldLight`): it may not cast an outdoor shadow.
+    spawn_carried_lights(commands, &dm.lights, root, true, |_| None);
     // The item's ribbon trails (weapon enchant streaks): ride the item root — a held item
     // poses at rest, so the bone-local origin is model-space (no pivot rebase). A held item
     // rests in Stand (anim 0): a thrown weapon's trail is keyed dark there, so the flight

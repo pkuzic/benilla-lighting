@@ -52,20 +52,23 @@ use bytemuck::Zeroable;
 use super::render::StaticGxView;
 use benilla_assets::materials::TorchBinds;
 
-/// MONKEY (static torch cache): each 512-square Depth32 face is 1 MiB. Two banks support
-/// sixteen resident static cubes and up to sixteen live entity overlays: 192 MiB total. Keep
-/// the edge here so a memory-constrained port can choose 384 (108 MiB, 25% less linear detail).
+/// MONKEY (live bank rank): each 512-square Depth32 face is 1 MiB. Sixteen static cubes plus
+/// eight compact live overlays cost 144 MiB; 384-square faces would cost 81 MiB.
 const TORCH_MAP_EDGE: u32 = 512;
 pub(crate) const MAX_TORCH_MAPS: usize = 16;
+const MAX_TORCH_DYNAMIC: usize = 8;
 pub(crate) const CUBE_FACES: usize = 6;
-/// MONKEY (static torch cache): matrices address the 96 STATIC faces. Physical texture layers
-/// 0..96 hold those faces permanently; 96..192 are live copies used only by dynamic-mask bits.
+/// MONKEY (live bank rank): matrix count stays 96, independent of texture capacity. Static
+/// layers 0..96 stay slot-addressed; live layers 96..144 follow ascending dynamic-mask rank.
 pub(crate) const MAX_TORCH_LAYERS: usize = MAX_TORCH_MAPS * CUBE_FACES;
-const TORCH_TEXTURE_LAYERS: usize = MAX_TORCH_LAYERS * 2;
+const TORCH_TEXTURE_LAYERS: usize = MAX_TORCH_LAYERS + MAX_TORCH_DYNAMIC * CUBE_FACES;
 /// MONKEY (static torch cache): count@0 (16), positions@16 (256), view_projs@272 (6144).
 /// Total 6416 bytes, identical under WGSL uniform/storage alignment. count.z is the live-bank
 /// bit mask, count.w reserved. Both WGSL TorchTable copies and render.rs MUST agree with this.
 pub(crate) const TORCH_TABLE_BYTES: u64 = 6416;
+/// MONKEY (outdoor torch shadows): `count.w` bit 0 — the exterior receiver lane's live gate. Keep
+/// in sync with `TORCH_EXT_LANE` in BOTH `static_gx.wgsl` and `wow_model.wgsl`.
+const TORCH_EXT_LANE: u32 = 1;
 
 /// **The app→render publication** (`benilla_app::torch_shadow` writes it each frame, extracted here):
 /// the promoted fixtures' cube-face matrices, world positions and static mesh revisions.
@@ -81,6 +84,13 @@ pub struct TorchShadowViews {
     /// 0.5..3). Carried here rather than in `DynamicInteriors` because it belongs to the shadow
     /// table's own bytes — [`TorchTableUniform::pack`] puts it in the otherwise-padding `count.y`.
     pub soft: f32,
+    /// MONKEY (outdoor torch shadows): does the EXTERIOR receiver lane run this frame? The app lane
+    /// sets it when `exteriorShadows` is on, the sun is below the daylight threshold, AND at least
+    /// one promoted slot is an exterior fixture. It rides to the receivers in the table's
+    /// `count.w` bit 0 (the word that has been reserved padding since the table was written), and
+    /// it is the ONE uniform read every exterior-lane cost in `static_gx.wgsl`/`wow_model.wgsl`
+    /// hangs off — by day, or with the cvar off, the receivers are the code they always were.
+    pub exterior: bool,
     /// `positions[i].xyz` = fixture world position (absolute Bevy), `.w` = the slot's FADE WEIGHT
     /// `0..1` (MONKEY, torch caster selection). The `.w` lane used to carry the fixture's range,
     /// which no shader ever read; it now carries the cross-fade, and both receivers return
@@ -98,6 +108,18 @@ pub struct TorchShadowViews {
     pub entity_mesh: Option<AssetId<Mesh>>,
 }
 
+impl TorchShadowViews {
+    /// MONKEY (live bank rank): expose the allocation cap through the existing app resource.
+    pub const MAX_TORCH_DYNAMIC: usize = MAX_TORCH_DYNAMIC;
+
+    /// MONKEY (live bank rank): WGSL countOneBits(mask & ((1u << slot) - 1u)). Use the
+    /// FINAL ready-filtered mask for rendering; app traces describe only requested ranks.
+    pub fn live_rank(dynamic_mask: u32, slot: usize) -> usize {
+        debug_assert!(slot < MAX_TORCH_MAPS);
+        (dynamic_mask & ((1u32 << slot) - 1)).count_ones() as usize
+    }
+}
+
 /// Hand-written because `[Mat4; 96]` has no `Default` — std only derives array `Default` up to
 /// `N = 32`, so the derive that worked at 24 layers stops compiling at 96. (It also lets `soft`
 /// default to a sane `1.0` rather than a zero tap radius.)
@@ -108,6 +130,7 @@ impl Default for TorchShadowViews {
             dynamic_mask: 0,
             ready_mask: 0,
             soft: 1.0,
+            exterior: false,
             positions: [Vec4::ZERO; MAX_TORCH_MAPS],
             view_projs: [Mat4::ZERO; MAX_TORCH_LAYERS],
             caster_meshes: [None; MAX_TORCH_MAPS],
@@ -117,9 +140,9 @@ impl Default for TorchShadowViews {
 }
 
 /// MONKEY (torch shadows Phase 3A): the ONE shared torch depth array — a `Depth32Float`
-/// MONKEY (static torch cache): 512×512×192-layer `Image` asset (render, sample, copy-src/dst),
+/// MONKEY (live bank rank): 512×512×144-layer `Image` asset (render, sample, copy-src/dst),
 /// no CPU data) whose sampler descriptor carries `compare: Some(GreaterEqual)`, so its `GpuImage`
-/// sampler is a real comparison sampler and its default view is a `D2Array` over all 192 layers
+/// sampler is a real comparison sampler and its default view is a `D2Array` over all 144 layers
 /// (wgpu's default view dimension for a multi-layer 2D texture). Created ONCE at startup by
 /// [`new_torch_shared`] (always — regardless of the interior-shadow cvars — because every model
 /// material binds it; a missing image would stall every material's bind group), inserted in the
@@ -212,7 +235,7 @@ pub fn new_torch_shared(
 }
 
 /// MONKEY (static torch cache): byte-identical std140/std430 table in BOTH receiver shaders.
-/// count@0: live high-water mark, soft*100, dynamic mask, reserved (16 bytes).
+/// count@0: live high-water mark, soft*100, dynamic mask, lane flags (16 bytes).
 /// positions[16]@16: world xyz + fade weight (256 bytes).
 /// view_projs[96]@272: six static-bank face matrices per physical slot (6144 bytes).
 /// Total 6416. Unready/hole slots have zero weight; no stale owner's depth can be sampled.
@@ -225,7 +248,11 @@ pub(crate) struct TorchTableUniform {
     /// alternative was a whole new 16-byte row for one dial.
     soft_x100: u32,
     dynamic_mask: u32,
-    _pad: u32,
+    /// MONKEY (outdoor torch shadows): lane flags, the word that was reserved padding.
+    /// Bit 0 ([`TORCH_EXT_LANE`]) = the EXTERIOR receiver lane is live this frame. Both WGSL
+    /// copies read it as `count.w`; the table's SIZE is untouched, which is what keeps the
+    /// 6416-byte contract (and therefore every building and model on screen) intact.
+    flags: u32,
     positions: [[f32; 4]; MAX_TORCH_MAPS],
     view_projs: [[[f32; 4]; 4]; MAX_TORCH_LAYERS],
 }
@@ -247,6 +274,9 @@ impl TorchTableUniform {
         // a hard edge), so a table published without a scale reads as the neutral 1.0.
         let soft = if views.soft > 0.01 { views.soft } else { 1.0 };
         table.soft_x100 = (soft * 100.0).round().max(1.0) as u32;
+        // MONKEY (outdoor torch shadows): the exterior receiver lane's live gate. Packed even when
+        // `count` is 0 costs nothing and is simpler to reason about than a conditional flag.
+        table.flags = if views.exterior { TORCH_EXT_LANE } else { 0 };
         for i in 0..count {
             table.positions[i] = views.positions[i].to_array();
             if views.ready_mask & (1 << i) == 0 { table.positions[i][3] = 0.0; }
@@ -270,12 +300,60 @@ fn upload_torch_table(
     queue: Res<RenderQueue>,
     buffer: Option<Res<SharedTorchBuffer>>,
     views: Option<Res<TorchShadowViews>>,
+    // MONKEY (torch lane perf): the last bytes actually uploaded, keyed by the buffer they went to
+    // (so a recreated buffer can never inherit another one's "already current" verdict), plus the
+    // trace counters for the second in progress.
+    mut last: Local<Option<(BufferId, TorchTableUniform)>>,
+    mut trace: Local<TorchUploadTrace>,
 ) {
     let Some(buffer) = buffer else {
         return;
     };
     let table = TorchTableUniform::pack(views.as_deref());
-    queue.write_buffer(&buffer.0, 0, bytemuck::bytes_of(&table));
+    // MONKEY (torch lane perf): skip the upload when the packed bytes are identical to the ones
+    // already in the buffer. A standing player in a lit room republishes the SAME 6416 bytes every
+    // frame — the fixtures have not moved, the cross-fades have saturated at 1 and the projections
+    // are rebuilt from unchanged positions — so this is a staging-belt allocation and a copy with
+    // nothing to say. A `memcmp` of 6 KB is far cheaper than the copy it replaces, and the compare
+    // is against what we WROTE, so it can never disagree with the buffer's real contents.
+    let id = buffer.0.id();
+    let current = last.as_ref().is_some_and(|(b, t)| {
+        *b == id && bytemuck::bytes_of(t) == bytemuck::bytes_of(&table)
+    });
+    if !current {
+        queue.write_buffer(&buffer.0, 0, bytemuck::bytes_of(&table));
+        *last = Some((id, table));
+        trace.uploads += 1;
+    }
+    trace.frames += 1;
+    trace.report();
+}
+
+/// MONKEY (torch lane perf): `WOW_TORCH_TRACE` accounting for [`upload_torch_table`] — the render
+/// world's half of the lane's per-second perf line (the app's half is `torch-perf:` in
+/// `benilla_app::torch_shadow`). `uploads` well below `frames` is the dedup working.
+struct TorchUploadTrace {
+    uploads: u32,
+    frames: u32,
+    since: std::time::Instant,
+}
+
+impl Default for TorchUploadTrace {
+    fn default() -> Self {
+        Self { uploads: 0, frames: 0, since: std::time::Instant::now() }
+    }
+}
+
+impl TorchUploadTrace {
+    fn report(&mut self) {
+        if self.since.elapsed().as_secs_f32() < 1.0 {
+            return;
+        }
+        if std::env::var_os("WOW_TORCH_TRACE").is_some() {
+            info!("torch-perf: table uploads {}/{} frames", self.uploads, self.frames);
+        }
+        *self = Self::default();
+    }
 }
 
 /// The persistent render-world state that does NOT depend on the image: the comparison sampler
@@ -302,7 +380,7 @@ impl TorchDepthTargets {
 #[derive(Resource, Default)]
 struct TorchLayerViews {
     texture: Option<TextureId>,
-    /// `views[i]` = the depth attachment for array layer `i` (fixture `i / 6`, face `i % 6`).
+    /// MONKEY (live bank rank): static slot `i / 6`; live rank `(i - 96) / 6`; face `i % 6`.
     views: Vec<TextureView>,
 }
 
@@ -457,9 +535,10 @@ fn prepare_torch_depth(
         return;
     }
     let cached = cache.0.lock().unwrap();
-    let (ready_mask, rebuild_mask) = torch_cache_plan(&*cached, &views.caster_meshes[..count],
+    let (ready_mask, rebuild_mask, dynamic_mask) = torch_cache_plan(&*cached, &views.caster_meshes[..count], views.dynamic_mask,
         |id| torch_mesh_ready(id, &meshes, &allocator));
     views.ready_mask = ready_mask;
+    views.dynamic_mask = dynamic_mask;
     // If entity upload is late, bind the static bank for this frame, never last frame's overlay.
     if !views.entity_mesh.is_some_and(|id| torch_mesh_ready(id, &meshes, &allocator)) {
         views.dynamic_mask = 0;
@@ -556,6 +635,7 @@ impl ViewNode for TorchDepthNode {
             let rebuild = draw.rebuild_mask & (1 << slot) != 0
                 && cached[slot] != views.caster_meshes[slot];
             let dynamic = views.dynamic_mask & (1 << slot) != 0;
+            let live_rank = dynamic.then(|| TorchShadowViews::live_rank(views.dynamic_mask, slot));
             // MONKEY (static torch cache): render static once, then copy to the disjoint live
             // bank BEFORE each entity pass. GreaterEqual + Load preserves the nearest surface.
             for face in 0..CUBE_FACES {
@@ -576,8 +656,10 @@ impl ViewNode for TorchDepthNode {
                     pass.set_bind_group(0, &draw.bind_groups[layer], &[]);
                     draw_torch_mesh(&mut pass, views.caster_meshes[slot], meshes, allocator);
                 }
-                if dynamic {
-                    let live = layer + MAX_TORCH_LAYERS;
+                if let Some(rank) = live_rank {
+                    // MONKEY (live bank rank): matrices remain slot-addressed; only the copy
+                    // destination/overlay attachment follows count.z's compact ready-set rank.
+                    let live = MAX_TORCH_LAYERS + rank * CUBE_FACES + face;
                     render_context.command_encoder().copy_texture_to_texture(
                         TexelCopyTextureInfo {
                             texture: &gpu.texture, mip_level: 0,
@@ -609,9 +691,10 @@ impl ViewNode for TorchDepthNode {
             }
             if rebuild { cached[slot] = views.caster_meshes[slot]; }
             if trace_on && (trace_due || rebuild) {
-                info!("torch-cache: slot {slot} static {} dynamic {}",
+                info!("torch-cache: slot {slot} static {} dynamic {} live_rank {:?} live_base {:?}",
                     if rebuild { "rebuilt" } else { "cached" },
-                    if dynamic { "yes" } else { "no" });
+                    if dynamic { "yes" } else { "no" }, live_rank,
+                    live_rank.map(|rank| MAX_TORCH_LAYERS + rank * CUBE_FACES));
             }
         }
         Ok(())
@@ -670,8 +753,8 @@ pub(super) fn build(app: &mut App) {
 
 // MONKEY (static torch cache): planning does not commit residency. A missing upload cannot
 // certify an empty map, and the two-rebuild budget also covers GPU texture recreation.
-fn torch_cache_plan<T: Copy + Eq>(cached: &[Option<T>], requested: &[Option<T>],
-    mut mesh_ready: impl FnMut(T) -> bool) -> (u32, u32) {
+fn torch_cache_plan<T: Copy + Eq>(cached: &[Option<T>], requested: &[Option<T>], dynamic_mask: u32,
+    mut mesh_ready: impl FnMut(T) -> bool) -> (u32, u32, u32) {
     let (mut ready, mut rebuild) = (0u32, 0u32);
     for (i, requested) in requested.iter().take(MAX_TORCH_MAPS).enumerate() {
         let Some(id) = *requested else { continue };
@@ -682,7 +765,15 @@ fn torch_cache_plan<T: Copy + Eq>(cached: &[Option<T>], requested: &[Option<T>],
             ready |= 1 << i;
         }
     }
-    (ready, rebuild)
+    // MONKEY (live bank rank): remove unready holes BEFORE ranking, exactly as table.count.z
+    // does. Bound even malformed resource masks to eight cubes so no copy can escape the bank.
+    let eligible = dynamic_mask & ready;
+    let dynamic = (0..MAX_TORCH_MAPS).fold(0, |mask, slot| {
+        if eligible & (1 << slot) != 0 && TorchShadowViews::live_rank(eligible, slot) < MAX_TORCH_DYNAMIC {
+            mask | (1 << slot)
+        } else { mask }
+    });
+    (ready, rebuild, dynamic)
 }
 
 // MONKEY (static torch cache): an empty mesh is a valid all-clear cube. A nonempty mesh without
@@ -714,11 +805,12 @@ impl super::StaticGx {
     /// MONKEY (static torch cache): fixture-local static collection uses batch bounds, not the
     /// building's placement origin. A distant Abbey room is still part of a WMO anchored more
     /// than 48 yards away. The key and the mesh MUST use this identical admission predicate.
-    pub fn append_torch_triangles(&self, center: Vec3, reach: f32,
+    pub fn append_torch_triangles(&self, center: Vec3, reach: f32, self_exclude: f32,
         positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>) {
         for cell in self.cells.values().chain(self.wmos.values()).chain(self.props.values()) {
             for item in &cell.items {
                 if !torch_item_in_range(item, center, reach) { continue; }
+                if torch_item_is_emitter(item, center, self_exclude) { continue; }
                 let base = positions.len() as u32;
                 positions.extend(item.geometry.positions.iter().map(|p|
                     item.transform.transform_point(benilla_assets::coords::wow_to_bevy(*p)).to_array()));
@@ -730,15 +822,41 @@ impl super::StaticGx {
         }
     }
 
+    /// MONKEY (torch lane perf): a CHEAP stamp of "has the retained scene changed at all" —
+    /// O(regions), where [`Self::torch_geometry_key`] is O(items) and is run per fixture.
+    ///
+    /// It folds each region's own `last_change` frame together with its population, which between
+    /// them cover every way the source set of ANY fixture can move: an item is only ever pushed
+    /// (`push_item` stamps `last_change`) or dropped (`release_owner` stamps it and changes the
+    /// count), and a whole region arriving or being culled changes the fold because the region set
+    /// itself is folded. Order-independent, so `HashMap` iteration order is invisible. A baker's
+    /// in-place SORT of a region's items is deliberately not covered and does not need to be: the
+    /// geometry key it guards is an order-independent sum too.
+    ///
+    /// This is a GATE, not a key: the app lane skips a fixture's expensive walk while this and the
+    /// entity-part census are both unchanged, and still computes the real per-fixture key whenever
+    /// either of them moves.
+    pub fn torch_residency_generation(&self) -> u64 {
+        let mut sum = 0u64;
+        for cell in self.cells.values().chain(self.wmos.values()).chain(self.props.values()) {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            cell.last_change.hash(&mut hash);
+            cell.items.len().hash(&mut hash);
+            sum = sum.wrapping_add(hash.finish());
+        }
+        sum
+    }
+
     /// MONKEY (static torch cache): residency fingerprint of the exact opaque source set used
     /// by append_torch_triangles. Order-independent per-item hashing ignores HashMap reordering
     /// and camera/portal/fader bookkeeping. Arrival, unload, replacement or transform edits in
     /// THIS fixture's sphere invalidate it even when neither camera nor fixture moves.
-    pub fn torch_geometry_key(&self, center: Vec3, reach: f32) -> u64 {
+    pub fn torch_geometry_key(&self, center: Vec3, reach: f32, self_exclude: f32) -> u64 {
         let mut sum = 0u64;
         for cell in self.cells.values().chain(self.wmos.values()).chain(self.props.values()) {
             for item in &cell.items {
                 if !torch_item_in_range(item, center, reach) { continue; }
+                if torch_item_is_emitter(item, center, self_exclude) { continue; }
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 // MONKEY (static torch cache): source residency stamp prevents allocator address
                 // reuse after unload/reload from impersonating the previous geometry Arc.
@@ -750,6 +868,40 @@ impl super::StaticGx {
         }
         sum
     }
+}
+
+/// MONKEY (outdoor torch shadows): EMITTER-OWNER EXCLUSION — is this item the fixture's own body?
+///
+/// A campfire's light sits AT the flame, inside the campfire prop's own opaque logs, and nothing in
+/// this lane knows the two belong together (the light is an ECS entity, the logs are a retained
+/// `GxItem`; the placement that spawned both is not carried on either side). Left in, the logs are
+/// the nearest occluder in every one of the six cube faces and the fire blacks out its OWN pool —
+/// which indoors never mattered, because an authored MOLT fixture stands clear of its bracket,
+/// and outdoors is the whole effect.
+///
+/// So identity is approximated by CONTAINMENT: an item whose entire bounding sphere lies inside
+/// `radius` of the fixture is the fixture's own body (or is so close to it that it can cast
+/// nothing but self-shadow). Containment, not centre distance, is what keeps a wall or a fence
+/// that merely PASSES near the fire — a large sphere with a near centre — casting normally.
+/// `radius <= 0` (the interior lane, and any caller that wants the old set) excludes nothing, so
+/// the interior gather is byte-for-byte the set it always was. An item with no bounds is never
+/// excluded: the failure direction of this test must be "keeps a caster", not "loses a wall".
+fn torch_item_is_emitter(item: &super::GxItem, center: Vec3, radius: f32) -> bool {
+    item.local_aabb.is_some_and(|aabb| torch_bound_contained(
+        &item.transform, aabb.center.into(), aabb.half_extents.into(), center, radius))
+}
+
+/// The containment half of [`torch_item_is_emitter`], split out exactly as `torch_bound_in_range`
+/// is: the transformed bounding sphere lies WHOLLY inside `radius` of the fixture. `radius <= 0`
+/// (the interior lane) contains nothing.
+fn torch_bound_contained(transform: &Transform, local_center: Vec3, half_extents: Vec3,
+    center: Vec3, radius: f32) -> bool {
+    if radius <= 0.0 {
+        return false;
+    }
+    let origin = transform.transform_point(local_center);
+    let r = (half_extents * transform.scale.abs()).length();
+    origin.distance(center) + r <= radius
 }
 
 // MONKEY (static torch cache): a conservative transformed bounding sphere, independent of
@@ -775,12 +927,39 @@ mod tests {
     #[test]
     fn cache_plan_reuses_and_limits_rebuilds() {
         let cached = [Some(10), Some(11), None, Some(13)];
-        assert_eq!(torch_cache_plan(&cached, &cached, |_| false), (0b1011, 0));
+        assert_eq!(torch_cache_plan(&cached, &cached, 0xf, |_| false), (0b1011, 0, 0b1011));
         let requested = [Some(20), Some(11), Some(12), Some(23)];
-        assert_eq!(torch_cache_plan(&cached, &requested, |_| true), (0b0111, 0b0101));
-        assert_eq!(torch_cache_plan(&cached, &requested, |id| id == 23), (0b1010, 0b1000));
-        assert_eq!(torch_cache_plan(&cached, &[None, Some(11)], |_| true), (0b10, 0));
-        assert_eq!(torch_cache_plan(&[None; 4], &requested, |_| true), (0b11, 0b11));
+        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, |_| true), (0b0111, 0b0101, 0b0111));
+        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, |id| id == 23), (0b1010, 0b1000, 0b1010));
+        assert_eq!(torch_cache_plan(&cached, &[None, Some(11)], 0xf, |_| true), (0b10, 0, 0b10));
+        assert_eq!(torch_cache_plan(&[None; 4], &requested, 0, |_| true), (0b11, 0b11, 0));
+    }
+
+    #[test]
+    fn live_bank_rank_matches_count_one_bits() {
+        // MONKEY (live bank rank): independently enumerate lower set bits, including holes,
+        // slot 15 and eight sparse overlays; every face must fit the compact allocation.
+        for mask in [0u32, 1, 1 << 15, 0x8085, 0xaaaa, 0xff] {
+            for slot in 0..MAX_TORCH_MAPS {
+                let expected = (0..slot).filter(|bit| mask & (1 << bit) != 0).count();
+                let rank = TorchShadowViews::live_rank(mask, slot);
+                assert_eq!(rank, expected, "mask {mask:#x}, slot {slot}");
+                if mask & (1 << slot) != 0 {
+                    assert!(MAX_TORCH_LAYERS + rank * CUBE_FACES + 5 < TORCH_TEXTURE_LAYERS);
+                }
+            }
+        }
+        let cached = [Some(1); MAX_TORCH_MAPS];
+        let (_, _, capped) = torch_cache_plan(&cached, &cached, 0xffff, |_| false);
+        assert_eq!(capped, 0xff);
+        let mut requested = cached;
+        requested[0] = None;
+        let (ready, _, dynamic) = torch_cache_plan(&cached, &requested, 0x8001, |_| false);
+        let views = TorchShadowViews { count: 16, ready_mask: ready, dynamic_mask: dynamic, ..Default::default() };
+        let table = TorchTableUniform::pack(Some(&views));
+        assert_eq!(dynamic, 0x8000);
+        assert_eq!(table.dynamic_mask, dynamic);
+        assert_eq!(TorchShadowViews::live_rank(table.dynamic_mask, 15), 0);
     }
 
     #[test]
@@ -808,6 +987,37 @@ mod tests {
         assert_eq!(table.positions[0][3], 0.0);
         assert_eq!(table.positions[15][3], 1.0);
         assert_eq!(MAX_TORCH_LAYERS, 96);
-        assert_eq!(TORCH_TEXTURE_LAYERS, 192);
+        assert_eq!(MAX_TORCH_DYNAMIC, 8);
+        assert_eq!(TORCH_TEXTURE_LAYERS, 144);
+        // MONKEY (outdoor torch shadows): the exterior lane rides `count.w`, the word that was
+        // reserved padding. The SIZE must not move with it — a table that disagrees with either
+        // WGSL copy blanks every building and model on screen.
+        assert_eq!(std::mem::offset_of!(TorchTableUniform, flags), 12);
+        assert_eq!(table.flags, 0, "not exterior by default");
+        views.exterior = true;
+        assert_eq!(TorchTableUniform::pack(Some(&views)).flags, TORCH_EXT_LANE);
+        assert_eq!(TorchTableUniform::pack(None).flags, 0, "no resource = no lane");
+    }
+
+    // MONKEY (outdoor torch shadows): EMITTER-OWNER EXCLUSION. A campfire's own logs must leave
+    // its caster gather (they are the nearest occluder on all six faces and would black out the
+    // fire's own pool); a crate beside it must not. The test is CONTAINMENT of the whole bounding
+    // sphere, so "near the fire" is not enough to be excluded — which is what keeps a long wall or
+    // a fence that merely passes the fire casting normally.
+    #[test]
+    fn only_the_fire_s_own_body_leaves_its_caster_gather() {
+        let excluded = |x: f32, half: f32, radius: f32| torch_bound_contained(
+            &Transform::from_xyz(x, 0.0, 0.0), Vec3::ZERO, Vec3::splat(half), Vec3::ZERO, radius);
+        // The campfire prop itself: centred on the flame, ~1 yd across.
+        assert!(excluded(0.2, 0.5, 2.5));
+        // A crate two yards off: its centre is inside 2.5, its sphere is not.
+        assert!(!excluded(2.0, 0.6, 2.5));
+        // A wall passing right by the fire: a huge sphere, never contained.
+        assert!(!excluded(0.0, 30.0, 2.5));
+        // The INTERIOR lane passes 0 and excludes nothing at all - its gather is untouched.
+        assert!(!excluded(0.0, 0.1, 0.0));
+        // Scale is applied to the extents, exactly as `torch_bound_in_range` applies it.
+        let scaled = Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(4.0));
+        assert!(!torch_bound_contained(&scaled, Vec3::ZERO, Vec3::splat(0.5), Vec3::ZERO, 2.5));
     }
 }

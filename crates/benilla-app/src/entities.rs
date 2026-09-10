@@ -50,6 +50,9 @@ use carried_light::spawn_carried_lights;
 // MONKEY (carried light stability): `torch_shadow` needs the settle verdict to refuse a MOVING
 // carried light a cube-shadow slot.
 pub(crate) use carried_light::CarriedLightMotion;
+// MONKEY (outdoor torch shadows): …and the HELD/creature-owned marker, so the exterior shadow lane
+// can refuse a torch that a body is carrying.
+pub(crate) use carried_light::HeldLight;
 
 /// Equipment visuals (decisions 0072/0074): held items (weapon/shield/ranged) plus worn-armor and
 /// helm/shoulder resolution, all resolved from the unit descriptor + ItemDisplayInfo and spawned as

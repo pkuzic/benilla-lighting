@@ -220,6 +220,7 @@ struct TorchTable {
     // MONKEY (static torch cache): byte-identical in BOTH shaders and TorchTableUniform.
     // count@0 (16): x high-water slot count, y soft*100, z dynamic/live-bank mask, w reserved.
     // positions@16 (256), view_projs@272 (6144): total 6416 bytes. A mismatch hides buildings.
+    // MONKEY (live bank rank): 96 static layers + 48 live layers; matrices stay slot-addressed.
     count: vec4<u32>,
     positions: array<vec4<f32>, 16>,
     view_projs: array<mat4x4<f32>, 96>,
@@ -242,6 +243,27 @@ const TORCH_NORMAL_OFFSET: f32 = 0.15;
 fn torch_soft() -> f32 {
     return max(f32(torch_table.count.y) * 0.01, 0.05);
 }
+// MONKEY (outdoor torch shadows, MIRRORED from static_gx.wgsl — keep in sync): the EXTERIOR lane's
+// world-distance fade radius (yd) and the CPU's one-bit lane gate in `count.w`. See the static_gx
+// copies for the full rationale (the interior `ndc.z` fade is already down to 5 % at 10 yd, which
+// erases a campfire's 15-25 yd pool).
+const TORCH_EXT_FADE_YD: f32 = 44.0;
+const TORCH_EXT_LANE: u32 = 1u;
+// MONKEY (torch lane perf): below THIS much unshadowed direct contribution a fragment skips the
+// torch table scan and its four comparison taps entirely, because the shadow factor is multiplied
+// into that contribution and can therefore only ever subtract less than this from the frame.
+//
+// Sized off what the eye can see, not off "small": the interior budget goes through the
+// `1 - exp(-x * exposure)` rolloff, which for a term this small is just `x * exposure`, so at the
+// shipped `interiorExposure 2.5` the worst possible step across the guard's boundary is
+// 2.5e-4 linear = well under one 8-bit code. A tenth of this (1e-3) would have been a visible
+// ~8/255 contour along the iso-surface where the guard flips. Most of the skips it buys are exact
+// zeros anyway -- `window` IS 0 past the fixture's reach and `nl` IS 0 on a surface facing away --
+// so the threshold only has to be small enough to be invisible, never large enough to be useful.
+const TORCH_SKIP_EPS: f32 = 1e-4;
+fn torch_ext_on() -> bool {
+    return (torch_table.count.w & TORCH_EXT_LANE) != 0u;
+}
 
 // MONKEY (Phase 5, MIRRORED from static_gx.wgsl — keep in sync): the cube face that contains
 // direction `d` (fixture → fragment) — the major axis, signed. Face order is the contract with
@@ -262,7 +284,16 @@ fn torch_face(d: vec3<f32>) -> u32 {
 // fixture at `light_pos` to a promoted torch (position match within 1 yd), pick the cube face
 // facing the fragment, and sample that layer through the shared projector. 1.0 (unshadowed) when
 // no map matches — the lane is off, or the fixture was not among the ≤4 promoted.
-fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+//
+// MONKEY (outdoor torch shadows): `fade_radius` picks the far fade and is the ONLY lane difference
+// (`0` = the interior/legacy `ndc.z` fade, bit-for-bit; `> 0` = the exterior world-distance fade
+// measured from the fixture). MIRRORS static_gx.wgsl's `torch_map_at`.
+fn torch_entity_shadow_at(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>, fade_radius: f32) -> f32 {
+    // MONKEY (torch lane perf): MIRRORS static_gx.wgsl's `torch_map_at` — the empty table is the
+    // common case, so answer it before the normal offset and the loop set-up.
+    if (torch_table.count.x == 0u) {
+        return 1.0;
+    }
     // Normal-offset the sample point out of the body (see TORCH_NORMAL_OFFSET).
     let Ps = P + N * TORCH_NORMAL_OFFSET;
     for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
@@ -270,10 +301,22 @@ fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 
         if (torch_table.positions[i].w <= 0.0) { continue; }
         let fixture = torch_table.positions[i].xyz;
         if (distance(fixture, light_pos) < 1.0) {
-            let layer = i * 6u + torch_face(Ps - fixture);
+            let face = torch_face(Ps - fixture);
+            let layer = i * 6u + face;
+            // MONKEY (live bank rank): count.z is CPU-ready-filtered; holes must not consume
+            // live cubes. Keep the projection on the static slot while compacting depth only.
+            let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
+            let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
+            // MONKEY (outdoor torch shadows): negative = the interior contract (let the projector
+            // use its own reverse-Z far fade); otherwise this lane's world-distance weight.
+            let fade = select(
+                -1.0,
+                1.0 - smoothstep(0.8 * fade_radius, fade_radius, distance(fixture, Ps)),
+                fade_radius > 0.0,
+            );
             let s = shadow_hook::torch_map_shadow(
-                torch_table.view_projs[layer], i32(layer + select(0u, 96u, (torch_table.count.z & (1u << i)) != 0u)), Ps, torch_depth, torch_samp, TORCH_BIAS,
-                torch_soft());
+                torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
+                torch_soft(), fade);
             // MONKEY (torch caster selection, MIRRORED from static_gx.wgsl): `.w` is the slot's
             // FADE WEIGHT, so a promoted fixture's shadow ramps in over ~1/3 s and a demoted one
             // ramps out. An entity and the floor under it MUST use the same weight or the NPC's
@@ -282,6 +325,17 @@ fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 
         }
     }
     return 1.0;
+}
+
+// The INTERIOR lane's call - unchanged behaviour (`fade_radius 0` => the reverse-Z `ndc.z` fade).
+fn torch_entity_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    return torch_entity_shadow_at(light_pos, P, N, 0.0);
+}
+
+// MONKEY (outdoor torch shadows): the EXTERIOR lane's call - a campfire/brazier/lamppost throwing
+// the player, an NPC or a doodad's shadow across the ground and the wall behind them.
+fn torch_entity_exterior_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    return torch_entity_shadow_at(light_pos, P, N, TORCH_EXT_FADE_YD);
 }
 
 // MONKEY (torch debug, interiorDebug 2 on ENTITIES): the MIN raw cube-map shadow factor over every
@@ -293,10 +347,14 @@ fn torch_entity_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
     var s = 1.0;
     for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
         if (torch_table.positions[i].w <= 0.0) { continue; }
-        let layer = i * 6u + torch_face(Ps - torch_table.positions[i].xyz);
+        let face = torch_face(Ps - torch_table.positions[i].xyz);
+        let layer = i * 6u + face;
+        // MONKEY (live bank rank): debug samples the same compact bank as the lit path.
+        let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
+        let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
         let raw = shadow_hook::torch_map_shadow(
-            torch_table.view_projs[layer], i32(layer + select(0u, 96u, (torch_table.count.z & (1u << i)) != 0u)), Ps, torch_depth, torch_samp, TORCH_BIAS,
-            torch_soft());
+            torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
+            torch_soft(), -1.0);
         // MONKEY (torch caster selection): the WEIGHTED factor, matching the real render.
         s = min(s, mix(1.0, raw, torch_table.positions[i].w));
     }
@@ -341,6 +399,12 @@ struct WowVsOut {
 #ifdef WOW_MERGED_SLOT
     @location(10) @interpolate(flat) merged_slot: u32,
 #endif
+    // MONKEY (outdoor torch shadows): WHICH <=3 exterior table entries `point_lit` was summed from,
+    // packed 10 bits each (see `EXT_SEL_NONE`). FLAT, because it is a choice and not a quantity -
+    // interpolating three packed indices would produce a fourth, meaningless one. `EXT_SEL_NONE` on
+    // every lane that takes no exterior point term (interior WMO surfaces, interior props), which
+    // makes the night lane a no-op there by construction.
+    @location(11) @interpolate(flat) ext_sel: u32,
 }
 
 // The dynamic point-light term at a world-space point (decisions 0016/0273/0278, selection 0285) —
@@ -380,7 +444,17 @@ fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), normalize(v), l2 > 1e-12);
 }
 
-fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
+// MONKEY (outdoor torch shadows, MIRRORED from static_gx.wgsl — keep in sync): the ≤3-nearest
+// EXTERIOR selection packed into ONE u32, three 10-bit indices (rank 0 in the low bits) with
+// `EXT_SEL_EMPTY` for an unfilled rank. The point table is capped at 256 entries, so 10 bits leaves
+// two bits of headroom. It exists so the per-FRAGMENT shadowed term below can re-evaluate the
+// VERTEX stage's choice rather than making its own — re-ranking per fragment would draw a hard
+// line wherever the ranking flips, which is precisely what the Gouraud term never does.
+const EXT_SEL_EMPTY: u32 = 1023u;
+const EXT_SEL_NONE: u32 = 1073741823u; // three empty ranks: 1023 | 1023<<10 | 1023<<20
+
+// The ranking half of `point_light_sum`, split out verbatim (same tests, same order, same ties).
+fn point_light_pick(anchor: vec3<f32>) -> u32 {
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, 3>(0u, 0u, 0u);
     var sd = array<f32, 3>(1e30, 1e30, 1e30);
@@ -409,19 +483,61 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
             sd[2] = d2; sel[2] = i;
         }
     }
+    return select(EXT_SEL_EMPTY, sel[0], sd[0] <= 9.9e29)
+        | (select(EXT_SEL_EMPTY, sel[1], sd[1] <= 9.9e29) << 10u)
+        | (select(EXT_SEL_EMPTY, sel[2], sd[2] <= 9.9e29) << 20u);
+}
+
+// The evaluation half — the byte-verified falloff `1/(0.7d + 0.03d²)` × `max(N·L, 0)` × the
+// committed colour, in rank order, stopping at the first empty rank exactly as the old
+// `sd[s] > 9.9e29` break did. Shared by both pickers (their sum loops were already identical).
+fn point_light_eval(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < 3u; s = s + 1u) {
-        if (sd[s] > 9.9e29) {
+        let idx = (sel >> (10u * s)) & 1023u;
+        if (idx == EXT_SEL_EMPTY) {
             break;
         }
-        let pos_range = wow_light.points[2u * sel[s]];
-        let to_light = pos_range.xyz - P;
+        let to_light = wow_light.points[2u * idx].xyz - P;
         let d = length(to_light);
         let atten = 1.0 / (0.7 * d + 0.03 * d * d);
         let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
-        sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
+        sum += wow_light.points[2u * idx + 1u].rgb * (atten * nl);
     }
     return sum;
+}
+
+// MONKEY (outdoor torch shadows): the SHADOWED evaluation — the same three entries, each
+// multiplied by its OWN fixture's cube-map occlusion (normal-offset, like every entity sample on
+// this lane), so a fence between the player and campfire A darkens A's term while lamppost B's is
+// untouched. Bounded at three iterations, and reached only under `torch_ext_on()`, so nothing here
+// runs in daylight or with `exteriorShadows 0`.
+fn point_light_eval_shadowed(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    for (var s = 0u; s < 3u; s = s + 1u) {
+        let idx = (sel >> (10u * s)) & 1023u;
+        if (idx == EXT_SEL_EMPTY) {
+            break;
+        }
+        let fixture = wow_light.points[2u * idx].xyz;
+        let to_light = fixture - P;
+        let d = length(to_light);
+        let atten = 1.0 / (0.7 * d + 0.03 * d * d);
+        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
+        // MONKEY (torch lane perf, MIRRORED from static_gx.wgsl): the occlusion is a factor on a
+        // term that is already zero on any surface facing away from the fire.
+        let ext_w = atten * nl;
+        var s = 1.0;
+        if (ext_w > TORCH_SKIP_EPS) {
+            s = torch_entity_exterior_shadow(fixture, P, N);
+        }
+        sum += wow_light.points[2u * idx + 1u].rgb * (ext_w * s);
+    }
+    return sum;
+}
+
+fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
+    return point_light_eval(point_light_pick(anchor), P, N);
 }
 
 // MONKEY (dynamic interiors): the per-FRAGMENT room light — MIRRORED from `static_gx.wgsl`
@@ -568,8 +684,17 @@ fn interior_room_light(P: vec3<f32>, N: vec3<f32>, room_inst: u32, room_group: u
         // `torch_surface_shadow` call): this fixture's OWN cube map, sampled through the
         // material's group-2 torch bindings — a pillar between an NPC and torch A darkens A's
         // term without touching torch B's, exactly as on the surfaces around it.
-        let s = torch_entity_shadow(pos_range.xyz, P, N);
-        direct += c_norm * (atten * nl * window) * s;
+        // MONKEY (torch lane perf, MIRRORED from static_gx.wgsl): skip the table scan and its four
+        // comparison taps where the direct term this occlusion multiplies is already nothing —
+        // past the fixture's reach (`window` is exactly 0 there) or on a surface facing away from
+        // it. An entity and the floor under it must agree about the shadow they show, so the
+        // threshold and the shape of the guard are the same on both sides.
+        let direct_w = atten * nl * window;
+        var s = 1.0;
+        if (direct_w > TORCH_SKIP_EPS) {
+            s = torch_entity_shadow(pos_range.xyz, P, N);
+        }
+        direct += c_norm * direct_w * s;
         // MONKEY (soft falloff): the fill's profile is UNCHANGED in FORM — `(1 − d/r)²`, which is
         // exactly `interior_window(d, r, 1.0)` — and only its radius moved, from R to
         // `INTERIOR_FILL_SPAN·R`. That is the whole "gentle wash between the pools": at the fixture
@@ -609,7 +734,9 @@ fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
 // the SAME candidates and agree at the seam. Candidacy is terrain's Chebyshev box, not this file's
 // 48 yd sphere, for that same agreement reason.
 const WMO_EXT_REACH: f32 = 33.570166;
-fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (outdoor torch shadows): the ranking half, split out for the same reason as
+// `point_light_pick` — the fragment stage re-evaluates the VERTEX's choice, never its own.
+fn wmo_exterior_pick(P: vec3<f32>) -> u32 {
     let anchor = mcnk_cell_anchor(P);
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, 3>(0u, 0u, 0u);
@@ -638,18 +765,12 @@ fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
             sd[2] = d2; sel[2] = i;
         }
     }
-    var sum = vec3<f32>(0.0);
-    for (var s = 0u; s < 3u; s = s + 1u) {
-        if (sd[s] > 9.9e29) {
-            break;
-        }
-        let to_light = wow_light.points[2u * sel[s]].xyz - P;
-        let d = length(to_light);
-        let atten = 1.0 / (0.7 * d + 0.03 * d * d);
-        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
-        sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
-    }
-    return sum;
+    return select(EXT_SEL_EMPTY, sel[0], sd[0] <= 9.9e29)
+        | (select(EXT_SEL_EMPTY, sel[1], sd[1] <= 9.9e29) << 10u)
+        | (select(EXT_SEL_EMPTY, sel[2], sd[2] <= 9.9e29) << 20u);
+}
+fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    return point_light_eval(wmo_exterior_pick(P), P, N);
 }
 
 // The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's shader locations (the
@@ -922,15 +1043,23 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
         // it as a blanket zero is what left Stormwind's Trade District torches lighting nothing but
         // the NPC beside them. Mirrors `static_gx.wgsl`'s branch (which draws the vast majority of
         // these batches) — keep the two in step.
-        out.point_lit = wmo_exterior_point_sum(out.world_position.xyz, out.world_normal);
+        // MONKEY (outdoor torch shadows): the pick is PUBLISHED so the fragment stage can shadow
+        // these same three entries at night without re-ranking. One table walk still, not two -
+        // the sum was always `eval(pick(..))`, it is just no longer inlined.
+        let sel = wmo_exterior_pick(out.world_position.xyz);
+        out.ext_sel = sel;
+        out.point_lit = point_light_eval(sel, out.world_position.xyz, out.world_normal);
     } else if (m.model_flags.x > 0.5 || m.model_flags.z > 0.5) {
         out.point_lit = vec3<f32>(0.0);
+        out.ext_sel = EXT_SEL_NONE;
     } else {
         var anchor = mesh_world_from_local[3].xyz;
         if (m.clutter_fade.w > 0.5) {
             anchor = mcnk_cell_anchor(out.world_position.xyz);
         }
-        out.point_lit = point_light_sum(out.world_position.xyz, out.world_normal, anchor);
+        let sel = point_light_pick(anchor);
+        out.ext_sel = sel;
+        out.point_lit = point_light_eval(sel, out.world_position.xyz, out.world_normal);
     }
     return out;
 }
@@ -1399,7 +1528,30 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // like the terrain it adjoins, which is what puts a street torch on the cobbles. The term
     // arrives GOURAUD-INTERPOLATED — per-vertex like the reference FFP, whose tessellation-scale
     // smoothing is the authored look. Diffuse-only (committed ambient/specular are zero).
-    let point_diffuse = in.point_lit;
+    // MONKEY (outdoor torch shadows): ...and after dark that Gouraud term is CAST-SHADOWED.
+    //
+    // The same three entries the vertex stage picked (`in.ext_sel`) are re-evaluated PER FRAGMENT
+    // with each fixture's own cube-map occlusion folded in, and the two results are blended by
+    // `night_w = 1 - sun_shadow_strength`. Written as a blend rather than a swap for two reasons:
+    //   - `fog_params.z` is EXACTLY 1.0 whenever the sun is above the daylight threshold
+    //     (`global_light::sun_shadow_strength` is a smoothstep that saturates), so `night_w` is
+    //     exactly 0 and the branch is not entered - DAYLIGHT IS THE SAME BITS, not "a mix that
+    //     ought to round back to b".
+    //   - at dusk the shadow, and the Gouraud->per-fragment change of the term itself, arrive on
+    //     the same clock the sun shadows leave on instead of snapping at some threshold.
+    // `torch_ext_on()` is the CPU's one-bit verdict (`exteriorShadows` AND night AND at least one
+    // promoted exterior fixture), so with the cvar off this is dead too. `n_lit` is the same
+    // normal every other lit term here uses, so the normal-offset sample leaves the skin the way
+    // the interior entity lane's does.
+    var point_diffuse = in.point_lit;
+    let ext_night_w = select(0.0, clamp(1.0 - wow_light.fog_params.z, 0.0, 1.0), torch_ext_on());
+    if (ext_night_w > 0.0) {
+        point_diffuse = mix(
+            in.point_lit,
+            point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit),
+            ext_night_w,
+        );
+    }
 
     // Hover/target model brighten (tag bit 31): the client's per-model highlight emissive —
     // `glMaterialfv(GL_EMISSION, +64/255)` per channel (shipped config default 0xff404040), verified

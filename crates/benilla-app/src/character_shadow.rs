@@ -17,7 +17,7 @@ use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 
 use crate::shadow_core::{
     collect_entity_geometry, empty_shadow_mesh, restore_mesh_buffers, shadow_trace,
-    spawn_solid_caster, take_mesh_buffers, ShadowDemand, ShadowFrame, ShadowSet,
+    spawn_solid_caster, take_mesh_buffers, RebuildRate, ShadowDemand, ShadowFrame, ShadowSet,
 };
 use crate::video::VideoConfig;
 
@@ -37,11 +37,15 @@ struct CharacterLane {
     mesh: Option<Handle<Mesh>>,
     /// [`shadow_trace`]'s change detector: (tris, admitted, rejected).
     traced: (u32, u32, u32),
+    /// MONKEY (sun shadow perf): the `characterShadowRate` cadence gate — see the rebuild comment
+    /// in [`collect_character_shadows`].
+    rate: RebuildRate,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn collect_character_shadows(
     video: Res<VideoConfig>,
+    time: Res<Time>,
     mut demand: ResMut<ShadowDemand>,
     frame: Res<ShadowFrame>,
     mut lane: ResMut<CharacterLane>,
@@ -73,6 +77,8 @@ fn collect_character_shadows(
         if let Some(handle) = lane.mesh.take() {
             meshes.remove(handle.id());
         }
+        // The mesh this gate was pacing is gone — re-arm so a re-enable builds on its first frame.
+        lane.rate.reset();
         return;
     }
     let Some(material) = frame.material.clone() else {
@@ -80,12 +86,30 @@ fn collect_character_shadows(
     };
 
     // Animated rigs re-skin every frame and creatures spawn/despawn under lifecycles this lane
-    // can't cheaply observe — so the caster is collected fresh every frame.
+    // can't cheaply observe — so the caster is collected fresh, at a CAPPED cadence.
     if lane.caster.is_none() {
         let mesh = meshes.add(empty_shadow_mesh());
         let entity = spawn_solid_caster(&mut commands, mesh.clone(), material);
         lane.caster = Some(entity);
         lane.mesh = Some(mesh);
+        // A brand-new caster is an EMPTY mesh; make sure this frame fills it.
+        lane.rate.reset();
+    }
+    // MONKEY (sun shadow perf): the `characterShadowRate` gate. This rebuild is the expensive half
+    // of the ~3 ms the character lane costs — it CPU-skins every admitted unit and then mutates the
+    // `Mesh` asset, and a mutated mesh is re-extracted and re-uploaded (vertices AND indices) to the
+    // GPU. Skipping it simply leaves the previous proxy in place: the shadow MAP is still rendered
+    // from that proxy every frame, so nothing flickers or disappears — a moving unit's silhouette
+    // merely lags by up to 1/rate second.
+    //
+    // Why a rate cap and not change detection: the obvious `Changed<GlobalTransform>` gate does not
+    // work here. A unit's shadow geometry comes from the RIG PALETTE (`append_skinned` reads
+    // `RigPalettes`, the per-frame skinning pose), not from the part's transform — so a standing NPC
+    // whose idle animation is breathing has an unchanged `GlobalTransform` and changed VERTICES.
+    // Gating on the transform would freeze exactly the poses this lane exists to draw. The rate cap
+    // is the honest saving, and it is bounded work rather than a guess about content.
+    if !lane.rate.due(time.elapsed_secs(), video.character_shadow_rate) {
+        return;
     }
     if let Some(handle) = lane.mesh.clone() {
         if let Some(mesh) = meshes.get_mut(&handle) {

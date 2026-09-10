@@ -423,11 +423,10 @@ pub(super) fn spawn_wmo_gameobject_props(
                     if !l.def.casts() {
                         continue; // directional lights feed an ambient term; a static `0` visibility key is dark
                     }
+                    let local = prop.local.transform_point(wow_to_bevy(l.def.position));
                     let mut glow = commands.spawn((
                         point_light(l.def.diffuse_color, l.def.diffuse_intensity),
-                        Transform::from_translation(
-                            prop.local.transform_point(wow_to_bevy(l.def.position)),
-                        ),
+                        Transform::from_translation(local),
                         Visibility::default(),
                     ));
                     // MONKEY (fire GO lights): a transport prop takes SYNTHESISED lights like the
@@ -435,6 +434,19 @@ pub(super) fn spawn_wmo_gameobject_props(
                     // so the live `fireLightGain` reaches them.
                     if l.synthetic {
                         glow.insert(benilla_world::lighting::SyntheticFireLight);
+                    }
+                    // MONKEY (flame flicker): a deck brazier on a moving zeppelin burns too. The
+                    // seed is the prop-LOCAL position (the hull moves; the phase must not) mixed
+                    // with the host, so two identical decks don't beat together.
+                    if let Some(kind) = benilla_world::lighting::flame_kind_for(
+                        l.flame,
+                        l.synthetic,
+                        l.def.diffuse_color,
+                        l.def.diffuse_intensity,
+                    ) {
+                        let seed = benilla_world::lighting::flicker_seed(local)
+                            ^ entity.to_bits().rotate_left(11) as u32;
+                        glow.insert(benilla_world::lighting::FlameFlicker::new(kind, seed));
                     }
                     let glow = glow.id();
                     commands.entity(entity).add_child(glow);

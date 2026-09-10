@@ -456,6 +456,9 @@ pub(super) fn spawn_loaded_placements(
                                     crate::static_gx::GxSite::Wmo {
                                         instance: i,
                                         groups: &m.submesh_group,
+                                        // MONKEY (ext-class night law): the MOGI table, so the
+                                        // assembler can read each batch's group CLASS + BOX.
+                                        bounds: &m.group_bounds,
                                     },
                                 )
                             })

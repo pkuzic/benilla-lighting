@@ -29,6 +29,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::light::{
     CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap, NotShadowReceiver,
+    ShadowFilteringMethod,
 };
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPlugin, MeshMaterial3d};
@@ -44,7 +45,7 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_formats::ModelBlend;
 use benilla_world::billboard::BillboardCard;
 use benilla_world::interact::PickMesh;
-use benilla_world::lighting::{ShadowDistance, WowLighting};
+use benilla_world::lighting::{ShadowDistance, ShadowFilterGaussian, WowLighting};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 use benilla_world::view::WorldCamera;
@@ -62,13 +63,113 @@ pub(crate) const PLAYER_SHADOW_LAYER: usize = 31;
 pub(crate) const DEFAULT_SHADOW_DISTANCE: f32 = 80.0;
 
 /// The `shadowDistance` slider range (yd). Min keeps a useful near shadow; max is bounded because
-/// the fixed 4096 shadow map spreads thinner (softer) over a larger area and the caster-collection
-/// cost grows with distance.
+/// the ONE shadow map spreads thinner (softer) over a larger area and the caster-collection cost
+/// grows with distance. (The map's edge is no longer the fixed 4096 this note was written against —
+/// it is `shadowMapSize`, default 2048 — which makes the softening at long range twice as quick.)
 pub(crate) const SHADOW_DISTANCE_RANGE: std::ops::RangeInclusive<f32> = 40.0..=200.0;
 
 /// How far the camera may drift before a cached caster-collection pass must refresh. The collection
 /// reach carries this as margin so coverage holds everywhere between refreshes.
 pub(crate) const STATIC_REBUILD_STEP: f32 = 16.0;
+
+// -------------------------------------------------------------------------------------------
+// MONKEY (sun shadow perf): the five live dials over this rig's cost. Measured on an RTX 3070 at
+// 1080p in the Lion's Pride Inn: 45-47 fps with both lanes on, 60-62 with `characterShadows 0`,
+// 68-73 with `worldShadows 0` too — i.e. ~5 ms/frame in the sun lanes, the renderer's single
+// biggest line item. The cost splits three ways and each dial takes one of them:
+//   * the shadow PASS's fill + its depth texture .... `shadowMapSize` (quadratic in the edge)
+//   * the RECEIVERS' PCF fetches ..................... `shadowFilter`  (9 samples vs 1)
+//   * the CPU caster rebuild + GPU re-upload ......... `characterShadowRate` / `worldShadowRate`
+// and `shadowCasterReach` trims the caster POPULATION those rebuilds walk. All live: nothing here
+// is latched at boot, so the user A/Bs the whole set from one chat line.
+// -------------------------------------------------------------------------------------------
+
+/// The `shadowMapSize` ladder. Powers of two only — Bevy's `validate_shadow_map_size` rounds a
+/// non-power-of-two up with a warning, so an off-ladder value would silently become a different
+/// (and larger) map than the one the user typed.
+pub(crate) const SHADOW_MAP_SIZES: [u32; 3] = [1024, 2048, 4096];
+
+/// The shipped shadow-map edge. **2048**, down from the rig's original 4096 literal: the pass is
+/// quadratic in this, and over ONE 80 yd cascade 2048 is ~26 texels/yd — finer than the Gaussian
+/// receiver kernel resolves. The softer edge is the accepted trade; `shadowMapSize 4096` restores
+/// the old crispness at the old price.
+pub(crate) const DEFAULT_SHADOW_MAP_SIZE: u32 = 2048;
+
+/// `shadowFilter` default: **1 = Gaussian**, the look the rig has always had. The cheap arm (0 =
+/// Hardware2x2) is one comparison sample instead of nine and is where the receiver-side win is,
+/// but it stair-steps edges, so it ships OFF and the user judges it.
+pub(crate) const DEFAULT_SHADOW_FILTER: u32 = 1;
+
+/// The `shadowFilter` ladder's top. Bevy also has `Temporal`, which is deliberately NOT offered:
+/// it is a randomized filter that only resolves under `TemporalAntiAliasing`, which benilla's
+/// world camera does not run — it would read as noise.
+pub(crate) const MAX_SHADOW_FILTER: u32 = 1;
+
+/// The shipped Hz cap on both lanes' per-frame caster rebuild. **30** — half of a 60 Hz frame's
+/// rebuilds for a silhouette that lags at most 33 ms, which is under the reaction threshold for a
+/// shadow you are not looking directly at.
+pub(crate) const DEFAULT_SHADOW_RATE: u32 = 30;
+
+/// The rate ladder's top. Above the frame rate the cap is inert, so 120 is "off" with headroom for
+/// a high-refresh panel; `0` is the explicit "every frame" (the pre-cvar behaviour).
+pub(crate) const MAX_SHADOW_RATE: u32 = 120;
+
+/// The `shadowCasterReach` multiplier range. `1` is the untouched reach law. The floor is 0.25 and
+/// not 0 because a 0 reach admits nothing and would read as "shadows broke", which is what
+/// `worldShadows 0` / `characterShadows 0` are for.
+pub(crate) const CASTER_REACH_RANGE: std::ops::RangeInclusive<f32> = 0.25..=2.0;
+
+/// Snap a requested `shadowMapSize` onto [`SHADOW_MAP_SIZES`] — nearest in LOG space, so 1500 lands
+/// on 1024 and 3000 on 4096 (halfway in ratio, not in texels, is what "one step" means here).
+pub(crate) fn clamp_shadow_map_size(asked: u32) -> u32 {
+    let asked = asked.clamp(SHADOW_MAP_SIZES[0], SHADOW_MAP_SIZES[SHADOW_MAP_SIZES.len() - 1]);
+    *SHADOW_MAP_SIZES
+        .iter()
+        .min_by(|a, b| {
+            let d = |v: u32| ((v as f32).ln() - (asked as f32).ln()).abs();
+            d(**a).total_cmp(&d(**b))
+        })
+        .unwrap_or(&DEFAULT_SHADOW_MAP_SIZE)
+}
+
+/// A lane's rebuild cadence gate. Holds the timestamp of the last rebuild and answers "may I
+/// rebuild now?" against a live Hz cap.
+///
+/// Deliberately time-based rather than frame-counted: the point is to bound the rebuild WORK per
+/// second, and a frame counter would tighten the real cadence exactly when the frame rate is
+/// already high (where the work is affordable) and loosen it when it drops (where it is not).
+///
+/// `rate == 0` means "every frame" — the pre-cvar behaviour, kept reachable so the cap can be
+/// ruled out as the cause of any artefact in one keystroke.
+#[derive(Default)]
+pub(crate) struct RebuildRate {
+    last: Option<f32>,
+}
+
+impl RebuildRate {
+    /// True when a rebuild is due at `now` (seconds since app start) for a cap of `rate` Hz; the
+    /// timestamp is taken on the way out, so a `true` consumes the slot. The FIRST call is always
+    /// due — a lane that has never built has nothing to show.
+    pub(crate) fn due(&mut self, now: f32, rate: u32) -> bool {
+        if rate == 0 {
+            self.last = Some(now);
+            return true;
+        }
+        let interval = 1.0 / rate as f32;
+        // `now < last` (a time reset) is treated as due rather than as a very long wait.
+        let due = self.last.is_none_or(|last| now - last >= interval || now < last);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    /// Forget the last rebuild, so the lane's next frame rebuilds immediately. Called when a lane
+    /// tears its caster down — the mesh it was pacing no longer exists.
+    pub(crate) fn reset(&mut self) {
+        self.last = None;
+    }
+}
 
 /// The tallest COMMON caster the reach law budgets for (the big Elwynn/Duskwood tree class, in world
 /// units). Not a clamp on what casts — only on how far past the resolve range collection hunts.
@@ -200,6 +301,10 @@ struct ShadowRigState {
     /// `CascadeShadowConfig` is only re-inserted when this changes — rebuilding it every frame would
     /// re-fit the cascade and defeat the texel snap (crawling every shadow edge).
     cascade_distance: Option<f32>,
+    /// MONKEY (sun shadow perf): the last (map size, gaussian, character Hz, world Hz, reach)
+    /// [`shadow_trace`] reported. Purely the trace's change detector — the values themselves are
+    /// applied straight from [`VideoConfig`], never cached here.
+    traced_quality: Option<(u32, bool, u32, u32, f32)>,
 }
 
 pub(crate) struct ShadowCorePlugin;
@@ -230,14 +335,96 @@ impl Material for ShadowCasterMaterial {
 
 impl Plugin for ShadowCorePlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(DirectionalLightShadowMap { size: 4096 }) // MONKEY: crisper shadow edges
+        // MONKEY (sun shadow perf): the shipped edge is now 2048, and it is a LIVE cvar
+        // (`apply_shadow_quality` writes this resource) rather than the 4096 boot literal this
+        // line used to be. Bevy re-extracts the resource on change and `prepare_lights` re-keys
+        // the texture cache with the new descriptor, so the map is genuinely re-created.
+        app.insert_resource(DirectionalLightShadowMap {
+            size: DEFAULT_SHADOW_MAP_SIZE as usize,
+        })
             .add_plugins(MaterialPlugin::<ShadowCasterMaterial>::default())
             .init_resource::<ShadowRigState>()
             .init_resource::<ShadowDemand>()
             .init_resource::<ShadowFrame>()
             // The rig runs before the lanes every frame; the lanes read the frame it publishes.
             .configure_sets(Last, (ShadowSet::Rig, ShadowSet::Lanes).chain())
-            .add_systems(Last, manage_rig.in_set(ShadowSet::Rig));
+            // MONKEY (sun shadow perf): the quality dials land BEFORE the rig each frame, and
+            // unconditionally — a `shadowMapSize` write must take even while the lanes are off, so
+            // turning shadows back on doesn't render one frame at the previous size.
+            .add_systems(
+                Last,
+                (apply_shadow_quality, manage_rig)
+                    .chain()
+                    .in_set(ShadowSet::Rig),
+            );
+    }
+}
+
+/// MONKEY (sun shadow perf): push the "how expensive is a shadow" QUALITY dials from [`VideoConfig`]
+/// to the places that own them, every frame, whether or not the lanes are up.
+///
+/// Three destinations, because Bevy spreads the shadow cost over three unrelated mechanisms:
+/// - **`shadowMapSize`** → the [`DirectionalLightShadowMap`] resource. Bevy's `extract_lights`
+///   re-publishes it into the render world on change and `prepare_lights` asks the texture cache
+///   for a descriptor carrying the new edge — a different descriptor is a different cache entry, so
+///   the depth texture is really re-created. Written through `ResMut` only on a genuine difference:
+///   touching it every frame would re-extract (and re-validate) it every frame for nothing.
+/// - **`shadowFilter`** → the world camera's [`ShadowFilteringMethod`], which keys the mesh
+///   pipeline for every Bevy-material receiver (terrain, `wow_model`). Bevy has no "default"
+///   component here — absent means Gaussian — but the component is inserted either way so the
+///   value on the camera always names what is actually running.
+/// - the same **`shadowFilter`** → [`ShadowFilterGaussian`], which `static_gx`'s hand-specialized
+///   retained pipeline reads in the render world. Both must move together or the ground and the
+///   buildings on it filter differently.
+///
+/// The rate dials need no push at all: each lane reads `VideoConfig` directly.
+fn apply_shadow_quality(
+    video: Res<VideoConfig>,
+    mut rig: ResMut<ShadowRigState>,
+    mut shadow_map: ResMut<DirectionalLightShadowMap>,
+    mut filter_out: ResMut<ShadowFilterGaussian>,
+    mut commands: Commands,
+    cameras: Query<(Entity, Option<&ShadowFilteringMethod>), With<WorldCamera>>,
+) {
+    let size = clamp_shadow_map_size(video.shadow_map_size) as usize;
+    if shadow_map.size != size {
+        shadow_map.size = size;
+    }
+
+    let gaussian = video.shadow_filter != 0;
+    let method = if gaussian {
+        ShadowFilteringMethod::Gaussian
+    } else {
+        ShadowFilteringMethod::Hardware2x2
+    };
+    for (entity, current) in &cameras {
+        if current != Some(&method) {
+            commands.entity(entity).insert(method);
+        }
+    }
+    if filter_out.0 != gaussian {
+        filter_out.0 = gaussian;
+    }
+
+    if shadow_trace() {
+        let now = (
+            size as u32,
+            gaussian,
+            video.character_shadow_rate,
+            video.world_shadow_rate,
+            video.shadow_caster_reach,
+        );
+        if rig.traced_quality != Some(now) {
+            info!(
+                "shadow-trace: quality — map {}² | filter {} | rebuild caps character {} / world {} Hz | caster reach ×{:.2}",
+                now.0,
+                if gaussian { "gaussian(9)" } else { "hardware2x2(1)" },
+                if now.2 == 0 { "every-frame".to_string() } else { now.2.to_string() },
+                if now.3 == 0 { "every-frame".to_string() } else { now.3.to_string() },
+                now.4,
+            );
+            rig.traced_quality = Some(now);
+        }
     }
 }
 
@@ -373,8 +560,15 @@ fn manage_rig(
 
     // MONKEY (moving sun): aim at the VISIBLE celestial sun (rises/sets), clamped in elevation.
     let sun_direction = shadow_sun_travel(lighting.celestial_dir());
-    let entity_reach = distance + STATIC_REBUILD_STEP;
-    let tall_reach = static_collection_reach(sun_direction, distance);
+    // MONKEY (sun shadow perf): `shadowCasterReach` scales BOTH reaches by the same factor, after
+    // the reach law rather than inside it — the law's terms (resolve range, rebuild margin, the
+    // sun-elevation extension) each mean something, and a dial that rewrote one of them would
+    // change what the others compensate for. A flat multiplier is honestly just "collect less".
+    let reach_scale = video
+        .shadow_caster_reach
+        .clamp(*CASTER_REACH_RANGE.start(), *CASTER_REACH_RANGE.end());
+    let entity_reach = (distance + STATIC_REBUILD_STEP) * reach_scale;
+    let tall_reach = static_collection_reach(sun_direction, distance) * reach_scale;
 
     if let Some(sun) = rig.sun {
         // Only the rotation matters; QUANTISED to hold the cascade texel snap (see SUN_SNAP_RADIANS).
@@ -605,10 +799,11 @@ fn append_skinned(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_triangles, casts_realtime_shadow, shadow_reach_extension, shadow_sun_travel,
-        static_collection_reach, sun_snap_due, DEFAULT_SHADOW_DISTANCE, MAX_CASTER_HEIGHT,
-        MAX_SHADOW_SUN_ELEVATION, MIN_SHADOW_SUN_ELEVATION, SHADOW_REACH_CAP, STATIC_REBUILD_STEP,
-        SUN_SNAP_RADIANS,
+        append_triangles, casts_realtime_shadow, clamp_shadow_map_size, shadow_reach_extension,
+        shadow_sun_travel, static_collection_reach, sun_snap_due, RebuildRate,
+        DEFAULT_SHADOW_DISTANCE, DEFAULT_SHADOW_MAP_SIZE, MAX_CASTER_HEIGHT,
+        MAX_SHADOW_SUN_ELEVATION, MIN_SHADOW_SUN_ELEVATION, SHADOW_MAP_SIZES, SHADOW_REACH_CAP,
+        STATIC_REBUILD_STEP, SUN_SNAP_RADIANS,
     };
     use benilla_formats::ModelBlend;
     use benilla_world::model_render::ModelKind;
@@ -684,5 +879,55 @@ mod tests {
         let mut out = Vec::new();
         append_triangles(&[0, 1, 2, 1, 2, 9, 2, 0, 1], 3, 10, &mut out);
         assert_eq!(out, vec![10, 11, 12, 12, 10, 11]);
+    }
+
+    /// MONKEY (sun shadow perf): the rate gate's arithmetic, which is the whole of the two lanes'
+    /// new behaviour. Three properties, each one a way the cap could go wrong in a way you would
+    /// only notice as a stuttering or frozen shadow:
+    /// 1. the FIRST call is always due (a lane with no mesh yet must not wait a frame-interval),
+    /// 2. a due call CONSUMES the slot (otherwise a 30 Hz cap rebuilds every frame forever),
+    /// 3. the interval is measured from the last GRANT, not from the last ask.
+    #[test]
+    fn the_rebuild_gate_paces_from_the_last_grant_and_first_call_is_always_due() {
+        let mut gate = RebuildRate::default();
+        assert!(gate.due(10.0, 30), "first call has nothing to show yet");
+        assert!(!gate.due(10.01, 30), "10 ms later is inside a 33 ms interval");
+        assert!(!gate.due(10.03, 30), "still inside, measured from the grant");
+        assert!(gate.due(10.04, 30), "past 1/30 s — due again");
+        assert!(!gate.due(10.05, 30), "the grant reset the clock");
+        // A reset (the lane tore its caster down) re-arms immediately.
+        gate.reset();
+        assert!(gate.due(10.051, 30));
+    }
+
+    /// `rate == 0` is the documented "every frame" escape hatch, and a backwards clock (a time
+    /// reset) must read as due rather than as a very long wait — a lane frozen until the clock
+    /// catches up would look exactly like a broken shadow.
+    #[test]
+    fn the_rebuild_gate_has_an_every_frame_arm_and_survives_a_clock_reset() {
+        let mut gate = RebuildRate::default();
+        for t in 0..5 {
+            assert!(gate.due(100.0 + t as f32 * 0.001, 0), "rate 0 never gates");
+        }
+        let mut gate = RebuildRate::default();
+        assert!(gate.due(100.0, 15));
+        assert!(!gate.due(100.01, 15));
+        assert!(gate.due(0.0, 15), "a clock that went backwards is due, not stuck");
+    }
+
+    /// The map-size ladder snaps in LOG space, so "halfway" means halfway in ratio (1448 = √2·1024)
+    /// rather than in texels — and every answer is a power of two, because Bevy silently rounds a
+    /// non-power-of-two UP and the user would get a bigger, slower map than the one they typed.
+    #[test]
+    fn the_shadow_map_size_snaps_onto_the_power_of_two_ladder() {
+        assert_eq!(clamp_shadow_map_size(2048), 2048);
+        assert_eq!(clamp_shadow_map_size(1024), 1024);
+        assert_eq!(clamp_shadow_map_size(4096), 4096);
+        assert_eq!(clamp_shadow_map_size(0), 1024, "clamped to the floor");
+        assert_eq!(clamp_shadow_map_size(99_999), 4096, "clamped to the ceiling");
+        assert_eq!(clamp_shadow_map_size(1500), 2048, "1500 is above the 1448 log midpoint");
+        assert_eq!(clamp_shadow_map_size(1400), 1024, "1400 < 1448");
+        assert!(SHADOW_MAP_SIZES.iter().all(|s| s.is_power_of_two()));
+        assert!(SHADOW_MAP_SIZES.contains(&DEFAULT_SHADOW_MAP_SIZE));
     }
 }
