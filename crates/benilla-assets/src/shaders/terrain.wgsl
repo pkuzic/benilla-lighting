@@ -78,6 +78,142 @@ struct WowLight {
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 
+// MONKEY (outdoor torch shadows: terrain): the GROUND receiver's torch bindings - the SAME depth
+// array static_gx's group 3 samples and the SAME 6416-byte table, riding this material's own group
+// (`TerrainExtension` bindings 91/92/93) because a Bevy material draw sets groups 0/1/2 only.
+// ALWAYS bound (the image and buffer exist from startup), so no shader-def guards this block; only
+// the fragment stage reads it. The struct text is COPIED VERBATIM from wow_model.wgsl - std430 here,
+// std140 in static_gx, identical bytes because every member is 16-aligned - and a drift between the
+// three copies would not be a compile error, it would be terrain sampling the wrong matrices.
+struct TorchTable {
+    // MONKEY (static torch cache): byte-identical in ALL THREE shaders and TorchTableUniform.
+    // count@0 (16): x high-water slot count, y soft*100, z dynamic/live-bank mask, w flags.
+    // positions@16 (256), view_projs@272 (6144): total 6416 bytes. A mismatch hides buildings.
+    // MONKEY (live bank rank): 96 static layers + 48 live layers; matrices stay slot-addressed.
+    count: vec4<u32>,
+    positions: array<vec4<f32>, 16>,
+    view_projs: array<mat4x4<f32>, 96>,
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(91) var torch_depth: texture_depth_2d_array;
+@group(#{MATERIAL_BIND_GROUP}) @binding(92) var torch_samp: sampler_comparison;
+@group(#{MATERIAL_BIND_GROUP}) @binding(93) var<storage, read> torch_table: TorchTable;
+// Reverse-Z receiver bias - KEEP IN SYNC with static_gx.wgsl / wow_model.wgsl's TORCH_BIAS (0.001,
+// the known-good value; larger detaches every shadow far from the torch).
+const TORCH_BIAS: f32 = 0.001;
+// NORMAL-OFFSET for the GROUND (yd): sample the map a hand's width above the surface along its own
+// normal. Terrain is the one receiver whose casters REST on it - a crate, a fence post, a standing
+// NPC - so the contact point is where receiver and caster depths agree to within a texel, i.e.
+// exactly where a plain compare produces acne. Offsetting along the terrain normal (not straight
+// up) is what keeps a SLOPE clean: on a 30 deg bank a vertical offset buys only `0.15*cos(30)` of
+// separation while the depth gradient across a texel has grown by `1/cos(30)`, so the margin
+// collapses on precisely the surfaces that need it most. The same 0.15 the entity lane uses, so a
+// character and the ground under it are offset alike and their shadows meet without a gap.
+const TORCH_NORMAL_OFFSET: f32 = 0.15;
+// MONKEY (torch caster selection, MIRRORED from static_gx.wgsl): the live PCF tap-radius scale,
+// unpacked from the table's `count.y` (stored x100 - the row is `vec4<u32>`).
+fn torch_soft() -> f32 {
+    return max(f32(torch_table.count.y) * 0.01, 0.05);
+}
+// MONKEY (outdoor torch shadows, MIRRORED from static_gx.wgsl - keep in sync): the EXTERIOR lane's
+// world-distance fade radius (yd) and the CPU's one-bit lane gate in `count.w`. See the static_gx
+// copies for the full rationale (the interior `ndc.z` fade is already down to 5 % at 10 yd, which
+// erases a campfire's 15-25 yd pool).
+const TORCH_EXT_FADE_YD: f32 = 44.0;
+const TORCH_EXT_LANE: u32 = 1u;
+// MONKEY (torch lane perf, MIRRORED from static_gx.wgsl): below THIS much unshadowed direct
+// contribution a fragment skips the torch table scan and its four comparison taps entirely, because
+// the shadow factor multiplies that contribution and can therefore only ever subtract less than this
+// from the frame. Terrain's combine is a plain modulate rather than the interior exposure rolloff,
+// so the worst possible step across the guard's boundary is 1e-4 of a fully-lit texel - two orders
+// under one 8-bit code. Most of the skips are exact zeros anyway (`nl` IS 0 on ground facing away
+// from the fire), so the threshold only has to be small enough to be invisible.
+const TORCH_SKIP_EPS: f32 = 1e-4;
+// The CPU's one-bit verdict: `exteriorShadows` AND night AND at least one promoted exterior
+// fixture. EVERYTHING this lane costs terrain hangs off this single uniform read.
+fn torch_ext_on() -> bool {
+    return (torch_table.count.w & TORCH_EXT_LANE) != 0u;
+}
+
+// MONKEY (Phase 5, COPIED VERBATIM from wow_model.wgsl - keep in sync): the cube face that contains
+// direction `d` (fixture -> fragment) - the major axis, signed. Face order is the contract with
+// `benilla_app::torch_shadow::cube_view_projs`: 0 +X, 1 -X, 2 +Y, 3 -Y, 4 +Z, 5 -Z.
+fn torch_face(d: vec3<f32>) -> u32 {
+    let a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) {
+        return select(1u, 0u, d.x > 0.0);
+    }
+    if (a.y >= a.z) {
+        return select(3u, 2u, d.y > 0.0);
+    }
+    return select(5u, 4u, d.z > 0.0);
+}
+
+// MONKEY (outdoor torch shadows: terrain): this fixture's OWN cast shadow on a GROUND fragment -
+// `wow_model.wgsl`'s `torch_entity_shadow_at` with the exterior fade already chosen, because terrain
+// has no interior lane to share the body with (an MCNK cell is outdoors by definition, and the
+// interior half of the light table is skipped before ranking). Correlate the `wow_light` fixture at
+// `light_pos` to a promoted torch (position match within 1 yd), pick the cube face facing the
+// fragment, and sample that layer through the shared projector. 1.0 (unshadowed) when no map matches
+// - the lane is off, or the fixture was not among the promoted slots.
+fn torch_terrain_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    // MONKEY (torch lane perf): the empty table is the common case, so answer it before the normal
+    // offset and the loop set-up.
+    if (torch_table.count.x == 0u) {
+        return 1.0;
+    }
+    // Normal-offset the sample point off the ground (see TORCH_NORMAL_OFFSET).
+    let Ps = P + N * TORCH_NORMAL_OFFSET;
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        // MONKEY (static torch cache): holes and pending uploads never sample stale layers.
+        if (torch_table.positions[i].w <= 0.0) { continue; }
+        let fixture = torch_table.positions[i].xyz;
+        if (distance(fixture, light_pos) < 1.0) {
+            let face = torch_face(Ps - fixture);
+            let layer = i * 6u + face;
+            // MONKEY (live bank rank): count.z is CPU-ready-filtered; holes must not consume live
+            // cubes. Keep the projection on the static slot while compacting depth only.
+            let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
+            let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
+            // The EXTERIOR world-distance fade, measured from the FIXTURE (not the camera): this is
+            // "how far does this fire's shadow carry", a property of the fire. Chosen just inside the
+            // cube projection's own 48 yd far plane so the frustum edge is never a hard cut.
+            let fade = 1.0 - smoothstep(0.8 * TORCH_EXT_FADE_YD, TORCH_EXT_FADE_YD, distance(fixture, Ps));
+            let s = shadow_hook::torch_map_shadow(
+                torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
+                torch_soft(), fade);
+            // MONKEY (torch caster selection): `.w` is the slot's FADE WEIGHT, so a promoted fixture's
+            // shadow ramps in over ~1/3 s and a demoted one ramps out. The ground and the NPC standing
+            // on it MUST use the same weight or one shadow would pop while the other faded.
+            return mix(1.0, s, torch_table.positions[i].w);
+        }
+    }
+    return 1.0;
+}
+
+// MONKEY (torch debug, interiorDebug 2 on TERRAIN): the MIN raw cube-map shadow factor over every
+// promoted fixture (ignoring the fixture match) - mirrors static_gx's `torch_debug_factor` and
+// wow_model's `torch_entity_debug_factor`, so the GROUND's sampling can be SEEN as greyscale:
+// all-white = the table is empty / the projection misses the ground; shaped dark = the depth map
+// reaches the terrain and any remaining fault is downstream of sampling (correlation, weighting).
+fn torch_terrain_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
+    let Ps = P + N * TORCH_NORMAL_OFFSET;
+    var s = 1.0;
+    for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
+        if (torch_table.positions[i].w <= 0.0) { continue; }
+        let face = torch_face(Ps - torch_table.positions[i].xyz);
+        let layer = i * 6u + face;
+        // MONKEY (live bank rank): debug samples the same compact bank as the lit path.
+        let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
+        let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
+        let raw = shadow_hook::torch_map_shadow(
+            torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
+            torch_soft(), -1.0);
+        // MONKEY (torch caster selection): the WEIGHTED factor, matching the real render.
+        s = min(s, mix(1.0, raw, torch_table.positions[i].w));
+    }
+    return s;
+}
+
 // Custom vertex→fragment payload: the standard fields the splat fragment needs, PLUS `specular` — the
 // per-vertex-clamped sun glint that must be Gouraud-interpolated (Q14). Same struct on both stages, so
 // `@builtin(position)` is clip-position out / frag-coord in (`world_position` is unused until Step 5 fog).
@@ -100,6 +236,22 @@ struct TerrainVsOut {
     // The receiver normal is carried so the real cascaded shadow lookup can apply a slope-aware
     // bias. This is forward-pass data only; the terrain shadow caster is a stock Bevy proxy.
     @location(7) world_normal: vec3<f32>,
+    // MONKEY (outdoor torch shadows: terrain): WHICH <=3 exterior table entries `primary`'s point
+    // term was summed from, packed 10 bits each (see `EXT_SEL_EMPTY`). FLAT, because it is a CHOICE
+    // and not a quantity - interpolating three packed indices across a triangle would produce a
+    // fourth, meaningless one. It lets the fragment stage re-shadow the VERTEX's own selection
+    // instead of re-ranking, which is what keeps the selection popping at chunk granularity (the
+    // authored behaviour) rather than drawing a hard line mid-cell.
+    @location(8) @interpolate(flat) ext_sel: u32,
+    // MONKEY (outdoor torch shadows: terrain): `primary` WITHOUT the point term and WITHOUT the
+    // clamp - just `ambient + sun*max(N.L,0)`. `primary` is clamped per VERTEX (the GL T&L locus,
+    // see its note above) and that clamp is lossy: once a hot torch has saturated a vertex there is
+    // no way to subtract the point term back out in the fragment stage. So the sun/ambient half
+    // rides its own slot and the night lane rebuilds `clamp(base + shadowed_points)` from it. This
+    // costs 3 interstage components and is read ONLY inside the night branch; the day path still
+    // reads `primary` and is therefore bit-identical. Unclamped is safe to interpolate: it is
+    // linear in `N.L` and the clamp that used to bound it is re-applied per fragment.
+    @location(9) base_lit: vec3<f32>,
 }
 
 // Terrain's point-light **candidacy half-width** (yd): the reference's guaranteed covered box is
@@ -135,7 +287,19 @@ const TERRAIN_REACH: f32 = 33.570166;
 // The M2 lane in wow_model.wgsl still uses the packed per-light range — its own `w` is 0 (a ±10 yd
 // box, a *different* byte-pinned number), a change that would move the approved interior look, so it
 // is the director's to weigh. The two lanes diverge on purpose; do not "fix" them back into one.
-fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
+// MONKEY (outdoor torch shadows: terrain, MIRRORED from wow_model.wgsl / static_gx.wgsl - keep in
+// sync): the <=3-nearest selection packed into ONE u32, three 10-bit indices (rank 0 in the low
+// bits) with `EXT_SEL_EMPTY` for an unfilled rank. The point table is capped at 256 entries, so ten
+// bits leaves two bits of headroom. It exists so the per-FRAGMENT shadowed term below can
+// re-evaluate the VERTEX stage's choice rather than making its own - re-ranking per fragment would
+// draw a hard line wherever the ranking flips, and on terrain that line would run straight through
+// the middle of an MCNK cell, which is exactly the chunk-shaped popping the 0285 anchor removed.
+const EXT_SEL_EMPTY: u32 = 1023u;
+
+// The RANKING half of the old `point_light_sum`, split out verbatim: the same interior-lane skip,
+// the same Chebyshev candidacy box, the same tie order, so the set a chunk selects is bit-for-bit
+// what it was and the day render cannot move.
+fn point_light_pick(anchor: vec3<f32>) -> u32 {
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, 3>(0u, 0u, 0u);
     var sd = array<f32, 3>(1e30, 1e30, 1e30);
@@ -169,17 +333,62 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
             sd[2] = d2; sel[2] = i;
         }
     }
+    return select(EXT_SEL_EMPTY, sel[0], sd[0] <= 9.9e29)
+        | (select(EXT_SEL_EMPTY, sel[1], sd[1] <= 9.9e29) << 10u)
+        | (select(EXT_SEL_EMPTY, sel[2], sd[2] <= 9.9e29) << 20u);
+}
+
+// The EVALUATION half - the byte-verified falloff `1/(0.7d + 0.03d^2)` x `max(N.L, 0)` x the
+// committed colour, in rank order, stopping at the first empty rank exactly as the old
+// `sd[s] > 9.9e29` break did (an unfilled rank packs as `EXT_SEL_EMPTY`, and no real index can
+// collide with it: the table caps at 256).
+fn point_light_eval(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < 3u; s = s + 1u) {
-        if (sd[s] > 9.9e29) {
+        let idx = (sel >> (10u * s)) & 1023u;
+        if (idx == EXT_SEL_EMPTY) {
             break;
         }
-        let pos_range = wow_light.points[2u * sel[s]];
-        let to_light = pos_range.xyz - P;
+        let to_light = wow_light.points[2u * idx].xyz - P;
         let d = length(to_light);
         let atten = 1.0 / (0.7 * d + 0.03 * d * d);
         let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
-        sum += wow_light.points[2u * sel[s] + 1u].rgb * (atten * nl);
+        sum += wow_light.points[2u * idx + 1u].rgb * (atten * nl);
+    }
+    return sum;
+}
+
+// MONKEY (outdoor torch shadows: terrain): the SHADOWED evaluation - the SAME three entries the
+// vertex picked, each multiplied by its OWN fixture's cube-map occlusion, so a crate between the
+// campfire and this patch of grass darkens the campfire's term while the brazier across the road is
+// untouched. This is what step (a) already did for WMO exteriors and models; without it a
+// character's shadow stopped dead at the grass.
+//
+// Bounded at THREE iterations (the FFP commit limit), each costing a <=16-slot table scan and four
+// comparison taps, and reached only under `torch_ext_on()` - so it is night-only and dead with
+// `exteriorShadows 0`. `TORCH_SKIP_EPS` drops the scan entirely wherever the unshadowed term is
+// already invisible, which on terrain is most of the frame (ground facing away from the fire, or
+// far enough out that the falloff has taken the term below a code).
+fn point_light_eval_shadowed(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    for (var s = 0u; s < 3u; s = s + 1u) {
+        let idx = (sel >> (10u * s)) & 1023u;
+        if (idx == EXT_SEL_EMPTY) {
+            break;
+        }
+        let fixture = wow_light.points[2u * idx].xyz;
+        let to_light = fixture - P;
+        let d = length(to_light);
+        let atten = 1.0 / (0.7 * d + 0.03 * d * d);
+        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
+        // MONKEY (torch lane perf): the occlusion is a factor on a term that is already zero on any
+        // ground facing away from the fire.
+        let ext_w = atten * nl;
+        var occ = 1.0;
+        if (ext_w > TORCH_SKIP_EPS) {
+            occ = torch_terrain_shadow(fixture, P, N);
+        }
+        sum += wow_light.points[2u * idx + 1u].rgb * (ext_w * occ);
     }
     return sum;
 }
@@ -237,8 +446,16 @@ fn vertex(in: Vertex) -> TerrainVsOut {
     // committed lights of this vertex's MCNK chunk cell — the terrain draw unit (0285) — at the
     // byte-verified `1/(0.7d + 0.03d²)`, raw over-gamut colours in.
     let ndotl = max(dot(n, l), 0.0);
-    let points = point_light_sum(out.world_position.xyz, n, mcnk_cell_anchor(out.world_position.xyz));
+    // MONKEY (outdoor torch shadows: terrain): the selection is PUBLISHED so the fragment stage can
+    // shadow these same three entries at night without re-ranking. One table walk still, not two -
+    // the sum was always `eval(pick(..))`, it is just no longer inlined.
+    let sel = point_light_pick(mcnk_cell_anchor(out.world_position.xyz));
+    out.ext_sel = sel;
+    let points = point_light_eval(sel, out.world_position.xyz, n);
     let sun_lighting = wow_light.light_diffuse.rgb * ndotl;
+    // The sun/ambient half on its own slot, UNCLAMPED (see `base_lit`) - the night lane's only way
+    // back to a `primary` that does not already have the unshadowed point term baked into it.
+    out.base_lit = wow_light.light_ambient.rgb + sun_lighting;
     out.primary = clamp(
         wow_light.light_ambient.rgb + sun_lighting + points,
         vec3<f32>(0.0),
@@ -318,15 +535,45 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     let view_z = (view.view_from_world * in.world_position).z;
     let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
     let sun_shadow_strength = wow_light.fog_params.z;
+    // Hoisted out of the `realtime_shadow` call (same expression, same bits) because the torch lane
+    // below needs the same normal for its normal-offset sample.
+    let n_lit = normalize(in.world_normal);
     let world_shadow = shadow_hook::realtime_shadow(
         in.world_position,
-        normalize(in.world_normal),
+        n_lit,
         view_z,
         cam_dist,
         wow_light._wmo_fog[1].z,
         sun_shadow_strength,
     );
-    let primary = in.primary;
+    // MONKEY (outdoor torch shadows: terrain): the exterior point term, CAST-SHADOWED at night.
+    //
+    // `in.primary` is the Gouraud (per-vertex, per-vertex-CLAMPED) diffuse, and it stays the only
+    // thing this lane reads by day. After dark the same three entries the vertex picked
+    // (`in.ext_sel`) are re-evaluated PER FRAGMENT with each fixture's own cube-map occlusion folded
+    // in, re-summed onto the sun/ambient half (`in.base_lit`) and re-clamped here - the clamp has to
+    // move to the fragment because the shadow is a per-fragment quantity, and clamping the sum is
+    // still the faithful GL order (saturate the light sum, then modulate the texture).
+    //
+    // Written as a BLEND rather than a swap, for the same two reasons the model and WMO lanes are:
+    //   - `fog_params.z` is EXACTLY 1.0 whenever the sun is above the daylight threshold
+    //     (`global_light::sun_shadow_strength` is a smoothstep that saturates), so `ext_night_w` is
+    //     exactly 0, the branch is not entered, and DAYTIME IS THE SAME BITS - not "a mix that ought
+    //     to round back to `in.primary`". Nothing here is evaluated by day at any cost.
+    //   - at dusk the shadow, and the Gouraud->per-fragment change of the term itself, arrive on the
+    //     same clock the sun shadows leave on instead of snapping at a threshold.
+    // `torch_ext_on()` is the CPU's one-bit verdict (`exteriorShadows` AND night AND at least one
+    // promoted exterior fixture), so with the cvar off this is dead too.
+    var primary = in.primary;
+    let ext_night_w = select(0.0, clamp(1.0 - sun_shadow_strength, 0.0, 1.0), torch_ext_on());
+    if (ext_night_w > 0.0) {
+        let primary_night = clamp(
+            in.base_lit + point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0),
+        );
+        primary = mix(in.primary, primary_night, ext_night_w);
+    }
 
     // STEP 4: MCSH baked shadow. On the reference path (pixelShaders+specular) terrain is ONE pass
     // through `terrainp_s.bls`, which carries the MCSH bit in the blend texture's alpha (1.0 lit / 0.0
@@ -364,6 +611,18 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     let diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
     let spec_term = in.specular * specmask * spec_gate;
     var tuned = clamp(diffuse_term + spec_term, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // MONKEY (torch debug, interiorDebug 2 on TERRAIN): the ground's OWN cube-map sampling as
+    // greyscale, the same instrument static_gx and wow_model already paint on walls and bodies. The
+    // mode rides `wmo_fog_params.w` packed as `1 + debug` (rows 18-19 here, hence `_wmo_fog[1]`), so
+    // a zero - the interior lane off entirely - decodes to mode 0 and this is dead. Only mode 2 is
+    // answered: 1/3/4 are questions about the INTERIOR lane and the WMO group classes, and terrain
+    // belongs to neither, so leaving it normally shaded is what makes those three views readable.
+    // Placed before the fog so a distant reading still fogs like the surfaces beside it.
+    let idbg = u32(max(wow_light._wmo_fog[1].w - 1.0, 0.0) + 0.5);
+    if (idbg == 2u) {
+        tuned = vec3<f32>(torch_terrain_debug_factor(in.world_position.xyz, n_lit));
+    }
 
     // STEP 5: gamma-space linear fog (q6). Applied AFTER tone/curve (so the diagnostic knobs see
     // the unfogged lit pixel) and BEFORE the viz bypass + raw output. The fog coordinate is

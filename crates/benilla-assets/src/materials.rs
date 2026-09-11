@@ -663,6 +663,24 @@ pub struct TerrainExtension {
     /// `terrain.wgsl` reads it as `var<storage, read> wow_light` (rows 0-5: light + fog + farclip).
     #[storage(90, read_only, buffer)]
     pub light_buf: Buffer,
+    /// MONKEY (outdoor torch shadows: terrain): the torch receiver's three bindings, at the SAME
+    /// numbers [`WowModelExt`] uses (91 depth array / 92 comparison sampler / 93 table) and for the
+    /// same reason - a Bevy material draw sets groups 0/1/2 only, so a receiver's shadow inputs have
+    /// to ride its own material group. Both resources are created ONCE at startup
+    /// (`benilla_world::assets`, beside the shared light buffer) and are ALWAYS bound: a missing
+    /// image would stall the tile's bind group on `RetryNextUpdate` and blank the GROUND, so the
+    /// spawn site idles until `TorchShared::binds()` is `Some` rather than baking a default.
+    ///
+    /// Fragment-only, like the splat/alpha/shadow arrays above (Bevy 0.18 narrows textures and
+    /// samplers but not uniforms) - the vertex stage only picks WHICH lights, it never samples.
+    #[texture(91, dimension = "2d_array", sample_type = "depth", visibility(fragment))]
+    #[sampler(92, sampler_type = "comparison", visibility(fragment))]
+    pub torch_depth: Handle<Image>,
+    /// The 6416-byte `TorchTableUniform` bytes (count / positions[16] / view_projs[96]) as the same
+    /// shared raw storage buffer the model lane binds, rewritten in place each frame - read by
+    /// `terrain.wgsl` as the byte-identical `var<storage, read> torch_table: TorchTable`.
+    #[storage(93, read_only, buffer, visibility(fragment))]
+    pub torch_buf: Buffer,
 }
 
 impl MaterialExtension for TerrainExtension {
@@ -678,6 +696,73 @@ impl MaterialExtension for TerrainExtension {
 
 #[cfg(test)]
 mod tests {
+    /// MONKEY (outdoor torch shadows: terrain): the GROUND receiver's three contracts with the
+    /// model lane, all of which fail SILENTLY at runtime rather than at compile time.
+    ///
+    /// 1. **The bindings.** `TerrainExtension` and [`WowModelExt`] must claim the SAME numbers
+    ///    (91 depth / 92 comparison sampler / 93 table). The Rust attributes and the WGSL `@binding`
+    ///    lines are two independent declarations of one layout, and a mismatch is not a build error
+    ///    — it is a bind-group validation failure at first tile spawn, i.e. no ground.
+    /// 2. **The table layout.** All three receivers (`terrain.wgsl`, `wow_model.wgsl`, and
+    ///    `static_gx.wgsl`'s std140 twin) mirror ONE 6416-byte buffer. Comments differ per lane on
+    ///    purpose; the member lines must not, or terrain reads matrices at the wrong offsets and
+    ///    projects shadows to the wrong place with nothing in any log.
+    /// 3. **Daytime identity.** The night lane must stay behind `ext_night_w > 0.0`. `fog_params.z`
+    ///    saturates to exactly 1.0 above the daylight threshold, so that guard is what makes the
+    ///    day render the same instructions AND the same bits it was before this feature — the whole
+    ///    "cost zero by day" claim, in one line of shader.
+    #[test]
+    fn the_terrain_lane_receives_the_torch_maps() {
+        let terrain = include_str!("shaders/terrain.wgsl");
+        let model = include_str!("shaders/wow_model.wgsl");
+
+        for binding in [
+            "@binding(91) var torch_depth: texture_depth_2d_array;",
+            "@binding(92) var torch_samp: sampler_comparison;",
+            "@binding(93) var<storage, read> torch_table: TorchTable;",
+        ] {
+            assert!(
+                terrain.contains(binding) && model.contains(binding),
+                "the terrain and model torch receivers disagree on `{binding}` — the WGSL and the \
+                 AsBindGroup attributes are two declarations of one layout, and this one blanks \
+                 the ground at the first tile spawn"
+            );
+        }
+
+        // The struct's MEMBER lines only: each copy carries its own prose about its own lane.
+        let layout = |src: &str| -> Vec<String> {
+            let body = src
+                .split_once("struct TorchTable {")
+                .expect("every torch receiver declares the table")
+                .1;
+            body.split_once("\n}")
+                .expect("the struct is closed")
+                .0
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert_eq!(
+            layout(terrain),
+            layout(model),
+            "the terrain and model `TorchTable` copies have drifted — they mirror ONE 6416-byte \
+             buffer (count / positions[16] / view_projs[96]); a member added, reordered or resized \
+             on one side moves every matrix offset on that side only"
+        );
+
+        assert!(
+            terrain.contains(
+                "let ext_night_w = select(0.0, clamp(1.0 - sun_shadow_strength, 0.0, 1.0), \
+                 torch_ext_on());"
+            ) && terrain.contains("if (ext_night_w > 0.0) {"),
+            "terrain's exterior torch lane is no longer gated on `ext_night_w > 0.0` — daylight is \
+             now paying for (and possibly rendering) the night blend, and the day look is free to \
+             drift by a rounding step"
+        );
+    }
+
     /// The sky depth law, for the one sky element that draws on the MODEL lane: the WMO skybox
     /// ([`WowModelKey::sky_depth`]). Every other sky shader is checked the same way, together, in
     /// `benilla_world::sky_order::every_sky_shader_forces_the_far_depth` — this half lives here
