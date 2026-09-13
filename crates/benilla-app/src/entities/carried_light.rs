@@ -30,8 +30,14 @@ use benilla_world::interior::{InteriorAnchor, WmoResidency};
 use benilla_world::lighting::{
     LightLane, LightLitRooms, LightRooms, ShadowProxyLight, SyntheticFireLight,
 };
+use benilla_world::static_gx::LightOwner;
 use benilla_world::terrain_stream::{carried_light_claims, point_light, CarriedClaimSet};
 use benilla_world::wmo_portal::{WmoGroupVis, WmoPortalInstance, WmoRoom};
+
+// MONKEY (spell light): the effect-side lifecycle this file's spawn helper stamps on — the
+// envelope, the budget and the kill switch all live beside the rest of the effect lifecycle
+// (`spell_fx::lifecycle`), because that is what a spell light's lifetime IS.
+use super::spell_fx::{spell_lights_enabled, SpellLight, SpellLightMode, SPELL_BURST_SPAN};
 
 /// Spawn a `PointLight` child for each **casting** (`type==1`, not visibility-gated dark) M2 light of
 /// an entity's model.
@@ -110,6 +116,26 @@ pub(super) fn spawn_carried_lights(
             ),
             None => (frame, l.def.position),
         };
+        // MONKEY (spell light): a SPELL/FIREWORK-derived light is not a carried FIXTURE and does
+        // not take this lane's rules. It has an onset, a lifecycle envelope and a budget, and it
+        // never flickers — all of which live on [`SpellLight`]. The branch is here because the
+        // firework GameObject arrives HERE: its shell (`World\Goober\G_Firework0*`) is a GO model
+        // like any other, so the entity lane is the only place its light can be born.
+        if let Some(fx) = l.spell {
+            spawn_spell_light_child(
+                commands,
+                parent,
+                local,
+                l,
+                fx,
+                // A GameObject that carries a spell light IS a one-shot: a firework shell, a
+                // trigger's effect model. Nothing on this lane holds.
+                SpellLightMode::Burst {
+                    span: SPELL_BURST_SPAN,
+                },
+            );
+            continue;
+        }
         let mut glow = commands.spawn((
             point_light(l.def.diffuse_color, l.def.diffuse_intensity),
             Transform::from_translation(wow_to_bevy(local)),
@@ -129,6 +155,14 @@ pub(super) fn spawn_carried_lights(
         if held {
             glow.insert(HeldLight);
         }
+        // MONKEY (torch owner exclusion): and the light's OWNER — the model frame it belongs to.
+        // Same bug as the placed lane's (`terrain_stream::spawn`'s `tag_light_owner`): the flame
+        // sits INSIDE the thing that burns it, so a placed brazier GameObject was the nearest
+        // occluder on all six of its own cube faces and stamped a black disc on the ground under
+        // itself. No `WorldObject` exists at this spawn site — a carried light's host is a net
+        // entity, not a placement — so the identity is the FRAME, and the caster gather asks
+        // "is this part a descendant of it?" (`LightOwner::Instance`).
+        glow.insert(LightOwner::Instance(frame));
         // MONKEY (flame flicker): a carried flame breathes like any other — the imp's hand fire, a
         // held torch, a brazier GameObject. It is safe on THIS lane specifically because the
         // modulation touches neither position nor reach: the settle/claim logic
@@ -149,6 +183,98 @@ pub(super) fn spawn_carried_lights(
         let glow = glow.id();
         commands.entity(parent).add_child(glow);
     }
+}
+
+/// MONKEY (spell light): spawn the ONE spell light a luminous effect model carries, as a child of
+/// that effect's root. `false` when the model carries none — which is the great majority of the
+/// corpus (frost, nature, arcane, shadow and everything unnamed synthesise nothing at all), and
+/// when the env kill switch `WOW_SPELL_LIGHT=0` is set.
+///
+/// `root` is the effect INSTANCE's root entity — the kit instance's attach node, the missile, the
+/// dest-anchored plant, the firework's GameObject frame. That parentage is the whole lifetime
+/// contract: every one of those lanes despawns its root when the effect ends (the reap, the
+/// arrival, the expiry), and a child light goes with it. There is no separate reaping path to get
+/// wrong, and no `on_owner_loss` case to answer — a light is not a particle pool and never drains.
+///
+/// The light hangs at the emitter's own model-space position, exactly as a synthesised fire light
+/// does, and does NOT ride a bone: a synthesised light stands for a whole flame VOLUME whose
+/// position was inferred, and riding an animating joint adds motion that the shadow/claim lanes
+/// read as an event (the same reasoning [`spawn_carried_lights`] gives for its `l.synthetic` arm).
+pub(super) fn spawn_spell_light(
+    commands: &mut Commands,
+    lights: &[benilla_assets::ModelLight],
+    root: Entity,
+    mode: SpellLightMode,
+) -> bool {
+    let Some((l, fx)) = lights.iter().find_map(|l| l.spell.map(|fx| (l, fx))) else {
+        return false;
+    };
+    spawn_spell_light_child(commands, root, l.def.position, l, fx, mode).is_some()
+}
+
+/// The shared body of the two spawn sites (the effect lanes' [`spawn_spell_light`] and the
+/// entity lane's firework branch): one `PointLight` child at `local` (WoW model space, relative to
+/// `parent`), carrying the tags every spell light must have.
+///
+/// The tag set is three separate promises, and each one is load-bearing:
+/// - [`SyntheticFireLight`] — this light was INVENTED, not authored, so the packer's synthetic gain
+///   owns it (and a future `spellLightGain` would find it here).
+/// - [`HeldLight`] — **never** an exterior torch-shadow caster. A spell light moves (a missile), is
+///   born and dies inside a second, and would churn the cube-shadow cache at frame rate for a
+///   shadow nobody could resolve in the time it exists. The marker is that lane's refusal.
+/// - [`SpellLight`] — the envelope and the budget ([`advance_spell_lights`] /
+///   [`budget_spell_lights`]), and the handle any future per-school gain or kill switch targets.
+///
+/// No [`FlameFlicker`](benilla_world::lighting::FlameFlicker), deliberately: the flicker makes a
+/// fire breathe, and a spell light already has a shape of its own. The two together read as the
+/// effect stuttering rather than as fire.
+///
+/// `None` when the kill switch is off — so a caller can tell "disabled" from "this model has no
+/// light", though neither has any further consequence.
+fn spawn_spell_light_child(
+    commands: &mut Commands,
+    parent: Entity,
+    local: [f32; 3],
+    l: &benilla_assets::ModelLight,
+    fx: benilla_assets::SpellLightInfo,
+    mode: SpellLightMode,
+) -> Option<Entity> {
+    if !spell_lights_enabled() {
+        return None;
+    }
+    let lit = point_light(l.def.diffuse_color, l.def.diffuse_intensity);
+    // Born DARK and raised by the envelope: the onset is real time (a firework's fuse), and a
+    // light that showed its full strength on its first frame and only then ramped would flash
+    // once before every effect it belongs to.
+    let base = lit.intensity;
+    let glow = commands
+        .spawn((
+            PointLight {
+                intensity: 0.0,
+                ..lit
+            },
+            Transform::from_translation(wow_to_bevy(local)),
+            Visibility::default(),
+            SyntheticFireLight,
+            HeldLight,
+            SpellLight::new(base, fx.onset, mode),
+            // The same owner exclusion every carried light takes: the flame sits INSIDE the thing
+            // that burns it, so the effect's own meshes must not occlude their own light.
+            LightOwner::Instance(parent),
+        ))
+        .id();
+    commands.entity(parent).add_child(glow);
+    if benilla_assets::trace::enabled() {
+        benilla_assets::trace::line(
+            "fx",
+            &format!(
+                "spell light e={glow} school={} onset={:.2} base={base:.1}",
+                fx.kind.label(),
+                fx.onset
+            ),
+        );
+    }
+    Some(glow)
 }
 
 /// MONKEY (fire GO lights): how far up the hierarchy the room walk looks before giving up. A
@@ -640,6 +766,7 @@ mod tests {
             bone_pivot: [1.0, 0.0, 0.5],
             synthetic: false,
             flame: false,
+            spell: None,
         }
     }
 

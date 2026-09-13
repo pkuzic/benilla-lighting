@@ -36,7 +36,9 @@ use crate::view::WorldCamera;
 /// per-material uniforms fed by `apply_wow_lighting` — editing this layout does NOT reach them.)
 ///   0 light_ambient (w=Mod2x 1.0) · 1 light_diffuse (w=clamp on) · 2 light_sun (w=dir/SH enable) ·
 ///   3 light_spec (w=terrain shininess 20) · 4 fog_color (w=enable) · 5 fog_params (x=start y=end w=farclip) ·
-///   6-8 sh_c10_{r,g,b} · 9-11 sh_c13_{r,g,b} · 12 sh_c16 ·
+///   6-8 sh_c10_{r,g,b} · 9-11 sh_c13_{r,g,b} · 12 sh_c16 (.w = the world-shadow flag in the
+///      integer part, MONKEY (bake floor) `interiorBakeFloor × interiorGain` in the fraction —
+///      [`BAKE_LANE_SCALE`]) ·
 ///   13-14 water river {shallow,deep} (w=alpha) · 15-16 water ocean {shallow,deep} (w=alpha) ·
 ///   17 grade — `.x` = the SIDN night fraction (`WowLighting::sidn_night`: 1 overnight, 0 all day;
 ///      `wow_model.wgsl` scales every WMO SIDN material's authored emissive by it); `.yzw` = the
@@ -129,7 +131,9 @@ pub fn pack_model_core_rows(
     rows[6][3] = ambient[0]; // the DC lanes carry ambient alone
     rows[7][3] = ambient[1];
     rows[8][3] = ambient[2];
-    rows[12][0] = sun[6].x; // 12 sh_c16 xyz — .w is a free lane (see the struct comment)
+    rows[12][0] = sun[6].x; // 12 sh_c16 xyz — .w is the shared world-shadow/bake-floor lane, written
+                            // by `build_light_data` alone (the portrait booth leaves it 0, so a
+                            // studio portrait takes neither — the frozen look is deliberate)
     rows[12][1] = sun[6].y;
     rows[12][2] = sun[6].z;
     // 17 `.yzw` — the sun's SH DC redistribution at intensity 1 (`D·(4/17)(0.375+0.9375(uₓ²+u_y²))`
@@ -158,10 +162,31 @@ pub fn commit_raw(rgb: [f32; 3]) -> [f32; 3] {
     rgb.map(|c| c.max(0.0))
 }
 
-/// Capacity of the packed point-light table (fixed-size in the WGSL mirror structs — keep in sync).
-/// 256 lights × 2 rows × 16 B = 8 KB — generous for the densest streamed village/city interior set;
-/// [`build_light_data`] packs the nearest-to-camera first when over capacity.
+/// **Slot** capacity of the packed point-light table (fixed-size in the WGSL mirror structs — keep
+/// in sync). 256 lights × 2 rows × 16 B = 8 KB — generous for the densest streamed village/city
+/// interior set; [`build_light_data`] packs the nearest-to-camera first when over capacity.
+///
+/// This is the BUFFER shape (`LightStd430` and [`RoomClaimTable`] size against it) and it must not
+/// move: the blob is 8528 B and is mirrored by three shaders plus the portrait booth. How many of
+/// those slots may actually hold a light is [`MAX_LIVE_POINT_LIGHTS`], which is one less.
 pub(super) const MAX_POINT_LIGHTS: usize = 256;
+
+/// MONKEY (ext light k8): how many of [`MAX_POINT_LIGHTS`] slots may hold a LIVE entry — **255**,
+/// one short of the buffer.
+///
+/// The three shaders publish each draw unit's chosen exterior lights from the vertex stage to the
+/// fragment stage as a packed index list (`ext_sel`). Widening that list from three lights to eight
+/// — the fix for the Darkmoon Faire "scars", where adjacent draw units kept different threes out of
+/// 15+ synthesised torch lights and the disagreement drew a straight edge across the grass — cost
+/// bits: eight ranks in two u32s is **8 bits each**, so an index runs 0..=254 and **255 is the
+/// `EXT_SEL_EMPTY` sentinel** for "this rank is unfilled". A 256th live light would pack as 255 and
+/// every shader would read it as "stop here", silently truncating that unit's whole list.
+///
+/// So the pack truncates one entry earlier. The lights are sorted nearest-camera-first before the
+/// truncation, so the one this drops is the farthest of a 256-strong set — sub-pixel and usually
+/// fogged at that density. The BUFFER keeps all 256 slots, so nothing about the layout, the 8528 B
+/// blob or the room-claim table changes.
+pub(super) const MAX_LIVE_POINT_LIGHTS: usize = MAX_POINT_LIGHTS - 1;
 
 /// MONKEY (dynamic interiors): a fixture this close to the camera (yd) is packed regardless of the
 /// portal flood — see the room term in [`build_light_data`]. Sized to a WHOLE BUILDING PLUS its
@@ -675,6 +700,80 @@ fn sun_shadow_strength(sun_height: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// MONKEY (enclosed day floor): how [`DynamicInteriors::daylight`] rides to the shader — as the
+/// FRACTIONAL part of the packed `wmo_fog_params.w` lane, `w = 1 + debug + daylight * this`.
+///
+/// **There was no free f32 left.** [`LightStd430`] is 8528 B, mirrored by three shaders plus the
+/// portrait booth, and must not grow; every `.w` in rows 0..=20 is spoken for (the Mod2x/clamp/SH
+/// enables, terrain shininess, fog enable, farclip, the ambient DC lanes, `sh_c13_*.w` which the
+/// SH `dot(row, quad)` reads as a real band, the world-shadow flag, the shadow distance, the
+/// exposure). The tail regions are declared only by `wow_model.wgsl`, so `static_gx` — the one
+/// consumer that needs this number — cannot reach them at all.
+///
+/// So it rides a lane that has spare RANGE rather than a spare slot. `wmo_fog_params.w` is packed
+/// as `0` (interior lane off) or `1 + interiorDebug` (0..=4), and every one of its four decodes
+/// across the three shaders is insensitive to a fraction below 0.5:
+///   * `w > 0.5` — the on/off test (`static_gx` x2, `wow_model`): adding to `1 + debug` cannot
+///     reach it from below, and cannot leave it from above.
+///   * `u32(max(w - 1, 0) + 0.5)` — the debug decode (`static_gx` x3, `wow_model`, `terrain`):
+///     `debug + f + 0.5` truncates to `debug` for every `f` in `[0, 0.5)`.
+/// **0.49** keeps a clear margin under that 0.5 cliff while spending the whole of the rest of the
+/// range on the value. `1 + debug` is an exact integer in f32, so the shader's `fract(w)` returns
+/// `daylight * 0.49` bit-for-bit up to the f32 ulp at `w <= 5.49` (~5e-7 — four orders of magnitude
+/// below anything the eye can see in an ambient floor). **Keep in sync with `static_gx.wgsl`'s
+/// `DAYLIGHT_LANE_SCALE`.**
+///
+/// **The default (0.12) is calibrated, not chosen.** At the owner's live cvars (`interiorExposure 4`,
+/// `interiorAmbient 0.02`, `interiorGain 0.7`) the room law's floor is `0.02 x 0.7 = 0.014`, so an
+/// unlit interior fragment renders `1 - exp(-0.014 x 4) = 0.055`. Elwynn at 11:28 renders its
+/// sunlit threshold at luminance **0.831** (`ambient (103,129,154)/255 + diffuse (255,133,0)/255 x
+/// N.L 0.5805`, clamped). With the floor: `1 - exp(-(0.014 + 0.12) x 4) = 0.415`, i.e. **50 % of
+/// the threshold** — a soft step across a doorway instead of a black hole. (0.10 reads 44 %, 0.14
+/// reads 55 %; the 0.35 the brief suggested reads **92 %**, which is a room with no walls.)
+pub const DAYLIGHT_LANE_SCALE: f32 = 0.49;
+
+/// MONKEY (bake floor): how [`DynamicInteriors::bake_floor`] rides to the shader — as the
+/// FRACTIONAL part of the packed `sh_c16.w` lane, `w = world_shadow_flag + bake × this`.
+///
+/// **There is still no free f32.** [`LightStd430`] is 8528 B and mirrored by three shaders plus the
+/// portrait booth (see [`DAYLIGHT_LANE_SCALE`] for the full accounting of why it must not grow).
+/// `wmo_fog_params.w` — the lane the daylight floor rides — is now spent: its integer part is
+/// `1 + interiorDebug` and its fraction is `interiorDaylight × 0.49`, and two fractions cannot
+/// share one lane without a second quantisation. So this one takes the OTHER lane with spare range.
+///
+/// `sh_c16.w` is the world-shadow flag: packed as exactly `0.0` or `1.0`, and it has precisely ONE
+/// decode in the whole shader set — `terrain.wgsl`'s `wow_light.sh_c16.w > 0.5` (the MCSH
+/// suppression gate). `sh_c16.xyz` is a real SH band that `wow_model`/`static_gx` read; neither
+/// read `.w` at all before this, and both now read only its FRACTION. A fraction strictly below
+/// 0.5 therefore cannot move terrain’s decode in either direction: `0 + f` stays below the
+/// threshold, `1 + f` stays above it.
+///
+/// **0.49** keeps the same clear margin under the 0.5 cliff that the daylight lane keeps, and the
+/// packed value is CLAMPED to `[0, 1]` before scaling — `bake_floor` is 0..1 but `interior_gain`
+/// reaches 1.5, so the product alone could reach 1.5 and push the fraction past the cliff (0.735),
+/// which would switch MCSH terrain shadows on for anyone running `interiorBakeFloor 1` with the
+/// Bright preset. The clamp costs nothing real: the slider's useful range is 0..0.3.
+///
+/// `world_shadow_flag` is an exact integer in f32, so the shader's `fract(w)` returns
+/// `bake × 0.49` bit-for-bit up to the f32 ulp at `w <= 1.49` (~6e-8). **Keep in sync with
+/// `static_gx.wgsl` / `wow_model.wgsl`'s `BAKE_LANE_SCALE`.**
+pub const BAKE_LANE_SCALE: f32 = 0.49;
+
+/// MONKEY (bake floor): the CPU half of the `sh_c16.w` pack — the lane word for a world-shadow
+/// flag and a bake floor. Split out so the round-trip test below exercises the SAME arithmetic the
+/// packer runs, not a transcription of it.
+pub fn pack_bake_lane(world_shadow: bool, bake_floor: f32, interior_gain: f32) -> f32 {
+    let flag = if world_shadow { 1.0 } else { 0.0 };
+    flag + (bake_floor * interior_gain).clamp(0.0, 1.0) * BAKE_LANE_SCALE
+}
+
+/// MONKEY (bake floor): the SHADER's decode, transcribed — `fract(w) / BAKE_LANE_SCALE`. Only
+/// exists for the round-trip test; the real decode lives in the two WGSL files.
+#[cfg(test)]
+fn unpack_bake_lane(w: f32) -> f32 {
+    (w - w.floor()) / BAKE_LANE_SCALE
+}
+
 /// MONKEY (dynamic interiors): the live knobs of the interior lane — WMO interior surfaces AND
 /// interior props light from the room's live fixtures (`static_gx.wgsl` `interior_room_light`)
 /// instead of the MOCV bake / the baked prop probe. Bridged every frame from the app-side cvars
@@ -727,14 +826,72 @@ pub struct DynamicInteriors {
     /// [`FireLightGain`]: that one scales the SYNTHESISED lane only, while a flicker belongs to
     /// authored wall torches just as much.
     pub flicker: f32,
+    /// MONKEY (darkness gains): the live dim on the EXTERIOR day/night law (`nightGain`, 0.2..1.5,
+    /// default **0.8** = nights 20 % darker). Folded into the packed ambient/diffuse/specular rows
+    /// by `mix(1, gain, night_w)`, `night_w = 1 - sun_shadow_strength(celestial_dir.y)` — so it is
+    /// EXACTLY inert while the sun is up and full strength after dark.
+    ///
+    /// It rides THIS resource despite being an exterior knob because the bridge is the same one
+    /// (a live video cvar → a resource the light packer folds at pack time), and a second resource
+    /// plus a second plugin to carry one `f32` buys nothing. `enabled` does NOT gate it: the night
+    /// law lights terrain and models whether or not the interior lane is on.
+    pub night_gain: f32,
+    /// MONKEY (darkness gains): the live dim on the whole INTERIOR room lane (`interiorGain`,
+    /// 0.2..1.5, default **0.7** = interiors 30 % darker). Scales the lane's three INPUTS — the
+    /// packed [`Self::ambient`], [`Self::fill`], and every interior fixture's committed colour —
+    /// and deliberately not [`Self::exposure`], which is the user's own live dial; a gain on the
+    /// inputs composes with whatever exposure they have settled on.
+    pub interior_gain: f32,
+    /// MONKEY (enclosed day floor): the DAYLIGHT a room in a building gets through the doorways
+    /// this renderer cannot locate (`interiorDaylight`, 0..1, default **0** — the director wants daylight ONLY at doorways/windows, i.e. from the daylight fixtures; the room-wide floor stays available as a dial).
+    ///
+    /// It is an ADDITIVE ambient in exactly [`Self::ambient`]'s units — the room law's pre-exposure
+    /// illumination — scaled by the sun's own day envelope and tinted by the sky's ambient band, so
+    /// it is 0 all night and full at midday. Three seeds now find a building's authored openings
+    /// (`lighting::daylight`), but the shipped corpus also contains rooms whose doorway is in NO
+    /// table: the Goldshire inn's entry group `g3` has no portal, no EXT-class batch, no vertex
+    /// stitched to the shell that owns its threshold planks, and no localized spot in its own MOCV
+    /// bake. For those there is nothing to stand a fixture in, and the honest fallback is to say
+    /// what IS known — the room is inside a building, the sun is up, so it is not pitch dark.
+    ///
+    /// Rides the free FRACTION of the packed `wmo_fog_params.w` lane (see
+    /// [`DAYLIGHT_LANE_SCALE`]); `0` restores the pre-feature look exactly.
+    pub daylight: f32,
+    /// MONKEY (bake floor): the share of a WMO interior batch's OWN MOCV bake that every
+    /// interior-lane fragment keeps, whether or not a fixture reaches it (`interiorBakeFloor`,
+    /// 0..1, default **0.12**).
+    ///
+    /// The lane's premise — "the live fixtures decide, the bake's LEVEL is wrong" — has one hole
+    /// in it: a room the fixture table cannot reach renders at the bare [`Self::ambient`] floor,
+    /// i.e. black. The Lion's Pride Inn's east vestibule (group `g0`, box x 14.1..20.5) is the case
+    /// that forced it — MOLR 0, ZERO fixture claims (nearest L2 ≈ 16 yd against R 11.2, L3 ≈ 17.6
+    /// against R 14.7), one faded portal hop, so the whole budget collapses to `0.0075` and the
+    /// door band renders 0.019 × tex between a sky-lit porch and a candle-lit hall. The reference
+    /// client has no such hole: it draws every interior batch at its authored MOCV regardless of
+    /// fixtures, so a fixture-starved room is DIM there, never black.
+    ///
+    /// So the honest floor is the bake ITSELF, at a fraction: `vc.rgb × this`, added to the room's
+    /// pre-exposure budget INSIDE the `1 − exp(−x·exposure)` rolloff, so it saturates with the
+    /// fixtures instead of stacking on top of them (a candle-lit surface barely moves — measured
+    /// +7 % at the inn's `g3` floor under `L9`, +9 % at a `g5` wall 3 yd from `L0`) while an unlit
+    /// one goes from black to the bake's own relative statement about the room. A FRACTION, not the
+    /// bake, precisely because the LEVEL is what this lane rejects: an UNCAPPED bake share on this
+    /// same band measured 15-18 × its neighbour and read as a flat grey slab (see the
+    /// `static_gx.wgsl` portal-bleed comment); 0.12 restores about an eighth of it.
+    ///
+    /// Scaled by [`Self::interior_gain`] at PACK time (so the Dim preset dims it with everything
+    /// else and the shader carries no second knob), and NOT by `fireLightGain`, NOT flickered — it
+    /// is not a fire, it is the room's own authored light. `0` restores the pre-feature look
+    /// exactly. Rides the free FRACTION of the packed `sh_c16.w` lane — see [`BAKE_LANE_SCALE`].
+    pub bake_floor: f32,
 }
 
 impl Default for DynamicInteriors {
     fn default() -> Self {
         Self {
             enabled: true,
-            ambient: 0.15,
-            fill: 0.12,
+            ambient: 0.015,
+            fill: 0.08,
             exposure: 2.5,
             // MONKEY (soft falloff): 1.6, matching the `interiorAttenScale` cvar default (2.5 read oversaturated — the soft core `0.26·R` widens with it too).
             atten_scale: 1.6,
@@ -744,6 +901,17 @@ impl Default for DynamicInteriors {
             debug: 0,
             // MONKEY (flame flicker): on at the authored amplitudes.
             flicker: 1.0,
+            // MONKEY (darkness gains): the director's call — nights 20 % darker, interiors 30 %.
+            night_gain: 0.45,
+            interior_gain: 0.5,
+            // MONKEY (enclosed day floor): calibrated, not chosen — see [`DAYLIGHT_LANE_SCALE`]
+            // for the arithmetic that lands the Goldshire inn's entry floor at ~half the sunlit
+            // threshold beside it instead of at the near-black `interiorAmbient`.
+            daylight: 0.0,
+            // MONKEY (bake floor): an eighth of the authored bake — see the field doc for the
+            // measurement this is calibrated against (the inn's `g0` door band, and the
+            // candle-lit surfaces it must NOT move).
+            bake_floor: 0.12,
         }
     }
 }
@@ -927,6 +1095,9 @@ fn build_light_data(
             // at spawn). Read-only, never written — the wobble is a pure function of it plus the
             // clock, so it adds no `Changed` traffic and no archetype churn to the frame.
             Option<&FlameFlicker>,
+            // MONKEY (darkness gains): the daylight-fixture marker — an interior-lane entry that
+            // is the SUN standing in a doorway, not a candle, so `interiorGain` must skip it.
+            Has<super::DaylightFixture>,
         ),
         Without<ShadowProxyLight>,
     >,
@@ -951,12 +1122,37 @@ fn build_light_data(
     let l = &*light;
     let fog_enable = if debug.lighting.disable_fog { 0.0 } else { 1.0 };
     let farclip = view.farclip;
+    // MONKEY (darkness gains): `nightGain` — one live dim over everything the EXTERIOR law lights
+    // (terrain, models, WMO exteriors, and the ext-class night blend, all of which derive from the
+    // ambient/diffuse/specular rows below). Folded CPU-side into those packed rows rather than
+    // added as a shader uniform because `LightStd430` has no free lane left (8528 B, mirrored by
+    // three WGSL structs) — and a pack-time fold costs the GPU exactly nothing anyway.
+    //
+    // The ramp is the DUSK CLOCK every other night feature already fades on: `sun_w` is
+    // `sun_shadow_strength(celestial_dir.y)` — 1 in daylight, smoothstepping to 0 as the celestial
+    // sun reaches the horizon — so `night_w = 1 - sun_w` is 0 all day and 1 after dark. Written as
+    // `1 + (g - 1)·night_w` (== `mix(1, g, night_w)`) so daylight multiplies by an EXACT 1.0 and
+    // every daytime frame stays bit-identical to before the feature: a gain that perturbed the day
+    // in the last ulp would move the `WOW_LIGHT_DUMP` row hash, which is the instrument three
+    // rounds of shading forensics are denominated in.
+    //
+    // POINT lights are deliberately NOT scaled by it. Dimming the sky law alone is the whole point:
+    // a campfire should read BRIGHTER against a darker night, not equally dim.
+    let sun_w = sun_shadow_strength(l.celestial_dir.y);
+    let night_k = 1.0 + (dynamic_interiors.night_gain - 1.0) * (1.0 - sun_w);
+    let night_dim = |c: [f32; 3]| c.map(|v| v * night_k);
     // Per-kind water swatches (shallow/deep rgb + alpha). River/lake use the non-ocean path.
     let (rs, rd, rsa, rda) = l.water_colors(LiquidKind::Still);
     let (os, od, osa, oda) = l.water_colors(LiquidKind::Ocean);
     data.0.rows = [[0.0; 4]; LIGHT_HEADER_ROWS];
     let rows = &mut data.0.rows;
-    rows[3] = [l.spec[0], l.spec[1], l.spec[2], 20.0]; // 3 light_spec (w=terrain shininess 20)
+    // MONKEY (darkness gains): the specular row takes the night dim because it IS the sun — the
+    // DBC sun-halo colour driving the terrain sheen. The FOG rows below do not (fog colour is the
+    // horizon backdrop the world is seen AGAINST, and dimming it would paint a dark world under a
+    // bright skyline), and neither does the sky dome (`resolve::apply_sky_backdrop`, which never
+    // reads this blob) or the water swatches.
+    let spec = night_dim(l.spec);
+    rows[3] = [spec[0], spec[1], spec[2], 20.0]; // 3 light_spec (w=terrain shininess 20)
     rows[4] = [l.fog_color[0], l.fog_color[1], l.fog_color[2], fog_enable]; // 4 fog_color (w=enable)
     rows[5] = [l.fog_start, l.fog_end, 0.0, farclip]; // 5 fog_params (z unused; w=farclip)
     rows[13] = [rs[0], rs[1], rs[2], rsa]; // 13 water river shallow (w=alpha)
@@ -979,16 +1175,31 @@ fn build_light_data(
     rows[19] = [l.wmo_fog_start, l.wmo_fog_end, 0.0, 0.0];
     // Rows 0-2, the SH block 6-12.xyz, and the sun DC (17.yzw) — the shared model-light core
     // (also the portrait booth's packer). Row 20 (point_count) is the point-table pack's below.
-    pack_model_core_rows(rows, l.ambient, l.diffuse, l.sun_dir);
+    // MONKEY (darkness gains): the night dim goes in HERE, on the (ambient, diffuse) triple the
+    // whole model core is derived from, rather than onto the packed rows afterwards — every row
+    // this packs (rows 0/1, the SH block, the sun's DC redistribution) is LINEAR in that triple, so
+    // one multiply at the input dims all of them consistently and no derived row can be missed.
+    pack_model_core_rows(rows, night_dim(l.ambient), night_dim(l.diffuse), l.sun_dir);
     // MONKEY (world shadows): pack the world-shadow lane flag into the free `sh_c16.w` lane. The
     // MCSH terrain-shadow suppression in `terrain.wgsl` keys on THIS — not on the mere presence of
     // a shadow sun — so character-only shadows (sun present, world lane off) keep the baked MCSH.
-    rows[12][3] = if world_shadow.0 { 1.0 } else { 0.0 };
+    // MONKEY (bake floor): ...and `interiorBakeFloor` rides the free FRACTION of that same lane,
+    // with `interiorGain` already folded in (the shader must not carry a second knob, and the room
+    // lane's other two inputs — the base ambient and the per-fixture fill — take the gain at pack
+    // time in exactly this way, three rows down). See [`BAKE_LANE_SCALE`] for why a fraction is
+    // invisible to the one `> 0.5` decode this lane has, and why the product is clamped first.
+    rows[12][3] = pack_bake_lane(
+        world_shadow.0,
+        dynamic_interiors.bake_floor,
+        dynamic_interiors.interior_gain,
+    );
     // MONKEY (night fade): realtime-shadow strength by the REAL celestial sun height, packed into
     // the free `fog_params.z` lane. The receivers (terrain/model) lighten their shadow term by it,
     // so shadows soften and vanish at night; the shadow basis is separately clamped to 18° so a low
     // sun still casts the right DIRECTION.
-    rows[5][2] = sun_shadow_strength(l.celestial_dir.y);
+    // MONKEY (darkness gains): computed once above — `nightGain` rides this exact same curve, so
+    // the dim and the shadow fade can never drift onto two different dusk clocks.
+    rows[5][2] = sun_w;
     // MONKEY (distance slider): the realtime-shadow render distance (yd), packed into the free
     // `_wmo_fog[1].z` / `wmo_fog_params.z` lane (row 19). The receivers' edge fade reads it so the
     // shadow fades at the cascade's actual `maximum_distance`, whatever the slider is set to.
@@ -997,8 +1208,13 @@ fn build_light_data(
     // interior surfaces + props light from the room's live fixtures, 0 = the faithful baked path).
     // Its three knobs ride `point_count.yzw`, packed with the table below.
     // On/off in the integer part, the debug mode added on top: 0 = off, 1 = on, 1+n = on + debug n.
+    // MONKEY (enclosed day floor): …and `interiorDaylight` rides the same lane's FRACTION (see
+    // [`DAYLIGHT_LANE_SCALE`] for why there was nowhere else to put it and why every existing
+    // decode survives it). Zero when the lane is off, so the packed word is byte-identical to
+    // before the feature in that arm.
     rows[19][3] = if dynamic_interiors.enabled {
         1.0 + dynamic_interiors.debug as f32
+            + dynamic_interiors.daylight.clamp(0.0, 1.0) * DAYLIGHT_LANE_SCALE
     } else {
         0.0
     };
@@ -1029,7 +1245,7 @@ fn build_light_data(
     // the interior lane, so `claims 4` beside `EXT` is the readout of exactly that trade.
     let mut pts: Vec<(f32, Vec3, f32, [f32; 3], bool, f32, RoomClaim, usize)> = lights_q
         .iter()
-        .filter(|(_, gt, rooms, _, _, _, _, _)| {
+        .filter(|(_, gt, rooms, _, _, _, _, _, _)| {
             // The ROOM term (decision 0689's law, fourth lane — see [`LightRooms`]). Not a
             // visibility test bolted onto a faithful gather: the reference's register walk has no
             // such term either, it simply never has a culled room's torch to register. Ungated for
@@ -1047,7 +1263,7 @@ fn build_light_data(
                 && gt.translation().distance_squared(cam_pos)
                     < INTERIOR_NEAR_ADMIT * INTERIOR_NEAR_ADMIT)
         })
-        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms, flicker)| {
+        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms, flicker, daylight)| {
             let p = gt.translation();
             let d2 = p.distance_squared(cam_pos);
             (d2 < POINT_PACK_RADIUS * POINT_PACK_RADIUS).then(|| {
@@ -1087,6 +1303,24 @@ fn build_light_data(
                 // is corrected outward, never the reverse — so the gap can never flash a pool onto
                 // an inn's lawn.
                 let interior = lane_of.map_or_else(|| rooms.is_some(), |l| l.interior);
+                // MONKEY (darkness gains): `interiorGain` dims the room lane's third input — every
+                // INTERIOR fixture's committed colour — downstream of the fire gain and the
+                // flicker, so those two keep their own meanings ("how bright is this invented
+                // source" / "how hard does it breathe") and this one reads purely as "how dark is
+                // the room". The EXTERIOR half of the table is untouched on purpose: an outdoor
+                // campfire belongs to the night law, which dims the sky around it and not it.
+                //
+                // And so is the DAYLIGHT FIXTURE ([`super::DaylightFixture`]) — an interior-lane
+                // entry that IS the sun standing in a doorway. A sunlit opening must not dim with
+                // the room's candles: this dial means "how dark is the CANDLELIGHT". Nor does
+                // `nightGain` claim it instead — that one dims the night, and a daylight fixture is
+                // already scaled to nothing by its own day envelope (`daylight_target`'s `sun_w`,
+                // the same curve) by the time the night dim is at full strength.
+                let rgb = if interior && !daylight {
+                    rgb.map(|c| c * dynamic_interiors.interior_gain)
+                } else {
+                    rgb
+                };
                 // A fixture's reach is its authored MOLT end where there is one and the M2 bucket
                 // otherwise, with a fail-open default for a MOLT record whose end is absent or
                 // degenerate (a few author 0 with `useAtten` clear).
@@ -1113,13 +1347,22 @@ fn build_light_data(
         })
         .collect();
     pts.sort_by(|a, b| a.0.total_cmp(&b.0));
-    pts.truncate(MAX_POINT_LIGHTS);
+    // MONKEY (ext light k8): 255, not 256 — index 255 is the shaders' `EXT_SEL_EMPTY` sentinel now
+    // that a draw unit's selection packs eight 8-bit ranks. See [`MAX_LIVE_POINT_LIGHTS`]. The sort
+    // above is nearest-camera-first, so the entry this drops is the farthest of the set.
+    pts.truncate(MAX_LIVE_POINT_LIGHTS);
     // `.x` = the live entry count; MONKEY (dynamic interiors): `.yzw` = the interior lane's live
     // knobs (base ambient, per-fixture fill gain, exposure) — free lanes until now.
+    // MONKEY (darkness gains): `interiorGain` scales two of the room lane's three inputs here (the
+    // base ambient floor and the per-fixture fill gain; the fixtures' own colours took it above)
+    // and pointedly leaves EXPOSURE alone — that one is the user's live dial (their config sits at
+    // 4), and folding a dim into it would have the two knobs fight over the same number. A gain on
+    // the INPUTS composes with whatever exposure is set to. The strict exterior-batch `ext_room`
+    // term and the ext-class night blend read these same packed lanes, so they follow for free.
     data.0.rows[20] = [
         pts.len() as f32,
-        dynamic_interiors.ambient,
-        dynamic_interiors.fill,
+        dynamic_interiors.ambient * dynamic_interiors.interior_gain,
+        dynamic_interiors.fill * dynamic_interiors.interior_gain,
         dynamic_interiors.exposure,
     ];
     for (i, (_, p, range, rgb, _, lane, claim, _)) in pts.iter().enumerate() {
@@ -1184,12 +1427,17 @@ fn build_light_data(
             // exterior lane should never have seen — a number, printed per row below as INT/EXT.
             let interior = pts.iter().filter(|(.., lane, _, _)| *lane > 0.5).count();
             eprintln!(
-                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, {flames} flickering, gain {:.2}, atten x{:.2}, flicker x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
+                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, {flames} flickering, gain {:.2}, atten x{:.2}, flicker x{:.2}, night x{:.2}, interior x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
                 pts.len(),
                 pts.len() - interior,
                 fire_gain.0,
                 dynamic_interiors.atten_scale,
                 dynamic_interiors.flicker,
+                // MONKEY (darkness gains): the two dim dials, beside the gains they compose with —
+                // "is this room dark because the gain is 0.2 or because no fixture claims it" is
+                // the question this line exists to answer without a rebuild.
+                dynamic_interiors.night_gain,
+                dynamic_interiors.interior_gain,
             );
             for (d2, p, _, rgb, synthetic, lane, claim, lit_n) in pts.iter().take(8) {
                 eprintln!(
@@ -2055,5 +2303,243 @@ mod tests {
                 eval0(n, 2.5)
             );
         }
+    }
+
+    /// MONKEY (ext light k8): the LIVE cap is one short of the SLOT cap, and the blob did not grow.
+    ///
+    /// The two numbers are easy to confuse and the failure mode of confusing them is invisible: a
+    /// light seated at index 255 packs identically to `EXT_SEL_EMPTY` in all three shaders, so the
+    /// draw units that selected it would read "end of list" and quietly drop every rank after it —
+    /// a dark patch with nothing in any log. The second assertion is the other half of the deal
+    /// that bought those bits: widening the selection had to cost the buffer NOTHING, because
+    /// `LightStd430` is mirrored by three shaders plus the portrait booth's frozen studio blob.
+    #[test]
+    fn the_live_point_cap_leaves_the_sentinel_index_free() {
+        assert_eq!(MAX_LIVE_POINT_LIGHTS, 255, "255 is EXT_SEL_EMPTY in the three shaders");
+        assert_eq!(MAX_LIVE_POINT_LIGHTS, MAX_POINT_LIGHTS - 1);
+        // 21 header rows + 2 x 256 point rows, 16 B each.
+        assert_eq!(per_frame_blob_bytes(), 8528, "the mirrored blob must not change size");
+    }
+
+    /// MONKEY (enclosed day floor): `interiorDaylight` rides the FRACTION of the interior lane's
+    /// on/off word, and every existing decode of that word must be blind to it.
+    ///
+    /// This is the test the feature stands on: there was no free `f32` left in an 8528-byte layout
+    /// three shaders mirror, so the value shares a lane with two other facts. If the fraction ever
+    /// grew past 0.5 — a wider `DAYLIGHT_LANE_SCALE`, a `daylight` that escaped its clamp — the
+    /// debug decode `u32(max(w - 1, 0) + 0.5)` would round UP and every building in the frame would
+    /// silently switch to a diagnostic overlay. Asserting the two decodes, not just the value, is
+    /// what makes that impossible to introduce quietly.
+    #[test]
+    fn the_daylight_lane_rides_the_fraction_without_disturbing_its_neighbours() {
+        // The shader's own two decodes of `wmo_fog_params.w`, transcribed.
+        let interiors_on = |w: f32| w > 0.5;
+        let idbg = |w: f32| (0.0f32.max(w - 1.0) + 0.5) as u32;
+        let daylight_of = |w: f32| (w - w.floor()) / DAYLIGHT_LANE_SCALE;
+        for debug in 0..=4u32 {
+            for daylight in [0.0f32, 0.01, 0.12, 0.5, 0.999, 1.0] {
+                let w = 1.0 + debug as f32 + daylight * DAYLIGHT_LANE_SCALE;
+                assert!(interiors_on(w), "lane off at debug {debug} daylight {daylight}");
+                assert_eq!(idbg(w), debug, "debug decode moved (w {w})");
+                assert!(
+                    (daylight_of(w) - daylight).abs() < 1e-4,
+                    "daylight {daylight} round-tripped as {} (w {w})",
+                    daylight_of(w),
+                );
+            }
+        }
+        // The OFF arm is untouched — byte-identical to before the feature, whatever the cvar says.
+        assert!(!interiors_on(0.0));
+        assert_eq!(daylight_of(0.0), 0.0);
+        // …and the packer really writes it. `1 + debug + d*scale`, clamped at both ends.
+        let pack = |enabled: bool, debug: u32, d: f32| {
+            if enabled {
+                1.0 + debug as f32 + d.clamp(0.0, 1.0) * DAYLIGHT_LANE_SCALE
+            } else {
+                0.0
+            }
+        };
+        assert_eq!(pack(false, 3, 0.5), 0.0);
+        assert_eq!(idbg(pack(true, 3, 5.0)), 3, "an out-of-range cvar must still clamp under 0.5");
+        assert!((daylight_of(pack(true, 3, 5.0)) - 1.0).abs() < 1e-4);
+        assert!((daylight_of(pack(true, 0, -1.0))).abs() < 1e-4);
+    }
+
+    /// MONKEY (bake floor): `interiorBakeFloor` rides the FRACTION of the world-shadow lane
+    /// (`sh_c16.w`), and that lane's one existing decode must be blind to it.
+    ///
+    /// Same shape as the daylight-lane test above and load-bearing for the same reason: the layout
+    /// has no free `f32`, so the value shares a row with a boolean. The failure this forbids is
+    /// quiet and remote — a fraction that reached 0.5 would make `terrain.wgsl` read
+    /// `sh_c16.w > 0.5` as TRUE with `worldShadows` OFF, i.e. every ADT in the world would drop its
+    /// baked MCSH shadows because someone moved an interior slider. Hence the clamp inside
+    /// [`pack_bake_lane`] (the product `bake_floor × interior_gain` reaches 1.5 at the knobs' own
+    /// limits, which × 0.49 is 0.735 — over the cliff) and hence asserting the DECODE, not the value.
+    #[test]
+    fn the_bake_floor_rides_the_fraction_without_disturbing_the_world_shadow_flag() {
+        // `terrain.wgsl`'s only decode of this lane, transcribed.
+        let world_shadow_lane = |w: f32| w > 0.5;
+        for &flag in &[false, true] {
+            for &bake in &[0.0f32, 0.01, 0.08, 0.12, 0.2, 0.5, 1.0] {
+                for &gain in &[0.2f32, 0.5, 1.0, 1.5] {
+                    let w = pack_bake_lane(flag, bake, gain);
+                    assert_eq!(
+                        world_shadow_lane(w),
+                        flag,
+                        "world-shadow decode moved (w {w}, bake {bake}, gain {gain})",
+                    );
+                    let want = (bake * gain).clamp(0.0, 1.0);
+                    assert!(
+                        (unpack_bake_lane(w) - want).abs() < 1e-4,
+                        "bake {bake} x gain {gain} round-tripped as {} (w {w})",
+                        unpack_bake_lane(w),
+                    );
+                }
+            }
+        }
+        // `0` restores the pre-feature look EXACTLY: the packed word is the bare flag, bit for bit.
+        assert_eq!(pack_bake_lane(false, 0.0, 0.5), 0.0);
+        assert_eq!(pack_bake_lane(true, 0.0, 0.5), 1.0);
+        // An out-of-range cvar still clamps under the cliff rather than flipping the flag.
+        assert!(!world_shadow_lane(pack_bake_lane(false, 9.0, 1.5)));
+        assert!((unpack_bake_lane(pack_bake_lane(false, 9.0, 1.5)) - 1.0).abs() < 1e-4);
+        // The gain really is the dimmer: the Dim preset's floor is under the Default's.
+        assert!(pack_bake_lane(false, 0.08, 0.5) < pack_bake_lane(false, 0.12, 0.5));
+    }
+
+    /// GOLDEN — MONKEY (darkness gains): `nightGain` is EXACTLY inert while the sun is up and
+    /// exactly the gain after dark, and it never touches a flame.
+    ///
+    /// The daylight half is the load-bearing one. The dial folds into rows the entire exterior look
+    /// is derived from (ambient, diffuse, the SH block, the sun halo), so a ramp that missed 1.0 by
+    /// an ulp at noon would perturb every daytime frame of a renderer whose fidelity work is
+    /// measured against bit-exact row hashes — the bug would be invisible on screen and expensive
+    /// in the log. `1 + (g - 1)·night_w` is written the way it is to make that endpoint exact.
+    ///
+    /// The point-table half is the FEATURE, not a detail: dimming the sky law while leaving the
+    /// fires alone is what makes a torch read brighter against a darker night. A gain that reached
+    /// the point entries would dim the flame by the same 20 % and net out to no change at all.
+    #[test]
+    fn the_night_gain_is_inert_by_day_and_exact_after_dark() {
+        let base = WowLighting {
+            ambient: [0.30, 0.32, 0.38],
+            diffuse: [0.85, 0.70, 0.45],
+            spec: [0.60, 0.55, 0.50],
+            sun_dir: Vec3::new(0.3, -0.8, 0.52).normalize(),
+            ..default()
+        };
+        // `sun_shadow_strength` saturates at `sin(12°)`: y = 1 is broad daylight, y = 0 the horizon.
+        let pack = |celestial_y: f32| {
+            let mut app = packer_app();
+            app.world_mut().insert_resource(WowLighting {
+                celestial_dir: Vec3::new(0.0, celestial_y, 0.0),
+                ..base
+            });
+            // An EXTERIOR fire, to prove the dial stops at the sky law.
+            app.world_mut().spawn((
+                crate::terrain_stream::point_light([1.0, 0.5, 0.25], 2.0),
+                GlobalTransform::from_translation(Vec3::X),
+            ));
+            app.update();
+            app.world().resource::<WowLightData>().0
+        };
+
+        let day = pack(1.0);
+        assert_eq!(day.rows[5][2], 1.0, "the sun is up: night_w is 0");
+        assert_eq!([day.rows[0][0], day.rows[0][1], day.rows[0][2]], base.ambient);
+        assert_eq!([day.rows[1][0], day.rows[1][1], day.rows[1][2]], base.diffuse);
+        assert_eq!([day.rows[3][0], day.rows[3][1], day.rows[3][2]], base.spec);
+        // The SH block is derived from the same triple — its DC lanes carry ambient verbatim.
+        assert_eq!(day.rows[6][3], base.ambient[0], "the SH DC is undimmed by day too");
+
+        let night = pack(0.0);
+        assert_eq!(night.rows[5][2], 0.0, "below the horizon: night_w is 1");
+        let g = DynamicInteriors::default().night_gain;
+        assert_eq!(g, 0.45, "the shipped default is the director's pick (2026-09-11: 0.45)");
+        for c in 0..3 {
+            assert_eq!(night.rows[0][c], base.ambient[c] * g, "ambient takes the gain");
+            assert_eq!(night.rows[1][c], base.diffuse[c] * g, "diffuse takes the gain");
+            assert_eq!(night.rows[3][c], base.spec[c] * g, "the sun halo follows its sun");
+        }
+        assert_eq!(night.rows[6][3], base.ambient[0] * g, "the SH DC follows the triple");
+        // The fire is the same brightness on both frames — which is the point of the feature.
+        assert_eq!(day.points[1], night.points[1], "a point light never takes the night dim");
+        assert!((night.points[1][0] - 2.0).abs() < 1e-4, "…at its authored value");
+    }
+
+    /// GOLDEN — MONKEY (darkness gains): `interiorGain` scales all THREE of the room lane's inputs
+    /// and nothing on the exterior lane.
+    ///
+    /// Three inputs make a room's brightness (`static_gx.wgsl`'s `interior_room_light`): the base
+    /// ambient floor, the per-fixture fill gain, and the fixtures' own colours. Scaling two of the
+    /// three would change the room's COLOUR BALANCE rather than dim it — a 30 % cut that left the
+    /// ambient floor standing reads as a washed-out room, not a darker one. `interiorExposure` is
+    /// pointedly NOT in the set: it is the dial the user tunes live, and this must compose with it.
+    ///
+    /// The exterior assertion is the seam that matters. The two lanes share one packed table, so a
+    /// gain applied before the lane verdict would dim every campfire and street torch in the world
+    /// with the candles.
+    #[test]
+    fn the_interior_gain_scales_the_room_lane_and_never_the_exterior_one() {
+        let mut app = packer_app();
+        // One recipe, one lane component apart: nothing else can separate the two entries.
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.5, 0.25], 2.0);
+        let lane = |interior| LightLane { interior, generation: LightLane::SETTLED };
+        app.world_mut()
+            .spawn((recipe(), GlobalTransform::from_translation(Vec3::X), lane(true)));
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            lane(false),
+        ));
+        // MONKEY (darkness gains): a DAYLIGHT fixture — an interior-lane entry that is the sun in
+        // a doorway. It rides the room lane but belongs to the exterior law, so the candle dial
+        // must step over it; without the marker check it would dim a sunlit doorway by 30 %.
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(3.0, 0.0, 0.0)),
+            lane(true),
+            crate::lighting::DaylightFixture {
+                instance: Entity::PLACEHOLDER,
+                group: 0,
+                portal: None,
+                how: crate::lighting::DaylightHow::Portal,
+                reach: 8.0,
+                cal_d: 4.0,
+                cal_ndl: 0.5,
+            },
+        ));
+        let g = 0.7;
+        app.world_mut().insert_resource(DynamicInteriors {
+            ambient: 0.2,
+            fill: 0.5,
+            exposure: 3.0,
+            interior_gain: g,
+            ..default()
+        });
+        app.update();
+
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.rows[20][0], 3.0, "all three packed");
+        assert_eq!(data.rows[20][1], 0.2 * g, "the base ambient floor takes the gain");
+        assert_eq!(data.rows[20][2], 0.5 * g, "the per-fixture fill takes the gain");
+        assert_eq!(data.rows[20][3], 3.0, "exposure stays the user's own dial");
+        // Nearest-first: the interior fixture at x=1 is entry 0, the exterior one at x=2 entry 1.
+        let (int, ext) = (data.points[1], data.points[3]);
+        assert!(int[3] > 0.5 && ext[3] == 0.0, "the lanes packed as expected: {int:?} {ext:?}");
+        assert!(
+            (int[0] - 2.0 * g).abs() < 1e-4,
+            "the interior fixture's colour takes the gain: {int:?}"
+        );
+        assert!(
+            (ext[0] - 2.0).abs() < 1e-4,
+            "the exterior light is untouched by it: {ext:?}"
+        );
+        let sun = data.points[5];
+        assert!(sun[3] > 0.5, "the daylight fixture packed on the interior lane: {sun:?}");
+        assert!(
+            (sun[0] - 2.0).abs() < 1e-4,
+            "…and a sunlit doorway does not dim with the candles: {sun:?}"
+        );
     }
 }

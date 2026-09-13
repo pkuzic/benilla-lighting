@@ -136,6 +136,10 @@ mod shadow; // MONKEY (world shadows): CPU triangle collection for the static-wo
 mod torch_depth; // MONKEY (torch shadows Phase 1): the per-fixture depth-map render + its targets
 pub use shadow::CutoutBucket; // MONKEY (world shadows): per-leaf-texture alpha-cutout caster group
 pub use torch_depth::TorchShadowViews; // MONKEY (torch shadows Phase 1): the app→render publication
+// MONKEY (torch owner exclusion): the light→caster ownership key, written at the light spawn
+// sites (`terrain_stream::spawn`, `benilla_app::entities::carried_light`) and read by both
+// torch caster gathers, so a fixture never casts its own body's shadow into its own map.
+pub use torch_depth::{torch_flame_inside_bounds, LightOwner};
 // MONKEY (torch shadows Phase 3A): the shared depth image + table buffer every model material binds,
 // their startup constructor, the one-param main-world accessor, and the always-on wiring — used by
 // the asset foundation (`crate::assets`) and every material-building site; NOT gated on `enabled()`.
@@ -405,6 +409,10 @@ struct GxItemWmo {
     /// ([`benilla_formats::room_claim::ext_building_scale`]) — the record table's bit 27, which
     /// makes `static_gx.wgsl` blend it onto the interior light law after dark.
     ext_night: bool,
+    /// MONKEY (enclosed day floor): this batch's group is an INTERIOR room inside a building-scale
+    /// shell ([`benilla_formats::room_claim::enclosed_by_building_shell`]) — the record table's
+    /// bit 28, which gives the room law a sun-driven ambient floor by day.
+    enclosed: bool,
     /// The batch-class lane exactly as `model_render` packs `tint.w`: 0 = EXT law, 1 = INT,
     /// 2 = TRANS — non-zero only on an interior group's batches.
     class_lane: u8,
@@ -576,6 +584,10 @@ pub struct GxWmoBatch {
     /// MOGI box ([`benilla_formats::room_claim::ext_building_scale`]), because that is the last
     /// place the model's group table is in hand; it rides to the shader as a record bit.
     pub ext_night: bool,
+    /// MONKEY (enclosed day floor): the mirror question — this is an INTERIOR-class group whose
+    /// box centre sits inside such a shell, i.e. a ROOM IN A BUILDING rather than a cave. Resolved
+    /// at the same site off the same table; rides to the shader as bit 28.
+    pub enclosed: bool,
     /// The MOBA batch class (INT/TRANS/EXT) — the lighting-lane selector on interior groups.
     pub class: Option<WmoBatchClass>,
     /// The MOMT SIDN night-glow colour.
@@ -699,6 +711,7 @@ impl StaticGx {
             group: w.group,
             interior: w.interior,
             ext_night: w.ext_night,
+            enclosed: w.enclosed,
             class_lane: match (w.interior, w.class) {
                 (true, Some(WmoBatchClass::Int)) => 1,
                 (true, Some(WmoBatchClass::Trans)) => 2,

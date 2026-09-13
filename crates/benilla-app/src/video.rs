@@ -316,11 +316,27 @@ pub(crate) struct VideoConfig {
     /// three", and a walking NPC's shadow lags its body by at most one frame's stride.
     pub(crate) interior_shadow_entity_rate: u32,
     /// MONKEY (torch caster selection): the PCF tap-radius scale for the torch maps
-    /// (`interiorShadowSoft`, 0.5..3, default 1). A candle cluster casts many hard-edged
+    /// (`interiorShadowSoft`, 0.5..3, default **1.5**). A candle cluster casts many hard-edged
     /// overlapping shadows; widening the 4-tap kernel is the cheap softening. Rides the torch
-    /// table's `count.y` (as `x100`) rather than a `DynamicInteriors` field, because it belongs
-    /// to the shadow table's own bytes.
+    /// table's `count.y` (as `x100`, LOW half) rather than a `DynamicInteriors` field, because it
+    /// belongs to the shadow table's own bytes.
+    ///
+    /// MONKEY (pcss): it is now the CONTACT radius, not the radius everywhere — the projector's
+    /// blocker search grows the kernel with the receiver's distance from its caster and clamps at
+    /// 4x this. So this dial sets how sharp the sharpest edge in the scene is, and 1 (the old
+    /// default) now reads sharper at a contact than it used to read anywhere; 1.5 restores the
+    /// shipped softness at a contact and lets the penumbra open up from there.
     pub(crate) interior_shadow_soft: f32,
+    /// MONKEY (shadow floor): how much of the DIRECT term a torch shadow removes
+    /// (`torchShadowStrength`, 0..1, default **0.7**). A torch map is the only occlusion the
+    /// direct arm has, so a blocked fragment used to lose all of it — the pitch-black razor-edged
+    /// "scars" the Darkmoon tents printed on the grass and the Darkshire chairs printed on the inn
+    /// floor. Nothing in this renderer bounces light, so the 30 % left standing at the default IS
+    /// the bounce. Rides the torch table's `count.y` HIGH half beside `interior_shadow_soft`, and
+    /// the receivers fold it into the slot's cross-fade weight (one multiply, no extra tap), so it
+    /// touches the direct arm only — fill and ambient never saw this factor. `1` restores the
+    /// shipped look exactly; `0` turns torch shadows off without disturbing the lane behind them.
+    pub(crate) torch_shadow_strength: f32,
     /// MONKEY (room gate): whether an interior fixture may only light the ROOMS IT CLAIMS
     /// (`interiorRoomGate`, default on). Off = the pre-gate behaviour, where every interior fixture
     /// in range lights every interior surface in range and the only occlusion is the handful of
@@ -332,6 +348,31 @@ pub(crate) struct VideoConfig {
     /// MONKEY (interior debug): the interior-lane diagnostic overlay (`interiorDebug`, 0..4). See
     /// [`benilla_world::lighting::DynamicInteriors::debug`].
     pub(crate) interior_debug: u32,
+    /// MONKEY (darkness gains): the exterior night dim (`nightGain`, 0.2..1.5, default **0.8** =
+    /// nights 20 % darker). Bridged to `DynamicInteriors::night_gain`, which the light packer folds
+    /// into the packed ambient/diffuse/specular rows on a `mix(1, gain, night_w)` ramp — so it is
+    /// exactly inert while the sun is up and live the frame it changes after dark.
+    pub(crate) night_gain: f32,
+    /// MONKEY (lighting debug panel): the interior dim (`interiorGain`, 0.2..1.5, default **0.5** =
+    /// room inputs 50 % weaker). Bridged to `DynamicInteriors::interior_gain`, which scales the room
+    /// lane's INPUTS (base ambient, per-fixture fill, every interior fixture's colour) and not
+    /// `interiorExposure` — that stays the user's own dial, and this composes with it.
+    pub(crate) interior_gain: f32,
+    /// MONKEY (enclosed day floor): the DAYLIGHT floor a room inside a building gets by day
+    /// (`interiorDaylight`, 0..1, default **0.12**). Bridged to
+    /// [`benilla_world::lighting::DynamicInteriors::daylight`], packed into the free fraction of
+    /// the interior lane's on/off word, and added to the room law's ambient budget for batches the
+    /// record table flags as enclosed. `0` restores the pre-feature look exactly; the night look is
+    /// unaffected at any value (the term is scaled by the sun's own day envelope).
+    pub(crate) interior_daylight: f32,
+    /// MONKEY (bake floor): the share of a WMO interior batch's OWN MOCV bake every interior-lane
+    /// fragment keeps whether or not a fixture reaches it (`interiorBakeFloor`, 0..1, default
+    /// **0.12**). Bridged to [`benilla_world::lighting::DynamicInteriors::bake_floor`], packed
+    /// (times `interiorGain`) into the free fraction of the world-shadow lane, and added to the
+    /// room law's budget inside its rolloff. It is what stops a room the fixture table cannot
+    /// reach — the Lion's Pride Inn's east vestibule — rendering black; `0` restores the
+    /// pre-feature look exactly.
+    pub(crate) interior_bake_floor: f32,
     /// MONKEY (fire GO lights): gain on every light SYNTHESISED from a fire prop's flame emitter
     /// (`fireLightGain`, 0..4; `0` = the invented-light lane off). Bridged to benilla-world's
     /// [`benilla_world::lighting::FireLightGain`] by `dynamic_interior`, and applied at PACK time
@@ -352,8 +393,8 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             vsync: !novsync_env(),
-            world_shadows: false,
-            character_shadows: false,
+            world_shadows: true,
+            character_shadows: true,
             shadow_distance: crate::shadow_core::DEFAULT_SHADOW_DISTANCE,
             // MONKEY (sun shadow perf): 2048, not the rig's old 4096 literal — see the field docs.
             shadow_map_size: crate::shadow_core::DEFAULT_SHADOW_MAP_SIZE,
@@ -363,8 +404,8 @@ impl Default for VideoConfig {
             shadow_caster_reach: 1.0,
             // The cvar defaults are the source of truth at load; these only stand in until then.
             interior_light: true,
-            interior_ambient: 0.15,
-            interior_fill: 0.12,
+            interior_ambient: 0.015,
+            interior_fill: 0.08,
             interior_exposure: 2.5,
             // MONKEY (soft falloff): 2.5, not 1 — see the field doc.
             interior_atten_scale: 1.6,
@@ -377,11 +418,24 @@ impl Default for VideoConfig {
             interior_shadow_dynamic: 4,
             // MONKEY (torch lane perf): 30 Hz - see the field doc.
             interior_shadow_entity_rate: 30,
-            interior_shadow_soft: 1.0,
+            // MONKEY (pcss): 1.5 — see the field doc; `soft` is now the CONTACT radius.
+            interior_shadow_soft: 1.5,
+            // MONKEY (shadow floor): 0.7 — a shadow takes 70 % of the direct term, not all of it.
+            torch_shadow_strength: 0.7,
             // MONKEY (room gate): on — without it a building's fixtures light through its own
             // floors and walls.
             interior_room_gate: true,
             interior_debug: 0,
+            // MONKEY (lighting debug panel): nights 20 % darker, interior inputs 50 % weaker.
+            night_gain: 0.45,
+            interior_gain: 0.5,
+            // MONKEY (enclosed day floor): calibrated so the Goldshire inn's entry floor reads
+            // ~50 % of the sunlit threshold beside it — see `lighting::DAYLIGHT_LANE_SCALE`.
+            interior_daylight: 0.0,
+            // MONKEY (bake floor): an eighth of the authored bake — measured to lift the inn's
+            // black door band from 0.019 to 0.108 x tex while moving candle-lit surfaces by
+            // under 10 % (see `lighting::DynamicInteriors::bake_floor`).
+            interior_bake_floor: 0.12,
             fire_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {

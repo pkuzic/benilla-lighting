@@ -57,6 +57,23 @@ fn bridge(
         // on the CPU in `build_light_data`, so `SetCVar("fireFlicker", 0)` freezes every flame on
         // the very next frame with no respawn and no shader change.
         flicker: video.fire_flicker,
+        // MONKEY (darkness gains): both dim dials ride this same bridge — they are consumed
+        // entirely on the CPU in `build_light_data` (folded into the packed rows / the packed
+        // colours), so `SetCVar("nightGain", 1)` restores the reference night on the very next
+        // frame with no respawn and no shader change. `night_gain` is an EXTERIOR knob living on an
+        // interior-named resource for the sake of one bridge rather than two; the packer reads it
+        // ungated by `enabled`.
+        night_gain: video.night_gain,
+        interior_gain: video.interior_gain,
+        // MONKEY (enclosed day floor): the daylight floor rides the same bridge, but is consumed in
+        // the SHADER (it rides the packed `wmo_fog_params.w` fraction) rather than folded on the
+        // CPU — the packer's only job is to put it in the lane.
+        daylight: video.interior_daylight,
+        // MONKEY (bake floor): the bake floor rides the same bridge. Half CPU, half shader: the
+        // packer folds `interiorGain` in and puts the product in the `sh_c16.w` fraction, and the
+        // two interior lanes read it from there — so `SetCVar("interiorBakeFloor", 0)` restores
+        // the pre-feature look on the very next frame with no respawn and no pipeline rebuild.
+        bake_floor: video.interior_bake_floor,
     };
     if *out != want {
         *out = want;

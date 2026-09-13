@@ -598,6 +598,163 @@ fn group_names(bytes: &[u8]) -> Vec<Option<String>> {
         .collect()
 }
 
+/// MONKEY (trans night floor): the group file's MOGP payload — `benilla_formats`'s own chunk walker
+/// is `pub(crate)` and this instrument lives in a separate bin target, so the four lines are
+/// repeated rather than the visibility widened for an audit.
+fn mogp_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let mut o = 0usize;
+    while o + 8 <= bytes.len() {
+        let tag = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+        let n = u32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?) as usize;
+        if &tag == b"PGOM" {
+            return bytes.get(o + 8..(o + 8 + n).min(bytes.len()));
+        }
+        o += 8 + n;
+    }
+    None
+}
+
+/// MONKEY (trans night floor): the per-group **MOBA batch-class** table — the instrument the
+/// interior seam actually asks for.
+///
+/// `wmolights`'s group table above answers "which LIGHTING LANE is this group on" (INT / ext* /
+/// ext). It cannot answer the next question down, which is the one a seam *inside* one interior
+/// room reduces to: an interior group's batches are split TRANS / INT / EXT by the MOGP batch
+/// section counts (`+0x28` / `+0x2a`), and the shader gives each class a DIFFERENT day weight
+/// (`static_gx.wgsl`'s `day_w` — TRANS takes the MOCV alpha, EXT takes 1, INT takes 0). So a hard
+/// line across a doorway inside one room is a BATCH-class line, invisible to every table we had.
+///
+/// The printed numbers are exactly the shader's inputs for that weight: the class, the batch's
+/// triangle count, its world-space (model-space) bbox so it can be matched to a screenshot, and the
+/// **MOCV alpha** range/mean — `trans_a` in the shader, straight off `wmo_group_fixed_colors` (the
+/// buffer as the renderer uploads it, doorway fade included), i.e. the number `day_w = trans_a *
+/// sun_w` is built from. `a=255` on a TRANS batch means the batch takes the exterior sky law at
+/// FULL weight whenever the sun is above the horizon.
+fn batch_class_table(
+    chain: &mut Chain,
+    root: &benilla_formats::WmoRoot,
+    root_path: &str,
+    names: &[Option<String>],
+    infos: &[benilla_formats::WmoGroupInfo],
+    // MONKEY (trans day law): dump this group's per-VERTEX rows as well (see the CLI doc).
+    verts: Option<usize>,
+) {
+    println!("=== MOBA batch classes (per group; a = MOCV alpha = the shader's `trans_a`) ===");
+    let stem = root_path
+        .to_ascii_lowercase()
+        .strip_suffix(".wmo")
+        .unwrap_or(root_path)
+        .to_string();
+    for gi in 0..root.group_count() as usize {
+        let Ok(gbytes) = chain.read_file(&format!("{stem}_{gi:03}.wmo")) else {
+            continue;
+        };
+        let Ok(benilla_wmo::ParsedWmo::Group(group)) =
+            benilla_wmo::parse_wmo(&mut std::io::Cursor::new(gbytes.as_slice()))
+        else {
+            continue;
+        };
+        // The MOGP batch-section counts — the SAME two reads `build_wmo_group_submeshes` makes.
+        let (trans_n, int_n) = mogp_payload(&gbytes)
+            .filter(|m| m.len() >= 0x2c)
+            .map_or((0usize, 0usize), |m| {
+                (
+                    u16::from_le_bytes([m[0x28], m[0x29]]) as usize,
+                    u16::from_le_bytes([m[0x2a], m[0x2b]]) as usize,
+                )
+            });
+        // The colours AS UPLOADED (doorway fade applied), so the alpha printed is the alpha the
+        // shader interpolates. BGRA — index 3 is alpha.
+        let colors = benilla_formats::wmo_group_fixed_colors(&gbytes, root);
+        let interior = (group.flags & 0x48) == 0;
+        println!(
+            "  g{gi:<3} {:<12} {:<4} batches {:<3} (trans {trans_n}, int {int_n}, ext {})",
+            names.get(gi).and_then(|n| n.as_deref()).unwrap_or("-"),
+            if interior { "INT" } else { "ext" },
+            group.render_batches.len(),
+            group.render_batches.len().saturating_sub(trans_n + int_n),
+        );
+        for (bi, batch) in group.render_batches.iter().enumerate() {
+            let class = if bi < trans_n {
+                "TRANS"
+            } else if bi < trans_n + int_n {
+                "INT"
+            } else {
+                "EXT"
+            };
+            let start = batch.start_index as usize;
+            let idx: Vec<usize> = group
+                .vertex_indices
+                .get(start..start + batch.count as usize)
+                .unwrap_or(&[])
+                .iter()
+                .map(|&i| i as usize)
+                .filter(|&g| g < group.vertex_positions.len())
+                .collect();
+            if idx.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            let (mut a_lo, mut a_hi, mut a_sum, mut rgb_sum, mut n) =
+                (255u16, 0u16, 0u32, [0u32; 3], 0u32);
+            for &g in &idx {
+                let p = &group.vertex_positions[g];
+                for (k, v) in [p.x, p.y, p.z].into_iter().enumerate() {
+                    lo[k] = lo[k].min(v);
+                    hi[k] = hi[k].max(v);
+                }
+                if let Some(c) = colors.as_ref().and_then(|c| c.get(g)) {
+                    let a = u16::from(c[3]);
+                    a_lo = a_lo.min(a);
+                    a_hi = a_hi.max(a);
+                    a_sum += u32::from(c[3]);
+                    // BGRA on disk — print it as RGB.
+                    rgb_sum[0] += u32::from(c[2]);
+                    rgb_sum[1] += u32::from(c[1]);
+                    rgb_sum[2] += u32::from(c[0]);
+                    n += 1;
+                }
+            }
+            let mean = |s: u32| if n == 0 { 0 } else { s / n };
+            println!(
+                "     b{bi:<3} {class:<5} tris {:>5}  a[{:>3}..{:>3}] mean {:>3}  mocv rgb ({:>3},{:>3},{:>3})  box ({:>7.2},{:>7.2},{:>6.2})..({:>7.2},{:>7.2},{:>6.2})",
+                idx.len() / 3,
+                if n == 0 { 255 } else { a_lo },
+                if n == 0 { 255 } else { a_hi },
+                if n == 0 { 255 } else { mean(a_sum) as u16 },
+                mean(rgb_sum[0]), mean(rgb_sum[1]), mean(rgb_sum[2]),
+                lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
+            );
+            // MONKEY (trans day law): the per-VERTEX rows. `trans_a` is interpolated across the
+            // triangle from these alphas, so the BEFORE curve of the TRANS day blend is a function
+            // of exactly this list; the batch mean above cannot produce it.
+            if verts == Some(gi) {
+                let mut seen: Vec<usize> = Vec::new();
+                for &g in &idx {
+                    if seen.contains(&g) {
+                        continue;
+                    }
+                    seen.push(g);
+                    let p = &group.vertex_positions[g];
+                    let c = colors.as_ref().and_then(|c| c.get(g)).copied().unwrap_or([255; 4]);
+                    let a = c[3];
+                    println!(
+                        "          v{g:<5} ({:>7.2},{:>7.2},{:>6.2})  a {a:>3} ({:.3})  rgb ({:>3},{:>3},{:>3})",
+                        p.x, p.y, p.z, f32::from(a) / 255.0, c[2], c[1], c[0],
+                    );
+                }
+                print!("          tris");
+                for t in idx.chunks(3) {
+                    print!(" [{}]", t.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
+                }
+                println!();
+            }
+        }
+    }
+    let _ = infos;
+    println!();
+}
+
 fn root_rooms(
     chain: &mut Chain,
     root: &benilla_formats::WmoRoot,
@@ -685,7 +842,7 @@ fn claim_cell(claims: &[benilla_formats::Claim]) -> String {
         .join(" ")
 }
 
-pub fn wmolights(chain: &mut Chain, raw_path: &str) -> Result<()> {
+pub fn wmolights(chain: &mut Chain, raw_path: &str, verts: Option<usize>) -> Result<()> {
     let root_path = raw_path.replace('/', "\\").to_ascii_lowercase();
     let bytes = chain
         .read_file(&root_path)
@@ -749,13 +906,74 @@ pub fn wmolights(chain: &mut Chain, raw_path: &str) -> Result<()> {
             .filter(|r| usize::from(r.portal) == pi)
             .map(|r| r.group)
             .collect();
+        // MONKEY (portal bleed): ...and the POLYGON's own box - centre + diagonal. The bleed seed
+        // reaches for both (`daylight_reach(diag)` is its radius, the centre its position), and the
+        // `BLEED` tag marks the population it seeds from: a portal whose two sides are BOTH
+        // interior-class groups, i.e. a doorway between two rooms rather than one to the outside.
+        // `DAY` is the daylight-fixture portal seed's own population, printed beside it so one
+        // table answers "which rule, if any, stands a light in this opening".
+        let pbox = rr
+            .portals
+            .infos
+            .get(pi)
+            .and_then(|i| {
+                let s = usize::from(i.start_vertex);
+                rr.portals.vertices.get(s..s + usize::from(i.count))
+            })
+            .map(|v| {
+                let mut lo = [f32::MAX; 3];
+                let mut hi = [f32::MIN; 3];
+                for p in v {
+                    for a in 0..3 {
+                        lo[a] = lo[a].min(p[a]);
+                        hi[a] = hi[a].max(p[a]);
+                    }
+                }
+                (lo, hi)
+            });
+        let (diag, ctr) = pbox.map_or((0.0, [0.0; 3]), |(lo, hi)| {
+            (
+                ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt(),
+                [
+                    0.5 * (lo[0] + hi[0]),
+                    0.5 * (lo[1] + hi[1]),
+                    0.5 * (lo[2] + hi[2]),
+                ],
+            )
+        });
+        let cls: Vec<bool> = joins
+            .iter()
+            .filter_map(|g| rr.infos.get(usize::from(*g)).map(|g| g.interior))
+            .collect();
+        let kind = if cls.len() == 2 && cls.iter().all(|i| *i) {
+            "  BLEED"
+        } else if cls.iter().any(|i| *i) {
+            "  DAY"
+        } else {
+            ""
+        };
         println!(
-            "  p{pi:<3} area {area:>7.2} yd^2  |n.z| {:.2}  joins {joins:?}{}",
+            "  p{pi:<3} area {area:>7.2} yd^2  diag {diag:>6.2}  ctr ({:>7.2},{:>7.2},{:>6.2})  |n.z| {:.2}  joins {joins:?}{}{kind}",
+            ctr[0], ctr[1], ctr[2],
             plane[2].abs(),
             if area >= benilla_formats::room_claim::SPLIT_PORTAL_MIN_AREA { "   SPLIT" } else { "" },
         );
+        // MONKEY (trans day law): the portal's own vertex BOX under `--verts`. The daylight seed's
+        // calibration geometry is read off it and nothing else prints it: `seed_point` stands the
+        // fixture at the box centre but no higher than `SEED_MAX_HZ` above the box BOTTOM, and
+        // `hz = z - lo.z` is the calibration height. Without `lo[2]` neither number is recoverable
+        // from the centre+diagonal line above.
+        if verts.is_some() {
+            if let Some((lo, hi)) = pbox {
+                println!(
+                    "        box ({:>7.2},{:>7.2},{:>6.2})..({:>7.2},{:>7.2},{:>6.2})",
+                    lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
+                );
+            }
+        }
     }
     println!();
+    batch_class_table(chain, &root, &root_path, &names, &infos, verts);
     for (i, l) in lights.iter().enumerate() {
         let prod = [
             l.color[0] * l.intensity,

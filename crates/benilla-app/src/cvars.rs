@@ -590,8 +590,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
     // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
     // players/NPCs/creatures/mounts cast realtime silhouettes instead of the legacy oval blob.
-    same("worldShadows", "0"),
-    same("characterShadows", "0"),
+    same("worldShadows", "1"),
+    same("characterShadows", "1"),
     // Realtime-shadow render distance in yards (the shadow-map cascade range + caster reach).
     // benilla's own — the reference has no realtime shadow to size. Clamped to SHADOW_DISTANCE_RANGE.
     ours(
@@ -640,12 +640,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     ours(
         "interiorAmbient",
-        "0.15",
+        "0.015",
         "benilla's own: interior base ambient, 0..1",
     ),
     ours(
         "interiorFill",
-        "0.12",
+        "0.08",
         "benilla's own: interior per-fixture bounce gain, 0..2",
     ),
     ours(
@@ -724,13 +724,63 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // extra texel-neighbourhood taps' worth of cache pressure, no extra samples.
     ours(
         "interiorShadowSoft",
-        "1",
-        "benilla's own: torch-shadow edge softness — the PCF tap radius scale, 0.5..3",
+        "1.5",
+        "benilla's own: torch-shadow edge softness — the PCF tap radius scale at a CONTACT, 0.5..3",
+    ),
+    // MONKEY (shadow floor): how BLACK a torch shadow is allowed to get. The lane's shadows were
+    // the only occlusion in the direct term and took all of it, which is what made them read as
+    // scars rather than as shadows; 0.7 leaves 30 % standing in place of the bounce light this
+    // renderer does not have. `1` is the shipped look, `0` is off.
+    ours(
+        "torchShadowStrength",
+        "0.7",
+        "benilla's own: torch-shadow darkness — how much of the direct term a shadow removes, 0..1",
     ),
     ours(
         "interiorDebug",
         "0",
         "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count, 4 WMO lane map",
+    ),
+    // MONKEY (darkness gains): the two live dim dials. `nightGain` scales the EXTERIOR day/night
+    // law (the packed ambient/diffuse/specular rows) by `mix(1, gain, night_w)`, so it is exactly
+    // inert by day and full strength after dark; `interiorGain` scales the room lane's inputs (base
+    // ambient, per-fixture fill, and every interior fixture's colour). Both fold in at PACK time in
+    // `build_light_data`, so `SetCVar` moves the whole world on the very next frame — which is how
+    // "20 % / 30 % darker" gets judged at all, and `1` on either is the restore.
+    //
+    // Neither touches the fires: a point light keeps its brightness under both dials, because the
+    // ask is for a darker night AROUND the flame, not a dimmer flame.
+    ours(
+        "nightGain",
+        "0.45",
+        "benilla's own: exterior night brightness, 0.2..1.5 (1 = the reference's own night)",
+    ),
+    // MONKEY (lighting debug panel): weaker fresh interiors; persisted gains still win at boot.
+    ours(
+        "interiorGain",
+        "0.5",
+        "benilla's own: WMO interior brightness, 0.2..1.5 (1 = the pre-dial fixture-lit room)",
+    ),
+    // MONKEY (enclosed day floor): the daylight a room INSIDE A BUILDING gets by day, for the
+    // doorways this renderer cannot locate in the data (the Goldshire inn's entry group authors no
+    // portal, no EXT-class batch, no stitched vertex and no bake hot spot — there is nowhere to
+    // stand a fixture). An additive ambient in `interiorAmbient`'s own units, scaled by the sun's
+    // day envelope, so it is exactly 0 at night and the night look never moves. `0` is the restore.
+    ours(
+        "interiorDaylight",
+        "0.0",
+        "benilla's own: daylight floor for rooms inside a building, 0..1 (0 = none, the old look)",
+    ),
+    // MONKEY (bake floor): the share of an interior batch's own MOCV bake that survives the live-
+    // fixture lane. The lane throws the bake away and lets the fixtures decide, which leaves a room
+    // no fixture reaches (the Lion's Pride Inn's east vestibule: MOLR 0, no claims, one faded
+    // portal hop) rendering black between a sky-lit porch and a candle-lit hall — something the
+    // reference client cannot do, because it draws every interior batch at its bake regardless of
+    // lights. A fraction of the bake, inside the room law's rolloff, so a lit surface barely moves.
+    ours(
+        "interiorBakeFloor",
+        "0.12",
+        "benilla's own: share of an interior batch's baked light kept where no fixture reaches, 0..1 (0 = the old look)",
     ),
     // MONKEY (fire GO lights): the gain on lights SYNTHESISED from a model's flame emitter for the
     // ~410 fire props the artists never gave a light block (campfires, wall torches, magic
@@ -1296,7 +1346,24 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
             knobs.video.interior_shadow_entity_rate = (v.max(0.0) as u32).min(240);
         }
         "interiorshadowsoft" => knobs.video.interior_shadow_soft = v.clamp(0.5, 3.0),
+        // MONKEY (shadow floor): 0 IS meaningful (shadows off), so this floors at 0, not at a
+        // minimum-useful value; 1 is the pre-feature pitch black.
+        "torchshadowstrength" => knobs.video.torch_shadow_strength = v.clamp(0.0, 1.0),
         "interiordebug" => knobs.video.interior_debug = (v.max(0.0) as u32).min(4),
+        // MONKEY (darkness gains): the two dim dials, clamped at the edge like every numeric row
+        // here. The floor is 0.2 rather than 0: a true 0 would be indistinguishable from a broken
+        // light pack (black world / black room), and the off switch people actually want is `1`.
+        "nightgain" => knobs.video.night_gain = v.clamp(0.2, 1.5),
+        "interiorgain" => knobs.video.interior_gain = v.clamp(0.2, 1.5),
+        // MONKEY (enclosed day floor): 0 IS meaningful here (it restores the pre-feature look
+        // exactly), unlike the two dim dials above whose 0 would be a broken-looking world.
+        "interiordaylight" => knobs.video.interior_daylight = v.clamp(0.0, 1.0),
+        // MONKEY (bake floor): 0 IS meaningful here too (it restores the pre-feature look exactly).
+        // The upper clamp matters more than usual: the packer multiplies this by `interiorGain`
+        // (up to 1.5) and rides the product in a lane fraction that must stay under 0.5 after
+        // scaling, so a value that escaped this clamp would reach the world-shadow flag it shares
+        // a lane with. `pack_bake_lane` clamps the product too — belt and braces, one at each end.
+        "interiorbakefloor" => knobs.video.interior_bake_floor = v.clamp(0.0, 1.0),
         // MONKEY (fire GO lights): the synthesised-fire gain, clamped at the edge like the rest.
         "firelightgain" => knobs.video.fire_light_gain = v.clamp(0.0, 4.0),
         // MONKEY (flame flicker): 0..2 — the amplitudes are authored at 1, and 2 is the deliberate
@@ -1604,7 +1671,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 67] = [
+        let session: [(&str, String); 72] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1676,7 +1743,12 @@ fn sync_cvars(
                 video.interior_shadow_entity_rate.to_string(),
             ),
             ("interiorShadowSoft", video.interior_shadow_soft.to_string()),
+            ("torchShadowStrength", video.torch_shadow_strength.to_string()),
             ("interiorDebug", video.interior_debug.to_string()),
+            ("nightGain", video.night_gain.to_string()),
+            ("interiorGain", video.interior_gain.to_string()),
+            ("interiorDaylight", video.interior_daylight.to_string()),
+            ("interiorBakeFloor", video.interior_bake_floor.to_string()),
             ("fireLightGain", video.fire_light_gain.to_string()),
             ("fireFlicker", video.fire_flicker.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
@@ -2105,6 +2177,20 @@ mod tests {
         assert_eq!(d["characterShadowRate"], shadows.character_shadow_rate as f32);
         assert_eq!(d["worldShadowRate"], shadows.world_shadow_rate as f32);
         assert_eq!(d["shadowCasterReach"], shadows.shadow_caster_reach);
+        // MONKEY (darkness gains): the two dim dials weld to the same knob for the same reason —
+        // the registered default IS what the light packer runs with until a config says otherwise,
+        // and a row that drifts is a setting that reads one way in the config and renders another.
+        assert_eq!(d["nightGain"], shadows.night_gain);
+        assert_eq!(d["interiorGain"], shadows.interior_gain);
+        // MONKEY (lighting debug panel): pin the requested dimmer baseline as well as the weld.
+        assert_eq!(d["interiorGain"], 0.5);
+        // MONKEY (enclosed day floor): same weld, same reason.
+        assert_eq!(d["interiorDaylight"], shadows.interior_daylight);
+        // MONKEY (bake floor): same weld, same reason — and pin the calibrated value, because the
+        // measurement the default stands on (the inn's door band at 0.108 x tex, candle-lit
+        // surfaces under +10 %) is only true at this number.
+        assert_eq!(d["interiorBakeFloor"], shadows.interior_bake_floor);
+        assert_eq!(d["interiorBakeFloor"], 0.12);
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Render scale (1639) welds to OFF. Not a taste default: the whole tree of visual

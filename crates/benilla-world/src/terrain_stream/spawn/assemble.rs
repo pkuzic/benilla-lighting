@@ -448,6 +448,15 @@ pub fn spawn_model_entities(
                                     ext_night: bounds
                                         .get(usize::from(g))
                                         .is_some_and(benilla_formats::room_claim::ext_building_scale),
+                                    // MONKEY (enclosed day floor): this batch's group is a ROOM
+                                    // INSIDE A BUILDING -- an interior-class group whose centre
+                                    // sits in a building-scale exterior shell of the same root.
+                                    // Same place, same table, same argument as `ext_night` above:
+                                    // this is the last point at which the model's group table is
+                                    // in hand, and the answer rides to the shader as a record bit.
+                                    enclosed: benilla_formats::room_claim::enclosed_by_building_shell(
+                                        bounds, g,
+                                    ),
                                     class: sub.wmo_batch,
                                     sidn: sub.sidn,
                                     window: sub.window,

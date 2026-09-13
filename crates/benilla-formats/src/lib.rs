@@ -225,6 +225,10 @@ pub use fire_light::{synthesize_fire_light, SyntheticFire};
 // MONKEY (lamp lights): the SECOND route in that same module — an emissive lamp/lantern
 // GEOSET rather than a flame emitter (a lamppost authors no particles at all).
 pub use fire_light::{synthesize_lamp_light, EmissiveBatch, LightRoute, SyntheticLamp};
+// MONKEY (spell light): the THIRD route in that same module — a SPELL EFFECT's / FIREWORK's
+// emitter, which the two above veto outright. Fire, holy and fel burn; frost, nature, arcane and
+// shadow emit nothing at all.
+pub use fire_light::{is_spell_light_path, synthesize_spell_light, SpellLightKind, SyntheticSpell};
 // MONKEY (portal claims): which ROOMS one fixture may light -- containment, MOLR, and one portal
 // hop. Shared by the runtime spawner and the `wmolights`/`wmolamps` audits so the gate the shader
 // enforces and the gate the instrument prints can never be two different rules.

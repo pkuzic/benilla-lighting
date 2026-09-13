@@ -6,7 +6,7 @@
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_assets::{ModelEmitter, ModelLight, WmoModel};
 use benilla_formats::room_claim::{self, PortalGraph};
-use benilla_formats::{WmoGroupInfo, WmoLight};
+use benilla_formats::{WmoBatchClass, WmoGroupInfo, WmoLight};
 use bevy::prelude::*;
 
 use crate::particles;
@@ -158,7 +158,15 @@ pub(super) fn spawn_lights_for(
     claims: Option<&PropClaims<'_>>,
     out: &mut Vec<Entity>,
 ) {
-    for l in lights.iter().filter(|l| synthetic || !l.synthetic) {
+    // MONKEY (spell light): `l.spell.is_none()` keeps the PLACED lane exactly as it was. The spell
+    // route (`fire_light::synthesize_spell_light`) lights effect models and fireworks, whose whole
+    // premise — a light that exists for the length of one cast, budgeted and enveloped — belongs to
+    // the entity lanes that reap it with its effect. A spell model placed as scenery must not enter
+    // a table built for fixtures that stand still for minutes.
+    for l in lights
+        .iter()
+        .filter(|l| (synthetic || !l.synthetic) && l.spell.is_none())
+    {
         let def = &l.def;
         if !def.casts() {
             continue; // directional lights feed an ambient term; a static `0` visibility key is dark
@@ -540,6 +548,100 @@ pub(super) fn spawn_wmo_lights_for(
             }),
             out,
         );
+    }
+}
+
+/// MONKEY (daylight fixtures): spawn one interior-lane point light per EXTERIOR-FACING OPENING of
+/// this placement — the doorways and windows whose sunlit threshold the room law otherwise meets
+/// with a hard line (see `crate::lighting`'s `daylight` module for the whole argument, the two
+/// seeds and the corpus measurement behind them).
+///
+/// It is deliberately the SAME entity shape a MOLT fixture gets — [`crate::lighting::LightRooms`]
+/// for the visibility gate, the `room_claims` claim set through [`lit_rooms`],
+/// [`crate::lighting::LightReach`] for the packer's window, an interior `LightLane` — so the
+/// packer, the claim table, the shader and the std430 layout all need no knowledge that this source
+/// is the sun rather than a candle. What it does NOT get is a `FlameFlicker` (daylight is steady)
+/// or `SyntheticFireLight` (`fireLightGain` must not be able to dim the sun).
+///
+/// The `PointLight` itself is NOT spawned here: `update_daylight_fixtures` inserts it on the first
+/// frame it is day, with the sun-calibrated colour and intensity. A placeholder would pack one
+/// uncalibrated frame — a flash of the wrong brightness in every doorway of a building that just
+/// streamed in — and a placement streaming in at night would spawn a light only to have it removed.
+///
+/// `instance` absent (a placement with no portal instance) means there is nothing to key a room
+/// claim to, and an unclaimed interior fixture is packed UNGATED, which fails OPEN — one doorway
+/// lighting every room of the building through its walls. Such a placement gets no daylight at all,
+/// exactly as the MOLT lane drops its own claims there.
+pub(super) fn spawn_daylight_fixtures_for(
+    commands: &mut Commands,
+    model: &WmoModel,
+    portals: PortalGraph<'_>,
+    instance: Option<Entity>,
+    transform: Transform,
+    out: &mut Vec<Entity>,
+) {
+    let Some(instance) = instance else {
+        return;
+    };
+    // The APERTURE seed's input: every render batch of the root as `(group, EXT-class?, points)`,
+    // borrowed straight off the loaded asset's two parallel arrays. The selection rule consumes it
+    // lazily, so a root whose groups are all exterior walks the batches once and allocates nothing.
+    let batches = model
+        .submeshes
+        .iter()
+        .zip(model.submesh_group.iter())
+        .map(|(s, g)| {
+            (
+                *g,
+                matches!(s.wmo_batch, Some(WmoBatchClass::Ext)),
+                &s.geometry.positions[..],
+            )
+        });
+    // MONKEY (portal bleed): one selection call for both lanes -- the exterior-facing openings that
+    // get the SUN and the interior<->interior doorways that get the ROOM NEXT DOOR -- ranked by area
+    // against each other, so the eight slots go to this building's biggest openings whichever kind
+    // they are.
+    let (day, bleed) = crate::lighting::placement_openings(&model.group_bounds, portals, batches);
+    for seed in day {
+        let fixture = seed.fixture(instance);
+        let claims = crate::lighting::daylight_claims(&model.group_bounds, portals, &seed);
+        let e = commands
+            .spawn((
+                Transform::from_translation(transform.transform_point(wow_to_bevy(seed.pos))),
+                fixture,
+                crate::lighting::daylight_rooms(instance, seed.group),
+                lit_rooms(instance, &claims, transform),
+                crate::lighting::LightReach(fixture.reach),
+                crate::lighting::daylight_lane(),
+            ))
+            .id();
+        out.push(e);
+    }
+    // MONKEY (portal bleed): the doorway fixtures. Deliberately the SAME bundle as above plus one
+    // component -- a bleed IS a daylight fixture as far as the packer, the claim table, the shader
+    // and `torch_shadow` are concerned, and `BleedFixture` only names the two rooms it joins and the
+    // plane it is calibrated at (in WORLD space: the per-frame evaluation has world positions and no
+    // placement matrix). Its visibility gate takes BOTH rooms, not one. The `PointLight` is again NOT
+    // spawned here -- a doorway between two unlit rooms never gets one at all.
+    for seed in bleed {
+        let fixture = seed.fixture(instance);
+        let claims = seed.claims(&model.group_bounds, portals);
+        let world = transform.transform_point(wow_to_bevy(seed.pos));
+        let e = commands
+            .spawn((
+                Transform::from_translation(world),
+                fixture,
+                crate::lighting::BleedFixture {
+                    sides: seed.sides,
+                    probe: world,
+                },
+                seed.rooms(instance),
+                lit_rooms(instance, &claims, transform),
+                crate::lighting::LightReach(fixture.reach),
+                crate::lighting::daylight_lane(),
+            ))
+            .id();
+        out.push(e);
     }
 }
 

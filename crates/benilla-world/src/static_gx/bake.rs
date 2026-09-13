@@ -297,6 +297,8 @@ fn bake_cell(items: &[GxItem], meshes: &mut Assets<Mesh>) -> render::GxCellDraw 
             sidn: item.wmo.as_ref().map_or([0; 3], |w| w.sidn),
             slot: item.prop.as_ref().and_then(|p| p.slot).unwrap_or(0),
             ext_night: item.wmo.as_ref().is_some_and(|w| w.ext_night),
+            // MONKEY (enclosed day floor): rides the bake exactly as `ext_night` does.
+            enclosed: item.wmo.as_ref().is_some_and(|w| w.enclosed),
         });
     }
     // Recentre for clip-space precision (0974): the shader reconstructs world = v + origin.
@@ -536,6 +538,7 @@ mod tests {
             window: true,
             batch_order: group + 1,
             ext_night: false,
+            enclosed: false,
         };
         // An INT batch of group 2, pushed FIRST — Matte shade must NOT refuse it…
         let mut b = batch(&g, Vec3::new(1.0, 0.0, 1.0), None, ModelBlend::Opaque);

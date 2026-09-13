@@ -310,6 +310,9 @@ pub(super) fn spawn_loaded_placements(
                     // there is no MOLT fixture beside it and nothing else would light it.
                     // Empty dedupe list: an ADT map doodad belongs to no WMO, so there is no MOLT
                     // table its flame could be duplicating.
+                    // MONKEY (torch owner exclusion): where this placement's own lights start in
+                    // `ents`, so they — and ONLY they — can be tagged with its identity below.
+                    let lights_from = ents.len();
                     spawn_lights_for(
                         &mut commands,
                         &m.lights,
@@ -323,6 +326,7 @@ pub(super) fn spawn_loaded_placements(
                         None,
                         &mut ents,
                     );
+                    tag_light_owner(&mut commands, &ents[lights_from..], &object);
                     tag_world_object(&mut commands, &ents, &object);
                     if let Some((target, r)) = fade_near_target() {
                         let pos = p.transform.translation;
@@ -670,6 +674,22 @@ pub(super) fn spawn_loaded_placements(
                         p.transform,
                         &mut ents,
                     );
+                    // MONKEY (daylight fixtures): …and one interior-lane light per exterior-facing
+                    // opening, so the room law has a sun to find at the threshold instead of
+                    // meeting the sky-lit doorway with a hard line (`lighting::daylight`).
+                    fx::spawn_daylight_fixtures_for(
+                        &mut commands,
+                        m,
+                        benilla_formats::PortalGraph {
+                            vertices: &m.portal_vertices,
+                            infos: &m.portal_infos,
+                            refs: &m.portal_refs,
+                            slices: &slices,
+                        },
+                        p.portal_instance,
+                        p.transform,
+                        &mut ents,
+                    );
                     tag_world_object(&mut commands, &ents, &object);
                     // Resolve the interior props for this instance's doodad set (set 0 + the selected
                     // set), each composed onto the WMO's world transform; their M2s load async.
@@ -961,6 +981,8 @@ pub(super) fn spawn_loaded_placements(
                 ents.first().copied(),
                 &fade,
             );
+            // MONKEY (torch owner exclusion): as at the ADT site — the prop's OWN lights only.
+            let lights_from = ents.len();
             spawn_lights_for(
                 &mut commands,
                 &m.lights,
@@ -986,6 +1008,7 @@ pub(super) fn spawn_loaded_placements(
                 claims.as_ref(),
                 &mut ents,
             );
+            tag_light_owner(&mut commands, &ents[lights_from..], &object);
             tag_world_object(&mut commands, &ents, &object);
             p.entities.extend(ents);
             d.spawned = true;
@@ -1145,6 +1168,27 @@ fn handle_label<A: Asset>(handle: &Handle<A>) -> String {
 fn tag_world_object(commands: &mut Commands, ents: &[Entity], object: &Arc<WorldObject>) {
     for &e in ents {
         commands.entity(e).insert((**object).clone());
+    }
+}
+
+/// MONKEY (torch owner exclusion): stamp a placement's OWN M2 lights with its identity, so the
+/// torch-shadow caster gathers can drop the fixture's own body out of its own shadow map
+/// (`static_gx::LightOwner` carries the whole argument).
+///
+/// Narrow on purpose — this takes the slice of `ents` that [`fx::spawn_lights_for`] just appended,
+/// never the placement's whole entity list, and it is NOT folded into [`tag_world_object`]. The
+/// WMO lane runs `tag_world_object` over its authored MOLT fixtures too, and a MOLT fixture's
+/// placement identity is the BUILDING's: tagged, an inn's hearth would name every wall, floor and
+/// pillar of the inn as its own body and the interior shadow lane would go dark. A MOLT light has
+/// no model of its own, so it needs no exclusion at all — only a light SYNTHESISED from (or
+/// authored inside) a model does, and those are exactly the ones `spawn_lights_for` makes.
+fn tag_light_owner(commands: &mut Commands, lights: &[Entity], object: &Arc<WorldObject>) {
+    if lights.is_empty() {
+        return;
+    }
+    let owner = crate::static_gx::LightOwner::placement(object);
+    for &e in lights {
+        commands.entity(e).insert(owner);
     }
 }
 

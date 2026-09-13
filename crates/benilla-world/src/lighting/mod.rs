@@ -11,6 +11,7 @@ use benilla_assets::AssetSet;
 use benilla_formats::{LightCatalog, LiquidKind};
 
 mod blob; // the off-world light-blob builder (booth studio, body pane, glue scene)
+mod daylight; // MONKEY (daylight fixtures): the sun as an interior-lane light in a doorway
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
 mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
@@ -18,6 +19,18 @@ mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ Mesh
 mod resolve; // the per-frame time-of-day sample into WowLighting + the WMO interior-fog crossfade
 mod sh; // the model SH light-probe coefficient math
 pub use blob::LightBlob;
+// MONKEY (daylight fixtures): the marker (torch_shadow excludes it), the selection rule and the
+// spawn-side helpers the placement lane calls.
+// MONKEY (portal bleed): `placement_openings` is the ONE selection entry point the placement lane
+// calls now -- daylight seeds and interior<->interior doorway seeds share the per-placement budget,
+// so neither can be ranked without the other. `BleedFixture`/`BleedSeed` are the doorway lane's own
+// two types; the fixture itself still wears `DaylightFixture`.
+pub use daylight::{
+    daylight_claims, daylight_intensity, daylight_lane, daylight_point_light, daylight_reach,
+    daylight_rooms, daylight_seeds, daylight_target, bleed_seeds, placement_openings, BleedFixture,
+    BleedSeed,
+    DaylightFixture, DaylightHow, DaylightSeed, BLEED_K, MAX_DAYLIGHT_PER_PLACEMENT,
+};
 // MONKEY (flame flicker): the component + the one route rule, so every spawn lane files a flame
 // the same way and the packer has a single function to evaluate.
 pub use flicker::{flame_kind_for, flicker_seed, FlameFlicker, FlameKind, FlickerMod};
@@ -339,5 +352,7 @@ impl Plugin for LightingPlugin {
         // The shared global-light buffer (build_light_data after the resolve above; the extract +
         // render-world upload). Materials read this instead of carrying their own light copy.
         global_light::register(app);
+        // MONKEY (daylight fixtures): the per-frame re-aim, ordered before the packer's own set.
+        daylight::register(app);
     }
 }

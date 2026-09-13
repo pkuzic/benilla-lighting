@@ -349,6 +349,49 @@ pub fn ext_building_scale(g: &WmoGroupInfo) -> bool {
     !g.interior && claimable_by_box(g)
 }
 
+/// MONKEY (enclosed day floor): the slack (yd) an exterior shell's authored MOGI box is grown by
+/// before it is asked whether it CONTAINS a room. An authored box is not always tight around its
+/// own geometry (NSabbey g3's bottom floats 1.5 yd above its own floor), and a room whose centre
+/// sits a hand's breadth outside its own building's shell is a measurement artefact, not a cave.
+pub const SHELL_CONTAIN_SLACK: f32 = 0.5;
+
+/// MONKEY (enclosed day floor): is this INTERIOR-class group a room INSIDE A BUILDING — i.e. is its
+/// box centre contained in some EXTERIOR-class group of the same root at building scale
+/// ([`ext_building_scale`])?
+///
+/// The question the daylight floor turns on, and the one thing that separates "a room whose door
+/// this renderer cannot find" from "a cave that has no door". A building authors a shell: the
+/// Goldshire inn's `g4 upstairs` (57.7 x 32.2 yd, exterior-class) swallows all ten of its rooms,
+/// and Northshire abbey's `g5 mainlobby2` its nave. A dungeon authors none — `az_deadmines_*`,
+/// Stratholme and the rest are interior groups end to end — so nothing there is ever flagged and
+/// the sunless look of a cave is preserved by the DATA rather than by a special case.
+///
+/// A city's district shell is deliberately refused by [`ext_building_scale`]'s
+/// [`CLAIM_EXT_SHELL_YD`] cut, for the same reason the claim lane refuses it: a 660 yd box is not a
+/// building, and flagging every interior group in Stormwind because one shell spans the district
+/// would daylight its sealed cellars.
+pub fn enclosed_by_building_shell(groups: &[WmoGroupInfo], group: u16) -> bool {
+    let Some(g) = groups.get(usize::from(group)) else {
+        return false;
+    };
+    if !g.interior {
+        return false; // an exterior-class group is lit by the sky already
+    }
+    let c = [
+        0.5 * (g.bbox_min[0] + g.bbox_max[0]),
+        0.5 * (g.bbox_min[1] + g.bbox_max[1]),
+        0.5 * (g.bbox_min[2] + g.bbox_max[2]),
+    ];
+    groups.iter().enumerate().any(|(i, e)| {
+        i != usize::from(group)
+            && ext_building_scale(e)
+            && (0..3).all(|a| {
+                c[a] >= e.bbox_min[a] - SHELL_CONTAIN_SLACK
+                    && c[a] <= e.bbox_max[a] + SHELL_CONTAIN_SLACK
+            })
+    })
+}
+
 /// `pos` inside a group's authored MOGI box.
 fn contains(g: &WmoGroupInfo, pos: [f32; 3]) -> bool {
     (0..3).all(|a| pos[a] >= g.bbox_min[a] && pos[a] <= g.bbox_max[a])
@@ -608,6 +651,42 @@ mod tests {
             bbox_min: lo,
             bbox_max: hi,
         }
+    }
+
+    /// MONKEY (enclosed day floor): a room inside a building's shell is flagged; a cave, a room
+    /// under a CITY-scale shell, and the shell itself are not.
+    #[test]
+    fn enclosed_is_a_room_in_a_building_and_nothing_else() {
+        // 0 the room, 1 the inn's own shell (57 x 32 yd, building scale), 2 a second room just
+        // OUTSIDE that shell, 3 a district-scale shell (200 yd) containing everything.
+        let groups = [
+            g(true, [0.0, 0.0, 0.0], [10.0, 10.0, 5.0]),
+            g(false, [-5.0, -5.0, -1.0], [52.0, 27.0, 10.0]),
+            g(true, [90.0, 90.0, 0.0], [95.0, 95.0, 5.0]),
+            g(false, [-100.0, -100.0, -10.0], [100.0, 100.0, 40.0]),
+        ];
+        assert!(enclosed_by_building_shell(&groups, 0));
+        assert!(!enclosed_by_building_shell(&groups, 1), "a shell is not a room");
+        assert!(
+            !enclosed_by_building_shell(&groups, 2),
+            "only the DISTRICT shell holds it, and that is not a building"
+        );
+        assert!(!enclosed_by_building_shell(&groups, 3));
+        assert!(!enclosed_by_building_shell(&groups, 9), "out of range");
+        // A dungeon: interior groups end to end, no shell anywhere -> nothing is ever flagged.
+        let cave = [
+            g(true, [0.0, 0.0, 0.0], [10.0, 10.0, 5.0]),
+            g(true, [10.0, 0.0, 0.0], [20.0, 10.0, 5.0]),
+        ];
+        assert!(!enclosed_by_building_shell(&cave, 0));
+        assert!(!enclosed_by_building_shell(&cave, 1));
+        // The slack really is applied: a room whose centre sits a hand's breadth outside its own
+        // shell is still in the building.
+        let tight = [
+            g(true, [0.0, 0.0, 0.0], [10.0, 10.0, 5.0]),
+            g(false, [-5.0, -5.0, -1.0], [52.0, 27.0, 2.3]),
+        ];
+        assert!(enclosed_by_building_shell(&tight, 0), "centre z 2.5 vs shell top 2.3 + 0.5");
     }
 
     /// A quad portal in the x = 5 plane, spanning y 0..2, z 0..3.

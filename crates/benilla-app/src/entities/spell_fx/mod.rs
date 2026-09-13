@@ -62,6 +62,14 @@ use benilla_world::vis_chain::VisChainOnly;
 
 use super::{BoneAttach, DisplayModel, EntityPart, ModelHandle};
 pub(super) use lifecycle::advance_fx_anim;
+// MONKEY (spell light): the luminous-effect light's lifecycle — its envelope, its budget, its kill
+// switch and the mode each lane spawns it in. Exported at `pub(crate)` because the spawners live
+// outside this module: `entities::carried_light` holds the one spawn helper (and the firework
+// GameObject's own branch), and `entities.rs` registers the two systems.
+pub(crate) use lifecycle::{
+    advance_spell_lights, budget_spell_lights, spell_lights_enabled, SpellLight, SpellLightMode,
+    SPELL_BURST_SPAN,
+};
 use lifecycle::{decay_span, FxAnimLife, FxDecay};
 
 /// The client's attach fallback cascade when a model lacks the requested point (wow-re
@@ -940,6 +948,12 @@ pub(super) fn attach_spell_fx(
                 &mut palettes,
                 None, // an attach-point kit effect opens on its model's own `Stand`
             );
+            // MONKEY (spell light): and the light the effect throws, if its school is a luminous
+            // one (fire / holy / fel — never frost, nature, arcane or shadow). A child of the
+            // instance root, so the reap that despawns the root takes it. `Kit` because that is
+            // this lane's lifecycle exactly: up on the ramp, held for the aura's life, out when
+            // `FxDecay` lands.
+            super::spawn_spell_light(&mut commands, &dm.lights, root, SpellLightMode::Kit);
             inst.root = Some(root);
             if !inst.persistent {
                 // The client's completion-callback moment: one full pass of the sequence the

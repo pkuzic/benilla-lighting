@@ -644,6 +644,12 @@ enum Command {
     Wmolights {
         /// Internal path to the WMO **root** (forward or back slashes accepted).
         internal_path: String,
+        /// MONKEY (trans day law): also dump ONE group's per-VERTEX rows - position + the MOCV
+        /// alpha the shader interpolates as `trans_a` - plus every portal's vertex bounds. The
+        /// batch table above gives a batch's alpha RANGE and mean; a per-vertex blend law can only
+        /// be evaluated against the actual vertices, which is what this prints.
+        #[arg(long)]
+        verts: Option<usize>,
     },
     /// MONKEY (interior prop lights): sweep every WMO **root** and audit whether its rooms have
     /// any light at all — MOLT omni fixtures, MODD props that would SYNTHESISE one (the
@@ -940,7 +946,10 @@ fn main() -> Result<()> {
             internal_path,
             filter,
         } => scan::wmodoodads(&mut chain, &internal_path, filter.as_deref())?,
-        Command::Wmolights { internal_path } => scan::wmolights(&mut chain, &internal_path)?,
+        Command::Wmolights {
+            internal_path,
+            verts,
+        } => scan::wmolights(&mut chain, &internal_path, verts)?,
         Command::Wmolamps { prefix, detail } => {
             scan::wmolamps(&mut chain, prefix.as_deref(), detail.as_deref())?
         }

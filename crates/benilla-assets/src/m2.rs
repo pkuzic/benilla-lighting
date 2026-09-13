@@ -313,6 +313,35 @@ pub struct ModelLight {
     /// than as fire. Keying on the ROUTE rather than on the hue is what gets both right — see
     /// `benilla_world::lighting::flame_kind_for`.
     pub flame: bool,
+    /// MONKEY (spell light): `true` when this light came from the **SPELL** route
+    /// ([`benilla_formats::synthesize_spell_light`]) — a spell effect's or a firework's emitter.
+    /// Always `false` on an authored block and on the two world routes.
+    ///
+    /// It exists so the PLACED lanes can keep refusing spell content exactly as they did before
+    /// this feature (`benilla_world::terrain_stream::spawn`'s `spawn_lights_for`): the world light
+    /// table is built for fixtures that stand still for minutes, and an effect model that happens
+    /// to be placed as scenery must not enter it. Only the ENTITY lanes — a spell-visual instance,
+    /// a missile, a firework GameObject — take it, and there it is budgeted, enveloped and reaped
+    /// with its effect (`entities::carried_light`'s spell-light helper).
+    ///
+    /// It also carries the light's **onset**: `benilla_formats::fire_light::emit_onset`, the delay
+    /// before the emitter this light stands for actually fires. A firework's shell detonates half
+    /// a second into its model's clip, and a light lit at spawn would flash the rocket's flight
+    /// instead of its burst.
+    pub spell: Option<SpellLightInfo>,
+}
+
+/// MONKEY (spell light): what a spell/firework-derived [`ModelLight`] carries beyond the light
+/// itself — see [`ModelLight::spell`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpellLightInfo {
+    /// The school judged at synthesis ([`benilla_formats::SpellLightKind`]) — for the trace and
+    /// for any future per-school gain. Never `None` (that case yields no light at all).
+    pub kind: benilla_formats::SpellLightKind,
+    /// Seconds from the instance's birth before the light comes up (the emitter's rate-track
+    /// onset). `0.0` for everything with a constant emission rate, which is every missile and
+    /// every kit glow.
+    pub onset: f32,
 }
 
 /// Bevy [`AssetLoader`] decoding `*.m2` → [`M2Model`].
@@ -502,6 +531,7 @@ impl AssetLoader for M2ModelLoader {
                 def,
                 synthetic: false,
                 flame: false,
+                spell: None,
             })
             .collect();
         // MONKEY (fire GO lights) / MONKEY (lamp lights): a prop that authors NO casting light gets
@@ -524,13 +554,49 @@ impl AssetLoader for M2ModelLoader {
             // yields the same four things: model-space position, host bone, colour, intensity —
             // plus, MONKEY (flame flicker), WHICH route won, because that is what decides whether
             // the light burns (flickers) or merely shines (see [`ModelLight::flame`]).
-            let synth = benilla_formats::synthesize_fire_light(
+            //
+            // MONKEY (spell light): and a THIRD route ahead of both — SPELL effects and FIREWORKS,
+            // which the two world rules veto by path (`fire_light::is_spell_path`). They are put
+            // first because the veto is theirs: a model that IS spell content can never be a
+            // placed prop, so there is nothing for the other two to say about it. What comes back
+            // is flagged ([`ModelLight::spell`]) so the PLACED lanes can keep refusing it exactly
+            // as they do today — only the entity lanes, which reap a light with its effect, take
+            // one.
+            let synth = benilla_formats::synthesize_spell_light(
                 &path,
                 emitters.iter().map(|e| &e.def),
             )
-            .map(|fire| {
-                let src = &emitters[fire.emitter].def;
-                (src.position, src.bone, fire.color, fire.intensity, true)
+            .map(|fx| {
+                let src = &emitters[fx.emitter].def;
+                (
+                    src.position,
+                    src.bone,
+                    fx.color,
+                    fx.intensity,
+                    // Never a FLAME for the flicker's purposes: a spell light runs its own
+                    // lifecycle envelope (ramp in / hold / decay) and a fire wobble on top of it
+                    // would read as the effect stuttering, not as fire breathing.
+                    false,
+                    Some(SpellLightInfo {
+                        kind: fx.kind,
+                        onset: fx.onset,
+                    }),
+                )
+            })
+            .or_else(|| {
+                benilla_formats::synthesize_fire_light(&path, emitters.iter().map(|e| &e.def)).map(
+                    |fire| {
+                        let src = &emitters[fire.emitter].def;
+                        (
+                            src.position,
+                            src.bone,
+                            fire.color,
+                            fire.intensity,
+                            true,
+                            None,
+                        )
+                    },
+                )
             })
             .or_else(|| {
                 // MONKEY (lamp lights): a lamppost/lantern/chandelier authors NO particle emitter
@@ -545,9 +611,9 @@ impl AssetLoader for M2ModelLoader {
                     .collect();
                 let bbox = bounds.as_ref().map(|b| (b.bbox_min, b.bbox_max));
                 benilla_formats::synthesize_lamp_light(&path, &batches, bbox)
-                    .map(|l| (l.position, l.bone, l.color, l.intensity, false))
+                    .map(|l| (l.position, l.bone, l.color, l.intensity, false, None))
             });
-            if let Some((position, src_bone, color, intensity, flame)) = synth {
+            if let Some((position, src_bone, color, intensity, flame, spell)) = synth {
                 // The light sits at the FLAME (or the lamp glass), not the model origin: a brazier's
                 // origin is under its bowl, and a light there back-lights the bowl into every
                 // surface it should be lighting (and self-shadows through the prop's own caster
@@ -582,6 +648,7 @@ impl AssetLoader for M2ModelLoader {
                         .map_or([0.0; 3], |b| b.pivot),
                     synthetic: true,
                     flame,
+                    spell,
                 });
             }
         }

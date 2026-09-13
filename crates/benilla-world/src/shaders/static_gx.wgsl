@@ -144,6 +144,135 @@ const RECORD_ROOM_MASK: u32 = 4095u;
 // `RECORD_EXT_NIGHT_BIT`.
 const RECORD_EXT_NIGHT: u32 = 134217728u; // 1 << 27
 
+// MONKEY (enclosed day floor): record column `w`, bit 28 — this batch's group is an INTERIOR room
+// whose box centre sits inside a BUILDING-SCALE exterior shell of the same WMO
+// (`benilla_formats::room_claim::enclosed_by_building_shell`). Bit 27 is the night law, so 28 is
+// the first free one; 29..=31 stay free. Keep in sync with `static_gx/render.rs`'s
+// `RECORD_ENCLOSED_BIT`.
+const RECORD_ENCLOSED: u32 = 268435456u; // 1 << 28
+
+// MONKEY (enclosed day floor): the fraction of `wmo_fog_params.w` that carries `interiorDaylight`
+// (`w = 1 + interiorDebug + interiorDaylight * this`). Keep in sync with
+// `benilla_world::lighting::DAYLIGHT_LANE_SCALE`, which carries the whole argument for why the
+// value rides a lane's spare RANGE rather than a spare slot, and why every existing decode of this
+// lane (`> 0.5`, `u32(max(w - 1, 0) + 0.5)`) is insensitive to a fraction below 0.5.
+const DAYLIGHT_LANE_SCALE: f32 = 0.49;
+
+// MONKEY (bake floor): the fraction of `sh_c16.w` that carries `interiorBakeFloor`, with
+// `interiorGain` ALREADY FOLDED IN by the packer (`w = worldShadows + bakeFloor * gain * this`).
+// Keep in sync with `benilla_world::lighting::BAKE_LANE_SCALE` and with `wow_model.wgsl`'s copy.
+// `sh_c16.w` has exactly ONE other decode in the whole shader set — `terrain.wgsl`'s
+// `sh_c16.w > 0.5` world-shadow gate — and a fraction strictly below 0.5 cannot move it from
+// either side; the packer clamps the product to 1 so the fraction can never reach the cliff.
+const BAKE_LANE_SCALE: f32 = 0.49;
+
+// MONKEY (bake floor): the SHARE OF ITS OWN MOCV BAKE that an interior-lane fragment keeps even
+// when no fixture reaches it.
+//
+// The room lane's premise is that the bake's LEVEL is wrong — authored for a different global
+// exposure, and the live fixtures decide instead. True, and it leaves a hole: a room the fixture
+// table cannot reach has NO budget at all beyond `interiorAmbient`, so it renders black. The
+// Lion's Pride Inn's east vestibule `g0` (the door band, box x 14.1..20.5, between the ext-class
+// porch `g11` and the INT room `g1`) is the measured case — MOLR 0, ZERO fixture claims (the
+// nearest fixtures are L2 at 16 yd against R 11.2 and L3 at 17.6 against R 14.7), one faded portal
+// hop worth ~0.0003, so the whole budget is the bare ambient floor and the band reads 0.0194 x tex
+// at the owner's cvars. The reference client has no such hole: every interior batch draws at its
+// authored MOCV whether or not a light is registered, so a fixture-starved vestibule is DIM there,
+// never black.
+//
+// What survives the lane's premise is the bake's RELATIVE statement about the room, so the floor
+// is a FRACTION of it (`vc.rgb * k`), not the bake. It is added INSIDE the rolloff next to
+// `enclosed_day_floor`, for the same reason that one is: it saturates with the fixtures rather
+// than stacking on a lit room, so a candle-lit surface barely moves while an unlit one comes up
+// off the floor. The previous attempt put the UNCAPPED bake share on the TRANS batches alone and
+// produced the flat grey band this file's portal-bleed comment records (15-18 x its INT
+// neighbour); a small fraction of the bake on EVERY interior batch is the other end of that trade.
+//
+// SCOPE — zero on an EXT-class batch of an interior group (`!class_int && !class_trans`, the
+// cellar stair). The loader forces that population's MOCV alpha to 1.0 and its `vc.rgb` is the
+// flat white the EXT batches carry (the extract prints `mocv rgb (255,255,255)` for every one of
+// them), so a bake term there would be a full-strength WHITE lift on exactly the geometry the
+// verified green-stair fix rebuilt — and there is no authored bake to restore anyway. That
+// predicate is written as the two class bits rather than as `trans_a >= 1.0` because the class
+// bits are what the loader actually sets; `trans_a` being 1 is a consequence. Zero as well on a
+// batch with NO authored MOCV at all (`has_vc`), where `vc` is the synthetic `vec4(1.0)` default:
+// there is no bake to keep a share of, and a full white `k` there would be an invention.
+//
+// NOT scaled by `fireLightGain` and NOT flickered: this is not a fire, it is the room's own
+// authored light. The `interiorGain` scale IS applied, folded in at pack time exactly as the
+// lane's other two inputs (base ambient, per-fixture fill) are — so the Dim preset dims it too and
+// the shader carries no second knob.
+//
+// MEASURED at the owner's live cvars (`interiorGain 0.5`, `interiorAmbient 0.015`,
+// `interiorFill 0.08`, `interiorExposure 2.5`, `interiorAttenScale 1.6`, `interiorDaylight 0`) at
+// `interiorBakeFloor 0.12` (so `k` = 0.06), at NIGHT:
+//   * `g0` one yard inside p1 (TRANS, MOCV (165,160,146) => bake 0.0377):
+//       room law 0.0194 -> **0.1075** x tex; the existing 1.5x TRANS floor then displays it at
+//       **0.1613** (the floor follows the raised room — it was 0.0291 before).
+//   * `g1` one yard the other side (INT, MOCV (119,106,77) => bake 0.0251):
+//       0.0215 -> **0.0810** x tex. Room-law ratio across the doorway 1.33x (was 1.11x); the
+//       DISPLAYED ratio is 1.99x because the pre-existing TRANS floor still lifts `g0` by 1.5x.
+//   * `g3`'s entry floor directly under L9 (1.52 yd, MOCV (250,164,83)): 0.5668 -> 0.6078, **+7.2 %**.
+//   * a `g5` hall wall 3 yd from L0 (MOCV (146,113,78)): 0.4192 -> 0.4578, **+9.2 %**.
+// i.e. both fixture-lit references move by well under the 15 % bar, and the black band does not.
+// (The floor is NOT sun-gated, unlike `enclosed_day_floor`: a bake floor that vanished by day
+// would black the same vestibule out at noon. Daylight therefore lifts by the same ~7-9 % on
+// fixture-lit interiors, and the `g0` band by ~+20 % through the TRANS blend.)
+fn interior_bake_floor(
+    vc_rgb: vec3<f32>,
+    has_vc: bool,
+    class_int: bool,
+    class_trans: bool,
+) -> vec3<f32> {
+    // `has_vc` too: with no MOCV authored, `vc` is the synthetic `vec4(1.0)` default, and lifting
+    // by a full white `k` would be inventing a bake rather than restoring a share of one.
+    if (!has_vc || (!class_int && !class_trans)) {
+        return vec3<f32>(0.0);
+    }
+    return vc_rgb * (fract(wow_light.sh_c16.w) / BAKE_LANE_SCALE);
+}
+
+// MONKEY (enclosed day floor): the SUN'S OWN AMBIENT FLOOR for a room inside a building — the
+// daylight that comes through the doorways this renderer cannot locate.
+//
+// Three seeds now stand real fixtures in a building's authored openings (`lighting::daylight`:
+// interior<->exterior portals, EXT-class batches of interior groups, stitched group seams), and
+// where an opening IS in the data that is the better answer — a pool at the door falling off
+// inward, not a uniform lift. But the shipped corpus keeps rooms whose doorway is in no table at
+// all: the Goldshire inn's entry group authors no portal to its shell, no EXT-class batch, no
+// vertex within half a yard of the shell that owns its threshold planks, and no localized hot spot
+// in its own MOCV bake. There is nowhere to stand a light. What IS known is that the group is a
+// room in a building and the sun is up, and the honest rendering of that is "not pitch dark".
+//
+// The colour is the sky's own AMBIENT band renormalised to unit luminance, so the scalar cvar is
+// the floor's luminance outright and the tint is the day's. `sun_w` is `fog_params.z` —
+// `sun_shadow_strength(celestial_dir.y)`, exactly 0 at and below the horizon — so the NIGHT LOOK IS
+// BIT-IDENTICAL and the ramp rides the same dusk clock as `day_w`, the realtime shadows and the
+// daylight fixtures.
+//
+// It is added at the CALL SITE of `interior_room_light` rather than inside it, deliberately: that
+// function is also the exterior lane's `ext_room` term, which would otherwise lift every street
+// and outer wall in the world by this constant. And it composes with `interiorGain` by NOT being
+// scaled by it — the gain dims candle light, and this is sunlight.
+// `record_w` is the RECORD TABLE's `w` column (`recs[word & 0xffff].w`) — where every record bit
+// lives — and NOT the vertex word, whose own flag bits are a different space entirely.
+fn enclosed_day_floor(record_w: u32) -> vec3<f32> {
+    if ((record_w & RECORD_ENCLOSED) == 0u) {
+        return vec3<f32>(0.0);
+    }
+    let k = fract(wow_light.wmo_fog_params.w) / DAYLIGHT_LANE_SCALE;
+    let sun_w = clamp(wow_light.fog_params.z, 0.0, 1.0);
+    if (k * sun_w <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let amb = wow_light.light_ambient.rgb;
+    let lum = dot(amb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // A degenerate ambient band (pitch-black zone) has no hue to carry, so fall back to white
+    // rather than dividing by nothing.
+    let tint = select(vec3<f32>(1.0), amb / max(lum, 1e-4), lum > 1e-4);
+    return tint * (k * sun_w);
+}
+
 // Vanilla cutout ref (224/255) — wow_model.wgsl's VANILLA_ALPHA_KEY.
 const VANILLA_ALPHA_KEY: f32 = 0.8784314;
 
@@ -169,11 +298,63 @@ struct TorchTable {
 // value that gave the clean forge-cast floor shadows; the residual acne only showed in the
 // worst-case interiorDebug 2 (min over all 4 maps), not the real per-fixture render.
 const TORCH_BIAS: f32 = 0.001;
+// MONKEY (surface normal offset): sample the map a hand's width OFF the receiving surface, along
+// its own normal. **MIRRORED from `terrain.wgsl` and `wow_model.wgsl` (same name, same 0.15) - keep
+// the three in sync**; this file was the one receiver still projecting the raw `P`, which is the
+// whole of the imp's "boxy" light pool.
+//
+// WHY A CONSTANT BIAS IS NOT ENOUGH, in numbers. A cube face is 512^2 at `TORCH_FACE_FOV` (pi/2 +
+// 0.02), so a texel covers `2*t*tan(45.57 deg)/512 = t/251` yd at ray distance `t`. On a floor `h`
+// below the fixture, `r` out from under it (`t = sqrt(r^2+h^2)`), the STORED depth changes across a
+// texel by that footprint times the grazing slope `r/h`, and the PCSS kernel's outermost tap sits
+// `soft * TORCH_PCSS_MAX = 1.5 * 4 = 6` texels out:
+//     kernel depth spread  D = 6 * (t/251) * (r/h)
+// while `TORCH_BIAS` in reverse-Z (near 0.1, `cube_view_projs`) is worth `0.001 * t^2 / 0.1 =
+// 0.01*t^2` YARDS of separation, and this offset adds `0.15 * (h/t)` (the normal's component along
+// the ray - which is exactly why it is taken along the NORMAL and not straight up: on a floor lit
+// from a low angle the two agree, on a wall the vertical offset would buy nothing).
+//
+//   WALL TORCH, h = 3 yd        r=1: D 0.025 vs bias 0.100     r=3: D 0.101 vs 0.180
+//                               r=6: D 0.321 vs 0.450          r=9: D 0.680 vs 0.900
+//     -> the bias alone clears the kernel by 1.3-1.8x at every radius. Torches were always fine.
+//   IMP HAND FLAME, h = 1 yd    r=1: D 0.034 vs bias 0.020     r=2: D 0.107 vs 0.050
+//                               r=3: D 0.227 vs 0.100
+//     -> the bias LOSES by 1.7-2.3x over the whole pool: every tap past the centre lands on floor
+//        texels nearer the fixture than the biased reference, so a fraction of the 4 (or 8) taps
+//        fails and the floor self-shadows. The fraction changes with the grazing angle and steps at
+//        the CUBE FACE boundaries, which is what turns a round pool into a square one (and, before
+//        PCSS widened the kernel, into concentric rings).
+//   WITH THIS OFFSET, h = 1 yd  r=1: 0.020+0.106 = 0.126 vs D 0.034  (3.7x margin)
+//                               r=2: 0.050+0.067 = 0.117 vs D 0.107  (1.1x)
+//                               r=3: 0.100+0.047 = 0.147 vs D 0.227  (still 1.5x short)
+//     -> clean out to r ~ 2.1 yd, which is where a 1 yd fixture's own direct term has already
+//        fallen to ~36 % of its peak (`INTERIOR_CORE_GAIN/(1+(d/1.75)^2)` at d = 2.3). RESIDUAL,
+//        named rather than hidden: a knee-high fixture's OUTER pool can still acne, and the honest
+//        cure for that is a slope-scaled bias or a grazing-angle clamp on the PCF radius, not a
+//        bigger constant (which detaches every real shadow - see TORCH_BIAS).
+const TORCH_NORMAL_OFFSET: f32 = 0.15;
 // MONKEY (torch caster selection): the live PCF tap-radius scale, unpacked from the table's
-// `count.y` (stored x100 because the row is `vec4<u32>`). Floored so a zero table cannot collapse
+// `count.y`'s LOW 16 bits (stored x100 because the row is `vec4<u32>`; the high half is the
+// MONKEY (shadow floor) strength). Floored so a zero table cannot collapse
 // the kernel to a single texel.
 fn torch_soft() -> f32 {
-    return max(f32(torch_table.count.y) * 0.01, 0.05);
+    return max(f32(torch_table.count.y & 0xffffu) * 0.01, 0.05);
+}
+// MONKEY (shadow floor): the live SHADOW STRENGTH (`torchShadowStrength`, 0..1, default 0.7),
+// unpacked from `count.y`'s HIGH half (`(strength x 100) << 16 | soft x 100` - see
+// `TorchTableUniform::pack`; the low half is `torch_soft` above and `count.w`'s flags are
+// untouched). It is applied as `mix(1, s, w * strength)` where the cross-fade weight already
+// multiplies the shadow factor, which is algebraically the same thing as flooring the factor
+// itself (`1 - w*strength*(1-s)` either way) for one extra multiply and no extra tap.
+//
+// WHY a floor at all: a torch map is the ONLY occlusion in the direct term, so a blocked fragment
+// used to drop that term to exactly zero - a pitch-black, razor-edged scar of tent canvas across
+// Darkmoon's grass, table legs printed on the Darkshire inn floor. Nothing in this renderer
+// bounces, so the 30 % that survives at the default IS the bounce: the fill/ambient arms are
+// untouched (they never saw this factor), only the DIRECT arm is floored. 1 restores the shipped
+// pitch-black look exactly, 0 disables torch shadows without disturbing the lane behind them.
+fn torch_strength() -> f32 {
+    return clamp(f32(torch_table.count.y >> 16u) * 0.01, 0.0, 1.0);
 }
 #endif
 
@@ -270,7 +451,10 @@ fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, fade_radius: f32) -> f32 {
             // into the shadow appearing/dissolving instead of switching. Without it the selection
             // churn in a candle-dense room (Northshire's 42 candelabra, 5 yd apart) reads as
             // shadows popping on and off as you walk - the bug this lane exists to fix.
-            return mix(1.0, s, torch_table.positions[i].w);
+            // MONKEY (shadow floor): and `torch_strength()` is the DIRECT-term floor folded
+            // into that same weight (see the function). `w * strength` rather than a second `mix`
+            // because the two are the same expression.
+            return mix(1.0, s, torch_table.positions[i].w * torch_strength());
         }
     }
 #endif
@@ -278,32 +462,43 @@ fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, fade_radius: f32) -> f32 {
 }
 
 // The INTERIOR lane's call — unchanged behaviour (`fade_radius 0` ⇒ the reverse-Z `ndc.z` fade).
-fn torch_surface_shadow(light_pos: vec3<f32>, P: vec3<f32>) -> f32 {
-    return torch_map_at(light_pos, P, 0.0);
+// MONKEY (surface normal offset): `N` is the LIT normal of the receiving fragment, and the offset
+// point is what gets projected, face-picked and compared — exactly as `terrain.wgsl`'s
+// `torch_terrain_shadow` and `wow_model.wgsl`'s `torch_entity_shadow_at` already do (both offset
+// BEFORE `torch_face`, so a fragment right on a cube-face boundary picks the same face its
+// neighbour does). See TORCH_NORMAL_OFFSET for the texel-vs-bias arithmetic this is the answer to.
+fn torch_surface_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, 0.0);
 }
 
 // MONKEY (outdoor torch shadows): the EXTERIOR lane's call — the campfire/brazier/lamppost pool on
 // a WMO's outdoor-class surfaces and on exterior doodads.
-fn torch_exterior_shadow(light_pos: vec3<f32>, P: vec3<f32>) -> f32 {
-    return torch_map_at(light_pos, P, TORCH_EXT_FADE_YD);
+// MONKEY (surface normal offset): the same 0.15 yd normal offset as the interior lane and the
+// terrain/entity receivers — an outdoor WMO floor under a low fire (a campfire on a porch) has the
+// same grazing-angle PCF acne as the imp's floor; see TORCH_NORMAL_OFFSET for the arithmetic.
+fn torch_exterior_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
+    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, TORCH_EXT_FADE_YD);
 }
 
 // MONKEY (torch debug, interiorDebug 2): the MIN raw depth-map shadow factor over EVERY promoted map
 // (ignores the fixture-position match), so the map's actual content is visible as greyscale on the
 // floor: all-WHITE = maps empty / projection misses the fragment; uniform GREY = self-shadow/bias;
 // SHAPED dark regions = real occlusion is being captured (then the fix is correlation/placement).
-fn torch_debug_factor(P: vec3<f32>) -> f32 {
+// MONKEY (surface normal offset): the overlay projects the SAME offset point the lit path does, or
+// it would show acne the render no longer has (and hide acne it does).
+fn torch_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
 #ifdef TORCH_SHADOWS
+    let Ps = P + N * TORCH_NORMAL_OFFSET;
     var s = 1.0;
     for (var i = 0u; i < torch_table.count.x; i = i + 1u) {
         if (torch_table.positions[i].w <= 0.0) { continue; }
-        let face = torch_face(P - torch_table.positions[i].xyz);
+        let face = torch_face(Ps - torch_table.positions[i].xyz);
         let layer = i * 6u + face;
         // MONKEY (live bank rank): debug samples the same compact bank as the lit path.
         let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
         let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
         let raw = shadow_hook::torch_map_shadow(
-            torch_table.view_projs[layer], i32(depth_layer), P, torch_depth, torch_samp, TORCH_BIAS,
+            torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
             torch_soft(), -1.0);
         // MONKEY (torch caster selection): the WEIGHTED factor, so the debug view shows what the
         // real render shows - a fading slot greys out here too, and a slot stuck at w = 0 (never
@@ -323,65 +518,161 @@ fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), normalize(v), l2 > 1e-12);
 }
 
-// MONKEY (outdoor torch shadows): the ≤3-nearest EXTERIOR selection, packed into ONE u32 as three
-// 10-bit indices (rank 0 in the low bits), `EXT_SEL_EMPTY` for an unfilled rank. The packed light
-// table is capped at 256 entries, so 10 bits carries two bits of headroom.
+// MONKEY (outdoor torch shadows): the ≤`EXT_SEL_K`-nearest EXTERIOR selection, packed into TWO
+// u32s as eight 8-bit indices (rank 0 in the low byte of `.x`), `EXT_SEL_EMPTY` for an unfilled
+// rank.
 //
 // WHY the selection is packed and TRAVELS from the vertex stage: the exterior point term is chosen
 // per VERTEX (the reference FFP's own granularity, and — on a WMO's outdoor-class surfaces —
-// anchored at the MCNK CELL so a street and the road it runs into rank the same three lights and
-// agree at the seam, see `wmo_exterior_point_sum`). The per-FRAGMENT shadowed term must use exactly
+// anchored at the MCNK CELL so a street and the road it runs into rank the same lights and agree
+// at the seam, see `wmo_exterior_point_sum`). The per-FRAGMENT shadowed term must use exactly
 // THAT selection: re-ranking per fragment would put a hard line across the cobbles at every cell
 // boundary, where the interpolated vertex term has none. So the vertex stage publishes its choice
 // and the fragment stage only re-EVALUATES it (and shadows it).
-const EXT_SEL_EMPTY: u32 = 1023u;
-const EXT_SEL_NONE: u32 = 1073741823u; // three empty ranks: 1023 | 1023<<10 | 1023<<20
+//
+// MONKEY (ext light k8) - **WHY K WENT 3 -> 8.** Three is the reference FFP's own commit limit (GL
+// slots 1-3; wow-re `wmo-surface-dynamic-light` sections 4/6) and it was the right number for the
+// reference's SPARSE, hand-authored light set: with two or three authored lights in a village the
+// nearest three IS all of them, and no two draw units can disagree. benilla does not have that set
+// - `fire_light.rs` SYNTHESISES a point light for every torch, lantern, brazier and campfire
+// GameObject/doodad in range, so a lamp-lit set piece now puts 15+ exterior fixtures inside ONE
+// chunk's candidacy box (measured at the Darkmoon Faire: 12 `Free Standing Torch 01` + 3
+// `General Lantern 01` within reach of the player's chunk, plus a stall lamp and the fireworks'
+// spell lights). Once the candidates outnumber the slots, adjacent draw units keep DIFFERENT
+// threes; and because the boundary between draw units is a straight line - an MCNK cell edge, or
+// the jump from a cell-anchored chunk to the origin-anchored bench standing on it - the
+// disagreement reads as a HARD STRAIGHT EDGE across a torch's pool of light (the director's
+// "scars"), and as a bench lit by a firework over ground that is not. Eight slots cover every
+// fixture that can meaningfully reach a unit in these set pieces, so neighbouring units agree and a
+// pool ends where the FALLOFF ends instead of where the cell does.
+//
+// 8 bits per rank caps the LIVE table at 255 real entries, `EXT_SEL_EMPTY` = 255 being the
+// sentinel; `global_light::MAX_LIVE_POINT_LIGHTS` enforces that CPU-side. The buffer still carries
+// 256 slots, so `LightStd430` keeps its 8528 B and no mirror struct moves.
+//
+// RAISING K: `ext_sel_get` and the pack tail index the selection vector dynamically
+// (`sel[s >> 2u]`) and the rank arrays are zero-constructed and filled, so K is not spelled out
+// anywhere but here. K=16 = swap `vec2<u32>` for `vec4<u32>` at its five type sites plus the
+// interstage field, set this to `16u`, and give `EXT_SEL_NONE` its two extra words. Worth knowing
+// because the Darkmoon Faire measurement is MARGINAL at 8: one 33.33 yd chunk there holds exactly
+// eight fixtures strictly inside its own cell, so a ninth standing 2.5 yd outside the edge cannot
+// win a slot under any ranking, and that chunk still disagrees with its neighbour about it. Eight
+// takes the worst measured seam jump there from 0.64 to 0.36 of a falloff unit (and the everyday
+// Goldshire/Stormwind case to zero); twelve would take it to 0.11, against a hard floor of ~0.14
+// set by the candidacy box itself, which is a separate change.
+const EXT_SEL_K: u32 = 8u;
+const EXT_SEL_EMPTY: u32 = 255u;
+// Eight empty ranks. MONKEY (ext light k8): two words now, so it can no longer be a scalar literal.
+const EXT_SEL_NONE: vec2<u32> = vec2<u32>(4294967295u, 4294967295u);
 
-// The ranking half of the old `point_light_sum` — the EXTERIOR doodad/MODD-prop family, anchored at
-// the receiving unit's own origin. Split out verbatim (same tests, same order, same tie handling)
-// so the sum can be re-evaluated later against the identical choice.
-fn point_light_pick(anchor: vec3<f32>) -> u32 {
+// MONKEY (ext light k8): how many of the `EXT_SEL_K` ranks pay for a CUBE-MAP OCCLUSION lookup in
+// the night lane. The ranking is by distance, so ranks 0..2 are the three fixtures whose term
+// dominates this fragment; ranks 3..7 are the long tail that fixes the SELECTION (the scars) and
+// contribute a soft, low-amplitude wash where a hard-edged shadow would not be legible anyway.
+// Holding the shadowed count at the OLD K pins the per-fragment cost of the night lane at exactly
+// what it was - three table scans and their taps - while the selection itself gets eight deep.
+const EXT_SEL_SHADOWED: u32 = 3u;
+
+// Unpack rank `s` (0..`EXT_SEL_K`-1) from the two-word selection. MIRRORED - keep in sync.
+fn ext_sel_get(sel: vec2<u32>, s: u32) -> u32 {
+    return (sel[s >> 2u] >> (8u * (s & 3u))) & 255u;
+}
+
+// The ranking half of the old `point_light_sum` — the EXTERIOR doodad/MODD-prop family, anchored
+// at the receiving unit's own origin. Same tests, same order, same tie handling (strictly-less
+// inserts, so an equal distance leaves the earlier table index at the better rank) so the sum can
+// be re-evaluated later against the identical choice.
+//
+// MONKEY (ext light k8): `box` is the draw unit's HORIZONTAL half-extent in yards, and it changes
+// what "nearest" MEANS - ranking is by the distance from the light to the unit's AABB, not to the
+// unit's anchor POINT. A cell-anchored unit (terrain's 33.33 yd MCNK chunk, clutter, an
+// exterior-class WMO street) passes `MCNK_CELL_HALF`: a torch standing 2 yd outside a cell's edge
+// is 2 yd from the nearest surface that cell draws, yet ~18 yd from its CENTRE, which is how it
+// used to lose its slot to three torches clustered near the middle while lighting nothing of the
+// ground right under it. Clamping the light into the box (`max(|d| - box, 0)` per horizontal axis)
+// ranks it the way the surface actually sees it, and - the point of the exercise - makes two
+// ADJACENT cells rank a light on their shared edge almost identically, so their sets agree there.
+// The VERTICAL stays unbounded, exactly as the reference's hash sweep is. `box = 0` reproduces the
+// old point-anchored ranking BIT-FOR-BIT, and that is what the own-origin units (props, entities)
+// pass, so nothing on those lanes moves.
+//
+// CANDIDACY deliberately stays on the anchor POINT (`dc2` below): it is the byte-verified gather
+// test, and widening it is a different question from how the survivors are ordered.
+fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec2<u32> {
     let count = u32(wow_light.point_count.x);
-    var sel = array<u32, 3>(0u, 0u, 0u);
-    var sd = array<f32, 3>(1e30, 1e30, 1e30);
+    var sel = array<u32, EXT_SEL_K>();
+    var sd = array<f32, EXT_SEL_K>();
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        sd[s] = 1e30;
+    }
     for (var i = 0u; i < count; i = i + 1u) {
         // MONKEY (light lanes): skip INTERIOR fixtures (colour row `.w > 0.5`) — mirrored from
         // wow_model.wgsl. This is the EXTERIOR doodad/MODD-prop family (a WMO surface takes
         // `wmo_exterior_point_sum` or nothing), so a building's own fixtures must not reach it — the
-        // warm pool on the grass at the foot of the inn's wall. Skipped before the ≤3 ranking, so
-        // an interior fixture cannot take a slot an outdoor fire should have had.
+        // warm pool on the grass at the foot of the inn's wall. Skipped before the ≤`EXT_SEL_K`
+        // ranking, so an interior fixture cannot take a slot an outdoor fire should have had.
         if (wow_light.points[2u * i + 1u].w > 0.5) {
             continue;
         }
         let pos_range = wow_light.points[2u * i];
         let dv = pos_range.xyz - anchor;
-        let d2 = dot(dv, dv);
-        if (d2 > pos_range.w * pos_range.w) {
+        let dc2 = dot(dv, dv);
+        if (dc2 > pos_range.w * pos_range.w) {
             continue;
         }
-        if (d2 < sd[0]) {
-            sd[2] = sd[1]; sel[2] = sel[1];
-            sd[1] = sd[0]; sel[1] = sel[0];
-            sd[0] = d2; sel[0] = i;
-        } else if (d2 < sd[1]) {
-            sd[2] = sd[1]; sel[2] = sel[1];
-            sd[1] = d2; sel[1] = i;
-        } else if (d2 < sd[2]) {
-            sd[2] = d2; sel[2] = i;
+        // MONKEY (ext light k8): rank by the distance to the draw unit's BOX (see the header
+        // note). With `box = 0` both `max`es are identities and this is exactly the old `dc2`.
+        let e = max(abs(dv.xz) - vec2<f32>(box), vec2<f32>(0.0));
+        let d2 = dot(e, e) + dv.y * dv.y;
+        // MONKEY (ext light k8): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
+        // 3-deep cascade. Both loops are bounded by a module const, so the compiler unrolls them;
+        // the comparison is strictly-less, which keeps the old tie order (first-found wins).
+        //
+        // The guard on the WORST kept rank first: `sd` is sorted, so a candidate that cannot beat
+        // `sd[K-1]` cannot beat anything, and the scan below would walk all eight slots only to
+        // decide that. It makes the REJECT path - which is what nearly every table entry takes once
+        // the set is full - ONE comparison, i.e. cheaper than the three the old cascade spent, so
+        // widening K did not make the common case more expensive. Exactly equivalent to letting the
+        // scan run: `d2 >= sd[K-1]` is precisely the condition under which it returns `r = K`.
+        if (d2 >= sd[EXT_SEL_K - 1u]) {
+            continue;
+        }
+        var r = EXT_SEL_K;
+        for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+            if (d2 < sd[s]) {
+                r = s;
+                break;
+            }
+        }
+        if (r < EXT_SEL_K) {
+            for (var s = EXT_SEL_K - 1u; s > r; s = s - 1u) {
+                sd[s] = sd[s - 1u];
+                sel[s] = sel[s - 1u];
+            }
+            sd[r] = d2;
+            sel[r] = i;
         }
     }
-    return select(EXT_SEL_EMPTY, sel[0], sd[0] <= 9.9e29)
-        | (select(EXT_SEL_EMPTY, sel[1], sd[1] <= 9.9e29) << 10u)
-        | (select(EXT_SEL_EMPTY, sel[2], sd[2] <= 9.9e29) << 20u);
+    // Pack low-byte-first, `EXT_SEL_EMPTY` for a rank nothing reached. No real index can collide
+    // with the sentinel: the live table caps at 255 (`MAX_LIVE_POINT_LIGHTS`).
+    var packed = vec2<u32>(0u, 0u);
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        let idx = select(EXT_SEL_EMPTY, sel[s], sd[s] <= 9.9e29);
+        packed[s >> 2u] |= idx << (8u * (s & 3u));
+    }
+    return packed;
 }
 
 // The evaluation half — the byte-verified falloff `1/(0.7d + 0.03d²)` × `max(N·L, 0)` × the
 // committed colour, in rank order, stopping at the first empty rank exactly as the old
 // `sd[s] > 9.9e29` break did. Shared by both pickers (their sum loops were already identical).
-fn point_light_eval(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (ext light k8): up to `EXT_SEL_K` terms now, still Gouraud (per vertex) and still linear
+// in the falloff, so nothing about the day lane's FORM changed — a unit simply stops dropping the
+// fixtures its neighbour kept.
+fn point_light_eval(sel: vec2<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
-    for (var s = 0u; s < 3u; s = s + 1u) {
-        let idx = (sel >> (10u * s)) & 1023u;
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        let idx = ext_sel_get(sel, s);
         if (idx == EXT_SEL_EMPTY) {
             break;
         }
@@ -394,18 +685,24 @@ fn point_light_eval(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     return sum;
 }
 
-// MONKEY (outdoor torch shadows): the SHADOWED evaluation — the same three entries, each multiplied
-// by its OWN fixture's cube-map occlusion, so a crate between the fragment and campfire A darkens
-// A's term while lamppost B's is untouched. Per fixture, exactly as the interior lane is (this is
-// the same argument one lane over: a single scene-wide shadow factor cannot express "shadowed from
-// one fire, lit by another", which is what a village square at night actually looks like).
+// MONKEY (outdoor torch shadows): the SHADOWED evaluation — the same entries the vertex picked,
+// each multiplied by its OWN fixture's cube-map occlusion, so a crate between the fragment and
+// campfire A darkens A's term while lamppost B's is untouched. Per fixture, exactly as the interior
+// lane is (this is the same argument one lane over: a single scene-wide shadow factor cannot
+// express "shadowed from one fire, lit by another", which is what a village square at night
+// actually looks like). Reached only under `torch_ext_on()`, so nothing here executes in daylight
+// or with `exteriorShadows 0`.
 //
-// Bounded at three iterations by construction, and reached only under `torch_ext_on()`, so nothing
-// here executes in daylight or with `exteriorShadows 0`.
-fn point_light_eval_shadowed(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (ext light k8): the SUM runs to `EXT_SEL_K`, but only the first `EXT_SEL_SHADOWED` ranks
+// pay for an occlusion lookup, so the per-fragment cost of this lane is pinned at exactly what it
+// was before the widening while the selection itself got eight deep. Ranks 3..7 are the
+// distance-ordered tail — the terms that make a torch's pool agree across a draw-unit boundary —
+// and they arrive unshadowed, which at their amplitude is not a look the eye can separate from a
+// shadowed one.
+fn point_light_eval_shadowed(sel: vec2<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
-    for (var s = 0u; s < 3u; s = s + 1u) {
-        let idx = (sel >> (10u * s)) & 1023u;
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        let idx = ext_sel_get(sel, s);
         if (idx == EXT_SEL_EMPTY) {
             break;
         }
@@ -418,17 +715,17 @@ fn point_light_eval_shadowed(sel: u32, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> 
         // occlusion is a factor on a term that is already zero on any surface facing away from the
         // fire, and the scan + four taps are the expensive half of this loop body.
         let ext_w = atten * nl;
-        var s = 1.0;
-        if (ext_w > TORCH_SKIP_EPS) {
-            s = torch_exterior_shadow(fixture, P);
+        var occ = 1.0;
+        if (s < EXT_SEL_SHADOWED && ext_w > TORCH_SKIP_EPS) {
+            occ = torch_exterior_shadow(fixture, P, N);
         }
-        sum += wow_light.points[2u * idx + 1u].rgb * (ext_w * s);
+        sum += wow_light.points[2u * idx + 1u].rgb * (ext_w * occ);
     }
     return sum;
 }
 
 fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
-    return point_light_eval(point_light_pick(anchor), P, N);
+    return point_light_eval(point_light_pick(anchor, 0.0), P, N);
 }
 
 // MONKEY (wmo exterior points): the EXTERIOR-lane point term for a WMO's OUTDOOR-class surfaces —
@@ -445,7 +742,7 @@ fn point_light_sum(P: vec3<f32>, N: vec3<f32>, anchor: vec3<f32>) -> vec3<f32> {
 // It is `terrain.wgsl`'s `point_light_sum` semantics DELIBERATELY, not this file's own:
 //  · the anchor is the **MCNK cell centre** ([`mcnk_cell_anchor`]), not the batch's baked
 //    placement anchor. A WMO's baked anchor is its PLACEMENT origin — one point for the whole of
-//    Stormwind — so a nearest-3 ranked from it would commit the same three lights to every street
+//    Stormwind — so a nearest-K ranked from it would commit the same few lights to every street
 //    in the city. The 33.33 yd cell is the unit terrain uses, so the road and the street it runs
 //    into rank the SAME candidates and agree at the seam, which is the whole requirement.
 //  · candidacy is terrain's Chebyshev box `TERRAIN_REACH`, not this file's 48 yd sphere, for the
@@ -468,13 +765,21 @@ fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
     let iz = floor((half + P.z) / cell);
     return vec3<f32>((ix + 0.5) * cell - half, P.y, (iz + 0.5) * cell - half);
 }
+
+// MONKEY (ext light k8): the MCNK cell's HORIZONTAL half-extent (yd) - the `box` a cell-anchored
+// draw unit ranks by. The same grid constant as above, halved: 533.33333/16/2 = 16.666666. An
+// own-origin unit passes 0 instead. MIRRORED in terrain.wgsl - keep in sync.
+const MCNK_CELL_HALF: f32 = 533.33333 / 32.0;
 // MONKEY (outdoor torch shadows): the ranking half, split out for the same reason as
 // `point_light_pick` — the fragment stage must re-evaluate the VERTEX's choice, not make its own.
-fn wmo_exterior_pick(P: vec3<f32>) -> u32 {
+fn wmo_exterior_pick(P: vec3<f32>) -> vec2<u32> {
     let anchor = mcnk_cell_anchor(P);
     let count = u32(wow_light.point_count.x);
-    var sel = array<u32, 3>(0u, 0u, 0u);
-    var sd = array<f32, 3>(1e30, 1e30, 1e30);
+    var sel = array<u32, EXT_SEL_K>();
+    var sd = array<f32, EXT_SEL_K>();
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        sd[s] = 1e30;
+    }
     for (var i = 0u; i < count; i = i + 1u) {
         // Exterior lane only: an interior fixture's `.w` is its reach (≥ 1), an exterior source's
         // is 0. A building's own candles must not pool on the street outside its wall.
@@ -487,21 +792,48 @@ fn wmo_exterior_pick(P: vec3<f32>) -> u32 {
         if (max(abs(dv.x), abs(dv.z)) > WMO_EXT_REACH) {
             continue;
         }
-        let d2 = dot(dv, dv);
-        if (d2 < sd[0]) {
-            sd[2] = sd[1]; sel[2] = sel[1];
-            sd[1] = sd[0]; sel[1] = sel[0];
-            sd[0] = d2; sel[0] = i;
-        } else if (d2 < sd[1]) {
-            sd[2] = sd[1]; sel[2] = sel[1];
-            sd[1] = d2; sel[1] = i;
-        } else if (d2 < sd[2]) {
-            sd[2] = d2; sel[2] = i;
+        // MONKEY (ext light k8): rank by the distance to the MCNK cell's BOX, not to its centre -
+        // see `point_light_pick`. This is the term that makes a street and the road it runs into
+        // agree about a torch standing on the seam between them.
+        let e = max(abs(dv.xz) - vec2<f32>(MCNK_CELL_HALF), vec2<f32>(0.0));
+        let d2 = dot(e, e) + dv.y * dv.y;
+        // MONKEY (ext light k8): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
+        // 3-deep cascade. Both loops are bounded by a module const, so the compiler unrolls them;
+        // the comparison is strictly-less, which keeps the old tie order (first-found wins).
+        //
+        // The guard on the WORST kept rank first: `sd` is sorted, so a candidate that cannot beat
+        // `sd[K-1]` cannot beat anything, and the scan below would walk all eight slots only to
+        // decide that. It makes the REJECT path - which is what nearly every table entry takes once
+        // the set is full - ONE comparison, i.e. cheaper than the three the old cascade spent, so
+        // widening K did not make the common case more expensive. Exactly equivalent to letting the
+        // scan run: `d2 >= sd[K-1]` is precisely the condition under which it returns `r = K`.
+        if (d2 >= sd[EXT_SEL_K - 1u]) {
+            continue;
+        }
+        var r = EXT_SEL_K;
+        for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+            if (d2 < sd[s]) {
+                r = s;
+                break;
+            }
+        }
+        if (r < EXT_SEL_K) {
+            for (var s = EXT_SEL_K - 1u; s > r; s = s - 1u) {
+                sd[s] = sd[s - 1u];
+                sel[s] = sel[s - 1u];
+            }
+            sd[r] = d2;
+            sel[r] = i;
         }
     }
-    return select(EXT_SEL_EMPTY, sel[0], sd[0] <= 9.9e29)
-        | (select(EXT_SEL_EMPTY, sel[1], sd[1] <= 9.9e29) << 10u)
-        | (select(EXT_SEL_EMPTY, sel[2], sd[2] <= 9.9e29) << 20u);
+    // Pack low-byte-first, `EXT_SEL_EMPTY` for a rank nothing reached. No real index can collide
+    // with the sentinel: the live table caps at 255 (`MAX_LIVE_POINT_LIGHTS`).
+    var packed = vec2<u32>(0u, 0u);
+    for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
+        let idx = select(EXT_SEL_EMPTY, sel[s], sd[s] <= 9.9e29);
+        packed[s >> 2u] |= idx << (8u * (s & 3u));
+    }
+    return packed;
 }
 fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     return point_light_eval(wmo_exterior_pick(P), P, N);
@@ -785,7 +1117,7 @@ fn interior_room_light(
         let direct_w = atten * nl * window;
         var s = 1.0;
         if (direct_w * w > TORCH_SKIP_EPS) {
-            s = torch_surface_shadow(pos_range.xyz, P);
+            s = torch_surface_shadow(pos_range.xyz, P, N);
         }
         direct += c_norm * direct_w * s * w;
         // MONKEY (soft falloff): the fill's profile is UNCHANGED in FORM — `(1 − d/r)²`, which is
@@ -801,7 +1133,85 @@ fn interior_room_light(
         fill = max(fill, c_fill * (k_fill * interior_window(d, fill_yd, INTERIOR_FILL_POW) * w));
     }
     // Fill is INDIRECT bounce, so it is not shadowed; direct already carries each fixture's shadow.
+    // MONKEY (shell candle add): STRICT callers want only the claimed DIRECT + FILL. The shell
+    // already has sky ambient; returning the raw budget here also avoids adding then subtracting
+    // that floor (cancellation would lose weak fixtures). Non-strict room lighting is unchanged.
+    if (strict) {
+        return direct + fill;
+    }
     return direct + fill + vec3<f32>(wow_light.point_count.y);
+}
+
+// MONKEY (trans blend continuity): the day blend's "never darker than the room law" guard, as a
+// C1-CONTINUOUS maximum instead of a per-channel `max`.
+//
+// THE BUG IT FIXES, measured on the Lion's Pride Inn's vestibule floor (`GoldshireInn` g0 batch b0 -
+// 8 TRANS triangles - rendered off `benilla-extract wmolights --verts 0` at 0.05 yd with this file's
+// exact interior-lane arithmetic at the owner's live cvars):
+//
+//   `max(room_rgb, rgb)` is evaluated PER CHANNEL, so the room law and the sunlit reference cross at
+//   a DIFFERENT place in R, in G and in B. Each crossing is continuous in value and BROKEN in its
+//   first derivative, and each is therefore a Mach line - three of them, at three different places,
+//   with the colour stepping warmer across each (the fragments between two loci have one channel on
+//   the reference and two on the room law, which is a hue no law in the shader ever asks for).
+//   The BLUE locus is the reported scar: a line from the door's south jamb running diagonally into
+//   the floor and dying near the middle -
+//       08:20  (20.30, -1.23) -> (15.16, -4.33)   jump 0.1595/yd = 32.5 %/yd at a level of 0.491
+//       noon   (19.96, -0.83) -> (15.68, -4.68)   jump 0.1594/yd = 28.6 %/yd at a level of 0.557
+//   with GREEN a second, shorter line nearer the door and RED crossing only at 08:20 (which is why
+//   the scar is worse in the morning than at noon). The wedge between the blue and green loci reads
+//   lighter and less warm than the floor beyond it (mean 0.621 lum / R:B 1.206 against 0.415 / 1.280
+//   at 08:20) - the "wedge on one side" of the report.
+//   That these are TRUE C1 breaks and not the light pool's own curvature is settled by halving the
+//   sample step: a break's |d2| scales as 1/h (2.25 -> 4.49 -> 8.93 /yd^2 at 0.05 / 0.025 / 0.0125 yd)
+//   while a smooth arc's does not.
+//
+// WHY THIS SHAPE. Three laws were measured against the same floor:
+//   (1) pick by LUMINANCE (one achromatic locus, all three channels switch together) - still a hard
+//       C1 break, and the colour step across it gets WORSE, not better (hue step 16.7 / 20.0 against
+//       the shipped 14.5 / 12.1 at 08:20 / noon): concentrating three small hue jumps into one big
+//       one is the wrong direction.
+//   (2) THIS - a quadratic smooth-max of half-width `TRANS_SMAX_W`. The selector disappears outright:
+//       the function is C1 everywhere, so there is no locus left to draw a line at. Costs at most
+//       0.0087 (08:20) / 0.0085 (noon) of display luminance against the shipped result - under 1 %,
+//       and under a single 8-bit code over most of the floor.
+//   (3) drop the `max` and `mix` straight to the reference - the same clean derivative, but it
+//       re-opens the subtraction the `max` was added against: it renders this floor up to 0.0811 x tex
+//       (11.0 %) DARKER at 08:20, 4.7 % at noon and 3.0 % at 20:00, because the room law is above the
+//       reference over the whole area the p0 daylight fixture actually reaches.
+//
+// It OVERSHOOTS rather than undershoots, deliberately and by at most `w/4` (0.0125): a C1 function
+// that equals `max` outside a band must do one or the other inside it, and undershooting would dip
+// BELOW `room_rgb` - which is precisely the "the blend may only ever brighten" invariant the outer
+// `max` and the night floor exist to hold. `smax >= max(a, b) >= room_rgb` still holds here.
+//
+// NIGHT IS BIT-IDENTICAL and not by argument: the whole selector is behind `day_w`, and
+// `mix(a, b, 0.0)` is `a * 1 + b * 0` = `a` exactly, whatever `b` is. Verified numerically against the
+// shipped law at `sun_w = 0` - max |difference| 0.000e+00 on every fragment of the floor.
+const TRANS_SMAX_W: f32 = 0.05;
+fn trans_smax(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
+    let h = clamp(0.5 + 0.5 * (b - a) / TRANS_SMAX_W, vec3<f32>(0.0), vec3<f32>(1.0));
+    return a + (b - a) * h + TRANS_SMAX_W * h * (vec3<f32>(1.0) - h);
+}
+
+// MONKEY (shell candle add): candle irradiance lights the TEXTURE, not the authored MOCV shadow
+// bake. Give it the room lane's exposure rolloff, then fade the RESULT over 60..90 yd: fading the
+// raw budget before exp would change the pool's brightness profile with camera distance. The sky,
+// exterior points and SIDN keep their original law; only their remaining display headroom bounds
+// the addition. A hard zero guard keeps unclaimed/distant facades bit-identical, even by daylight.
+// `texture_rgb` is the sample BEFORE the MOCV fold: dividing folded black by 1/255 cannot recover
+// a texture on a zero-bake vertex. The reference path keeps its fold/divide arithmetic untouched.
+fn shell_candle_add(
+    sky_rgb: vec3<f32>,
+    texture_rgb: vec3<f32>,
+    room_raw: vec3<f32>,
+    far: f32,
+) -> vec3<f32> {
+    if (far <= 0.0 || all(room_raw <= vec3<f32>(0.0))) {
+        return sky_rgb;
+    }
+    let candle = vec3<f32>(1.0) - exp(-room_raw * wow_light.point_count.w);
+    return clamp(sky_rgb + texture_rgb * candle * far, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // ---- the pass ----
@@ -825,12 +1235,15 @@ struct GxVsOut {
     @location(3) @interpolate(flat) word: u32,
     @location(4) point_lit: vec3<f32>,
     @location(5) color: vec4<f32>,
-    // MONKEY (outdoor torch shadows): WHICH ≤3 exterior table entries `point_lit` was summed from,
-    // packed 10 bits each (see `EXT_SEL_NONE`). FLAT, because it is a choice, not a quantity —
-    // interpolating three packed indices would produce a fourth, meaningless one. `EXT_SEL_NONE` on
-    // every lane that takes no exterior point term (interior WMO surfaces, interior props, the
-    // collapsed exile vertex), which makes the fragment lane a no-op there by construction.
-    @location(6) @interpolate(flat) ext_sel: u32,
+    // MONKEY (outdoor torch shadows; ext light k8): WHICH ≤`EXT_SEL_K` exterior table entries
+    // `point_lit` was summed from, packed 8 bits each across TWO u32s (see `EXT_SEL_NONE` /
+    // `ext_sel_get`). FLAT, because it is a choice, not a quantity — interpolating packed indices
+    // would produce a different, meaningless one. `EXT_SEL_NONE` on every lane that takes no
+    // exterior point term (interior WMO surfaces, interior props, the collapsed exile vertex),
+    // which makes the fragment lane a no-op there by construction. Widened from ONE u32 of three
+    // 10-bit ranks to TWO u32s of eight 8-bit ranks — one extra interstage component — see
+    // `EXT_SEL_K`.
+    @location(6) @interpolate(flat) ext_sel: vec2<u32>,
 }
 
 @vertex
@@ -871,7 +1284,7 @@ fn vertex(v: GxVertex) -> GxVsOut {
     out.uv = v.uv;
     out.word = v.word;
     out.color = v.color;
-    // The ≤3-nearest FFP selection, anchored at the PLACEMENT origin exactly like the entity
+    // The ≤`EXT_SEL_K`-nearest selection, anchored at the PLACEMENT origin exactly like the entity
     // path (the baked per-vertex anchor — 1429's parity note; the blob path coarsened this).
     // WMO surfaces take ZERO point lights — the entity path zeroes them in the vertex stage
     // (wow-re trace-forensics-abbey-interior-d3d §2: zero on every observed WMO surface) —
@@ -892,13 +1305,15 @@ fn vertex(v: GxVertex) -> GxVsOut {
         // Per-vertex like terrain's, not per-fragment: WMO surfaces are MOCV-baked per vertex, so
         // they carry the tessellation a Gouraud term needs, and this stays one bounded walk.
         // MONKEY (outdoor torch shadows): the pick is published so the fragment stage can shadow
-        // these same three entries at night without re-ranking (see `EXT_SEL_NONE`). One table walk
+        // this same selection at night without re-ranking (see `EXT_SEL_NONE`). One table walk
         // still, not two — the sum was always `eval(pick(...))`, it is just no longer inlined.
         let sel = wmo_exterior_pick(world);
         out.ext_sel = sel;
         out.point_lit = point_light_eval(sel, world, v.normal);
     } else {
-        let sel = point_light_pick(v.anchor);
+        // MONKEY (ext light k8): `box = 0` — an exterior doodad/MODD prop is its own draw unit and
+        // ranks from its baked PLACEMENT origin, exactly as it did before the widening.
+        let sel = point_light_pick(v.anchor, 0.0);
         out.ext_sel = sel;
         out.point_lit = point_light_eval(sel, world, v.normal);
     }
@@ -963,7 +1378,7 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // MONKEY (outdoor torch shadows): the EXTERIOR point term, cast-shadowed at night.
     //
     // `in.point_lit` is the Gouraud (per-vertex) exterior sum, and it stays the ONLY thing this
-    // lane reads by day. After dark the same three entries are re-evaluated PER FRAGMENT with each
+    // lane reads by day. After dark the same entries are re-evaluated PER FRAGMENT with each
     // one's own cube-map occlusion folded in (`point_light_eval_shadowed`), and the two are blended
     // by `night_w = 1 − sun_shadow_strength`. Two things fall out of writing it as a blend rather
     // than a swap:
@@ -1127,8 +1542,8 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // shell keeps the reference sky law day and night; its claimed fixtures still arrive
         // through the strict `ext_room` term below. The BATCH-level half of the fix (an EXT-class
         // batch inside an INTERIOR group — the cellar stair) lives in `day_w` and is untouched.
-        // `ext_night` itself is kept for the `interiorDebug 4` overlay only.
-        let night_w = 0.0;
+        // MONKEY (shell candle add): `ext_night` is the building eligibility gate as well as the
+        // `interiorDebug 4` overlay key; despite its historical name it applies by DAY too.
         // MONKEY (portal claims): the EXTERIOR-class group's own room light. Bug B's second
         // cause: plenty of groups INSIDE a building are authored EXTERIOR-class (MOGP `& 0x48`) —
         // the Goldshire inn's whole shell is one, and its basement stairwell reads night-sky GREEN
@@ -1141,17 +1556,11 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // over: their own torches are EXTERIOR-lane sources, which this loop skips, and the
         // district shells they belong to carry no eligible claim.
         //
-        // ADDITIVE into the same clamped sum `in.point_lit` rides, rather than a blend toward the
-        // interior law: an exterior group's batches are EXT class, so the interior lane's
-        // batch-class blend would weight them 1.0 and change nothing. The clamp is why daylight is
-        // unaffected — the sky term already saturates it.
-        //
-        // MINUS the interior lane's BASE AMBIENT floor, which `interior_room_light` adds
-        // unconditionally: indoors that floor is what keeps a fixture-less nook off pure black, but
-        // an exterior-class surface already has the sky for that, and adding it here would lift
-        // every street and every outer wall in the world by a constant. Subtracting it is what
-        // makes an UNCLAIMED exterior fragment come out at exactly zero — rendering byte-identical
-        // to before — and leaves a claimed one with just its fixtures' direct + fill.
+        // MONKEY (shell candle add): STRICT now returns DIRECT + FILL without the room ambient.
+        // Carry it separately from `primary`: multiplying this live light through MOCV suppresses
+        // it on baked-dark reveals, and omitting the exposure rolloff dims even an unbaked shell
+        // beside its room. Goldshire g4 actually has NO MOCV (vc = 1); its measured doorway also
+        // changes normal across g3/g4, so matching the law does not promise identical irradiance.
         //
         // COST: this is a per-FRAGMENT walk of the point table on surfaces that never had one —
         // and exterior WMO geometry is most of a city's screen. So it is distance-gated, with a
@@ -1160,27 +1569,18 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // sits at `R = 7..15` yd (fill 10..22), so the gate costs nothing visible and is the
         // difference between paying for the effect where it can be seen and paying for it across
         // the whole skyline.
-        var ext_room = vec3<f32>(0.0);
+        var ext_room_raw = vec3<f32>(0.0);
+        var ext_room_far = 0.0;
         let ext_room_d = distance(in.world_position.xyz, view.world_position.xyz);
-        if (!interior && interiors_on && ext_room_d < EXT_ROOM_FADE_END) {
-            let lit = interior_room_light(
+        if (ext_night && ext_room_d < EXT_ROOM_FADE_END) {
+            ext_room_raw = interior_room_light(
                 in.world_position.xyz,
                 n_lit,
                 gx_room_inst(),
                 gx_room_group(in.word),
                 true, // fail CLOSED: an unclaimed exterior surface renders exactly as before
             );
-            let far = 1.0 - smoothstep(EXT_ROOM_FADE_START, EXT_ROOM_FADE_END, ext_room_d);
-            // MONKEY (ext-class night law): the ambient floor is subtracted by `1 − night_w`, not
-            // flat. The floor is removed here because an exterior surface has the SKY for its
-            // floor — but that premise is exactly what `night_w` retires, so the two must move
-            // together or the dusk cross-fade dips (the sky half already faded out, the interior
-            // half's floor still subtracted away). At `night_w = 1` this term is weighted to zero
-            // by the blend below anyway; the scaling is what keeps the ramp between monotone.
-            ext_room = max(
-                lit - vec3<f32>(wow_light.point_count.y * (1.0 - night_w)),
-                vec3<f32>(0.0),
-            ) * far;
+            ext_room_far = 1.0 - smoothstep(EXT_ROOM_FADE_START, EXT_ROOM_FADE_END, ext_room_d);
         }
         // GL_COLOR_MATERIAL: MOCV multiplies the lit terms INSIDE the clamp, emission adds
         // beside. MONKEY (wmo exterior points): `in.point_lit` is zero on INTERIOR groups (the
@@ -1188,7 +1588,7 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // exterior nearest-3 point term on EXTERIOR-class ones, which is what makes a street
         // torch reach the cobbles. The clamp is why it costs nothing in daylight.
         let primary = clamp(
-            vc.rgb * (lit_wmo + point_lit + ext_room) + sidn_e,
+            vc.rgb * (lit_wmo + point_lit) + sidn_e,
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
@@ -1197,13 +1597,10 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         // break the pixel-identity bar.
         let tex_rgb = folded / max(vc.rgb, vec3<f32>(1.0 / 255.0));
         rgb = tex_rgb * primary;
-        // MONKEY (ext-class night law): `night_w > 0` is a HARD gate, not a redundant one. With the
-        // sun up the blend below would be `mix(interior_result, rgb, 1.0)` = `a + (b − a)`, which
-        // in floats does not always round back to `b` — the ±1/255 film this renderer has chased
-        // before, and it would land on every sunlit street, wall and courtyard in the world, which
-        // is most of a city's screen. Skipping the branch outright makes DAYLIGHT bit-identical to
-        // the reference path, and costs nothing but the per-fragment point walk we also do not want
-        // to pay in daylight. Interior groups are unaffected: they enter on `interior` as before.
+        rgb = shell_candle_add(rgb, base.rgb, ext_room_raw, ext_room_far);
+        // MONKEY (shell candle add): only actual interior groups enter the room-law blend. Shells
+        // keep the sky plus the strictly claimed texture addition above, without a room ambient
+        // floor or an enclosed day floor spilling across their whole building-sized extent.
         if (interior && interiors_on) {
             // MONKEY (dynamic interiors #A, `interiorLight` on): the WHOLE interior group — INT, TRANS and EXT batch
             // classes alike — lights from the LIVE room torches instead of the MOCV bake. Gating
@@ -1269,18 +1666,158 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
             // exterior point term, i.e. the street torch hanging on the wall being lit. Without it
             // the blend would take that torch away from every building facade the moment it swapped
             // laws, which is a new seam where the wall meets the lit cobbles.
+            // MONKEY (enclosed day floor): the day's ambient floor joins the room's own budget,
+            // INSIDE the rolloff — so it saturates with everything else instead of stacking on top
+            // of a lit room, and a fixture-lit corner by day reads brighter than an unlit one by
+            // exactly as much as the rolloff still has room for. Zero on every batch that is not a
+            // room in a building, and zero at night, so both of those are bit-identical.
+            // MONKEY (bake floor): the batch's own MOCV bake, at `interiorBakeFloor x interiorGain`,
+            // joins the same budget — see `interior_bake_floor` for the whole argument and the
+            // measured before/after at the owner's cvars. Inside the rolloff for the same reason
+            // the day floor is: a lit room absorbs it, an unlit one is carried by it.
             let illum = vec3<f32>(1.0)
-                - exp(-(room + point_lit + sidn_e) * wow_light.point_count.w);
+                - exp(
+                    -(room
+                        + enclosed_day_floor(rec.w)
+                        + interior_bake_floor(vc.rgb, has_vc, class_int, class_trans)
+                        + point_lit
+                        + sidn_e)
+                        * wow_light.point_count.w,
+                );
             // BLEND toward the reference's own lit result (`rgb` above — MOCV × the exterior law)
             // by the authored batch-class weight; never ADD daylight on top of the room light,
             // which left the interior side of every threshold brighter than the exterior floor a
             // step away (the hard line at the smithy door). At the portal (weight 1) this IS the
             // exterior group's law, so the seam closes by construction, day or night; deep inside
             // (weight 0) it is pure room light. EXT-class batches (1) stay on the reference path.
-            rgb = mix(tex_rgb * illum, rgb, day_w);
+            //
+            // MONKEY (trans night floor): …and the blend may only ever BRIGHTEN, and it carries a
+            // FLOOR. Both halves are one rule — **the room lane must never render a threshold batch
+            // darker than the reference law's own guaranteed minimum for that fragment** — and both
+            // are needed, because the Lion's Pride Inn's front door is dark in two different ways.
+            //
+            // MEASURED (`benilla-extract wmolights`, GoldshireInn, with the new MOBA batch-class
+            // table): the front-door vestibule is group **g0** — the unnamed group the MOGN table
+            // prints as `-`, portalled to the ext* porch `room04` (p0) on one side and to the room
+            // beyond (p1) on the other, and the ONLY group in the whole WMO with TRANS batches
+            // (3/3, MOCV alpha 13..255, mean 111..131 ⇒ `trans_a ≈ 0.44..0.51`). It is NOT the group
+            // named `entry` (g3 — 13/13 INT, and portalled only to the cellar and the kitchen, so
+            // nothing enters the building through it). That misidentification is why this was
+            // measured as "13/13 INT, no TRANS" once before. g0 is what `interiorDebug 4` paints
+            // YELLOW-GREEN in the doorway, framed by the BLUE ext* porch and backed by GREEN INT.
+            //
+            // (1) At NIGHT the blend is already off (`day_w = trans_a · sun_w`, and
+            //     `sun_shadow_strength` is exactly 0 at and below the horizon — in Elwynn that is
+            //     from ~20:30 on, so it was 0 in BOTH of the user's 20:40 and after-dark
+            //     screenshots). What is left is the room lane, and no fixture reaches g0: all ten
+            //     MOLT fixtures are ≥ 13 yd away with their windows closed, and its only claim is a
+            //     faded portal hop, so the budget collapses to the bare `interiorAmbient` floor —
+            //     `1 − exp(−0.0075 × 4) = 0.0296 × tex`, i.e. black, against `0.73 × tex` for the
+            //     candle-lit floor a step away. A 25× step, which is the reported hard rectangle.
+            //     The FLOOR fixes that: a TRANS batch's reference value is `vc × ((1 − trans_a) +
+            //     trans_a · sky)`, so `vc × (1 − trans_a)` is what the reference renders it at under
+            //     a COMPLETELY BLACK SKY — its guaranteed minimum, the artist's own "the doorway is
+            //     the light" bake share, and the one term the live-fixture lane threw away with the
+            //     rest of the bake. Restoring it puts the band at `0.324 × tex`: dimmer than the lit
+            //     room (0.44×), brighter than an unlit corner, no rectangle.
+            // (2) In the dusk WINDOW where `sun_w` is between 0 and 1 (Elwynn ~19:19→20:30) the
+            //     blend runs toward a reference that is ALREADY DARKER than the room law — the
+            //     night sky under `nightGain` — so it actively subtracts light from exactly this
+            //     band: at `sun_w = 0.2` it drags `0.19` down to `0.14`. `max(room_rgb, rgb)`
+            //     forbids that: the mix now runs between the room result and the BRIGHTER of the
+            //     two, so it can add the sky's contribution and never take the room's away. This
+            //     also makes "the enclosed day floor must be on both sides" automatic — the floor
+            //     lives in `room_rgb`, and the result is now `>= room_rgb` by construction.
+            //
+            // SCOPE, by construction rather than by a new flag:
+            //   · INT batches — `day_w` is 0 and `class_trans` is false, so BOTH halves are exact
+            //     no-ops. That is the overwhelming majority of interior geometry, and dynamic
+            //     interiors keeps every bit of it.
+            //   · EXT-class batches of an interior group (the cellar stair the sun-scaled `day_w`
+            //     was introduced for) — the loader forces their MOCV alpha to 1.0, so their bake
+            //     share `1 − trans_a` is exactly 0; they keep the sun-gated blend and CANNOT get the
+            //     night sky back through the floor. The verified green-stair fix is untouched.
+            //   · DAYLIGHT — with the sun up the reference is the sun law and the room lane carries
+            //     `enclosed_day_floor`, so both are far above the bake share and `max` is a no-op:
+            //     the same fragment at noon computes 0.4476 before and 0.4476 after. At the very top
+            //     of the dusk ramp (sun_w still 1, the sky already warm-dim) the `max` can bite by
+            //     ~0.0003 — a 0.07 % brightening of a band that the next minute falls off a cliff,
+            //     which is the trade this whole comment is about.
+            let room_rgb = tex_rgb * illum;
+            // MONKEY (portal bleed): …and the floor is a RELATIVE lift now, not an absolute display
+            // value. The bake share below is `vc x (1 - trans_a)` — what the REFERENCE renders this
+            // fragment at under a black sky — and the room lane's whole premise is that the bake's
+            // LEVEL is wrong (it was authored for a different global exposure; the live fixtures
+            // decide). What survives that premise is the bake's RELATIVE statement: "this threshold
+            // is brighter than the room around it". So the floor is capped at
+            // `TRANS_NIGHT_FLOOR_LIFT x the room result` and carries the ROOM's own hue, which fixes
+            // the reported band in both of the ways it was wrong.
+            //
+            // MEASURED at the owner's live cvars (`interiorGain 0.5`, `interiorAmbient 0.015`,
+            // `interiorFill 0.08`, `interiorExposure 2.5`, `interiorAttenScale 1.6`,
+            // `interiorDaylight 0`) on the Lion's Pride Inn's vestibule `g0`, one yard inside p1,
+            // at night, with the portal bleed in:
+            //   room law here 0.0194 x tex; its INT neighbour g1 one yard the other side 0.0215.
+            //   UNCAPPED bake floor 0.324..0.357 (the three TRANS batches' mean MOCV) = **15-18x the
+            //   neighbour**, and neutral grey where the neighbour is candle-warm. That is the flat
+            //   grey band in the 20:50 and 23:59 screenshots, exactly: the floor had become the
+            //   brightest surface in the entrance and the only unwarm one.
+            //   CAPPED at 1.5x: 0.0291, i.e. 1.35x the neighbour, in the neighbour's own colour.
+            // The 25x black-hole step the floor was introduced against is gone for a different
+            // reason — the "candle-lit floor a step away" it was measured against (0.73 x tex) was
+            // an `interiorExposure 4` / `interiorGain 0.7` number, and at 2.5/0.5 that same floor
+            // renders 0.019. The floor's own justification evaporated with the cvars; what remains
+            // of its job is done by the bleed (absolute level) and by this cap (the doorway is a
+            // little brighter than its room), and neither can produce a 15x step at any cvar setting
+            // because one is bounded by the neighbour and the other by 1.5x the fragment's own room.
+            //
+            // 1.5 rather than 2: a threshold plainly reads as the brightest thing in an unlit
+            // vestibule at half again, and at low absolute levels a 2x step across a batch-class
+            // boundary starts to read as an edge rather than as a doorway. Where the bake share is
+            // small the `min` keeps taking it, so a nearly-opaque TRANS batch is unchanged, and an
+            // EXT-class batch of an interior group (`trans_a` forced to 1, bake share exactly 0)
+            // still gets nothing at all — the verified green-cellar-stair fix is untouched.
+            //
+            // BY DAY it is a no-op twice over, as before: at noon this fragment's room law is 0.276,
+            // the blend toward the sunlit reference takes it to 0.562, and the floor is
+            // `min(0.324, 1.5 x 0.276) = 0.324` — under the blend, so `max` keeps the blend.
+            let trans_floor_lift = 1.5;
+            let trans_night_floor = select(
+                vec3<f32>(0.0),
+                min(
+                    // `primary` with `lit_int_base := 0` — literally the reference's own expression
+                    // evaluated against a black sky, so the bake share can never exceed what the
+                    // reference renders, at any hour, and needs no tuning constant of its own.
+                    tex_rgb
+                        * clamp(
+                            vc.rgb * (1.0 - trans_a) + sidn_e,
+                            vec3<f32>(0.0),
+                            vec3<f32>(1.0),
+                        ),
+                    room_rgb * trans_floor_lift,
+                ),
+                class_trans,
+            // MONKEY (trans floor sun gate): x (1 - sun_w). The floor was meant as a NIGHT term and
+            // its comment above calls it a day no-op, but the evaluator that found the diagonal
+            // (MONKEY trans blend continuity) showed it is not: at noon `max(blend, floor)` flips to
+            // the floor from ~5.2 yd inside the vestibule door inward (0.3395 -> 0.3475, a
+            // non-monotone step), and the selector locus is a near-VERTICAL C1 break of ~0.12/yd
+            // running the full width of the floor about 1.5 yd inside p1 - the same class of line
+            // as the diagonal, parallel to the threshold. Gating it on `1 - sun_w` (the exact mirror
+            // of `day_w = trans_a * sun_w`) makes the day no-op true by construction: the floor is
+            // exactly 0 while the sun is up, ramps in over the same dusk clock the blend ramps out
+            // on, and is bit-identical at night (`sun_w = 0`). By day the bake floor
+            // (`interior_bake_floor`, inside the rolloff, not sun-gated) already carries a
+            // fixture-starved TRANS room, so nothing goes dark: the inner end of the vestibule at
+            // noon moves from 0.3475 to the room law (~0.33), a 5 % drop over its last yard.
+            ) * (1.0 - sun_w);
+            // MONKEY (trans blend continuity): `trans_smax` replaces the per-channel `max` here, and
+            // nothing else about this line moves - see the function for the three-locus scar it
+            // removes, the two laws it was measured against, and the night bit-identity.
+            rgb = max(mix(room_rgb, trans_smax(room_rgb, rgb), day_w), trans_night_floor);
             let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
             if (idbg == 2u) {
-                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz));
+                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz, n_lit));
             } else {
                 rgb = shadow_hook::interior_debug_override(idbg, rgb, in.world_position, n_lit);
             }
@@ -1367,7 +1904,7 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
             rgb = folded * (vec3<f32>(1.0) - exp(-room * wow_light.point_count.w));
             let idbg = u32(max(wow_light.wmo_fog_params.w - 1.0, 0.0) + 0.5);
             if (idbg == 2u) {
-                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz));
+                rgb = vec3<f32>(torch_debug_factor(in.world_position.xyz, n_lit));
             } else {
                 rgb = shadow_hook::interior_debug_override(idbg, rgb, in.world_position, n_lit);
             }

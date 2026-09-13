@@ -75,6 +75,10 @@ pub(crate) struct GxItemDraw {
     /// record table's bit 27 (see [`RECORD_EXT_NIGHT_BIT`]). False on cells, props and interior
     /// batches.
     pub ext_night: bool,
+    /// MONKEY (enclosed day floor): this is an INTERIOR-class WMO batch whose group sits inside a
+    /// building-scale shell — the record table's bit 28 (see [`RECORD_ENCLOSED_BIT`]). False on
+    /// cells, props, exterior batches, and every group of a dungeon (which authors no shell).
+    pub enclosed: bool,
 }
 
 /// One baked cell (or WMO region), published by the main-world flush.
@@ -187,6 +191,13 @@ const RECORD_ROOM_MASK: u32 = 0xfff;
 /// bits 15..=26, so 27 is the first free bit. **Keep in sync with `static_gx.wgsl`'s
 /// `RECORD_EXT_NIGHT`.**
 const RECORD_EXT_NIGHT_BIT: u32 = 1 << 27;
+
+/// MONKEY (enclosed day floor): record column `w`, bit 28 — this batch's group is an INTERIOR room
+/// inside a building-scale exterior shell, so by day `static_gx.wgsl` gives its room law a
+/// sun-driven ambient floor (the daylight a doorway lets in, for the doorways this renderer cannot
+/// locate). Bit 27 is the night law, so 28 is the first free bit; bits 29..=31 remain free.
+/// **Keep in sync with `static_gx.wgsl`'s `RECORD_ENCLOSED`.**
+const RECORD_ENCLOSED_BIT: u32 = 1 << 28;
 
 /// The room key for one baked item: `group + 1` for a WMO surface batch, and for a PROP batch whose
 /// referrer set names exactly one group (a prop in one room — the common case); 0 for a terrain
@@ -759,7 +770,11 @@ fn assemble_region(
                     // could carry a room key. An ungated region's ext-class group still must not
                     // read as night sky; its `interior_room_light` simply falls open, exactly as an
                     // ungated interior group's already does.
-                    | if item.ext_night { RECORD_EXT_NIGHT_BIT } else { 0 },
+                    | if item.ext_night { RECORD_EXT_NIGHT_BIT } else { 0 }
+                    // MONKEY (enclosed day floor): unconditional on `gated` for the same reason —
+                    // "is this group a room in a building" is a fact about the authored group
+                    // table, not about whether this region could carry a room key.
+                    | if item.enclosed { RECORD_ENCLOSED_BIT } else { 0 },
             ]
         })
         .collect();
@@ -1280,6 +1295,7 @@ mod tests {
             sidn: [0; 3],
             slot: 0,
             ext_night: false,
+            enclosed: false,
         }
     }
 

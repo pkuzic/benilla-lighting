@@ -56,17 +56,23 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_assets::coords::wow_to_bevy;
 use benilla_formats::ModelBlend;
 use benilla_world::billboard::BillboardCard;
-use benilla_world::interact::PickMesh;
+// MONKEY (torch owner exclusion): the placement identity an entity-lane caster part carries, and
+// the model-local bound the containment fallback is decided on.
+use benilla_world::interact::{PickMesh, WorldObject};
+use bevy::camera::primitives::Aabb;
 use benilla_world::lighting::{
-    interior_reach, m2_light_reach, DynamicInteriors, FireLightGain, LightLane, LightLitRooms,
-    LightReach, LightRooms, ShadowDistance, ShadowProxyLight, SyntheticFireLight, WowLighting,
+    interior_reach, m2_light_reach, DaylightFixture, DynamicInteriors, FireLightGain, LightLane,
+    LightLitRooms, LightReach, LightRooms, ShadowDistance, ShadowProxyLight, SyntheticFireLight,
+    WowLighting,
 };
 // MONKEY (carried light stability): the settle verdict a carried light earns by standing still.
 // MONKEY (outdoor torch shadows): …and the marker that says a light is CARRIED BY A BODY.
 use crate::entities::{CarriedLightMotion, HeldLight};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
-use benilla_world::static_gx::{StaticGx, TorchShadowViews};
+use benilla_world::static_gx::{
+    torch_flame_inside_bounds, LightOwner, StaticGx, TorchShadowViews,
+};
 use benilla_world::view::WorldCamera;
 
 use crate::char_select::ClientState;
@@ -158,16 +164,35 @@ const TORCH_STALE_DRIFT_SQ: f32 = 0.01;
 /// range: past [`TORCH_RANGE`] a fixture's whole shadow volume is outside the projection anyway,
 /// and the world fade in the shaders has already ended by then.
 const TORCH_EXT_ELIGIBLE_YD: f32 = TORCH_RANGE;
-/// MONKEY (outdoor torch shadows): EMITTER-OWNER EXCLUSION radius for an exterior slot (yd) — any
-/// retained item whose whole bounding sphere sits inside this of the flame is the fire's OWN body
-/// and is dropped from its caster gather (`StaticGx::append_torch_triangles`). Indoors this is 0
-/// (the interior gather is untouched): an authored MOLT fixture stands clear of its bracket, so
-/// nothing was ever wrong there. Outdoors the light sits INSIDE the campfire prop's opaque logs, and
-/// left in they are the nearest occluder on all six faces — the fire blacks out its own pool.
-/// 2.5 yd covers a campfire/brazier prop whole; a crate or fence post two yards away has its centre
-/// inside that but not its sphere, so it still casts (containment, not centre distance — see
-/// `torch_item_is_emitter`).
-const TORCH_EXT_SELF_EXCLUDE: f32 = 2.5;
+/// MONKEY (moving fixture): how many slots may be FULLY DYNAMIC in one frame — rebuilt from
+/// scratch (static geometry AND entities, into their live layers) because their fixture is
+/// physically moving. Shared with the render plan, which keeps a matching separate rebuild budget.
+const TORCH_MOVING_MAX: usize = TorchShadowViews::MAX_TORCH_MOVING;
+/// MONKEY (moving fixture): how long a fixture must hold still before it is treated as SETTLED and
+/// handed back to the cached path. Long enough to cover a walk cycle's pauses and a pet's
+/// stop-turn-start, short enough that a brazier dropped on the ground is cached within a second.
+const TORCH_MOVING_SETTLE: f64 = 0.75;
+/// MONKEY (moving fixture): how far (yd²) a fixture must shift between two frames to count as
+/// having MOVED at all. A hand-held flame on an idling NPC jitters by millimetres with the breathe
+/// animation; at 60 fps this threshold is ~1.2 yd/s, so an idle never registers and a walk always
+/// does. It is deliberately NOT [`TORCH_STALE_DRIFT_SQ`]: that one asks "is the cached map still
+/// valid" (a question about the map), this one asks "is the fixture in motion" (a question about
+/// the fixture), and a fixture creeping 0.09 yd a frame would answer the first "yes, forever".
+const TORCH_MOVING_EPS_SQ: f32 = 0.0004;
+/// MONKEY (moving fixture): the fade rate (weight per second) for a moving slot that could NOT get
+/// the moving budget — 0.15 s to nothing, five times the normal [`TORCH_FADE_RATE`]. The normal
+/// rate exists to keep a *correct* shadow on screen while it dissolves; this one is for a shadow
+/// that is already wrong (its map is frozen at a position the light has left), so the only good
+/// answer is to get rid of it faster than the eye tracks it, and the fade is there purely so it
+/// dissolves instead of blinking.
+const TORCH_MOVING_FADE_RATE: f32 = 1.0 / 0.15;
+/// MONKEY (torch owner exclusion): how far up the `ChildOf` chain a caster part is followed while
+/// asking "is this the host model of the light that is lighting me?" — the entity-lane half of the
+/// owner test ([`benilla_world::static_gx::LightOwner::Instance`]). A part's chain to its model
+/// frame is `part → (joint → …) → frame`, and a rig's joint chain is the deep part; 64 clears every
+/// shipped skeleton (it is `carried_light`'s own `ANCHOR_WALK_DEPTH`, for the same hierarchy) and
+/// the cap is there so a malformed cycle can never hang the frame.
+const OWNER_WALK_DEPTH: usize = 64;
 /// Each cube face's FOV: 90° plus a hair, so a direction exactly on a face border still lands
 /// inside the face the shader picks for it (the projector returns "lit" outside its frustum).
 const TORCH_FACE_FOV: f32 = std::f32::consts::FRAC_PI_2 + 0.02;
@@ -223,6 +248,29 @@ struct TorchSlot {
     /// exterior by where it physically stands ([`LightLane`]), and if that verdict ever flipped the
     /// fixture would leave `cands` and be cross-faded out like any other loss.
     exterior: bool,
+    /// MONKEY (torch owner exclusion): WHO this fixture is part of — the identity its caster
+    /// gathers drop out of its own map, so the lamp never shadows itself. `None` for a fixture
+    /// that carries no owner tag (an authored WMO MOLT fixture, which has no model at all, and any
+    /// light source predating the tag); those fall back to the containment rule alone.
+    owner: Option<LightOwner>,
+    /// MONKEY (torch owner exclusion): how many items the LAST rebuild of this slot dropped as its
+    /// own body — `WOW_TORCH_TRACE` only. Held on the slot rather than in a per-frame counter
+    /// because the gather is cached: the answer is "at the last rebuild", not "this frame".
+    trace_excluded: (u32, u32),
+    /// MONKEY (moving fixture): where the fixture stood LAST frame, and the last time it was seen
+    /// to move further than [`TORCH_MOVING_EPS_SQ`]. `still_since` starts "long ago" (0.0) so a
+    /// freshly promoted slot takes the ordinary cached path on its first frame and only becomes a
+    /// moving slot once it has actually been observed moving — a placed brazier or a standing NPC's
+    /// torch must never spend its first three quarters of a second on the moving budget.
+    last_pos: Vec3,
+    still_since: f64,
+    /// MONKEY (moving fixture): this slot holds one of the [`TORCH_MOVING_MAX`] live rebuild
+    /// budgets this frame — its caster mesh is regathered and its six faces re-rendered EVERY
+    /// frame, from the live fixture position, with the moving entities overlaid.
+    moving_live: bool,
+    /// MONKEY (moving fixture): …and this one is moving but did NOT get a budget, so it is being
+    /// dropped at [`TORCH_MOVING_FADE_RATE`] rather than kept as a stale map.
+    fast_fade: bool,
     /// The cross-fade weight, published as `positions[i].w` and applied as `mix(1, shadow, w)` by
     /// both receivers.
     w: f32,
@@ -230,6 +278,32 @@ struct TorchSlot {
     /// shrank). It keeps rendering while `w` ramps down, and the slot is freed for a challenger
     /// only when `w` reaches 0 — "fade, not switch".
     evicting: bool,
+}
+
+impl TorchSlot {
+    /// MONKEY (moving fixture): has the fixture left the position its cached map was baked from?
+    /// This is [`map_publishable`]'s complement with one extra condition — a slot that has NEVER
+    /// built is not "drifted", it is simply new, and belongs to the promotion path rather than to
+    /// the moving budget.
+    fn drifted(&self) -> bool {
+        self.built_at
+            .is_some_and(|p| p.distance_squared(self.pos) > TORCH_STALE_DRIFT_SQ)
+    }
+
+    /// MONKEY (moving fixture): is this fixture MOVING right now, i.e. does it need its whole cube
+    /// re-rendered this frame instead of its cached one republished?
+    ///
+    /// Two halves, and both are needed. WHO it is: an entity-hosted light ([`LightOwner::Instance`]
+    /// — `entities::carried_light`'s pet flames, NPC torches, GameObject braziers) is the only kind
+    /// that CAN move, and a fixture that has already drifted off its baked map is proof of motion
+    /// whoever owns it. WHETHER it is moving NOW: a placed campfire is `Instance`-owned and never
+    /// moves, so the owner alone would put every brazier in a village on the moving budget forever.
+    /// `still_since` is stamped by the per-frame motion test and the fixture is handed back to the
+    /// cache [`TORCH_MOVING_SETTLE`] after it stops.
+    fn moving(&self, now: f64) -> bool {
+        (matches!(self.owner, Some(LightOwner::Instance(_))) || self.drifted())
+            && now - self.still_since < TORCH_MOVING_SETTLE
+    }
 }
 
 /// MONKEY (static torch cache): stable physical slots and per-fixture source meshes.
@@ -288,9 +362,17 @@ struct PartCensus {
 /// with distance while its RANK by distance changes in steps.
 ///
 /// MONKEY (torch caster selection): one scored candidate — `(fixture, position, score, exterior,
-/// reach)`. Named because MONKEY (torch lane perf) added the trailing REACH lane, and a `(.., x)`
-/// pattern over a bare tuple would silently have re-bound to it.
-type Candidate = (Entity, Vec3, f32, bool, f32);
+/// reach, owner)`. Named because MONKEY (torch lane perf) added the trailing REACH lane, and a
+/// `(.., x)` pattern over a bare tuple would silently have re-bound to it. MONKEY (torch owner
+/// exclusion) added the OWNER lane for the same reason it rides the slot.
+type Candidate = (Entity, Vec3, f32, bool, f32, Option<LightOwner>);
+
+/// MONKEY (torch owner exclusion): one fixture in a caster gather — `(slot, position, admission
+/// radius, owner)`. The owner rides the gather because the exclusion is per FIXTURE, not per lane:
+/// the static gather runs for one slot at a time and is therefore exact, and the shared moving
+/// gather (one mesh for the whole dynamic set) excludes a part owned by ANY of its fixtures, which
+/// is the only thing one mesh can express.
+type GatherFixture = (usize, Vec3, f32, Option<LightOwner>);
 
 /// MONKEY (torch caster reach): retain the intensity and soft inverse-square core at the player's
 /// distance, but stretch the selection window to 4R (including eligibility slack). This is a
@@ -375,7 +457,7 @@ fn exterior_budget(want: usize) -> usize {
 /// fires, which is the same ranking rule the whole lane runs on.
 fn cap_exterior_candidates(cands: &mut Vec<Candidate>, cap: usize) {
     let mut seen = 0usize;
-    cands.retain(|(_, _, _, exterior, _)| {
+    cands.retain(|(_, _, _, exterior, ..)| {
         if !*exterior {
             return true;
         }
@@ -412,6 +494,21 @@ fn map_publishable(built_at: Option<Vec3>, pos: Vec3) -> bool {
     built_at.is_some_and(|p| p.distance_squared(pos) <= TORCH_STALE_DRIFT_SQ)
 }
 
+/// MONKEY (moving fixture): split this frame's scored movers into the [`TORCH_MOVING_MAX`] that get
+/// a live rebuild and the rest, which are dropped (fast-faded) rather than kept as frozen maps.
+///
+/// Ranked by the SAME contribution score the whole lane ranks by, so the budget goes to the mover
+/// whose shadow the player can actually see, and tied scores fall back to slot order so the answer
+/// is deterministic frame to frame — a budget that alternated between two equally-scored pets would
+/// fast-fade each of them in turn, which is the churn the whole selection machinery exists to avoid.
+fn moving_budget(mut movers: Vec<(usize, f32)>) -> (Vec<usize>, Vec<usize>) {
+    movers.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    (
+        movers.iter().take(TORCH_MOVING_MAX).map(|(i, _)| *i).collect(),
+        movers.iter().skip(TORCH_MOVING_MAX).map(|(i, _)| *i).collect(),
+    )
+}
+
 /// MONKEY (static torch cache): the nearest promoted fixtures to the player receive entities.
 /// Stable physical-slot tie breaking keeps coincident/equidistant candles deterministic; this
 /// subset is independent of contribution ranking and never moves the resident static maps.
@@ -437,8 +534,67 @@ fn entity_gather_radius(reach: f32) -> f32 {
 /// MONKEY (torch lane perf): is `origin` inside ANY of the gather's fixtures' own radii — the
 /// UNION that replaced "48 yd of every dynamic fixture". Split out as a pure function because it is
 /// the whole admission rule of the gather and the one part of it worth a test.
-fn within_any_reach(fixtures: &[(usize, Vec3, f32)], origin: Vec3) -> bool {
-    fixtures.iter().any(|(_, p, r)| p.distance_squared(origin) <= r * r)
+fn within_any_reach(fixtures: &[GatherFixture], origin: Vec3) -> bool {
+    fixtures.iter().any(|(_, p, r, _)| p.distance_squared(origin) <= r * r)
+}
+
+/// MONKEY (torch owner exclusion): is this entity-lane caster part the fixture's OWN body?
+///
+/// The entity half of `static_gx`'s `torch_item_is_emitter`, and deliberately the same two rules in
+/// the same order — a part must not cast or not cast depending on which lane happens to be drawing
+/// its placement that frame:
+///
+///  1. OWNERSHIP. A placed light names its placement by content ([`LightOwner::Placement`]), and
+///     the entity path's parts carry a CLONE of that identity, so a doodad still in its feather
+///     band (or one the retained lane never took) is excluded exactly as its retained twin is. A
+///     carried light names its host model FRAME instead ([`LightOwner::Instance`] — a GameObject
+///     brazier, an NPC's torch have no placement identity at all), and a part is its body iff it
+///     hangs under that frame.
+///  2. CONTAINMENT of the flame in the part's own bound, shared verbatim with the retained lane
+///     ([`torch_flame_inside_bounds`], including the fixture-size cap that stops a room-sized batch
+///     from claiming every candle in it).
+///
+/// Excluded if ANY fixture of the gather owns it: the moving gather feeds ONE mesh to up to eight
+/// fixtures, so per-fixture exclusion is not representable there. The cost is that a self-lit
+/// creature stops casting for the other fixtures of the same dynamic set — a shadow that is at
+/// worst missing, against a self-shadow artefact that is always visible.
+///
+/// **Rule 2 never applies to a CREATURE.** A body standing against a wall torch has that torch's
+/// flame inside its own bounding box perfectly often, and a player who walks up to a brazier and
+/// loses their shadow is a worse bug than the one this function exists to fix. A creature that
+/// really does carry its own light (an imp's hand fire, a fire elemental, a torch-bearing guard)
+/// is covered by rule 1 instead, which is exact — `entities::carried_light` tags every one of
+/// those lights with the frame it hangs under.
+fn part_is_own_body(
+    ents: &EntityCasters, fixtures: &[GatherFixture], entity: Entity, kind: ModelKind,
+    object: Option<&WorldObject>, global: Option<&GlobalTransform>, aabb: Option<&Aabb>,
+) -> bool {
+    let bound = (kind != ModelKind::Creature).then_some(()).and(global.zip(aabb));
+    fixtures.iter().any(|(_, pos, _, owner)| {
+        let owned = match owner.map(|o| (o, o.instance())) {
+            Some((_, Some(frame))) => hangs_under(ents, entity, frame),
+            Some((o, None)) => object.is_some_and(|obj| o.owns(obj)),
+            None => false,
+        };
+        owned
+            || bound.is_some_and(|(g, b)| {
+                torch_flame_inside_bounds(g.affine(), b.center.into(), b.half_extents.into(), *pos)
+            })
+    })
+}
+
+/// MONKEY (torch owner exclusion): is `entity` `frame`, or a descendant of it? See
+/// [`OWNER_WALK_DEPTH`] for the cap.
+fn hangs_under(ents: &EntityCasters, entity: Entity, frame: Entity) -> bool {
+    let mut at = entity;
+    for _ in 0..OWNER_WALK_DEPTH {
+        if at == frame {
+            return true;
+        }
+        let Ok(parent) = ents.parents.get(at) else { return false };
+        at = parent.parent();
+    }
+    false
 }
 
 /// MONKEY (torch lane perf): is a REGATHER of the moving-caster mesh due this frame?
@@ -470,9 +626,18 @@ struct EntityCasters<'w, 's> {
             Option<&'static RigPart>,
             &'static ShadowOccluder,
             Option<&'static MeshMaterial3d<WowModelMaterial>>,
+            // MONKEY (torch owner exclusion): the placement identity the entity lane carries (a
+            // CLONE of the retained lane's `Arc`, which is why the owner key compares by content),
+            // and the model-local bound the containment fallback needs. Both `Option`: a part that
+            // has neither is simply never excluded, which is the safe failure direction.
+            Option<&'static WorldObject>,
+            Option<&'static Aabb>,
         ),
         Without<BillboardCard>,
     >,
+    /// MONKEY (torch owner exclusion): the hierarchy walk for a CARRIED light's owner — a brazier
+    /// GameObject's light names its model frame, and its own meshes are that frame's descendants.
+    parents: Query<'w, 's, &'static ChildOf>,
     rigs: Query<'w, 's, &'static RigSkin>,
     palettes: Res<'w, RigPalettes>,
     distance: Res<'w, ShadowDistance>,
@@ -571,11 +736,20 @@ fn update_torch_shadows(
     // per-candidate on the INTERIOR arm below, so the interior candidate set is unchanged
     // member-for-member. `Has<LightLitRooms>` rides the tuple to reproduce the other half of the
     // retired `Or`, and `Has<HeldLight>` to refuse a body-carried torch an EXTERIOR slot.
+    // MONKEY (torch owner exclusion): `Option<&LightOwner>` — who this fixture is part of, written
+    // at the two light spawn sites (`terrain_stream::spawn`'s `tag_light_owner`,
+    // `entities::carried_light`). It rides the candidate and then the slot, because the caster
+    // gathers need it and they run far downstream of this query.
     torches: Query<
         (Entity, &GlobalTransform, &PointLight, Option<&LightReach>, Option<&LightLane>,
          Has<LightRooms>, Has<LightLitRooms>, Has<SyntheticFireLight>, Has<ChildOf>,
-         Has<HeldLight>, Option<&crate::entities::CarriedLightMotion>),
-        Without<ShadowProxyLight>,
+         Has<HeldLight>, Option<&crate::entities::CarriedLightMotion>, Option<&LightOwner>),
+        // MONKEY (daylight fixtures): a doorway's daylight source is NOT a caster candidate. It is
+        // an AREA source the width of the opening, standing in a hole in a wall — a point-cube
+        // shadow of it would be wrong in kind (hard radial wedges from a soft sky) — and being
+        // bright and close to the player the moment they walk in, it would outrank the room's real
+        // fixtures for the twelve cube slots and take their shadows away.
+        (Without<ShadowProxyLight>, Without<DaylightFixture>),
     >,
     // MONKEY (torch caster selection): `atten_scale` — a fixture's EFFECTIVE radius is its authored
     // end times this live cvar, and the score's window is a fraction of that radius. Reading the
@@ -631,6 +805,15 @@ fn update_torch_shadows(
     let want = (video.interior_shadow_casters as usize).clamp(1, MAX_TORCH_CASTERS);
     let dt = time.delta_secs();
     let now = time.elapsed_secs_f64();
+    // MONKEY (moving fixture): who held a live rebuild budget LAST frame. Read before the candidate
+    // closure because the closure needs it and `lane` is borrowed mutably from (1b) on; last
+    // frame's answer is the right one anyway — the point of the test is incumbency.
+    let live_held: Vec<Entity> = lane
+        .slots
+        .iter()
+        .filter(|s| s.moving_live)
+        .map(|s| s.fixture)
+        .collect();
 
     // (1a) MONKEY (torch caster reach): each pool is eligible from 4R + slack away. Rank with the
     // same soft core/intensity so nearby contributors still win over pools seen across the room.
@@ -638,25 +821,29 @@ fn update_torch_shadows(
     let mut cands: Vec<Candidate> = torches
         .iter()
         .filter_map(|(e, gt, pl, reach, light_lane, has_rooms, has_lit, synthetic, carried,
-                      held, motion)| {
+                      held, motion, owner)| {
             // MONKEY (carried light stability): a CARRIED light (`ChildOf` — a pet's hand flame,
-            // an NPC's torch, a transport's deck brazier) casts only while it is STANDING STILL.
+            // an NPC's torch, a transport's deck brazier) used to cast ONLY while standing still,
+            // because a cached cube is valid only while its fixture stays within
+            // `TORCH_STALE_DRIFT_SQ` of where it was baked ([`map_publishable`]) and a moving one
+            // toggled a full-strength shadow at frame rate.
             //
-            // This whole lane caches a depth cube per fixture and keeps it only while the fixture
-            // stays within `TORCH_STALE_DRIFT_SQ` of where it was baked ([`map_publishable`]); a
-            // slot whose map is withdrawn has its cross-fade weight forced to 0 with NO ramp
-            // (`static_gx::torch_depth`'s `TorchTable::pack`). A moving fixture therefore toggled
-            // a full-strength shadow at frame rate — the reported epileptic pool around a
-            // summoned imp — and consumed the lane's global two-rebuilds-a-frame budget re-baking
-            // a mesh that was stale again on arrival, so the STATIC candles beside it flickered too.
+            // MONKEY (moving fixture): that ban is lifted, because the lane can now RE-RENDER a
+            // moving fixture's whole cube every frame instead of republishing a frozen one (see
+            // [`TorchSlot::moving`]). What survives of the old rule is its arithmetic: only
+            // [`TORCH_MOVING_MAX`] fixtures can be afforded that way, so a moving carried light is
+            // admitted as a candidate only if it already HOLDS one of those budgets or one is free.
+            // Doing it here, at candidacy, rather than by promoting it and evicting it a moment
+            // later, is what stops a third walking pet from churning the slot machinery: it never
+            // enters `cands`, so nothing downstream has to fade it out and refill after it.
             //
-            // Gated on MOTION rather than excluded outright, because the stationary members of the
-            // same `ChildOf` family are exactly what the entity half of this lane was built for: a
-            // placed brazier GameObject, a campfire. They settle in well under a second and cast
-            // like a MOLT fixture. And because this is a CANDIDACY verdict, an incumbent that
-            // starts walking drops out of `cands` and is cross-faded out by (1b)/(1c) rather than
-            // cut — "fade, not switch" holds for the eviction as much as for a swap.
-            if carried && !motion.is_some_and(CarriedLightMotion::settled) {
+            // The stationary members of the same `ChildOf` family are untouched — a placed brazier
+            // GameObject or a campfire is `settled` and takes the ordinary cached path.
+            if carried
+                && !motion.is_some_and(CarriedLightMotion::settled)
+                && !live_held.contains(&e)
+                && live_held.len() >= TORCH_MOVING_MAX
+            {
                 return None;
             }
             let p = gt.translation();
@@ -702,7 +889,7 @@ fn update_torch_shadows(
                     candidate_score(lum, d, r, light_lane, has_rooms, synthetic, fire_gain.0);
                 // MONKEY (torch lane perf): `r` rides along — the moving-caster gather sizes its
                 // radius off the light that will be sampled, not off the cube's 48 yd far plane.
-                return (score > 0.0).then_some((e, p, score, false, r));
+                return (score > 0.0).then_some((e, p, score, false, r, owner.copied()));
             }
             // The EXTERIOR arm — a campfire, a brazier, a lamppost, a bonfire.
             if !exterior_on || held {
@@ -718,7 +905,7 @@ fn update_torch_shadows(
             let score = exterior_fixture_score(lum * gain, d);
             // MONKEY (torch lane perf): an exterior entry packs no reach and its receivers apply an
             // un-windowed falloff, so the cube's own range is the only honest gather radius here.
-            (score > 0.0).then_some((e, p, score, true, TORCH_RANGE))
+            (score > 0.0).then_some((e, p, score, true, TORCH_RANGE, owner.copied()))
         })
         .collect();
     cands.sort_by(|a, b| b.2.total_cmp(&a.2));
@@ -731,10 +918,14 @@ fn update_torch_shadows(
     // fades its extra shadows out instead of cutting them.
     for (i, slot) in lane.slots.iter_mut().enumerate() {
         match cands.iter().find(|(e, ..)| *e == slot.fixture) {
-            Some((_, p, sc, _, r)) => {
+            Some((_, p, sc, _, r, owner)) => {
                 slot.pos = *p;
                 slot.score = *sc;
                 slot.reach = *r;
+                // The owner tag can only ever LAND (it is written at spawn and never removed), so
+                // refreshing it here is what lets a fixture promoted on its very first frame pick
+                // it up rather than casting its own body's shadow until it is next re-promoted.
+                slot.owner = *owner;
             }
             None => {
                 slot.score = 0.0;
@@ -746,9 +937,49 @@ fn update_torch_shadows(
         }
     }
 
+    // (1b2) MONKEY (moving fixture): the motion test and the live-rebuild budget.
+    //
+    // The bug this answers: a carried light's slot kept publishing the cube it baked at `built_at`
+    // while the light pool followed the pet, so the imp walked around the Darkshire inn dragging a
+    // dark smear that belonged to where it had been. The eviction rule that produced it ("a drifted
+    // slot on its way out publishes from `built_at` and fades") is correct for a fixture that is
+    // LEAVING; it is simply the wrong rule for one that is merely walking, and the only right
+    // answer for that one is to re-render it.
+    //
+    // Ordering matters: this sits between the incumbent refresh (which wrote this frame's `pos` and
+    // `score`) and the weight ramp below (which needs to know who fades fast), so every slot's
+    // verdict is made from fresh positions and acted on in the same frame it is made.
+    for slot in lane.slots.iter_mut() {
+        if slot.pos.distance_squared(slot.last_pos) > TORCH_MOVING_EPS_SQ {
+            slot.still_since = now;
+        }
+        slot.last_pos = slot.pos;
+    }
+    let (live, dropped) = moving_budget(
+        lane.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.moving(now))
+            .map(|(i, s)| (i, s.score))
+            .collect(),
+    );
+    for (i, slot) in lane.slots.iter_mut().enumerate() {
+        slot.moving_live = live.contains(&i);
+        // A mover past the cap is withdrawn rather than kept: a frozen map on a fixture that is
+        // still walking is a shadow in the wrong place, which is worse than no shadow. It still
+        // FADES (over 0.15 s) rather than blinking, and it still publishes from `built_at` while it
+        // does, which is what the `evicting` flag buys it in the publish step below.
+        slot.fast_fade = dropped.contains(&i);
+        if slot.fast_fade {
+            slot.evicting = true;
+        }
+    }
+
     // (1c) Ramp the weights, then release the slots that finished fading out.
     let step = TORCH_FADE_RATE * dt;
     for slot in lane.slots.iter_mut() {
+        // MONKEY (moving fixture): a dropped mover leaves five times faster — see the const.
+        let step = if slot.fast_fade { TORCH_MOVING_FADE_RATE * dt } else { step };
         slot.w = if slot.evicting {
             (slot.w - step).max(0.0)
         } else {
@@ -769,7 +1000,7 @@ fn update_torch_shadows(
     // MONKEY (static torch cache): at most two new residents per frame, including startup.
     let mut promotions = 0;
     while lane.slots.len() < want && promotions < 2 {
-        let Some(&(e, p, sc, exterior, reach)) = cands
+        let Some(&(e, p, sc, exterior, reach, owner)) = cands
             .iter()
             .find(|(e, ..)| !lane.slots.iter().any(|s| s.fixture == *e))
         else {
@@ -789,6 +1020,15 @@ fn update_torch_shadows(
             reach,
             checked: None,
             exterior,
+            owner,
+            trace_excluded: (0, 0),
+            // MONKEY (moving fixture): born settled — `still_since` at 0 is "moved long ago", so
+            // the first frame takes the ordinary (queue-jumping) cached build and only an observed
+            // move promotes the slot onto the live budget.
+            last_pos: p,
+            still_since: 0.0,
+            moving_live: false,
+            fast_fade: false,
             w: 0.0,
             evicting: false,
         });
@@ -834,8 +1074,21 @@ fn update_torch_shadows(
     // removals and replacements even with a stationary camera. Entity-resident rigid furniture
     // joins the static mesh; creatures and skinned/animated parts belong to the dynamic overlay.
     let fixture_positions: Vec<_> = promoted.iter().map(|(i, _, p, ..)| (*i, *p)).collect();
-    let dynamic = dynamic_set(&fixture_positions, anchor, video.interior_shadow_dynamic as usize);
+    // MONKEY (moving fixture): a live slot is dynamic BY DEFINITION — the moving entities are half
+    // of what makes its map wrong when it is frozen (the pet's own body is usually excluded as its
+    // own owner, but everyone it walks past is not), and the overlay is where they are drawn. OR'd
+    // in rather than folded into `dynamic_set`'s nearest-N so the cvar keeps meaning exactly what
+    // it says; `torch_cache_plan` still clamps the union to the eight-cube live bank.
+    let moving_mask = lane
+        .slots
+        .iter()
+        .filter(|s| s.moving_live)
+        .fold(0u32, |mask, s| mask | (1 << s.cache_slot));
+    let dynamic = dynamic_set(&fixture_positions, anchor, video.interior_shadow_dynamic as usize)
+        | moving_mask;
     let mut rebuilt = 0;
+    // MONKEY (moving fixture): the live slots' own rebuild allowance, kept apart from `rebuilt`.
+    let mut moving_rebuilt = 0;
     let mut static_rebuilt = 0u32;
     // MONKEY (torch lane perf): how many fingerprint walks the gate actually let through this
     // frame, folded into the lane's per-second trace below (`lane` is mutably borrowed inside the
@@ -844,7 +1097,11 @@ fn update_torch_shadows(
     let mut published = TorchShadowViews {
         count: promoted.iter().map(|(i, ..)| *i as u32 + 1).max().unwrap_or(0),
         soft: video.interior_shadow_soft,
+        // MONKEY (shadow floor): the direct-term floor, packed beside `soft` in `count.y`.
+        strength: video.torch_shadow_strength,
         dynamic_mask: dynamic,
+        // MONKEY (moving fixture): the render plan's own budget follows the same set.
+        moving_mask,
         // MONKEY (outdoor torch shadows): the receivers' one-bit gate — the cvar, the sun AND an
         // actual exterior slot to sample. Keyed on the SLOTS rather than on `exterior_on` alone so
         // that a night with the cvar on but nothing promoted (no fires in range) costs the
@@ -882,10 +1139,39 @@ fn update_torch_shadows(
         .position(|s| s.checked.is_none())
         .unwrap_or_else(|| if slot_count == 0 { 0 } else { lane.rebuild_cursor % slot_count });
     let scan = slot_count.min(TORCH_SCAN_PER_FRAME);
+    // MONKEY (moving fixture): a live slot is scanned EVERY frame, in addition to (and ahead of)
+    // the cursor's window. It cannot wait its turn in a rotation that takes a dozen frames to come
+    // round: its fingerprint changes every frame by construction (`slot.pos` is hashed into it), so
+    // "wait for the cursor" and "publish a map baked somewhere else for twelve frames" are the same
+    // sentence. The two budgets stay separate below, so this never costs the resident slots their
+    // own rebuild.
+    let mut scanning: Vec<usize> = lane
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.moving_live)
+        .map(|(i, _)| i)
+        .collect();
     for offset in 0..scan {
         let index = (start + offset) % slot_count;
+        if !scanning.contains(&index) {
+            scanning.push(index);
+        }
+    }
+    for index in scanning {
         let slot = &mut lane.slots[index];
         let i = slot.cache_slot;
+        // MONKEY (moving fixture): this slot's verdict, read once — it picks the gather radius,
+        // the rebuild budget and whether the mesh asset is reused in place.
+        let moving = slot.moving_live;
+        // MONKEY (moving fixture): a moving fixture gathers static geometry inside its OWN reach
+        // rather than the cube's flat 48 yd. The receivers' direct term is exactly zero past
+        // `reach` (`interior_window`), so everything between the two radii could only ever shadow
+        // fragments this fixture does not light — for a cached slot that waste is paid once and
+        // does not matter, but this slot pays it EVERY frame, and an imp's flame reaches ~10 yd
+        // where the cube reaches 48 (a hundredth of the volume). Settled slots keep the full range
+        // verbatim, so no cached key or mesh changes meaning.
+        let range = if moving { entity_gather_radius(slot.reach) } else { TORCH_RANGE };
         // MONKEY (torch lane perf): the skip. The fixture's own position joins the census because
         // it is hashed INTO the fingerprint (a carried torch moves without the world changing),
         // and a slot is only ever stamped once its key is actually committed below — a rebuild
@@ -897,18 +1183,25 @@ fn update_torch_shadows(
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         slot.fixture.hash(&mut hash);
         slot.pos.to_array().map(f32::to_bits).hash(&mut hash);
-        // MONKEY (outdoor torch shadows): the exclusion radius is part of the ADMISSION, so it
-        // must be part of the FINGERPRINT — a key computed over a different source set than the
-        // mesh would certify the wrong geometry as current.
-        let self_exclude = if slot.exterior { TORCH_EXT_SELF_EXCLUDE } else { 0.0 };
+        // MONKEY (torch owner exclusion): the owner is part of the ADMISSION, so it is part of the
+        // FINGERPRINT by construction — a key computed over a different source set than the mesh
+        // would certify the wrong geometry as current. (It needs no separate hash lane: the owner
+        // is a function of `slot.fixture`, which is hashed above, and it never changes for a slot.)
+        let owner = slot.owner;
+        let gather = [(i, slot.pos, range, owner)];
         gx.as_ref()
-            .map(|gx| gx.torch_geometry_key(slot.pos, TORCH_RANGE, self_exclude))
+            .map(|gx| gx.torch_geometry_key(slot.pos, range, owner))
             .hash(&mut hash);
         let mut entity_key = 0u64;
-        for (entity, pick, part, global, rig, occluder, _) in &ents.parts {
+        for (entity, pick, part, global, rig, occluder, _, object, aabb) in &ents.parts {
             if !static_part(part, rig.is_some()) || !occluder.0 { continue; }
             let Some(global) = global else { continue };
-            if global.translation().distance_squared(slot.pos) > TORCH_RANGE * TORCH_RANGE { continue; }
+            if global.translation().distance_squared(slot.pos) > range * range { continue; }
+            // The same exclusion the gather below applies, or the key would certify a mesh that
+            // was never built from this set.
+            if part_is_own_body(&ents, &gather, entity, part.kind, object, Some(global), aabb) {
+                continue;
+            }
             // Arc identity catches geometry replacement, transform bits catch moved furniture.
             let mut part_hash = std::collections::hash_map::DefaultHasher::new();
             entity.hash(&mut part_hash);
@@ -922,22 +1215,47 @@ fn update_torch_shadows(
         if !dirty {
             slot.checked = Some((census.gx, census.parts, slot.pos));
         }
-        if dirty && rebuilt < 2 {
-            let mut positions = Vec::new();
-            let mut indices = Vec::new();
-            if let Some(gx) = &gx {
+        // MONKEY (moving fixture): two budgets, not one. A moving slot asks to rebuild every
+        // frame, so sharing the resident slots' two would let one walking pet freeze every static
+        // map in the room for as long as it walked.
+        let afford = if moving { moving_rebuilt < TORCH_MOVING_MAX } else { rebuilt < 2 };
+        if dirty && afford {
+            // MONKEY (moving fixture): recycle THIS slot's own buffers when it is live, so a
+            // fixture that rebuilds sixty times a second does not allocate two Vecs a frame.
+            let (mut positions, mut indices) = slot
+                .mesh
+                .as_ref()
+                .filter(|_| moving)
+                .and_then(|h| meshes.get_mut(h))
+                .map(take_mesh_buffers)
+                .unwrap_or_default();
+            let gx_excluded = gx.as_ref().map_or(0, |gx| {
                 gx.append_torch_triangles(
-                    slot.pos, TORCH_RANGE, self_exclude, &mut positions, &mut indices);
+                    slot.pos, range, owner, &mut positions, &mut indices)
+            });
+            let (_, part_excluded) =
+                collect_torch_entities(&ents, true, &gather, &mut positions, &mut indices);
+            slot.trace_excluded = (gx_excluded, part_excluded);
+            // MONKEY (moving fixture): a live slot MUTATES its mesh in place and keeps its asset
+            // id; only a settled rebuild takes a fresh one. Two reasons. A new `Mesh` asset every
+            // frame churns a vertex+index GPU allocation per frame per mover. And, worse, a brand
+            // new asset is not certified resident on the frame it is added — `torch_cache_plan`
+            // answers an unready mesh by clearing the slot's ready bit, which `TorchTable::pack`
+            // turns into a zero cross-fade weight: the shadow would blink off on exactly the frames
+            // the fixture is moving. With the id stable the mesh is always ready, and the render
+            // plan rebuilds a `moving_mask` slot unconditionally instead of on an id change.
+            match slot.mesh.as_ref().filter(|_| moving).and_then(|h| meshes.get_mut(h)) {
+                Some(mesh) => restore_mesh_buffers(mesh, positions, indices),
+                None => {
+                    let mut mesh = empty_shadow_mesh();
+                    restore_mesh_buffers(&mut mesh, positions, indices);
+                    if let Some(old) = slot.mesh.replace(meshes.add(mesh)) { meshes.remove(old.id()); }
+                }
             }
-            collect_torch_entities(
-                &ents, true, &[(i, slot.pos, TORCH_RANGE)], &mut positions, &mut indices);
-            let mut mesh = empty_shadow_mesh();
-            restore_mesh_buffers(&mut mesh, positions, indices);
-            if let Some(old) = slot.mesh.replace(meshes.add(mesh)) { meshes.remove(old.id()); }
             slot.geometry_key = Some(key);
             slot.built_at = Some(slot.pos);
             slot.checked = Some((census.gx, census.parts, slot.pos));
-            rebuilt += 1;
+            if moving { moving_rebuilt += 1 } else { rebuilt += 1 }
             static_rebuilt |= 1 << i;
         }
     }
@@ -984,12 +1302,12 @@ fn update_torch_shadows(
     // (`interior_window`), so a caster admitted beyond it could only ever shadow fragments this
     // fixture does not light — it was pure cost. A candle's ~12 yd pool is a twentieth of the
     // volume the 48 yd radius swept, and this gather CPU-SKINS every part it admits.
-    let dynamic_positions: Vec<(usize, Vec3, f32)> = lane
+    let dynamic_positions: Vec<GatherFixture> = lane
         .slots
         .iter()
         .take(MAX_TORCH_CASTERS)
         .filter(|s| dynamic & (1 << s.cache_slot) != 0)
-        .map(|s| (s.cache_slot, s.pos, entity_gather_radius(s.reach)))
+        .map(|s| (s.cache_slot, s.pos, entity_gather_radius(s.reach), s.owner))
         .collect();
     // MONKEY (torch lane perf): and only at `interiorShadowEntityRate` Hz. The gather + the
     // `Mesh` mutation it feeds (a full vertex/index re-extraction, a GPU re-upload and an
@@ -1001,7 +1319,15 @@ fn update_torch_shadows(
     if dynamic != 0 {
         let fresh = lane.entity_mesh.is_none();
         if fresh { lane.entity_mesh = Some(meshes.add(empty_shadow_mesh())); }
+        // MONKEY (moving fixture): a live slot overrides the cadence. `interiorShadowEntityRate`
+        // ages the POSE of the moving casters, which is invisible on a fixture that is standing
+        // still (the shadow is in the right place either way, a frame's stride out of date at
+        // worst). On a fixture that is itself walking it is not: the overlay is re-rendered from a
+        // NEW position every frame, so a mesh gathered two frames ago puts the room's other bodies
+        // in the wrong place relative to the light, which is the smear this change is about. The
+        // rate is untouched for the settled case, which is every other slot in the room.
         let due = fresh
+            || moving_mask != 0
             || entity_gather_due(
                 video.interior_shadow_entity_rate,
                 now - lane.entity_at,
@@ -1011,7 +1337,7 @@ fn update_torch_shadows(
         if due {
             if let Some(mesh) = lane.entity_mesh.as_ref().and_then(|h| meshes.get_mut(h)) {
                 let (mut positions, mut indices) = take_mesh_buffers(mesh);
-                lane.trace_parts = collect_torch_entities(
+                (lane.trace_parts, _) = collect_torch_entities(
                     &ents, false, &dynamic_positions, &mut positions, &mut indices);
                 restore_mesh_buffers(mesh, positions, indices);
             }
@@ -1022,7 +1348,7 @@ fn update_torch_shadows(
         published.entity_mesh = lane.entity_mesh.as_ref().map(Handle::id);
     }
     lane.trace_scans += lane_scans;
-    lane.trace_reach = dynamic_positions.iter().map(|(.., r)| *r).fold(0.0, f32::max);
+    lane.trace_reach = dynamic_positions.iter().map(|(_, _, r, _)| *r).fold(0.0, f32::max);
     *views = published;
 
     // `WOW_TORCH_TRACE=1` — once a second, what the lane published: fixture distances + whether a
@@ -1075,8 +1401,21 @@ fn update_torch_shadows(
             // MONKEY (torch caster reach): scientific scores expose the small distant tail;
             // distance is still from the player, and eligibility now extends to 4R + 3 yd.
             for (i, e, p, sc, w, ext) in &promoted {
+                // MONKEY (torch owner exclusion): `owner` + `own body` are the fix's own readout —
+                // "who this fixture belongs to" and "how many retained items / entity parts its
+                // LAST rebuild dropped as that owner's body". A fixture standing in its own black
+                // square with `own body 0/0` is a missing owner tag; one with a plausible count and
+                // a shadow still under it is a caster arriving by some third route.
+                let slot = lane.slots.iter().find(|s| s.cache_slot == *i);
+                let (gx_excl, part_excl) = slot.map_or((0, 0), |s| s.trace_excluded);
+                // MONKEY (moving fixture): `moving` is this feature's readout — `live` is a slot
+                // being re-rendered from scratch every frame, `dropped` one that is moving but past
+                // TORCH_MOVING_MAX and fast-fading out, `settled` the ordinary cached path. An imp
+                // whose shadow lags is a slot reading `settled` while it walks (then look at
+                // `still_since` / the owner tag); a room whose static shadows freeze is two slots
+                // stuck on `live`.
                 info!(
-                    "  slot {i}: lane {} {e} at [{:.1},{:.1},{:.1}] d(player) {:.1} score {:.4e} w {:.2} (camera <= shadowDistance AND player <= 4R+3) static {} dynamic {} requested_live_rank {:?}",
+                    "  slot {i}: lane {} {e} at [{:.1},{:.1},{:.1}] d(player) {:.1} score {:.4e} w {:.2} owner {:?} moving {} own body {gx_excl} gx + {part_excl} parts (camera <= shadowDistance AND player <= 4R+3) static {} dynamic {} requested_live_rank {:?}",
                     if *ext { "EXT" } else { "INT" },
                     p.x,
                     p.y,
@@ -1084,6 +1423,12 @@ fn update_torch_shadows(
                     p.distance(anchor),
                     sc,
                     w,
+                    slot.and_then(|s| s.owner),
+                    match slot {
+                        Some(s) if s.moving_live => "live",
+                        Some(s) if s.fast_fade => "dropped",
+                        _ => "settled",
+                    },
                     if static_rebuilt & (1 << i) != 0 { "rebuilt (GPU pending)" } else { "cached/requested" },
                     if dynamic & (1 << i) != 0 { "yes" } else { "no" },
                     (dynamic & (1 << i) != 0).then(|| TorchShadowViews::live_rank(dynamic, *i)),
@@ -1099,16 +1444,20 @@ fn static_part(part: &ModelPart, rigged: bool) -> bool {
     part.kind != ModelKind::Creature && !rigged && part.blend == ModelBlend::Opaque
 }
 
-/// MONKEY (torch lane perf): `fixtures` is `(slot, position, RADIUS)` — each fixture carries the
-/// radius it admits casters inside, instead of the whole gather sharing [`TORCH_RANGE`]. The static
-/// (cached) caller passes `TORCH_RANGE` and is therefore byte-for-byte the gather it always was;
+/// MONKEY (torch lane perf): `fixtures` is `(slot, position, RADIUS, owner)` — each fixture carries
+/// the radius it admits casters inside, instead of the whole gather sharing [`TORCH_RANGE`]. The
+/// static (cached) caller passes `TORCH_RANGE`, so its admission WINDOW is the one it always was;
 /// only the per-frame MOVING gather narrows, to `entity_gather_radius(reach)`.
+///
+/// MONKEY (torch owner exclusion): …and the owner, which drops the fixture's own body
+/// ([`part_is_own_body`]). Returns `(admitted, excluded-as-own-body)` — the second is trace only.
 fn collect_torch_entities(
-    ents: &EntityCasters, want_static: bool, fixtures: &[(usize, Vec3, f32)],
+    ents: &EntityCasters, want_static: bool, fixtures: &[GatherFixture],
     positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>,
-) -> u32 {
+) -> (u32, u32) {
     let mut admitted = 0;
-    for (_, pick, part, global, rig_part, occluder, _) in &ents.parts {
+    let mut excluded = 0;
+    for (entity, pick, part, global, rig_part, occluder, _, object, aabb) in &ents.parts {
         if !occluder.0 || static_part(part, rig_part.is_some()) != want_static { continue; }
         let solid = part.blend == ModelBlend::Opaque
             || (part.kind == ModelKind::Creature && part.blend == ModelBlend::AlphaTest);
@@ -1118,6 +1467,12 @@ fn collect_torch_entities(
             .or_else(|| rig.and_then(|r| ents.palettes.slot_origin(r.slot)));
         let Some(origin) = origin else { continue };
         if !within_any_reach(fixtures, origin) { continue; }
+        // After the cheap window, before the expensive CPU skin: this is the lamp's own housing,
+        // the brazier's own bowl, the lantern post the light hangs off.
+        if part_is_own_body(ents, fixtures, entity, part.kind, object, global, aabb) {
+            excluded += 1;
+            continue;
+        }
         let base = positions.len() as u32;
         if let Some(rig) = rig {
             let Some(palette) = ents.palettes.world_palette(rig.slot, rig.bones() as usize) else { continue };
@@ -1149,7 +1504,7 @@ fn collect_torch_entities(
         }
         admitted += 1;
     }
-    admitted
+    (admitted, excluded)
 }
 
 /// MONKEY (torch lane perf): the entity half of [`PartCensus`] — one branch-free mix per RIGID
@@ -1164,7 +1519,7 @@ fn collect_torch_entities(
 /// the column sampled — has no bearing on a shadow's silhouette to the precision this lane renders.
 fn static_part_census(ents: &EntityCasters) -> u64 {
     let mut census = 0u64;
-    for (entity, pick, part, global, rig, occluder, _) in &ents.parts {
+    for (entity, pick, part, global, rig, occluder, ..) in &ents.parts {
         if !occluder.0 || !static_part(part, rig.is_some()) { continue; }
         let Some(global) = global else { continue };
         let a = global.affine();
@@ -1322,14 +1677,15 @@ mod tests {
         assert_eq!(exterior_budget(1), 1, "the smallest budget still gets one outdoor shadow");
         let mut cands: Vec<Candidate> = (0..8)
             .map(|i| {
-                (Entity::from_raw_u32(i).unwrap(), Vec3::ZERO, 8.0 - i as f32, i % 2 == 0, 10.0)
+                (Entity::from_raw_u32(i).unwrap(), Vec3::ZERO, 8.0 - i as f32, i % 2 == 0, 10.0,
+                 None)
             })
             .collect();
         cap_exterior_candidates(&mut cands, 2);
         // Identified by score, which is also their rank: 8,7,6,5,4,3,2,1 with the even ranks
         // exterior. Capped at two, ranks 8 and 6 (the best two fires) survive; 4 and 2 do not.
         let kept: Vec<(u32, bool)> =
-            cands.iter().map(|(_, _, sc, x, _)| (*sc as u32, *x)).collect();
+            cands.iter().map(|(_, _, sc, x, ..)| (*sc as u32, *x)).collect();
         assert_eq!(
             kept,
             vec![(8, true), (7, false), (6, true), (5, false), (3, false), (1, false)],
@@ -1337,7 +1693,7 @@ mod tests {
         );
         // A cap of zero is a lane switched off, and it takes nothing else with it.
         let mut all_ext: Vec<Candidate> =
-            vec![(Entity::from_raw_u32(0).unwrap(), Vec3::ZERO, 1.0, true, 10.0)];
+            vec![(Entity::from_raw_u32(0).unwrap(), Vec3::ZERO, 1.0, true, 10.0, None)];
         cap_exterior_candidates(&mut all_ext, 0);
         assert!(all_ext.is_empty());
     }
@@ -1365,7 +1721,7 @@ mod tests {
     fn the_gather_admits_the_union_of_the_fixture_reaches() {
         let candle = entity_gather_radius(8.0);
         let hearth = entity_gather_radius(30.0);
-        let set = [(0usize, Vec3::ZERO, candle), (1usize, Vec3::X * 60.0, hearth)];
+        let set = [(0usize, Vec3::ZERO, candle, None), (1usize, Vec3::X * 60.0, hearth, None)];
         assert!(within_any_reach(&set, Vec3::X * 5.0), "inside the candle");
         assert!(within_any_reach(&set, Vec3::X * 40.0), "inside the hearth, not the candle");
         assert!(!within_any_reach(&set, Vec3::X * 20.0), "between the two, lit by neither");
@@ -1378,6 +1734,71 @@ mod tests {
     // changed dynamic set always overrides the clock (the mesh is only valid for the fixtures it
     // was gathered around), and the tolerance stops a 30 Hz cadence from beating against a 60 fps
     // frame into an alternating 1/3-frame stutter.
+    // MONKEY (moving fixture): a slot for the motion tests — everything but the four fields the
+    // verdict reads is inert.
+    fn moving_slot(owner: Option<LightOwner>, built_at: Vec3, pos: Vec3, still_since: f64) -> TorchSlot {
+        TorchSlot {
+            cache_slot: 0,
+            mesh: None,
+            geometry_key: None,
+            built_at: Some(built_at),
+            fixture: Entity::PLACEHOLDER,
+            pos,
+            score: 1.0,
+            reach: 10.0,
+            checked: None,
+            exterior: false,
+            owner,
+            trace_excluded: (0, 0),
+            last_pos: pos,
+            still_since,
+            moving_live: false,
+            fast_fade: false,
+            w: 1.0,
+            evicting: false,
+        }
+    }
+
+    // MONKEY (moving fixture): WHO may be re-rendered every frame, and for HOW LONG after it stops.
+    #[test]
+    fn a_fixture_is_moving_only_while_it_is_actually_moving() {
+        let pet = Some(LightOwner::Instance(Entity::PLACEHOLDER));
+        let wall = Some(LightOwner::Placement { kind: ModelKind::Wmo, id: 7, label: 0 });
+        let now = 100.0;
+        // A pet's flame that moved this frame: live.
+        assert!(moving_slot(pet, Vec3::ZERO, Vec3::ZERO, now).moving(now));
+        // …still live a moment later (a walk cycle pauses; the map must not thrash back and forth).
+        assert!(moving_slot(pet, Vec3::ZERO, Vec3::ZERO, now - 0.5).moving(now));
+        // …and settled once it has held still past the threshold — back on the cached path.
+        assert!(!moving_slot(pet, Vec3::ZERO, Vec3::ZERO, now - 1.0).moving(now));
+        // A placed brazier that has never moved is never live, however recently it was promoted.
+        assert!(!moving_slot(wall, Vec3::ZERO, Vec3::ZERO, now).moving(now));
+        // …unless it has physically drifted off its own baked map, which IS proof of motion:
+        // exactly TORCH_STALE_DRIFT_SQ (0.1 yd) worth, the same threshold `map_publishable` uses.
+        assert!(!moving_slot(wall, Vec3::ZERO, Vec3::X * 0.09, now).moving(now));
+        assert!(moving_slot(wall, Vec3::ZERO, Vec3::X * 0.2, now).moving(now));
+        // A slot with no map yet is NEW, not drifted — it belongs to the promotion path.
+        let mut fresh = moving_slot(wall, Vec3::ZERO, Vec3::splat(50.0), now);
+        fresh.built_at = None;
+        assert!(!fresh.drifted());
+        assert!(!fresh.moving(now));
+    }
+
+    // MONKEY (moving fixture): the budget is by contribution, capped, and deterministic.
+    #[test]
+    fn the_moving_budget_keeps_the_best_two_and_drops_the_rest() {
+        assert_eq!(moving_budget(vec![]), (vec![], vec![]));
+        assert_eq!(moving_budget(vec![(3, 0.5)]), (vec![3], vec![]));
+        let (live, dropped) = moving_budget(vec![(0, 0.1), (1, 9.0), (2, 4.0), (3, 0.2)]);
+        assert_eq!(live, vec![1, 2]);
+        assert_eq!(dropped, vec![3, 0]);
+        // Equal scores resolve by slot order, both ways round, so the set cannot alternate.
+        let tied = vec![(5, 1.0), (2, 1.0), (9, 1.0)];
+        assert_eq!(moving_budget(tied.clone()).0, vec![2, 5]);
+        assert_eq!(moving_budget(tied.into_iter().rev().collect()).0, vec![2, 5]);
+        assert_eq!(TORCH_MOVING_MAX, 2, "the cap the render plan budgets for");
+    }
+
     #[test]
     fn the_entity_gather_cadence_is_a_rate_not_a_gate() {
         assert!(entity_gather_due(0, 0.0, 1, 1), "rate 0 = every frame");

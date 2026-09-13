@@ -50,6 +50,11 @@ use bevy::render::{Render, RenderApp, RenderStartup, RenderSystems};
 use bytemuck::Zeroable;
 
 use super::render::StaticGxView;
+// MONKEY (torch owner exclusion): the placement identity both caster lanes carry, and the
+// subsystem tag that keeps a building's own batches apart from the props standing in it.
+use crate::interact::WorldObject;
+use crate::model_render::ModelKind;
+use bevy::math::Affine3A;
 use benilla_assets::materials::TorchBinds;
 
 /// MONKEY (live bank rank): each 512-square Depth32 face is 1 MiB. Sixteen static cubes plus
@@ -57,6 +62,14 @@ use benilla_assets::materials::TorchBinds;
 const TORCH_MAP_EDGE: u32 = 512;
 pub(crate) const MAX_TORCH_MAPS: usize = 16;
 const MAX_TORCH_DYNAMIC: usize = 8;
+/// MONKEY (moving fixture): how many slots may be FULLY DYNAMIC in one frame - re-rendered from
+/// scratch (static geometry AND entities) because their fixture is physically moving. Two, because
+/// each one costs a whole cached slot's work every frame: the CPU gather that the static cache
+/// exists to amortise, plus the render-world depth rebuild. The app lane picks the two by score and
+/// fast-fades the rest ([`benilla_app::torch_shadow`]); the same number bounds the rebuild budget
+/// in [`torch_cache_plan`], so a moving fixture can never starve a resident room's static maps of
+/// their own (separate) two.
+pub(crate) const TORCH_MOVING_MAX: usize = 2;
 pub(crate) const CUBE_FACES: usize = 6;
 /// MONKEY (live bank rank): matrix count stays 96, independent of texture capacity. Static
 /// layers 0..96 stay slot-addressed; live layers 96..144 follow ascending dynamic-mask rank.
@@ -69,6 +82,112 @@ pub(crate) const TORCH_TABLE_BYTES: u64 = 6416;
 /// MONKEY (outdoor torch shadows): `count.w` bit 0 — the exterior receiver lane's live gate. Keep
 /// in sync with `TORCH_EXT_LANE` in BOTH `static_gx.wgsl` and `wow_model.wgsl`.
 const TORCH_EXT_LANE: u32 = 1;
+
+/// MONKEY (torch owner exclusion): WHO a light belongs to — the identity a caster gather uses to
+/// drop a fixture's OWN body out of the fixture's OWN shadow map.
+///
+/// The bug this answers. A synthetic fire light is placed AT THE FLAME, and a flame is *inside* the
+/// thing that burns it: inside a lantern's glass housing, inside a campfire's ring of logs, at the
+/// head of a wall torch. Nothing in this lane knew the two belonged together — the light is an ECS
+/// entity, the mesh is either a retained [`super::GxItem`] or a model-part entity, and the
+/// placement that spawned both is not carried on either side — so the fixture was the nearest
+/// occluder on all six of its cube faces and blacked out its own pool. That is the moving bright
+/// WEDGE on the ground under the inn's swinging lantern (the housing shadowing every direction but
+/// one gap), the BLACK SQUARE under the wall torch by the crate, and the dark blotches under the
+/// faire torches.
+///
+/// The first attempt approximated ownership by PROXIMITY (the retired `TORCH_EXT_SELF_EXCLUDE`:
+/// drop an item whose whole bounding sphere lies within 2.5 yd of the flame). That covers a
+/// campfire — a prop that is a ball around its own flame — and essentially nothing else: a lantern
+/// hanging off a 4-yd post, or a torch on a tall bracket, has bounds that run all the way to the
+/// ground and is never "wholly within 2.5 yd" of anything. So ownership is carried EXPLICITLY here,
+/// and proximity is demoted to a bounded fallback ([`torch_bound_contains`]).
+///
+/// Two shapes, because lights reach the world by two routes:
+///  * [`Self::Placement`] — a placed ADT doodad's or WMO prop's own M2 light
+///    (`terrain_stream::spawn`'s `spawn_lights_for`). The key is the placement's
+///    [`WorldObject`] identity, because that is the one identity BOTH caster lanes already carry:
+///    the retained `GxItem` holds it as an `Arc`, and the entity path's parts hold a CLONE of it.
+///    Compared by CONTENT (kind + placement uniqueId + label hash) for exactly that reason — an
+///    `Arc` pointer would match the retained half and never the entity half.
+///  * [`Self::Instance`] — an entity-hosted light (`entities::carried_light`): a GameObject
+///    brazier, a placed campfire, an NPC's torch. Those hang under the host model's FRAME entity,
+///    which no `WorldObject` is available at, so the frame IS the identity and a caster part is
+///    "mine" iff it is a descendant of it.
+///
+/// Deliberately NOT written onto a WMO's authored MOLT fixtures. A MOLT light has no model of its
+/// own, and its placement identity is the BUILDING's — tagging it would exclude every wall, floor
+/// and pillar of the building from its own torch's map, i.e. delete the interior shadow lane.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LightOwner {
+    Placement {
+        kind: ModelKind,
+        /// The placement uniqueId (`WorldObject::id`).
+        id: u32,
+        /// A hash of the model path, so two identical lanterns in one building are told apart from
+        /// its barrels and its chairs (WMO props all share their BUILDING's uniqueId).
+        label: u64,
+    },
+    Instance(Entity),
+}
+
+impl LightOwner {
+    /// The placement key of `object` — the value both caster lanes are compared against.
+    pub fn placement(object: &WorldObject) -> Self {
+        Self::Placement {
+            kind: object.kind,
+            id: object.id,
+            label: label_hash(&object.label),
+        }
+    }
+
+    /// Does this owner name `object`? The two SCALAR lanes are tested first and the label hash only
+    /// if they both match: this runs per candidate item inside a 48-yd gather, and hashing a model
+    /// path for every barrel in a city would be real cost for an answer that is almost always "no".
+    pub fn owns(&self, object: &WorldObject) -> bool {
+        match *self {
+            Self::Placement { kind, id, label } => {
+                id == object.id && kind == object.kind && label == label_hash(&object.label)
+            }
+            Self::Instance(_) => false,
+        }
+    }
+
+    /// The host model frame, for the entity lane's ancestry test — `None` for a placed light.
+    pub fn instance(&self) -> Option<Entity> {
+        match *self {
+            Self::Instance(e) => Some(e),
+            Self::Placement { .. } => None,
+        }
+    }
+}
+
+fn label_hash(label: &str) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    label.hash(&mut hash);
+    hash.finish()
+}
+
+/// MONKEY (torch owner exclusion): how far OUTSIDE its own bounds a flame may sit and still count
+/// as being inside the fixture (yd). A synthesised light is positioned from the model's flame
+/// EMITTER, which routinely sits a finger's width proud of the housing it burns in; 0.3 yd closes
+/// that gap without reaching anything the fixture merely stands next to.
+const TORCH_SELF_PAD: f32 = 0.3;
+/// MONKEY (torch owner exclusion): the containment fallback applies only to FIXTURE-SIZED items —
+/// this is the cap on the transformed bounding-sphere radius (yd).
+///
+/// Unbounded containment would be a disaster, and specifically on the lane that works today: a WMO
+/// group's wall batch is a ROOM-sized box, it trivially "contains" every candle in the room, and
+/// excluding it would delete that room's shadows and leak the candle straight through its walls.
+/// 6 yd covers a tall lamp post, a gallows-arm lantern bracket and a bonfire whole, and is an order
+/// of magnitude under any wall, floor, building or terrain batch.
+const TORCH_SELF_MAX_EXTENT: f32 = 6.0;
+/// MONKEY (torch owner exclusion): the last resort, for items whose bounds are DEGENERATE (a candle
+/// flame card, a zero-extent helper) where containment cannot decide anything. An item whose WHOLE
+/// bounding sphere lies inside this of the flame is the flame's own body by construction. This is
+/// the surviving half of the retired `TORCH_EXT_SELF_EXCLUDE`, shrunk from 2.5 yd to 0.6 so that it
+/// can no longer swallow the crate, fence post or barrel standing beside the fire.
+const TORCH_SELF_TINY: f32 = 0.6;
 
 /// **The app→render publication** (`benilla_app::torch_shadow` writes it each frame, extracted here):
 /// the promoted fixtures' cube-face matrices, world positions and static mesh revisions.
@@ -84,6 +203,19 @@ pub struct TorchShadowViews {
     /// 0.5..3). Carried here rather than in `DynamicInteriors` because it belongs to the shadow
     /// table's own bytes — [`TorchTableUniform::pack`] puts it in the otherwise-padding `count.y`.
     pub soft: f32,
+    /// MONKEY (shadow floor): the live torch SHADOW STRENGTH (`torchShadowStrength`, 0..1, default
+    /// 0.7) - how much of the direct term a fully shadowed fragment loses. It rides the same
+    /// `count.y` word as [`Self::soft`] (high half; see [`TorchTableUniform::pack`]) and the
+    /// receivers fold it into the slot's cross-fade weight, so a shadow darkens the direct arm to
+    /// 30 % instead of to nothing. The fill/ambient arms never saw this factor and are untouched.
+    pub strength: f32,
+    /// MONKEY (moving fixture): which slots are MOVING this frame - a carried/unit-hosted fixture
+    /// or one that has drifted off the position its cached map was baked at. They get their own
+    /// rebuild budget in [`torch_cache_plan`] ([`TORCH_MOVING_MAX`]) ahead of the resident slots,
+    /// because a moving fixture's map is WRONG (not merely stale) the moment it is deferred: the
+    /// projections republish from the live position every frame while the depth still holds the
+    /// old one, which is the smeared, lagging pool the imp dragged across the inn floor.
+    pub moving_mask: u32,
     /// MONKEY (outdoor torch shadows): does the EXTERIOR receiver lane run this frame? The app lane
     /// sets it when `exteriorShadows` is on, the sun is below the daylight threshold, AND at least
     /// one promoted slot is an exterior fixture. It rides to the receivers in the table's
@@ -111,6 +243,9 @@ pub struct TorchShadowViews {
 impl TorchShadowViews {
     /// MONKEY (live bank rank): expose the allocation cap through the existing app resource.
     pub const MAX_TORCH_DYNAMIC: usize = MAX_TORCH_DYNAMIC;
+    /// MONKEY (moving fixture): ONE definition of the moving budget, shared by the app lane that
+    /// picks the slots and the render plan that rebuilds them.
+    pub const MAX_TORCH_MOVING: usize = TORCH_MOVING_MAX;
 
     /// MONKEY (live bank rank): WGSL countOneBits(mask & ((1u << slot) - 1u)). Use the
     /// FINAL ready-filtered mask for rendering; app traces describe only requested ranks.
@@ -130,6 +265,10 @@ impl Default for TorchShadowViews {
             dynamic_mask: 0,
             ready_mask: 0,
             soft: 1.0,
+            // MONKEY (shadow floor): 1.0 = the pre-feature pitch-black shadow, so a views value
+            // that never went through the cvar cannot silently lighten the world.
+            strength: 1.0,
+            moving_mask: 0,
             exterior: false,
             positions: [Vec4::ZERO; MAX_TORCH_MAPS],
             view_projs: [Mat4::ZERO; MAX_TORCH_LAYERS],
@@ -235,7 +374,7 @@ pub fn new_torch_shared(
 }
 
 /// MONKEY (static torch cache): byte-identical std140/std430 table in BOTH receiver shaders.
-/// count@0: live high-water mark, soft*100, dynamic mask, lane flags (16 bytes).
+/// count@0: live high-water mark, (strength*100 << 16 | soft*100), dynamic mask, lane flags (16 B).
 /// positions[16]@16: world xyz + fade weight (256 bytes).
 /// view_projs[96]@272: six static-bank face matrices per physical slot (6144 bytes).
 /// Total 6416. Unready/hole slots have zero weight; no stale owner's depth can be sampled.
@@ -246,7 +385,13 @@ pub(crate) struct TorchTableUniform {
     /// MONKEY (torch caster selection): `soft x 100` — the PCF tap-radius scale, riding the first
     /// of the three padding words the `vec4<u32>` alignment already forced us to carry. The
     /// alternative was a whole new 16-byte row for one dial.
-    soft_x100: u32,
+    ///
+    /// MONKEY (shadow floor): and now `strength x 100` in its HIGH 16 bits, for the same reason
+    /// one level down — the word was carrying one dial in a range (1..300) that needs nine bits,
+    /// and growing the table by a row costs 16 bytes in a struct whose SIZE is the contract with
+    /// three shaders (a mismatch hides every building). Low half `soft`, high half `strength`;
+    /// both receivers mask/shift rather than reading the word whole.
+    soft_strength: u32,
     dynamic_mask: u32,
     /// MONKEY (outdoor torch shadows): lane flags, the word that was reserved padding.
     /// Bit 0 ([`TORCH_EXT_LANE`]) = the EXTERIOR receiver lane is live this frame. Both WGSL
@@ -273,7 +418,14 @@ impl TorchTableUniform {
         // MONKEY (torch caster selection): 0 would mean a zero tap radius (four identical taps =
         // a hard edge), so a table published without a scale reads as the neutral 1.0.
         let soft = if views.soft > 0.01 { views.soft } else { 1.0 };
-        table.soft_x100 = (soft * 100.0).round().max(1.0) as u32;
+        // MONKEY (shadow floor): the cvar is clamped 0..1 on the way in, so the pack only has to
+        // keep the two halves from colliding - `soft` is capped at 3.0 (300, nine bits) by its own
+        // cvar clamp and belt-and-braces here, and `strength` cannot exceed 100. A strength of 0 is
+        // MEANINGFUL (shadows off) and must survive the pack, which is why it gets no `max(1)`.
+        let soft_pct = ((soft * 100.0).round() as i64).clamp(1, 0xffff) as u32;
+        let strength_pct = ((views.strength.clamp(0.0, 1.0) * 100.0).round() as i64)
+            .clamp(0, 100) as u32;
+        table.soft_strength = (strength_pct << 16) | soft_pct;
         // MONKEY (outdoor torch shadows): the exterior receiver lane's live gate. Packed even when
         // `count` is 0 costs nothing and is simpler to reason about than a conditional flag.
         table.flags = if views.exterior { TORCH_EXT_LANE } else { 0 };
@@ -535,7 +687,8 @@ fn prepare_torch_depth(
         return;
     }
     let cached = cache.0.lock().unwrap();
-    let (ready_mask, rebuild_mask, dynamic_mask) = torch_cache_plan(&*cached, &views.caster_meshes[..count], views.dynamic_mask,
+    let (ready_mask, rebuild_mask, dynamic_mask) = torch_cache_plan(
+        &*cached, &views.caster_meshes[..count], views.dynamic_mask, views.moving_mask,
         |id| torch_mesh_ready(id, &meshes, &allocator));
     views.ready_mask = ready_mask;
     views.dynamic_mask = dynamic_mask;
@@ -632,8 +785,12 @@ impl ViewNode for TorchDepthNode {
         if trace_due { *last_trace = Some(std::time::Instant::now()); }
         for slot in 0..count / CUBE_FACES {
             if views.ready_mask & (1 << slot) == 0 { continue; }
+            // MONKEY (moving fixture): same reasoning as `torch_cache_plan` — a live slot's mesh
+            // id is stable by design, so the id comparison would veto every rebuild the plan just
+            // granted it and freeze the map at the fixture's first position.
+            let moving = views.moving_mask & (1 << slot) != 0;
             let rebuild = draw.rebuild_mask & (1 << slot) != 0
-                && cached[slot] != views.caster_meshes[slot];
+                && (moving || cached[slot] != views.caster_meshes[slot]);
             let dynamic = views.dynamic_mask & (1 << slot) != 0;
             let live_rank = dynamic.then(|| TorchShadowViews::live_rank(views.dynamic_mask, slot));
             // MONKEY (static torch cache): render static once, then copy to the disjoint live
@@ -753,14 +910,34 @@ pub(super) fn build(app: &mut App) {
 
 // MONKEY (static torch cache): planning does not commit residency. A missing upload cannot
 // certify an empty map, and the two-rebuild budget also covers GPU texture recreation.
+//
+// MONKEY (moving fixture): `moving_mask`'s slots draw from a SEPARATE budget of
+// [`TORCH_MOVING_MAX`], and they draw from it first. Two reasons it cannot be one shared budget:
+// a moving slot asks for a rebuild EVERY frame (its mesh id changes every frame by construction),
+// so sharing would let two moving fixtures own the budget forever and freeze every resident room's
+// static map at whatever it last held; and a deferred moving rebuild is not a stale map but a
+// wrong one — the table republishes its six projections from the live fixture position each frame
+// while the depth still holds the old one, i.e. a shadow drawn from where the light no longer is.
 fn torch_cache_plan<T: Copy + Eq>(cached: &[Option<T>], requested: &[Option<T>], dynamic_mask: u32,
-    mut mesh_ready: impl FnMut(T) -> bool) -> (u32, u32, u32) {
+    moving_mask: u32, mut mesh_ready: impl FnMut(T) -> bool) -> (u32, u32, u32) {
     let (mut ready, mut rebuild) = (0u32, 0u32);
+    let mut budget = 2usize;
+    let mut moving_budget = TORCH_MOVING_MAX;
     for (i, requested) in requested.iter().take(MAX_TORCH_MAPS).enumerate() {
         let Some(id) = *requested else { continue };
-        if cached[i] == Some(id) {
+        let moving = moving_mask & (1 << i) != 0;
+        // MONKEY (moving fixture): a live slot MUTATES its caster mesh in place and keeps its asset
+        // id (an asset added this frame would not be certified resident until the next one, and the
+        // slot would lose its ready bit — a zero weight — on every frame its fixture moved). So the
+        // usual "same id ⇒ the cached depth is still good" shortcut is exactly wrong here: the id
+        // is the same and the CONTENTS are a frame old. A live slot always takes the rebuild path.
+        if !moving && cached[i] == Some(id) {
             ready |= 1 << i;
-        } else if rebuild.count_ones() < 2 && mesh_ready(id) {
+            continue;
+        }
+        let lane = if moving { &mut moving_budget } else { &mut budget };
+        if *lane > 0 && mesh_ready(id) {
+            *lane -= 1;
             rebuild |= 1 << i;
             ready |= 1 << i;
         }
@@ -805,12 +982,17 @@ impl super::StaticGx {
     /// MONKEY (static torch cache): fixture-local static collection uses batch bounds, not the
     /// building's placement origin. A distant Abbey room is still part of a WMO anchored more
     /// than 48 yards away. The key and the mesh MUST use this identical admission predicate.
-    pub fn append_torch_triangles(&self, center: Vec3, reach: f32, self_exclude: f32,
-        positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>) {
+    ///
+    /// MONKEY (torch owner exclusion): returns how many in-range items were dropped as the
+    /// FIXTURE'S OWN BODY — the `WOW_TORCH_TRACE` counter, and the one number that says whether
+    /// this fix is doing anything for a given slot.
+    pub fn append_torch_triangles(&self, center: Vec3, reach: f32, owner: Option<LightOwner>,
+        positions: &mut Vec<[f32; 3]>, indices: &mut Vec<u32>) -> u32 {
+        let mut excluded = 0;
         for cell in self.cells.values().chain(self.wmos.values()).chain(self.props.values()) {
             for item in &cell.items {
                 if !torch_item_in_range(item, center, reach) { continue; }
-                if torch_item_is_emitter(item, center, self_exclude) { continue; }
+                if torch_item_is_emitter(item, center, owner) { excluded += 1; continue; }
                 let base = positions.len() as u32;
                 positions.extend(item.geometry.positions.iter().map(|p|
                     item.transform.transform_point(benilla_assets::coords::wow_to_bevy(*p)).to_array()));
@@ -820,6 +1002,7 @@ impl super::StaticGx {
                 }
             }
         }
+        excluded
     }
 
     /// MONKEY (torch lane perf): a CHEAP stamp of "has the retained scene changed at all" —
@@ -851,12 +1034,12 @@ impl super::StaticGx {
     /// by append_torch_triangles. Order-independent per-item hashing ignores HashMap reordering
     /// and camera/portal/fader bookkeeping. Arrival, unload, replacement or transform edits in
     /// THIS fixture's sphere invalidate it even when neither camera nor fixture moves.
-    pub fn torch_geometry_key(&self, center: Vec3, reach: f32, self_exclude: f32) -> u64 {
+    pub fn torch_geometry_key(&self, center: Vec3, reach: f32, owner: Option<LightOwner>) -> u64 {
         let mut sum = 0u64;
         for cell in self.cells.values().chain(self.wmos.values()).chain(self.props.values()) {
             for item in &cell.items {
                 if !torch_item_in_range(item, center, reach) { continue; }
-                if torch_item_is_emitter(item, center, self_exclude) { continue; }
+                if torch_item_is_emitter(item, center, owner) { continue; }
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 // MONKEY (static torch cache): source residency stamp prevents allocator address
                 // reuse after unload/reload from impersonating the previous geometry Arc.
@@ -870,30 +1053,70 @@ impl super::StaticGx {
     }
 }
 
-/// MONKEY (outdoor torch shadows): EMITTER-OWNER EXCLUSION — is this item the fixture's own body?
+/// MONKEY (torch owner exclusion): EMITTER-OWNER EXCLUSION — is this item the fixture's own body?
 ///
-/// A campfire's light sits AT the flame, inside the campfire prop's own opaque logs, and nothing in
-/// this lane knows the two belong together (the light is an ECS entity, the logs are a retained
-/// `GxItem`; the placement that spawned both is not carried on either side). Left in, the logs are
-/// the nearest occluder in every one of the six cube faces and the fire blacks out its OWN pool —
-/// which indoors never mattered, because an authored MOLT fixture stands clear of its bracket,
-/// and outdoors is the whole effect.
+/// Three tests, cheapest and most exact first. Only the first is IDENTITY; the other two are the
+/// fallback for a light whose owner could not be plumbed (a server-placed GameObject fire, a light
+/// whose placement tag has not landed yet) and for one whose own model is split across placements.
 ///
-/// So identity is approximated by CONTAINMENT: an item whose entire bounding sphere lies inside
-/// `radius` of the fixture is the fixture's own body (or is so close to it that it can cast
-/// nothing but self-shadow). Containment, not centre distance, is what keeps a wall or a fence
-/// that merely PASSES near the fire — a large sphere with a near centre — casting normally.
-/// `radius <= 0` (the interior lane, and any caller that wants the old set) excludes nothing, so
-/// the interior gather is byte-for-byte the set it always was. An item with no bounds is never
-/// excluded: the failure direction of this test must be "keeps a caster", not "loses a wall".
-fn torch_item_is_emitter(item: &super::GxItem, center: Vec3, radius: f32) -> bool {
-    item.local_aabb.is_some_and(|aabb| torch_bound_contained(
-        &item.transform, aabb.center.into(), aabb.half_extents.into(), center, radius))
+///  1. OWNERSHIP. `owner` names a placement and this item belongs to it — see [`LightOwner`]. This
+///     is the case the lantern-on-a-post and the tall wall torch need: their bounds reach the
+///     ground, so no proximity rule of any radius could have found them.
+///  2. CONTAINMENT of the FLAME. The item's own bounds hold the light position (padded by
+///     [`TORCH_SELF_PAD`]) and the item is FIXTURE-SIZED ([`TORCH_SELF_MAX_EXTENT`]). A lamp
+///     housing contains its own flame; a crate a yard and a half away does not. The size cap is
+///     load-bearing, not tidiness — see the constant.
+///  3. The DEGENERATE case: the item's whole bounding sphere lies within [`TORCH_SELF_TINY`] of the
+///     flame, i.e. it is a flame card or a helper sitting on top of the light and can cast nothing
+///     but self-shadow. This is all that survives of the old 2.5-yd proximity rule.
+///
+/// An item with no bounds is never excluded by 2 or 3: the failure direction of a heuristic here
+/// must be "keeps a caster", not "loses a wall".
+fn torch_item_is_emitter(item: &super::GxItem, center: Vec3, owner: Option<LightOwner>) -> bool {
+    if owner.is_some_and(|o| o.owns(&item.object)) {
+        return true;
+    }
+    item.local_aabb.is_some_and(|aabb| {
+        let (c, h) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
+        torch_bound_contains(&item.transform, c, h, center)
+            || torch_bound_contained(&item.transform, c, h, center, TORCH_SELF_TINY)
+    })
 }
 
-/// The containment half of [`torch_item_is_emitter`], split out exactly as `torch_bound_in_range`
+/// MONKEY (torch owner exclusion): does this bound CONTAIN the flame? Tested in MODEL space (the
+/// inverse transform), so a rotated lamp post is measured against its own box rather than against
+/// the circumsphere a world-space test would have to use — the difference between "the lantern
+/// housing" and "a 3-yd ball centred on the lantern" that would swallow the porch it hangs from.
+/// The size cap is applied FIRST and on the cheap sphere radius, so the inverse is only ever paid
+/// by the handful of fixture-sized items standing at a flame.
+///
+/// `pub` and taking an `Affine3A` because BOTH caster lanes need the identical rule and they hold
+/// their pose in different shapes: the retained lane has a `Transform`, the entity lane a
+/// `GlobalTransform`. Two copies of a heuristic that decides "does this cast" would drift.
+pub fn torch_flame_inside_bounds(world_from_local: Affine3A, local_center: Vec3,
+    half_extents: Vec3, light: Vec3) -> bool {
+    let m = world_from_local.matrix3;
+    // The basis columns' lengths ARE the scale, whatever rotation is folded in with them.
+    let scale = Vec3::new(m.x_axis.length(), m.y_axis.length(), m.z_axis.length());
+    if (half_extents * scale).length() > TORCH_SELF_MAX_EXTENT {
+        return false;
+    }
+    let local = world_from_local.inverse().transform_point3(light);
+    // A world-space pad has to be expressed in model units, hence the divide; the floor keeps a
+    // degenerate (zero-scale) placement from producing an infinite pad that contains the world.
+    let pad = Vec3::splat(TORCH_SELF_PAD) / scale.max(Vec3::splat(1e-4));
+    (local - local_center).abs().cmple(half_extents + pad).all()
+}
+
+/// The retained lane's shape of [`torch_flame_inside_bounds`].
+fn torch_bound_contains(transform: &Transform, local_center: Vec3, half_extents: Vec3,
+    light: Vec3) -> bool {
+    torch_flame_inside_bounds(transform.compute_affine(), local_center, half_extents, light)
+}
+
+/// The proximity half of [`torch_item_is_emitter`], split out exactly as `torch_bound_in_range`
 /// is: the transformed bounding sphere lies WHOLLY inside `radius` of the fixture. `radius <= 0`
-/// (the interior lane) contains nothing.
+/// contains nothing.
 fn torch_bound_contained(transform: &Transform, local_center: Vec3, half_extents: Vec3,
     center: Vec3, radius: f32) -> bool {
     if radius <= 0.0 {
@@ -927,12 +1150,46 @@ mod tests {
     #[test]
     fn cache_plan_reuses_and_limits_rebuilds() {
         let cached = [Some(10), Some(11), None, Some(13)];
-        assert_eq!(torch_cache_plan(&cached, &cached, 0xf, |_| false), (0b1011, 0, 0b1011));
+        assert_eq!(torch_cache_plan(&cached, &cached, 0xf, 0, |_| false), (0b1011, 0, 0b1011));
         let requested = [Some(20), Some(11), Some(12), Some(23)];
-        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, |_| true), (0b0111, 0b0101, 0b0111));
-        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, |id| id == 23), (0b1010, 0b1000, 0b1010));
-        assert_eq!(torch_cache_plan(&cached, &[None, Some(11)], 0xf, |_| true), (0b10, 0, 0b10));
-        assert_eq!(torch_cache_plan(&[None; 4], &requested, 0, |_| true), (0b11, 0b11, 0));
+        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, 0, |_| true), (0b0111, 0b0101, 0b0111));
+        assert_eq!(torch_cache_plan(&cached, &requested, 0xf, 0, |id| id == 23), (0b1010, 0b1000, 0b1010));
+        assert_eq!(torch_cache_plan(&cached, &[None, Some(11)], 0xf, 0, |_| true), (0b10, 0, 0b10));
+        assert_eq!(torch_cache_plan(&[None; 4], &requested, 0, 0, |_| true), (0b11, 0b11, 0));
+    }
+
+    // MONKEY (moving fixture): a moving slot rebuilds out of its OWN budget, so two moving
+    // fixtures cannot consume the resident slots' two - the failure that would freeze a room's
+    // static shadows for as long as a pet walked around in it.
+    #[test]
+    fn moving_slots_rebuild_on_a_separate_budget() {
+        let cached = [None, None, None, None];
+        let requested = [Some(1), Some(2), Some(3), Some(4)];
+        // No moving slots: the historical two-rebuild ceiling, untouched.
+        assert_eq!(torch_cache_plan(&cached, &requested, 0, 0, |_| true).1, 0b0011);
+        // Slots 0 and 1 moving: they take the moving budget and slots 2/3 still get the static one.
+        assert_eq!(torch_cache_plan(&cached, &requested, 0, 0b0011, |_| true).1, 0b1111);
+        // Three moving: the third waits (it fast-fades app-side rather than showing a wrong map).
+        assert_eq!(torch_cache_plan(&cached, &requested, 0, 0b0111, |_| true).1, 0b1011);
+    }
+
+    // MONKEY (shadow floor): the two dials share one word; neither may corrupt the other, and a
+    // strength of 0 (shadows off) must survive the pack as a real 0 rather than a floored 1.
+    #[test]
+    fn count_y_packs_soft_low_and_strength_high() {
+        for (soft, strength, soft_pct, strength_pct) in [
+            (1.5f32, 0.7f32, 150u32, 70u32),
+            (3.0, 1.0, 300, 100),
+            (0.5, 0.0, 50, 0),
+            // Out-of-range inputs are clamped, never wrapped into the other half.
+            (0.0, 2.0, 100, 100),
+            (0.5, -1.0, 50, 0),
+        ] {
+            let views = TorchShadowViews { count: 1, soft, strength, ..Default::default() };
+            let word = TorchTableUniform::pack(Some(&views)).soft_strength;
+            assert_eq!(word & 0xffff, soft_pct, "soft {soft}");
+            assert_eq!(word >> 16, strength_pct, "strength {strength}");
+        }
     }
 
     #[test]
@@ -950,11 +1207,11 @@ mod tests {
             }
         }
         let cached = [Some(1); MAX_TORCH_MAPS];
-        let (_, _, capped) = torch_cache_plan(&cached, &cached, 0xffff, |_| false);
+        let (_, _, capped) = torch_cache_plan(&cached, &cached, 0xffff, 0, |_| false);
         assert_eq!(capped, 0xff);
         let mut requested = cached;
         requested[0] = None;
-        let (ready, _, dynamic) = torch_cache_plan(&cached, &requested, 0x8001, |_| false);
+        let (ready, _, dynamic) = torch_cache_plan(&cached, &requested, 0x8001, 0, |_| false);
         let views = TorchShadowViews { count: 16, ready_mask: ready, dynamic_mask: dynamic, ..Default::default() };
         let table = TorchTableUniform::pack(Some(&views));
         assert_eq!(dynamic, 0x8000);
@@ -1019,5 +1276,77 @@ mod tests {
         // Scale is applied to the extents, exactly as `torch_bound_in_range` applies it.
         let scaled = Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(4.0));
         assert!(!torch_bound_contained(&scaled, Vec3::ZERO, Vec3::splat(0.5), Vec3::ZERO, 2.5));
+    }
+
+    // MONKEY (torch owner exclusion): the IDENTITY key. Both caster lanes have to agree on it while
+    // holding the placement identity in two different shapes — the retained `GxItem` owns an `Arc`,
+    // the entity path's parts own a CLONE — so the comparison must be by CONTENT, never by pointer.
+    // And WMO props all share their building's uniqueId, which is why the model path is in the key:
+    // without it a candelabra's light would drop every barrel and chair in the building.
+    #[test]
+    fn a_light_owner_names_one_placement_by_content() {
+        let lantern = WorldObject {
+            kind: ModelKind::Doodad,
+            label: "world/generic/lantern01.m2".into(),
+            id: 4242,
+            detail: "emitters: 1".into(),
+        };
+        let owner = LightOwner::placement(&lantern);
+        // The entity lane's CLONE of the same identity still matches (a pointer key would not).
+        assert!(owner.owns(&lantern.clone()));
+        // Same building, different prop model — a WMO prop shares its building's uniqueId.
+        let barrel = WorldObject { label: "world/generic/barrel01.m2".into(), ..lantern.clone() };
+        assert!(!owner.owns(&barrel));
+        // Same model, different placement: the lantern down the street still casts.
+        let other = WorldObject { id: 4243, ..lantern.clone() };
+        assert!(!owner.owns(&other));
+        // The BUILDING itself is a different subsystem, so a prop light can never delete its shell.
+        let building = WorldObject { kind: ModelKind::Wmo, ..lantern.clone() };
+        assert!(!owner.owns(&building));
+        // An entity-hosted light names a frame, and never claims a placement by accident.
+        assert!(!LightOwner::Instance(Entity::from_raw_u32(7).unwrap()).owns(&lantern));
+        assert_eq!(owner.instance(), None);
+    }
+
+    // MONKEY (torch owner exclusion): the CONTAINMENT fallback, for a light whose owner could not
+    // be plumbed. The housing that holds the flame is excluded; the crate beside it is not; and —
+    // the rule that keeps the shipped interior lane intact — a room-sized batch is never excluded
+    // however deep inside it the candle sits.
+    #[test]
+    fn only_a_fixture_sized_bound_may_contain_its_own_flame() {
+        let at = |x: f32, y: f32| Transform::from_xyz(x, y, 0.0);
+        // A lantern housing 3 yd up a post: the placement's box runs from the ground to the lamp,
+        // so its CENTRE is 1.5 yd below the flame and no proximity rule of any radius finds it —
+        // the exact case `TORCH_EXT_SELF_EXCLUDE = 2.5` could not exclude.
+        let post = Vec3::new(0.0, 1.5, 0.0);
+        let post_half = Vec3::new(0.4, 1.6, 0.4);
+        let flame = Vec3::new(0.0, 3.0, 0.0);
+        assert!(torch_bound_contains(&at(0.0, 0.0), post, post_half, flame));
+        assert!(!torch_bound_contained(&at(0.0, 0.0), post, post_half, flame, TORCH_SELF_TINY),
+            "the retired proximity rule never saw it");
+        // The crate 1.5 yd away keeps casting — that shadow is the whole point of the feature.
+        assert!(!torch_bound_contains(&at(1.5, 0.3), Vec3::ZERO, Vec3::splat(0.5), flame));
+        // A room-sized wall batch holds the candle but is NOT fixture-sized: excluding it would
+        // delete the room's shadows and leak the candle through its own walls.
+        assert!(!torch_bound_contains(&at(0.0, 0.0), Vec3::ZERO, Vec3::splat(20.0), flame));
+        assert!(!torch_bound_contains(&at(0.0, 0.0), Vec3::ZERO,
+            Vec3::splat(TORCH_SELF_MAX_EXTENT), flame), "at the cap, still a building");
+        // The pad reaches a flame sitting just proud of its housing, and stops well short of the
+        // next prop along.
+        let head = Vec3::new(0.0, 0.0, 0.0);
+        let head_half = Vec3::splat(0.25);
+        assert!(torch_bound_contains(&at(0.0, 0.0), head, head_half, Vec3::new(0.0, 0.5, 0.0)));
+        assert!(!torch_bound_contains(&at(0.0, 0.0), head, head_half, Vec3::new(0.0, 0.9, 0.0)));
+        // Scale applies to the box AND to the pad (a world-space pad in model units).
+        let big = Transform::from_xyz(0.0, 0.0, 0.0).with_scale(Vec3::splat(4.0));
+        assert!(torch_bound_contains(&big, Vec3::ZERO, Vec3::splat(0.3), Vec3::new(0.0, 1.2, 0.0)));
+        assert!(!torch_bound_contains(&big, Vec3::ZERO, Vec3::splat(2.0), Vec3::ZERO),
+            "scaled past the fixture cap");
+        // A rotated post is tested against its own box, not its circumsphere.
+        let spun = Transform::from_xyz(0.0, 0.0, 0.0)
+            .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        assert!(torch_bound_contains(&spun, Vec3::new(0.0, 1.5, 2.0), post_half,
+            Vec3::new(2.0, 3.0, 0.0)));
+        assert!(!torch_bound_contains(&spun, Vec3::new(0.0, 1.5, 2.0), post_half, flame));
     }
 }

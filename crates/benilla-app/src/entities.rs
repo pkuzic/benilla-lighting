@@ -47,6 +47,10 @@ use attach::{attach_entity_visuals, build_dressup_preview, build_glue_pet, build
 /// decision 0016's law applied to the *entity* half of the scene, not just the placed half.
 mod carried_light;
 use carried_light::spawn_carried_lights;
+// MONKEY (spell light): the same file's second spawner — the ONE light a luminous spell effect /
+// firework throws, hung on the effect's own root so the effect's death reaps it. Used by the kit,
+// missile and dest-anchored lanes.
+use carried_light::spawn_spell_light;
 // MONKEY (carried light stability): `torch_shadow` needs the settle verdict to refuse a MOVING
 // carried light a cube-shadow slot.
 pub(crate) use carried_light::CarriedLightMotion;
@@ -882,6 +886,19 @@ impl Plugin for EntitiesPlugin {
             PostUpdate,
             carried_light::track_carried_light_motion
                 .after(bevy::transform::TransformSystems::Propagate),
+        )
+        // MONKEY (spell light): the luminous-effect lights' envelope and their ceiling. `Update`,
+        // after the attach passes that spawn them (`EntityVisualsSet`) so a light born this frame
+        // is already on its own clock, and well before `PostUpdate`'s packer reads the intensity
+        // they write. The budget runs after the envelope so the age it orders on is this frame's.
+        .add_systems(
+            Update,
+            (
+                spell_fx::advance_spell_lights,
+                spell_fx::budget_spell_lights,
+            )
+                .chain()
+                .after(EntityVisualsSet),
         )
         // The aura CharProc layer (`crate::aura_visual`): the state kit's effect on the BODY.
         // The drain installs/removes this frame's nodes; the author then owns the render alpha
