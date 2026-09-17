@@ -11,13 +11,44 @@ use benilla_assets::AssetSet;
 use benilla_formats::{LightCatalog, LiquidKind};
 
 mod blob; // the off-world light-blob builder (booth studio, body pane, glue scene)
+mod daylight; // MONKEY (daylight fixtures): the sun as an interior-lane light in a doorway
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
+mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
 mod resolve; // the per-frame time-of-day sample into WowLighting + the WMO interior-fog crossfade
 mod sh; // the model SH light-probe coefficient math
 pub use blob::LightBlob;
-pub use global_light::{new_shared_light_buffer, LightRooms, SharedLightBuffer, WorldPointLight};
+// MONKEY (daylight fixtures): the marker (torch_shadow excludes it), the selection rule and the
+// spawn-side helpers the placement lane calls.
+// MONKEY (portal bleed): `placement_openings` is the ONE selection entry point the placement lane
+// calls now -- daylight seeds and interior<->interior doorway seeds share the per-placement budget,
+// so neither can be ranked without the other. `BleedFixture`/`BleedSeed` are the doorway lane's own
+// two types; the fixture itself still wears `DaylightFixture`.
+pub use daylight::{
+    daylight_claims, daylight_intensity, daylight_lane, daylight_point_light, daylight_reach,
+    daylight_rooms, daylight_seeds, daylight_target, bleed_seeds, placement_openings, BleedFixture,
+    BleedSeed,
+    DaylightFixture, DaylightHow, DaylightSeed, BLEED_K, MAX_DAYLIGHT_PER_PLACEMENT,
+};
+// MONKEY (flame flicker): the component + the one route rule, so every spawn lane files a flame
+// the same way and the packer has a single function to evaluate.
+pub use flicker::{flame_kind_for, flicker_seed, FlameFlicker, FlameKind, FlickerMod};
+pub use global_light::{
+    interior_reach, m2_light_reach, new_shared_light_buffer, DynamicInteriors, FireLightGain,
+    ClaimFade, LightLane, LightLitRooms, LightReach, LightRooms, RoomClaimTable,
+    SharedLightBuffer,
+    ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
+    WorldShadowActive,
+};
+// MONKEY (merge 2026-09-17): upstream's world-light component, adopted as THE world light.
+pub use global_light::WorldPointLight;
+// MONKEY (spellLightGain): the spell lane's marker + its live gain — the two-word world-side
+// shadow of benilla-app's own `SpellLight` lifecycle, and the dial the packer folds over it.
+pub use global_light::{SpellFxLight, SpellLightGain};
+pub use global_light::{
+    room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,
+};
 pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
 // The std430 layout itself — row indices, byte sizes, region offsets and the folds that fill them
 // — stays in the crate. Off-world producers state values through `LightBlob` and never a row index
@@ -166,6 +197,13 @@ pub struct WowLighting {
 }
 
 impl WowLighting {
+    /// The visible **celestial sun** direction (camera→sun, Bevy space) — the body that genuinely
+    /// rises and sets over the day. Exposed for the shadow rig, which aims its basis at this MOVING
+    /// sun (with an elevation clamp) rather than the near-fixed lighting `sun_dir`.
+    pub fn celestial_dir(&self) -> Vec3 {
+        self.celestial_dir
+    }
+
     /// Per-kind **water swatch endpoints**: `(shallow_rgb, deep_rgb, shallow_alpha, deep_alpha)`. These
     /// are the ENDPOINTS; the ramp between them is a 64-row byte-space accumulator that `liquid.wgsl`
     /// reproduces (`swatch_row`), not the plain lerp this doc used to describe — it stops one row short
@@ -363,6 +401,8 @@ impl Plugin for LightingPlugin {
         // The shared global-light buffer (build_light_data after the resolve above; the extract +
         // render-world upload). Materials read this instead of carrying their own light copy.
         global_light::register(app);
+        // MONKEY (daylight fixtures): the per-frame re-aim, ordered before the packer's own set.
+        daylight::register(app);
     }
 }
 
@@ -449,6 +489,12 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            // MONKEY (daylight fixtures / portal bleed): both systems are PostUpdate,
+            // chained before `global_light::classify_light_lanes`.
+            (
+                "lighting/daylight.rs",
+                "update_daylight_fixtures + update_bleed_fixtures: PostUpdate",
+            ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();

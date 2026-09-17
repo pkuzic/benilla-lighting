@@ -57,6 +57,9 @@ mod m2;
 pub use m2::{
     EmitterBillboard, M2Model, M2ModelLoader, M2SequenceInfo, ModelEmitter, ModelLight,
     ModelRibbon, PortraitCamera,
+    // MONKEY (spell light): what a spell/firework-derived light carries beyond the light itself
+    // (its school and its onset) — see [`ModelLight::spell`].
+    SpellLightInfo,
 };
 mod wmo;
 pub use benilla_formats::{WmoPortalInfo, WmoPortalRef};

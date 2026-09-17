@@ -48,6 +48,8 @@ pub(super) fn update_model_particles(
     mut mesh_assets: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<WowModelMaterial>>,
     light: Res<crate::lighting::SharedLightBuffer>,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings every instance material takes.
+    torch: crate::static_gx::TorchShared,
     mut emitters: Query<&mut ParticleEmitter>,
     mut draws: Query<
         (
@@ -59,6 +61,11 @@ pub(super) fn update_model_particles(
         With<ChildDraw>,
     >,
 ) {
+    // Created in the same startup system as the light buffer; absent only before it ran, when
+    // there is nothing to build a material against yet.
+    let Some(torch) = torch.binds() else {
+        return;
+    };
     for mut emitter in &mut emitters {
         let Some(geometry) = emitter.geometry.clone() else {
             continue;
@@ -117,6 +124,7 @@ pub(super) fn update_model_particles(
                         false,
                         false, // an effect model is never a skybox
                         &light.0,
+                        &torch,
                         None, // a shard's material is shared by the whole emitter
                     );
                     // Realized at once: the over-life ramp writes this material through

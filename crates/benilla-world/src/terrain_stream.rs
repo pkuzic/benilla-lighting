@@ -62,7 +62,10 @@ pub use spawn::prop_light::{fold_interior_probe, hex_word, interior_light_up, Pr
 // doodad-prop path's spawner (`crate::entities`' `wmo_props`: the ship's sails ride the streamed
 // gameobject entity, and its cargo hulls ride the boat's kinematic body).
 pub use collider::{build_collider_task, placement_collider_data, PendingCollider};
-pub use spawn::{m2_anim_bound, m2_fade, point_light, spawn_model_entities, SpawnedModel};
+pub use spawn::{
+    carried_light_claims, m2_anim_bound, m2_fade, point_light, spawn_model_entities,
+    CarriedClaimSet, SpawnedModel,
+};
 // The position queries + area authority (their home is `queries`; paths stay `terrain_stream::X`).
 use queries::update_current_area;
 pub use queries::{
@@ -634,6 +637,11 @@ fn stream_terrain(
         Res<Assets<WdtIndex>>,
         Res<Time>,
         ResMut<StreamActivity>,
+        // MONKEY (outdoor torch shadows: terrain): the shared torch depth array + table every tile
+        // material binds (91/92/93). Nested here for the same 16-param reason as the rest of the
+        // tuple - this system is already AT Bevy's ceiling - and beside the material store because
+        // that is what it is: an input to the one `TerrainExtension` built below.
+        crate::static_gx::TorchShared<'_>,
     ),
     liquid_assets: Option<Res<LiquidAssets>>,
     clutter: Option<Res<GroundClutter>>,
@@ -662,11 +670,18 @@ fn stream_terrain(
     ),
 ) {
     let (mut welds, mut static_merge, mut staticgx) = batchers;
-    let (mut materials, mut meshes, wdts, _time, mut activity) = asset_stores;
+    let (mut materials, mut meshes, wdts, _time, mut activity, torch) = asset_stores;
     let (current_map, map_catalog, view) = location;
     // The shared light buffer + map catalog are set up by other plugins' startup; until they exist
     // there's nothing to stream against, so idle.
-    let (Some(shared_light), Some(map_catalog)) = (shared_light, map_catalog) else {
+    // MONKEY (outdoor torch shadows: terrain): the torch binds join that same gate. They are born in
+    // the SAME Startup system as the light buffer (`assets::open_world_assets`), so in practice the
+    // two are never split - but a tile material built against a missing depth image would never get
+    // a bind group at all, so this retries next frame exactly as `shared_light` does rather than
+    // baking a default that would blank the ground.
+    let (Some(shared_light), Some(map_catalog), Some(torch)) =
+        (shared_light, map_catalog, torch.binds())
+    else {
         return;
     };
     let t0 = Instant::now();
@@ -962,6 +977,12 @@ fn stream_terrain(
                 shadow_array: adt.shadow_array.clone(),
                 params: Vec4::new(tiling, 0.0, 0.0, 0.0),
                 light_buf: shared_light.0.clone(),
+                // MONKEY (outdoor torch shadows: terrain): cloned per tile like the light buffer -
+                // a handle + a `Buffer` (an Arc), so the per-tile cost is two refcount bumps and
+                // every tile ends up pointing at the one image and the one table the depth node
+                // rewrites each frame.
+                torch_depth: torch.depth.clone(),
+                torch_buf: torch.table.clone(),
             },
         });
         // Terrain collider (decision 0009): ONE static trimesh per tile, welded from the same decoded

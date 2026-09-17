@@ -13,7 +13,7 @@ use bevy::mesh::{Indices, MeshTag, PrimitiveTopology};
 use bevy::prelude::*;
 use bevy::render::render_resource::Buffer;
 
-use benilla_assets::materials::{LiquidMaterial, WowModelMaterial};
+use benilla_assets::materials::{LiquidMaterial, TorchBinds, WowModelMaterial};
 use benilla_world::clouds::CloudMaterial;
 use benilla_world::model_render::{
     far_twin_of, model_material, zfill_material, MaterialCache, ShadeSel,
@@ -103,6 +103,8 @@ pub(super) fn spawn_menagerie(
     lanes: &mut WarmLanes,
     cache: &mut MaterialCache,
     light: &Buffer,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings, beside the light buffer.
+    torch: &TorchBinds,
 ) -> usize {
     // The four vertex layouts the model lane ships (0837 dump: strides 32/48/56/72): static ×
     // {plain, vertex-colours} and their skinned twins. Statics are RENDER_WORLD-only, so their
@@ -162,6 +164,7 @@ pub(super) fn spawn_menagerie(
                         false,
                         false, // warms the WORLD lane; the sky lane warms with its own model
                         light,
+                        torch,
                         // The pipeline menagerie warms the SHARED batch material; the
                         // per-placement lane (1408) builds an identical pipeline, so a clone
                         // needs no row of its own here.
@@ -205,6 +208,7 @@ pub(super) fn spawn_menagerie(
                         false,
                         false, // warms the WORLD lane; the sky lane warms with its own model
                         light,
+                        torch,
                         // The pipeline menagerie warms the SHARED batch material; the
                         // per-placement lane (1408) builds an identical pipeline, so a clone
                         // needs no row of its own here.
@@ -216,7 +220,7 @@ pub(super) fn spawn_menagerie(
         // The depth-prime twin (colour writes masked off), plain and cutout.
         for cutout in [false, true] {
             mats.push(zfill_material(
-                cache, materials, None, two_sided, cutout, light,
+                cache, materials, None, two_sided, cutout, light, torch,
             ));
         }
         // The **WMO-skybox lane** (decision 1264): `sky_depth` is a `WowModelKey` axis — it
@@ -259,6 +263,7 @@ pub(super) fn spawn_menagerie(
                     false,
                     true, // the sky lane
                     light,
+                    torch,
                     None, // the shared lane — see the note above
                 ));
             }
@@ -301,6 +306,7 @@ pub(super) fn spawn_menagerie(
                 false,
                 false, // warms the WORLD lane; the sky lane warms with its own model
                 light,
+                torch,
                 None, // the shared lane — see the note above
             );
             // The warmer reads what it builds (`model_render::lazy` parks a built material
@@ -353,6 +359,7 @@ pub(super) fn spawn_menagerie(
                         false,
                         false, // warms the WORLD lane; the sky lane warms with its own model
                         light,
+                        torch,
                         None, // the shared lane — see the note above
                     );
                     benilla_world::model_render::lazy::realize_all(materials);

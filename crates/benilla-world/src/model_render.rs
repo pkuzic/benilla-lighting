@@ -10,7 +10,7 @@ use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Buffer, Face};
 
-use benilla_assets::materials::{WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
+use benilla_assets::materials::{TorchBinds, WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
 
 mod batch;
 pub mod lazy;
@@ -254,6 +254,9 @@ pub fn model_material(
     // and the skybox sort rung instead of the ordinary batch-order eps. See [`MatKey::sky_depth`].
     sky_depth: bool,
     light: &Buffer,
+    // MONKEY (torch shadows Phase 3A): the shared torch depth image + table buffer, cloned into the
+    // material beside `light` (not a key axis — one pair for the whole scene, like the light).
+    torch: &TorchBinds,
     // The ONE placement this material belongs to, or `None` for the shared batch material every
     // instance of the model reuses. `Some` only for a batch whose animated UV/tint loop depends on
     // the sequence its instance is playing (decision 1408): the animated-material registries are
@@ -505,6 +508,9 @@ pub fn model_material(
                 // table slot is baked in exactly once.
                 anim_slots: Vec4::ZERO,
                 light_buf: light.clone(),
+                // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
+                torch_depth: torch.depth.clone(),
+                torch_buf: torch.table.clone(),
             },
         },
     );
@@ -598,6 +604,7 @@ pub fn zfill_material(
     two_sided: bool,
     cutout: bool,
     light: &Buffer,
+    torch: &TorchBinds,
 ) -> Handle<WowModelMaterial> {
     let key = MatKey {
         light: light.id(),
@@ -669,6 +676,9 @@ pub fn zfill_material(
                 sidn: Vec4::ZERO,
                 anim_slots: Vec4::ZERO,
                 light_buf: light.clone(),
+                // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
+                torch_depth: torch.depth.clone(),
+                torch_buf: torch.table.clone(),
             },
         },
     );
@@ -1285,9 +1295,27 @@ pub enum ModelKind {
 /// Tags every spawned model submesh with the metadata the panel toggles on: its subsystem and its
 /// blend mode (the "layer" — opaque trunk vs alpha-cut canopy).
 #[derive(Component, Clone, Copy)]
+#[require(ShadowOccluder)]
 pub struct ModelPart {
     pub kind: ModelKind,
     pub blend: ModelBlend,
+}
+
+/// The camera-INDEPENDENT half of [`visibility::apply_model_visibility`]'s verdict: does this
+/// submesh exist as world content this frame (toggles, far clip, distance fade, material alpha)?
+///
+/// `Visibility` cannot answer that for a shadow caster: it also folds the exterior window gate,
+/// the portal PVS and the exterior-scene cull — all functions of where the camera LOOKS — and a
+/// wall behind the camera still blocks the sun. Gating the caster proxy on `InheritedVisibility`
+/// made every entity-lane shadow swing with view direction. Defaults to occluding so a part casts
+/// correctly from its spawn frame; the walk corrects a toggled-off part one frame later.
+#[derive(Component, Clone, Copy)]
+pub struct ShadowOccluder(pub bool);
+
+impl Default for ShadowOccluder {
+    fn default() -> Self {
+        Self(true)
+    }
 }
 
 /// **Why this submesh is an entity at all** — the world streamer's answer, one static label per

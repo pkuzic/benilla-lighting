@@ -8,7 +8,9 @@ mod fx;
 pub(crate) mod prop_light;
 
 pub use assemble::{spawn_model_entities, SpawnedModel};
-pub use fx::point_light;
+// MONKEY (GO room claims): `carried_light_claims` is the placed lanes' claim rule reached from
+// the app side, for a light a WMO's own tables never named (a brazier GameObject).
+pub use fx::{carried_light_claims, point_light, CarriedClaimSet};
 use fx::{
     emitter_fade, spawn_emitters_for, spawn_lights_for, spawn_ribbons_for, spawn_wmo_lights_for,
 };
@@ -69,6 +71,9 @@ type SpawnTables<'w> = (
     // `None` only under `WOW_STATIC_GX=0` (the resource exists whenever the retained pass
     // is armed — the default since 1434).
     Option<ResMut<'w, crate::static_gx::StaticGx>>,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings every spawned material takes
+    // (nested here for the same 16-param reason as the rest of the tuple).
+    crate::static_gx::TorchShared<'w>,
 );
 
 pub(super) fn spawn_loaded_placements(
@@ -96,10 +101,15 @@ pub(super) fn spawn_loaded_placements(
     // model-forms cache (decision 0834).
     tables: SpawnTables,
 ) {
-    let (mut probes, mut activity, focus, mut forms, mut welds, mut merge, mut staticgx) = tables;
+    let (mut probes, mut activity, focus, mut forms, mut welds, mut merge, mut staticgx, torch) =
+        tables;
     let Some(shared_light) = shared_light else {
         return;
     };
+    let Some(torch) = torch.binds() else {
+        return; // created in the same startup system as the light buffer — retry like it
+    };
+    let torch = &torch;
     // Steady state is everything spawned, and the walk below still visits every placement and
     // every WMO prop to find that out — the pending count (kept by the register/handoff/release
     // sites) makes that frame free.
@@ -145,7 +155,19 @@ pub(super) fn spawn_loaded_placements(
             let entities = match &p.model {
                 ModelHandle::M2(h) => {
                     let Some(m) = m2s.get(h) else {
-                        continue; // model still loading (or missing) — try next frame
+                        // MONKEY (missing model): a placement whose M2 the client doesn't ship
+                        // (`Path not found`) can never spawn — left pending it holds the loading
+                        // screen's scene term down FOREVER (Stormwind harbour's
+                        // `alliancebrasscannon_flat.m2`, 2026-09-08). Retire it as an empty
+                        // spawn so the accounting completes; the reference draws nothing there
+                        // either.
+                        if matches!(asset_server.load_state(h), bevy::asset::LoadState::Failed(_)) {
+                            warn!("placement {unique_id}: its model failed to load — spawning nothing");
+                            p.spawned = true;
+                            *pending_spawns -= 1;
+                            activity.placements_spawned += 1;
+                        }
+                        continue; // model still loading — try next frame
                     };
                     // The model's app-built render forms (decision 0834): request static — plus
                     // the skinned twins iff the anim host will rig this model — and wait for the
@@ -212,6 +234,7 @@ pub(super) fn spawn_loaded_placements(
                         mat_cache,
                         materials,
                         light,
+                        torch,
                         &m.submeshes,
                         FormSlices {
                             stat: forms.static_meshes(key).unwrap_or(&[]),
@@ -303,7 +326,28 @@ pub(super) fn spawn_loaded_placements(
                         ents.first().copied(),
                         &fade,
                     );
-                    spawn_lights_for(&mut commands, &m.lights, p.transform, None, &mut ents);
+                    // MONKEY (fire GO lights): `true` — an ADT map doodad's campfire/wall
+                    // torch/brazier takes a SYNTHESISED light when it authors none; outdoors
+                    // there is no MOLT fixture beside it and nothing else would light it.
+                    // Empty dedupe list: an ADT map doodad belongs to no WMO, so there is no MOLT
+                    // table its flame could be duplicating.
+                    // MONKEY (torch owner exclusion): where this placement's own lights start in
+                    // `ents`, so they — and ONLY they — can be tagged with its identity below.
+                    let lights_from = ents.len();
+                    spawn_lights_for(
+                        &mut commands,
+                        &m.lights,
+                        p.transform,
+                        None,
+                        true,
+                        &[],
+                        // MONKEY (portal claims): an ADT map doodad belongs to no building, so
+                        // there is no group table to claim a room in — the packer leaves its
+                        // light ungated, exactly as before.
+                        None,
+                        &mut ents,
+                    );
+                    tag_light_owner(&mut commands, &ents[lights_from..], &object);
                     tag_world_object(&mut commands, &ents, &object);
                     if let Some((target, r)) = fade_near_target() {
                         let pos = p.transform.translation;
@@ -324,6 +368,14 @@ pub(super) fn spawn_loaded_placements(
                 }
                 ModelHandle::Wmo(h) => {
                     let Some(m) = wmos.get(h) else {
+                        // MONKEY (missing model): see the M2 arm — a WMO the client lacks
+                        // retires as an empty spawn rather than pinning the loading screen.
+                        if matches!(asset_server.load_state(h), bevy::asset::LoadState::Failed(_)) {
+                            warn!("placement {unique_id}: its WMO failed to load — spawning nothing");
+                            p.spawned = true;
+                            *pending_spawns -= 1;
+                            activity.placements_spawned += 1;
+                        }
                         continue;
                     };
                     // The building's app-built render forms (0834): static only — WMO group
@@ -397,6 +449,7 @@ pub(super) fn spawn_loaded_placements(
                         mat_cache,
                         materials,
                         light,
+                        torch,
                         &m.submeshes,
                         FormSlices {
                             stat: forms.static_meshes(key).unwrap_or(&[]),
@@ -434,6 +487,9 @@ pub(super) fn spawn_loaded_placements(
                                     crate::static_gx::GxSite::Wmo {
                                         instance: i,
                                         groups: &m.submesh_group,
+                                        // MONKEY (ext-class night law): the MOGI table, so the
+                                        // assembler can read each batch's group CLASS + BOX.
+                                        bounds: &m.group_bounds,
                                     },
                                 )
                             })
@@ -626,10 +682,37 @@ pub(super) fn spawn_loaded_placements(
                     // Interior MOLT lights (forge fire, inn fireplaces, chapel candles) — the radiating
                     // sources that light nearby NPCs/doodads AND the building's own walls/floor over
                     // their baked MOCV (decision 0273).
+                    // MONKEY (portal claims): the per-group MOPR ranges the claim rule's portal
+                    // hop indexes — one small Vec per placement, built here because the graph it
+                    // completes is borrowed from the asset.
+                    let slices = fx::portal_slices(m);
                     spawn_wmo_lights_for(
                         &mut commands,
                         &m.lights,
                         &m.group_light_refs,
+                        &m.group_bounds,
+                        benilla_formats::PortalGraph {
+                            vertices: &m.portal_vertices,
+                            infos: &m.portal_infos,
+                            refs: &m.portal_refs,
+                            slices: &slices,
+                        },
+                        p.portal_instance,
+                        p.transform,
+                        &mut ents,
+                    );
+                    // MONKEY (daylight fixtures): …and one interior-lane light per exterior-facing
+                    // opening, so the room law has a sun to find at the threshold instead of
+                    // meeting the sky-lit doorway with a hard line (`lighting::daylight`).
+                    fx::spawn_daylight_fixtures_for(
+                        &mut commands,
+                        m,
+                        benilla_formats::PortalGraph {
+                            vertices: &m.portal_vertices,
+                            infos: &m.portal_infos,
+                            refs: &m.portal_refs,
+                            slices: &slices,
+                        },
                         p.portal_instance,
                         p.transform,
                         &mut ents,
@@ -661,11 +744,47 @@ pub(super) fn spawn_loaded_placements(
         // Copied out before the loop borrows `p.doodads`: the props tag onto the same portal
         // instance their building's groups did (decision 0689).
         let portal_instance = p.portal_instance;
+        // MONKEY (wmo exterior points): this placement's authored MOLT fixtures in world space —
+        // the duplicate guard for the synthesised prop lights below (`spawn_lights_for`). Built
+        // here, once per placement per spawn wave, and only while props are still landing: it is
+        // read by the prop loop, which cannot reach `p.model`/`p.transform` while it holds
+        // `p.doodads` mutably. Empty for an M2 placement, and for a WMO whose root isn't resident.
+        //
+        // MONKEY (interior prop lights): the owning WMO asset itself is held alongside, for the
+        // ROOM CLAIMS a synthesised prop light now needs (`fx::PropClaims`). It borrows `wmos`
+        // (a `Res`), never the placement, so it survives the `&mut p.doodads` below — which is
+        // exactly why `p.transform` and the fixture list are copied out here instead.
+        let wmo: Option<&WmoModel> = match &p.model {
+            ModelHandle::Wmo(h) if p.doodads.iter().any(|d| !d.spawned) => wmos.get(h),
+            _ => None,
+        };
+        let placement = p.transform;
+        let molt_world: Vec<Vec3> = wmo
+            .map(|w| {
+                w.lights
+                    .iter()
+                    .filter(|l| l.is_omni())
+                    .map(|l| placement.transform_point(wow_to_bevy(l.position)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let slices = wmo.map(fx::portal_slices).unwrap_or_default();
+        // MONKEY (review fixes): the claim list owns its placement even when no MODR names it.
+        let claims = wmo.zip(portal_instance)
+            .map(|(w, instance)| fx::PropClaims::new(w, &slices, placement, instance));
         for d in &mut p.doodads {
             if d.spawned {
                 continue;
             }
             let Some(m) = m2s.get(&d.handle) else {
+                // MONKEY (missing model): a prop whose M2 the client doesn't ship would hold its
+                // BUILDING un-"up" (`placements_pending`) for the loading screen's whole life —
+                // the 2371 s Stormwind hang on `alliancebrasscannon_flat.m2`. Retire the prop.
+                if matches!(asset_server.load_state(&d.handle), bevy::asset::LoadState::Failed(_)) {
+                    warn!("placement {unique_id}: a WMO prop's model failed to load — skipping it");
+                    d.spawned = true;
+                    *pending_spawns -= 1;
+                }
                 continue; // this prop's M2 still loading
             };
             // The prop's app-built render forms (0834) — same gate as its owning placement's.
@@ -756,6 +875,7 @@ pub(super) fn spawn_loaded_placements(
                 mat_cache,
                 materials,
                 light,
+                torch,
                 &m.submeshes,
                 FormSlices {
                     stat: forms.static_meshes(key).unwrap_or(&[]),
@@ -893,13 +1013,34 @@ pub(super) fn spawn_loaded_placements(
                 ents.first().copied(),
                 &fade,
             );
+            // MONKEY (torch owner exclusion): as at the ADT site — the prop's OWN lights only.
+            let lights_from = ents.len();
             spawn_lights_for(
                 &mut commands,
                 &m.lights,
                 d.transform,
                 fade.room.as_ref(), // the prop's glow rides its rooms like its mesh (0689)
+                // MONKEY (interior prop lights): a synthesised flame/lamp light is accepted for
+                // EVERY WMO prop now, indoors included. This was `matches!(d.light,
+                // PropLight::Exterior)` — exterior-group props only — on the reasoning that a
+                // building's artists put a MOLT fixture at each of its indoor flames, so a
+                // synthesised twin would double-light the interiors the lane is calibrated
+                // against. The `wmolamps` sweep measures that assumption at 30% true: of the
+                // 14,937 props corpus-wide whose model would synthesise a light, only 4,477 have
+                // an authored fixture within `MODD_SYNTH_DEDUPE`. The Stormwind Bank's ceiling
+                // lanterns, the Crawford Winery's lanterns and the Wizard's Sanctum's candelabras
+                // are all in the other 70% and lit nothing at all. The DEDUPE below, not the
+                // group class, is what holds the double-lighting back where the assumption is
+                // true (NSabbey pairs 41 of its 42 flames with a fixture, and keeps 0).
+                true,
+                // …so skip a flame an authored fixture already stands at.
+                &molt_world,
+                // MONKEY (portal claims): and give the kept ones the same room claims a MOLT
+                // fixture gets, or the gate would refuse a lantern in the room it hangs in.
+                claims.as_ref(),
                 &mut ents,
             );
+            tag_light_owner(&mut commands, &ents[lights_from..], &object);
             tag_world_object(&mut commands, &ents, &object);
             p.entities.extend(ents);
             d.spawned = true;
@@ -1059,6 +1200,27 @@ fn handle_label<A: Asset>(handle: &Handle<A>) -> String {
 fn tag_world_object(commands: &mut Commands, ents: &[Entity], object: &Arc<WorldObject>) {
     for &e in ents {
         commands.entity(e).insert((**object).clone());
+    }
+}
+
+/// MONKEY (torch owner exclusion): stamp a placement's OWN M2 lights with its identity, so the
+/// torch-shadow caster gathers can drop the fixture's own body out of its own shadow map
+/// (`static_gx::LightOwner` carries the whole argument).
+///
+/// Narrow on purpose — this takes the slice of `ents` that [`fx::spawn_lights_for`] just appended,
+/// never the placement's whole entity list, and it is NOT folded into [`tag_world_object`]. The
+/// WMO lane runs `tag_world_object` over its authored MOLT fixtures too, and a MOLT fixture's
+/// placement identity is the BUILDING's: tagged, an inn's hearth would name every wall, floor and
+/// pillar of the inn as its own body and the interior shadow lane would go dark. A MOLT light has
+/// no model of its own, so it needs no exclusion at all — only a light SYNTHESISED from (or
+/// authored inside) a model does, and those are exactly the ones `spawn_lights_for` makes.
+fn tag_light_owner(commands: &mut Commands, lights: &[Entity], object: &Arc<WorldObject>) {
+    if lights.is_empty() {
+        return;
+    }
+    let owner = crate::static_gx::LightOwner::placement(object);
+    for &e in lights {
+        commands.entity(e).insert(owner);
     }
 }
 

@@ -313,6 +313,22 @@ pub(super) fn attach_ground_fx_models(
                 continue; // model still building — attach on a later pass
             }
             inst.spawned = true;
+            // MONKEY (spell light): the IMPACT flash. A dest-anchored effect is the one lane whose
+            // light must not hold — a Fire Nova lights the ground it lands on and is gone. The
+            // burst span is the model's own first-sequence duration where it authors one (so the
+            // light fades with the effect rather than on a guess), the shared default otherwise;
+            // a LOOPING plant (a persistent ground aura) takes the default too, because "as long
+            // as the aura lasts" is exactly what a burst must not be.
+            let span = dm
+                .first_seq_span
+                .filter(|_| !inst.looping)
+                .unwrap_or(super::spell_fx::SPELL_BURST_SPAN);
+            super::spawn_spell_light(
+                &mut commands,
+                &dm.lights,
+                entity,
+                super::spell_fx::SpellLightMode::Burst { span },
+            );
             if !inst.looping {
                 // One pass of the first sequence — the kit pipeline's completion-callback
                 // stand-in (`spell_fx`'s span clock, same law).

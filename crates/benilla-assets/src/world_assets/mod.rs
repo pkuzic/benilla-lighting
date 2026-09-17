@@ -24,7 +24,7 @@ use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Buffer, Face};
 
-use crate::materials::{WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
+use crate::materials::{TorchBinds, WowModelExt, WowModelMaterial, VANILLA_ALPHA_KEY_REF};
 use crate::SpatialCache;
 use benilla_formats::{blp_to_rgba, read_texture_native_chain, tga_to_rgba, Chain, ModelBlend};
 
@@ -101,6 +101,10 @@ pub struct WorldAssets {
     /// can clone it into every deduped model material's `light_buf` without threading a `Buffer` through
     /// the many call sites. One buffer for the whole scene, updated in place each frame.
     pub shared_light: Buffer,
+    /// MONKEY (torch shadows Phase 3A): the shared torch depth image + torch table buffer, held
+    /// beside `shared_light` for the same reason — cloned into every deduped model material's
+    /// `torch_depth`/`torch_buf` without threading them through the call sites.
+    pub torch: TorchBinds,
 }
 
 /// Identity of a deduped model material: a textured material is uniquely determined by its texture
@@ -388,7 +392,10 @@ impl WorldAssets {
     /// sit under the renderer: the store's only use of it is `clone()` into every deduped model
     /// material's `light_buf`, so the parameter severs what would otherwise be a dependency on the
     /// lighting layout and, through it, the rig-palette regions (decision 1164).
-    pub fn open(chain: Chain, shared_light: Buffer) -> Self {
+    ///
+    /// `torch` (MONKEY, torch shadows Phase 3A) is the same shape of seam for the torch-shadow
+    /// receiver bindings: the raw image handle + table buffer, cloned into every model material.
+    pub fn open(chain: Chain, shared_light: Buffer, torch: TorchBinds) -> Self {
         Self {
             chain: Arc::new(Mutex::new(chain)),
             textures: SpatialCache::default(),
@@ -402,6 +409,7 @@ impl WorldAssets {
             loose_root: None,
             model_materials: SpatialCache::default(),
             shared_light,
+            torch,
         }
     }
 
@@ -754,6 +762,9 @@ impl WorldAssets {
                 anim_slots: Vec4::ZERO,
                 // The shared global light (light/fog/SH come from here, updated in place each frame).
                 light_buf: self.shared_light.clone(),
+                // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
+                torch_depth: self.torch.depth.clone(),
+                torch_buf: self.torch.table.clone(),
             },
         });
         self.model_materials.insert(key, handle.clone());

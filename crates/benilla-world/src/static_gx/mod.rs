@@ -134,6 +134,21 @@ mod cull;
 mod pick;
 mod pool;
 mod render;
+mod shadow; // MONKEY (world shadows): CPU triangle collection for the static-world shadow caster
+mod torch_depth; // MONKEY (torch shadows Phase 1): the per-fixture depth-map render + its targets
+pub use shadow::CutoutBucket; // MONKEY (world shadows): per-leaf-texture alpha-cutout caster group
+pub use torch_depth::TorchShadowViews; // MONKEY (torch shadows Phase 1): the app→render publication
+// MONKEY (torch owner exclusion): the light→caster ownership key, written at the light spawn
+// sites (`terrain_stream::spawn`, `benilla_app::entities::carried_light`) and read by both
+// torch caster gathers, so a fixture never casts its own body's shadow into its own map.
+pub use torch_depth::{torch_flame_inside_bounds, LightOwner};
+// MONKEY (torch shadows Phase 3A): the shared depth image + table buffer every model material binds,
+// their startup constructor, the one-param main-world accessor, and the always-on wiring — used by
+// the asset foundation (`crate::assets`) and every material-building site; NOT gated on `enabled()`.
+pub use torch_depth::{
+    new_torch_shared, SharedTorchBuffer, TorchDepthImage, TorchShared,
+};
+pub(crate) use torch_depth::register_shared as register_torch_shared;
 
 /// The doodad spatial cell — ¼ ADT tile, the same 133⅓-yd locality key the merge lanes use
 /// (`terrain_stream::merge::CELL`; 1413 round 2 proved the locality load-bearing).
@@ -296,8 +311,11 @@ struct GxItem {
     owner: (i32, i32),
     texture: Option<AssetId<bevy::image::Image>>,
     /// Kept as a live handle so the render world's `GpuImage` can never be dropped from under
-    /// the baked cell (the id alone holds nothing).
-    _texture_handle: Option<Handle<bevy::image::Image>>,
+    /// the baked cell (the id alone holds nothing). Never READ (the bake keys everything off
+    /// [`Self::texture`]'s id) — its whole job is the strong reference held by its own
+    /// existence, so `dead_code` is a false positive here.
+    #[allow(dead_code)]
+    texture_handle: Option<Handle<bevy::image::Image>>,
     cutout: bool,
     two_sided: bool,
     unlit: bool,
@@ -389,6 +407,14 @@ enum FaderState {
 struct GxItemWmo {
     group: u16,
     interior: bool,
+    /// MONKEY (ext-class night law): this batch's group is EXTERIOR-class at BUILDING scale
+    /// ([`benilla_formats::room_claim::ext_building_scale`]) — the record table's bit 27, which
+    /// makes `static_gx.wgsl` blend it onto the interior light law after dark.
+    ext_night: bool,
+    /// MONKEY (enclosed day floor): this batch's group is an INTERIOR room inside a building-scale
+    /// shell ([`benilla_formats::room_claim::enclosed_by_building_shell`]) — the record table's
+    /// bit 28, which gives the room law a sun-driven ambient floor by day.
+    enclosed: bool,
     /// The batch-class lane exactly as `model_render` packs `tint.w`: 0 = EXT law, 1 = INT,
     /// 2 = TRANS — non-zero only on an interior group's batches.
     class_lane: u8,
@@ -542,7 +568,13 @@ pub enum GxSite<'a> {
     Doodad { owner: (i32, i32) },
     /// A WMO placement's group geometry: the pre-spawned `WmoPortalInstance` entity + the
     /// model's per-batch group map (`WmoModel::submesh_group`, index-parallel with batches).
-    Wmo { instance: Entity, groups: &'a [u16] },
+    /// MONKEY (ext-class night law): `bounds` is the model's MOGI group table (`group_bounds`),
+    /// indexed by ABSOLUTE group index — the class + box the per-batch night-law bit is read off.
+    Wmo {
+        instance: Entity,
+        groups: &'a [u16],
+        bounds: &'a [benilla_formats::WmoGroupInfo],
+    },
     /// A WMO doodad prop (B4, decision 1433 — 1418's lane 3, absorbed): the building's
     /// instance entity, the referrer set of rooms that name the prop, and the interior
     /// prop's folded SH-probe slot. Only a placement WITH an instance qualifies (no
@@ -563,6 +595,15 @@ pub struct GxWmoBatch {
     pub group: u16,
     /// This batch's group is a true interior (`MOGI & 0x48 == 0`) — `RenderSubmesh::interior`.
     pub interior: bool,
+    /// MONKEY (ext-class night law): EXTERIOR-class, but at BUILDING scale — an inn's shell or its
+    /// basement stairwell, not a city district's. Resolved at the spawn site from the group's own
+    /// MOGI box ([`benilla_formats::room_claim::ext_building_scale`]), because that is the last
+    /// place the model's group table is in hand; it rides to the shader as a record bit.
+    pub ext_night: bool,
+    /// MONKEY (enclosed day floor): the mirror question — this is an INTERIOR-class group whose
+    /// box centre sits inside such a shell, i.e. a ROOM IN A BUILDING rather than a cave. Resolved
+    /// at the same site off the same table; rides to the shader as bit 28.
+    pub enclosed: bool,
     /// The MOBA batch class (INT/TRANS/EXT) — the lighting-lane selector on interior groups.
     pub class: Option<WmoBatchClass>,
     /// The MOMT SIDN night-glow colour.
@@ -696,6 +737,8 @@ impl StaticGx {
         let wmo = b.wmo.map(|w| GxItemWmo {
             group: w.group,
             interior: w.interior,
+            ext_night: w.ext_night,
+            enclosed: w.enclosed,
             class_lane: match (w.interior, w.class) {
                 (true, Some(WmoBatchClass::Int)) => 1,
                 (true, Some(WmoBatchClass::Trans)) => 2,
@@ -797,7 +840,7 @@ impl StaticGx {
             local_aabb: b.aabb,
             owner: b.owner,
             texture: b.texture.as_ref().map(Handle::id),
-            _texture_handle: b.texture,
+            texture_handle: b.texture,
             cutout: b.blend == ModelBlend::AlphaTest && !crate::model_render::alphatest_disabled(),
             two_sided: b.two_sided,
             unlit: b.unlit,

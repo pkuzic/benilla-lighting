@@ -47,6 +47,16 @@ use attach::{attach_entity_visuals, build_dressup_preview, build_glue_pet, build
 /// decision 0016's law applied to the *entity* half of the scene, not just the placed half.
 mod carried_light;
 use carried_light::spawn_carried_lights;
+// MONKEY (spell light): the same file's second spawner — the ONE light a luminous spell effect /
+// firework throws, hung on the effect's own root so the effect's death reaps it. Used by the kit,
+// missile and dest-anchored lanes.
+use carried_light::spawn_spell_light;
+// MONKEY (carried light stability): `torch_shadow` needs the settle verdict to refuse a MOVING
+// carried light a cube-shadow slot.
+pub(crate) use carried_light::CarriedLightMotion;
+// MONKEY (outdoor torch shadows): …and the HELD/creature-owned marker, so the exterior shadow lane
+// can refuse a torch that a body is carrying.
+pub(crate) use carried_light::HeldLight;
 
 /// Equipment visuals (decisions 0072/0074): held items (weapon/shield/ranged) plus worn-armor and
 /// helm/shoulder resolution, all resolved from the unit descriptor + ItemDisplayInfo and spawned as
@@ -964,6 +974,41 @@ impl Plugin for EntitiesPlugin {
                 .after(benilla_world::model_render::ModelVisSet)
                 .after(apply_render_fade)
                 .before(crate::player::apply_self_model_fade),
+        )
+        // MONKEY (fire GO lights): copy each carried light's owner room onto the light, so an
+        // entity's torch/brazier is portal-gated like a building's own fixture AND is eligible for
+        // a cube shadow. In `Update` **after the classifier** — that is the frame's only writer of
+        // `InteriorAnchor::room`, and the whole of `Update` precedes `PostUpdate`'s light pack
+        // (`lighting::build_light_data`), so a claim made here is always in this frame's table.
+        .add_systems(
+            Update,
+            carried_light::claim_carried_light_rooms
+                .after(benilla_world::interior::classify_entity_interior),
+        )
+        // MONKEY (carried light stability): how long each carried light has been standing still,
+        // which is what lets `torch_shadow` refuse a MOVING one a cube-shadow slot (a walking
+        // bearer invalidated its cached depth map every frame, and a withdrawn map zeroes the
+        // slot's cross-fade weight with no ramp — the imp's strobing green pool). `PostUpdate`
+        // after transform propagation, because a child light's `GlobalTransform` is only this
+        // frame's once `Propagate` has run; `update_torch_shadows` reads it later the SAME frame,
+        // in `Last`.
+        .add_systems(
+            PostUpdate,
+            carried_light::track_carried_light_motion
+                .after(bevy::transform::TransformSystems::Propagate),
+        )
+        // MONKEY (spell light): the luminous-effect lights' envelope and their ceiling. `Update`,
+        // after the attach passes that spawn them (`EntityVisualsSet`) so a light born this frame
+        // is already on its own clock, and well before `PostUpdate`'s packer reads the intensity
+        // they write. The budget runs after the envelope so the age it orders on is this frame's.
+        .add_systems(
+            Update,
+            (
+                spell_fx::advance_spell_lights,
+                spell_fx::budget_spell_lights,
+            )
+                .chain()
+                .after(EntityVisualsSet),
         )
         // The aura CharProc layer (`crate::aura_visual`): the state kit's effect on the BODY.
         // The drain installs/removes this frame's nodes; the author then owns the render alpha

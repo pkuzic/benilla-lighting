@@ -2560,6 +2560,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "AudioRowBackgroundSound",
             ),
             ("BENILLA_TOOLTIP_BRIGHTNESS", "GraphicsRowBrightness"),
+            ("BENILLA_TOOLTIP_CHARACTER_SHADOWS", "GraphicsRowCharacterShadows"),
+            ("BENILLA_TOOLTIP_WORLD_SHADOWS", "GraphicsRowWorldShadows"),
+            ("BENILLA_TOOLTIP_SHADOW_DISTANCE", "GraphicsRowShadowDistance"),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2618,7 +2621,9 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // …and Brightness (2182), the FOURTH row whose description is benilla's own rather than 1.12
     // GlobalStrings — OPTION_TOOLTIP_GAMMA spends its second sentence on the stock window's
     // 21-step grey ramp, which this page does not have (see the guard above). 77 -> 78.
-    assert_eq!(checked, 78, "every tipped row carries a live key");
+    // MONKEY (world shadows): +3 for Real Character Shadows, World Shadows and the Shadow
+    // Distance slider (all benilla-owned keys, carved out in BENILLA_OWNED above). 78 -> 81.
+    assert_eq!(checked, 81, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2738,7 +2743,9 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // own key, which is what makes the count move by exactly the number of rows added.
     // …and Weather Intensity (2181) and Brightness (2182), the Graphics page's fourth and fifth
     // sliders.
-    assert_eq!(raised, 78, "every row but Auto Loot raises a description");
+    // MONKEY (world shadows): +3 for Real Character Shadows, World Shadows and the Shadow
+    // Distance slider (all benilla-owned keys, carved out in BENILLA_OWNED above). 78 -> 81.
+    assert_eq!(raised, 81, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

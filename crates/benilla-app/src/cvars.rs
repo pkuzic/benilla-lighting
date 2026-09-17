@@ -908,6 +908,250 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
     // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
     same("gxVSync", "1").latched(),
+    // Benilla's opt-in realtime shadow-map path, split into two INDEPENDENT lanes over one shared
+    // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
+    // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
+    // players/NPCs/creatures/mounts cast realtime silhouettes instead of the legacy oval blob.
+    //
+    // `ours(...)`, not `same(...)`: the reference has no realtime shadow at all — it bakes MCSH
+    // into the terrain and draws an oval under every unit — so there is no registered default for
+    // these two to agree with, and claiming `Same` would put a false entry in the one column
+    // [`Reference`] exists to keep honest. (They read `same("…", "1")` until the 2303 registry
+    // port; the default string is unchanged.)
+    ours(
+        "worldShadows",
+        "1",
+        "benilla's own: the static world (trees, buildings, alpha-tested foliage) casts a realtime \
+         shadow and the baked MCSH terrain shadows stand aside; the reference bakes and has no \
+         such switch",
+    ),
+    ours(
+        "characterShadows",
+        "1",
+        "benilla's own: units cast a realtime silhouette instead of the reference's oval blob \
+         decal, which is all 1.12 has and is therefore not a setting there",
+    ),
+    // Realtime-shadow render distance in yards (the shadow-map cascade range + caster reach).
+    // benilla's own — the reference has no realtime shadow to size. Clamped to SHADOW_DISTANCE_RANGE.
+    ours(
+        "shadowDistance",
+        "80",
+        "1900: benilla's own realtime-shadow render-distance slider; the reference bakes MCSH and \
+         has no cascade to size",
+    ),
+    // MONKEY (sun shadow perf): the five live dials over the sun lanes' ~5 ms/frame (RTX 3070,
+    // 1080p, both lanes on: 45-47 fps, and 68-73 with both off). All benilla's own — the reference
+    // bakes MCSH and has no realtime shadow to tune. `shadow_core`'s constants block holds the cost
+    // split each one takes; every row is LIVE, so the whole set A/Bs from one chat line.
+    ours(
+        "shadowMapSize",
+        "2048",
+        "benilla's own: directional shadow-map edge in texels, 1024/2048/4096 (cost is quadratic)",
+    ),
+    ours(
+        "shadowFilter",
+        "1",
+        "benilla's own: shadow PCF kernel: 0 hardware-2x2 (1 sample), 1 gaussian (9, the look)",
+    ),
+    ours(
+        "characterShadowRate",
+        "30",
+        "benilla's own: Hz cap on the character shadow proxy re-skin+upload, 0..120 (0 = per frame)",
+    ),
+    ours(
+        "worldShadowRate",
+        "30",
+        "benilla's own: Hz cap on the world lane's environment caster, 0..120 (0 = per frame)",
+    ),
+    ours(
+        "shadowCasterReach",
+        "1",
+        "benilla's own: multiplier on the shadow caster-collection reach, 0.25..2 (1 = unchanged)",
+    ),
+    // MONKEY (dynamic interiors): WMO interiors + their props light from the room's LIVE fixtures
+    // instead of the MOCV bake / the baked prop probe (`static_gx.wgsl` `interior_room_light`;
+    // bridged by `dynamic_interior`). The three numeric knobs are live-tunable from chat —
+    // `/script SetCVar("interiorExposure", 2)` — which is how their defaults were found.
+    ours(
+        "interiorLight",
+        "1",
+        "benilla's own: fixture-lit WMO interiors (0 = the reference's baked interior path)",
+    ),
+    ours(
+        "interiorAmbient",
+        "0.015",
+        "benilla's own: interior base ambient, 0..1",
+    ),
+    ours(
+        "interiorFill",
+        "0.08",
+        "benilla's own: interior per-fixture bounce gain, 0..2",
+    ),
+    ours(
+        "interiorExposure",
+        "2.5",
+        "benilla's own: interior light-budget multiplier before the soft rolloff, 0.25..8",
+    ),
+    // MONKEY (soft falloff): the live scale on every interior fixture's AUTHORED attenuation
+    // window (WMO MOLT `+0x28/+0x2c`; M2 sources bucket by intensity instead — their authored pair
+    // is a template default, not a reach). A fixture's EFFECTIVE RADIUS is `authored end × this`.
+    // The artists' own ends — Goldshire inn 6.97-9.53 yd over 10 fixtures, its blacksmith 6.0,
+    // NSabbey 4.17-5.56, Stormwind's 606 median 6.94 — are where FULL brightness ends, not where
+    // light stops, so `1` drew a hard-edged disc at exactly that radius with black beyond it (the
+    // abbey candelabra ring). **2.5** is the default: the pool now tails smoothly to 2.5× the
+    // authored end, reading ~⅓ of its 1 yd brightness AT the authored end and ~8 % at twice it.
+    // `>1.6` widens further, `<1.6` tightens, `0` switches the window off (the 48 yd lane), so the
+    // whole shape A/Bs from chat.
+    ours(
+        "interiorAttenScale",
+        "1.6",
+        "benilla's own: scale on interior fixtures' authored attenuation window = their effective \
+         radius, 0..8 (0 = no window, the old flat lane)",
+    ),
+    // MONKEY (room gate): whether an interior fixture may light only the rooms it CLAIMS — its
+    // authored MOLR groups unioned with the interior groups whose MOGI bounding box it stands
+    // inside (`LightLitRooms` carries the corpus evidence for why MOLR alone is far too sparse:
+    // the Goldshire inn authors one on 2 of its 12 groups). Off restores the pre-gate behaviour:
+    // every interior fixture in range lights every interior surface in range, so an inn's
+    // ground-floor candles light its basement through the floor. Kept as a dial because a room the
+    // gate leaves on ambient alone looks the same as a bug, and this tells the two apart in one
+    // keystroke.
+    ours(
+        "interiorRoomGate",
+        "1",
+        "benilla's own: an interior fixture lights only the WMO groups it claims (0 = the old \
+         leak-through-walls behaviour)",
+    ),
+    ours(
+        "interiorShadows",
+        "1",
+        "benilla's own: interior fixtures cast real shadows (Stage B, the nearest few); needs \
+         interiorLight",
+    ),
+    // MONKEY (outdoor torch shadows): the outdoor half of the same cube-map lane. Its own row
+    // because it is its own audience (a night camp, a lit village) and its own cost profile — and
+    // because "turn the outdoor shadows off" must not also turn the inn's candles' shadows off.
+    ours(
+        "exteriorShadows",
+        "1",
+        "benilla's own: outdoor fire lights (campfires, braziers, lampposts) cast real shadows at          night; no effect by day",
+    ),
+    // MONKEY (static torch cache): residency and per-frame work have separate live budgets.
+    ours(
+        "interiorShadowCasters",
+        "12",
+        "benilla's own: resident interior fixture shadow maps, 1..16",
+    ),
+    ours(
+        "interiorShadowDynamic",
+        "4",
+        "benilla's own: nearest promoted fixtures with moving entity shadows, 0..16",
+    ),
+    // MONKEY (torch lane perf): the moving-caster REGATHER cadence. Its own row (and not folded
+    // into `interiorShadowDynamic`) because it trades a different currency: `Dynamic` buys how
+    // MANY fixtures overlay moving casters, this buys how OFTEN the one shared overlay mesh is
+    // rebuilt. Neither of the count dials moved the frame time at all, so the cost was never per
+    // map -- it was this gather + mesh mutation, paid once a frame no matter what the counts said.
+    // `0` is the pre-feature every-frame behaviour, kept as the live A/B.
+    ours(
+        "interiorShadowEntityRate",
+        "30",
+        "benilla's own: how often (Hz) moving torch-shadow casters are regathered; 0 = every frame",
+    ),
+    // MONKEY (torch caster selection): the PCF tap radius on the torch maps. Candle clusters read
+    // very hard-edged at 1 (a half-texel box on a 512² face); 2 is a visible softening for four
+    // extra texel-neighbourhood taps' worth of cache pressure, no extra samples.
+    ours(
+        "interiorShadowSoft",
+        "1.5",
+        "benilla's own: torch-shadow edge softness — the PCF tap radius scale at a CONTACT, 0.5..3",
+    ),
+    // MONKEY (shadow floor): how BLACK a torch shadow is allowed to get. The lane's shadows were
+    // the only occlusion in the direct term and took all of it, which is what made them read as
+    // scars rather than as shadows; 0.7 leaves 30 % standing in place of the bounce light this
+    // renderer does not have. `1` is the shipped look, `0` is off.
+    ours(
+        "torchShadowStrength",
+        "0.7",
+        "benilla's own: torch-shadow darkness — how much of the direct term a shadow removes, 0..1",
+    ),
+    ours(
+        "interiorDebug",
+        "0",
+        "benilla's own: interior diagnostic overlay — 1 classification, 2 shadow, 3 caster count, 4 WMO lane map",
+    ),
+    // MONKEY (darkness gains): the two live dim dials. `nightGain` scales the EXTERIOR day/night
+    // law (the packed ambient/diffuse/specular rows) by `mix(1, gain, night_w)`, so it is exactly
+    // inert by day and full strength after dark; `interiorGain` scales the room lane's inputs (base
+    // ambient, per-fixture fill, and every interior fixture's colour). Both fold in at PACK time in
+    // `build_light_data`, so `SetCVar` moves the whole world on the very next frame — which is how
+    // "20 % / 30 % darker" gets judged at all, and `1` on either is the restore.
+    //
+    // Neither touches the fires: a point light keeps its brightness under both dials, because the
+    // ask is for a darker night AROUND the flame, not a dimmer flame.
+    ours(
+        "nightGain",
+        "0.45",
+        "benilla's own: exterior night brightness, 0.2..1.5 (1 = the reference's own night)",
+    ),
+    // MONKEY (lighting debug panel): weaker fresh interiors; persisted gains still win at boot.
+    ours(
+        "interiorGain",
+        "0.5",
+        "benilla's own: WMO interior brightness, 0.2..1.5 (1 = the pre-dial fixture-lit room)",
+    ),
+    // MONKEY (enclosed day floor): the daylight a room INSIDE A BUILDING gets by day, for the
+    // doorways this renderer cannot locate in the data (the Goldshire inn's entry group authors no
+    // portal, no EXT-class batch, no stitched vertex and no bake hot spot — there is nowhere to
+    // stand a fixture). An additive ambient in `interiorAmbient`'s own units, scaled by the sun's
+    // day envelope, so it is exactly 0 at night and the night look never moves. `0` is the restore.
+    ours(
+        "interiorDaylight",
+        "0.0",
+        "benilla's own: daylight floor for rooms inside a building, 0..1 (0 = none, the old look)",
+    ),
+    // MONKEY (bake floor): the share of an interior batch's own MOCV bake that survives the live-
+    // fixture lane. The lane throws the bake away and lets the fixtures decide, which leaves a room
+    // no fixture reaches (the Lion's Pride Inn's east vestibule: MOLR 0, no claims, one faded
+    // portal hop) rendering black between a sky-lit porch and a candle-lit hall — something the
+    // reference client cannot do, because it draws every interior batch at its bake regardless of
+    // lights. A fraction of the bake, inside the room law's rolloff, so a lit surface barely moves.
+    ours(
+        "interiorBakeFloor",
+        "0.12",
+        "benilla's own: share of an interior batch's baked light kept where no fixture reaches, 0..1 (0 = the old look)",
+    ),
+    // MONKEY (fire GO lights): the gain on lights SYNTHESISED from a model's flame emitter for the
+    // ~410 fire props the artists never gave a light block (campfires, wall torches, magic
+    // braziers, forges, candles). Live, like the interior knobs — and `0` is the kill switch for
+    // the whole invented-light lane, which matters because unlike everything beside it this one is
+    // a heuristic over content rather than a byte-verified mechanism.
+    ours(
+        "fireLightGain",
+        "1",
+        "benilla's own: brightness of lights synthesised from fire props' flame emitters (0 = off)",
+    ),
+    // MONKEY (spellLightGain): the same dial for the SPELL lane — a kit's aura glow, a missile's
+    // core, an impact flash, a firework's burst. A separate knob from the one above it because the
+    // two are separate judgements: that one tunes SCENERY (how bright is the invented campfire),
+    // this one tunes COMBAT (how hard does a fight flash the room), and a spell light carries both
+    // markers, so one dial over both would mean dimming the world's hearths to calm a fireball.
+    // `0` is this lane's kill switch and reaches nothing else.
+    ours(
+        "spellLightGain",
+        "1",
+        "benilla's own: brightness of spell, missile and impact lights (0 = off)",
+    ),
+    // MONKEY (flame flicker): how hard every FLAME breathes — candles fast and shallow, bonfires
+    // slow and shallower still (`benilla_world::lighting::FlameKind`). Live like the gain beside
+    // it, and `0` restores the steady constants every fire had before the feature, which is the
+    // escape hatch this needs precisely because "subtle" is a judgement call and a flicker that
+    // reads as a strobe is worse than none.
+    ours(
+        "fireFlicker",
+        "1",
+        "benilla's own: how strongly fire lights flicker — 0 steady, 1 default, 2 pronounced",
+    ),
     // **Display mode** (decisions 1627, 1650) — 1.12's own `gxWindow`, worn since 1650 as modern
     // Classic's two-entry *Display Mode* dropdown rather than 1.12's *Windowed Mode* checkbox: the
     // two states 1627 settled on ARE that client's two (its own `Graphics.lua` builds the list from
@@ -2405,6 +2649,85 @@ mod tests {
         // VSync welds to the video knob, which in turn welds to the window literal's boot
         // mode (`video::tests`) — so the registered "1" cannot drift from what we ship.
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
+        // ── MONKEY (lighting): the weld for the dynamic light + shadow system's whole row set ──
+        //
+        // **All 29, as one census, with the count asserted.** Every one of them lands on
+        // `VideoConfig` and is read from there per frame (`shadow_core::update_shadows`,
+        // `dynamic_interior::bridge`, `torch_shadow`), so a registered default that drifts from
+        // the struct's literal is a setting that reads one way in `config.toml` and renders
+        // another — invisible until someone compares a fresh install against a configured one.
+        // Spelling the table out rather than asserting a favourite handful is what makes "added
+        // a row, forgot its weld" fail HERE: the length check below is the gate.
+        let shadows = VideoConfig::default();
+        let flag = |b: bool| if b { 1.0 } else { 0.0 };
+        let lighting: [(&str, f32); 29] = [
+            // The two sun lanes and the cascade they share.
+            ("worldShadows", flag(shadows.world_shadows)),
+            ("characterShadows", flag(shadows.character_shadows)),
+            ("shadowDistance", shadows.shadow_distance),
+            // MONKEY (sun shadow perf): the five cost dials.
+            ("shadowMapSize", shadows.shadow_map_size as f32),
+            ("shadowFilter", shadows.shadow_filter as f32),
+            ("characterShadowRate", shadows.character_shadow_rate as f32),
+            ("worldShadowRate", shadows.world_shadow_rate as f32),
+            ("shadowCasterReach", shadows.shadow_caster_reach),
+            // MONKEY (dynamic interiors): the room lane's switch and its light law.
+            ("interiorLight", flag(shadows.interior_light)),
+            ("interiorAmbient", shadows.interior_ambient),
+            ("interiorFill", shadows.interior_fill),
+            ("interiorExposure", shadows.interior_exposure),
+            ("interiorAttenScale", shadows.interior_atten_scale),
+            ("interiorRoomGate", flag(shadows.interior_room_gate)),
+            ("interiorDebug", shadows.interior_debug as f32),
+            // MONKEY (torch shadows): the cube-map lane, indoors and out.
+            ("interiorShadows", flag(shadows.interior_shadows)),
+            ("exteriorShadows", flag(shadows.exterior_shadows)),
+            (
+                "interiorShadowCasters",
+                shadows.interior_shadow_casters as f32,
+            ),
+            (
+                "interiorShadowDynamic",
+                shadows.interior_shadow_dynamic as f32,
+            ),
+            (
+                "interiorShadowEntityRate",
+                shadows.interior_shadow_entity_rate as f32,
+            ),
+            ("interiorShadowSoft", shadows.interior_shadow_soft),
+            ("torchShadowStrength", shadows.torch_shadow_strength),
+            // MONKEY (darkness gains) / (enclosed day floor) / (bake floor): the four level dials.
+            ("nightGain", shadows.night_gain),
+            ("interiorGain", shadows.interior_gain),
+            ("interiorDaylight", shadows.interior_daylight),
+            ("interiorBakeFloor", shadows.interior_bake_floor),
+            // MONKEY (fire GO lights) / (spellLightGain) / (flame flicker): the invented lanes.
+            ("fireLightGain", shadows.fire_light_gain),
+            ("spellLightGain", shadows.spell_light_gain),
+            ("fireFlicker", shadows.fire_flicker),
+        ];
+        for (name, want) in lighting {
+            assert_eq!(d[name], want, "{name}: registered default left the knob");
+        }
+        // …and the census IS the row set. A name here that nothing registers would weld against a
+        // row the client does not have; the length is the other half — 29 rows, 29 welds.
+        let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
+        assert_eq!(welded.len(), 29, "the lighting lane welds 29 distinct rows");
+        for name in &welded {
+            assert!(
+                REGISTERED.iter().any(|r| r.name == *name),
+                "{name}: welded but not registered"
+            );
+        }
+        // Three of them are CALIBRATED rather than chosen, so the weld alone is not enough — it
+        // would pass just as happily if a tuning session left the struct's literal wherever it was
+        // last dragged in the debug panel. These pin the measured numbers themselves.
+        assert_eq!(d["interiorGain"], 0.5, "MONKEY (lighting debug panel)");
+        // MONKEY (bake floor): the inn's black door band measured up to 0.108 x tex with
+        // candle-lit surfaces moving under +10 % — only true at this number.
+        assert_eq!(d["interiorBakeFloor"], 0.12);
+        assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
+        // ── end MONKEY (lighting) ─────────────────────────────────────────────────────────────
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Render scale (1639) welds to OFF. Not a taste default: the whole tree of visual

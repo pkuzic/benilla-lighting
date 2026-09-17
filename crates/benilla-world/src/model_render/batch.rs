@@ -20,7 +20,7 @@
 //! two lanes that build the same batch the same way get the same handle — which is the whole
 //! reason the cache exists, and was true of four separate caches only by luck.
 
-use benilla_assets::materials::WowModelMaterial;
+use benilla_assets::materials::{TorchBinds, WowModelMaterial};
 use benilla_assets::ModelSubmesh;
 use benilla_formats::ModelBlend;
 use bevy::ecs::system::SystemParam;
@@ -29,6 +29,7 @@ use bevy::render::render_resource::Buffer;
 
 use super::{model_material, zfill_material, MaterialCache, ShadeSel};
 use crate::lighting::SharedLightBuffer;
+use crate::static_gx::TorchShared;
 
 /// The engine's one `WowModelMaterial` dedup cache. Swept by distance like every other art cache
 /// (`art_scope`) and cleared whole on a map change; an evicted entry costs one rebuild, never a
@@ -95,12 +96,16 @@ pub struct M2BatchMaterials<'w> {
     cache: ResMut<'w, ModelMaterials>,
     materials: ResMut<'w, Assets<WowModelMaterial>>,
     light: Option<Res<'w, SharedLightBuffer>>,
+    /// MONKEY (torch shadows Phase 3A): the shared torch bindings every built material takes —
+    /// created in the same startup system as the light buffer, so the same "retry" contract.
+    torch: TorchShared<'w>,
 }
 
 impl M2BatchMaterials<'_> {
-    /// Is the shared light buffer resident? A spawner that has other work to skip asks first.
+    /// Is the shared light buffer (and the torch pair) resident? A spawner that has other work to
+    /// skip asks first.
     pub fn ready(&self) -> bool {
-        self.light.is_some()
+        self.light.is_some() && self.torch.binds().is_some()
     }
 
     /// The material store this param already holds — for a spawner that builds a batch's world
@@ -124,6 +129,7 @@ impl M2BatchMaterials<'_> {
         order: u16,
     ) -> Option<Handle<WowModelMaterial>> {
         let light = self.light.as_ref()?.0.clone();
+        let torch = self.torch.binds()?;
         Some(self.build(
             sub,
             texture,
@@ -133,6 +139,7 @@ impl M2BatchMaterials<'_> {
             false,
             false,
             &light,
+            &torch,
         ))
     }
 
@@ -177,6 +184,7 @@ impl M2BatchMaterials<'_> {
         order: u16,
     ) -> Option<SkyboxBatch> {
         let light = self.light.as_ref()?.0.clone();
+        let torch = self.torch.binds()?;
         let mut mk = |fade: bool| {
             model_material(
                 &mut self.cache.0,
@@ -208,6 +216,7 @@ impl M2BatchMaterials<'_> {
                 false,
                 true, // the sky lane
                 &light,
+                &torch,
                 None, // one shared sky material — no per-sequence channel to key on
             )
         };
@@ -250,7 +259,18 @@ impl M2BatchMaterials<'_> {
         rig: bool,
     ) -> Handle<WowModelMaterial> {
         let shade = if rig { ShadeSel::Rig } else { ShadeSel::Lit };
-        self.build(sub, texture, order, shade, false, false, rig, light)
+        // MONKEY (torch shadows Phase 3A): the torch pair is global (one image, one table for the
+        // whole process), so an off-world lane takes it from the shared resources even though its
+        // LIGHT is its own. Both are inserted by `assets::open_world_assets` at `Startup`, before
+        // any booth or glue system can run, so this cannot fire in a real app; it is an `expect`
+        // rather than an `Option` return because both callers build `BoothPart`s inside `.map()`
+        // closures that want a handle, not a retry. (An off-world scene never lights by the
+        // interior room lane, so the bindings are only ever read as "no torches".)
+        let torch = self.torch.binds().expect(
+            "TorchShared: the torch depth image + table are created at Startup \
+             (assets::open_world_assets) before any off-world material is built",
+        );
+        self.build(sub, texture, order, shade, false, false, rig, light, &torch)
     }
 
     /// The full variant set an **entity** part needs: every M2 entity — unit, player, GameObject,
@@ -279,6 +299,7 @@ impl M2BatchMaterials<'_> {
         uv: &mut EntityUvLane<'_>,
     ) -> Option<BatchVariants> {
         let light = self.light.as_ref()?.0.clone();
+        let torch = self.torch.binds()?;
         let steady = self.build(
             sub,
             texture.clone(),
@@ -288,6 +309,7 @@ impl M2BatchMaterials<'_> {
             false,
             true,
             &light,
+            &torch,
         );
         let interior = self.build(
             sub,
@@ -298,6 +320,7 @@ impl M2BatchMaterials<'_> {
             false,
             true,
             &light,
+            &torch,
         );
         let interior_bake = self.build(
             sub,
@@ -308,6 +331,7 @@ impl M2BatchMaterials<'_> {
             false,
             true,
             &light,
+            &torch,
         );
         // A multiply batch (Mod/Mod2x) and an authored-Blend batch are their own twin: the first
         // because its blend equation reads no alpha at all — the fade rides the shader's
@@ -331,6 +355,7 @@ impl M2BatchMaterials<'_> {
                 true,
                 true,
                 &light,
+                &torch,
             )
         };
         let interior_bake_blend = if own_twin {
@@ -345,6 +370,7 @@ impl M2BatchMaterials<'_> {
                 true,
                 true,
                 &light,
+                &torch,
             )
         };
         // On the lane, now, in the same call that built and seeded them. `register_entity_uv` is
@@ -374,7 +400,7 @@ impl M2BatchMaterials<'_> {
             interior_bake,
             interior_bake_blend,
             fade_blend,
-            zfill: self.zfill_for(sub, texture, &light),
+            zfill: self.zfill_for(sub, texture, &light, &torch),
         })
     }
 
@@ -392,6 +418,7 @@ impl M2BatchMaterials<'_> {
         two_sided: bool,
     ) -> Option<BatchVariants> {
         let light = self.light.as_ref()?.0.clone();
+        let torch = self.torch.binds()?;
         let mut mk = |shade: ShadeSel, probe: bool, fade: bool| {
             model_material(
                 &mut self.cache.0,
@@ -422,6 +449,7 @@ impl M2BatchMaterials<'_> {
                 false, // …nor the WINDOW flag
                 false, // a character composite is never a skybox
                 &light,
+                &torch,
                 None, // a composite sheet carries no animated UV/tint channel at all
             )
         };
@@ -441,6 +469,7 @@ impl M2BatchMaterials<'_> {
                 two_sided,
                 blend == ModelBlend::AlphaTest,
                 &light,
+                &torch,
             )),
         })
     }
@@ -456,9 +485,15 @@ impl M2BatchMaterials<'_> {
     /// this facade to a lane it does not serve.
     pub fn pieces(
         &mut self,
-    ) -> Option<(&mut MaterialCache, &mut Assets<WowModelMaterial>, Buffer)> {
+    ) -> Option<(
+        &mut MaterialCache,
+        &mut Assets<WowModelMaterial>,
+        Buffer,
+        TorchBinds,
+    )> {
         let light = self.light.as_ref()?.0.clone();
-        Some((&mut self.cache.0, &mut self.materials, light))
+        let torch = self.torch.binds()?;
+        Some((&mut self.cache.0, &mut self.materials, light, torch))
     }
 
     /// The depth-prime twin, or `None` for a batch that primes nothing: one that disables depth
@@ -469,6 +504,7 @@ impl M2BatchMaterials<'_> {
         sub: &ModelSubmesh,
         texture: Option<Handle<Image>>,
         light: &Buffer,
+        torch: &TorchBinds,
     ) -> Option<Handle<WowModelMaterial>> {
         if sub.no_depth_write || sub.no_depth_test {
             return None;
@@ -482,6 +518,7 @@ impl M2BatchMaterials<'_> {
                 sub.two_sided,
                 b == ModelBlend::AlphaTest,
                 light,
+                torch,
             )),
         }
     }
@@ -498,6 +535,7 @@ impl M2BatchMaterials<'_> {
         fade: bool,
         play_uv: bool,
         light: &Buffer,
+        torch: &TorchBinds,
     ) -> Handle<WowModelMaterial> {
         model_material(
             &mut self.cache.0,
@@ -530,6 +568,7 @@ impl M2BatchMaterials<'_> {
             // asks for, so it cannot be one more variant built from `sub` here.
             false,
             light,
+            torch,
             // The ENTITY lane's batches (units, GameObjects, held items): shared per batch, as
             // ever. The per-placement lane is the world streamer's alone (decision 1408) — every
             // affected model is a placed `World\…` prop, and an entity already resolves its

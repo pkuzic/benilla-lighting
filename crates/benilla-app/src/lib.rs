@@ -71,6 +71,8 @@ mod debug_panel;
 /// rule, in one file. Always compiled; what it *holds* is not.
 mod dev;
 mod doodad_events;
+/// MONKEY (dynamic interiors): the cvar → benilla-world bridge for the fixture-lit interior lane.
+mod dynamic_interior;
 mod entities;
 mod fishing_line;
 mod footprints;
@@ -93,6 +95,7 @@ mod npc_text;
 mod pending_item_ops;
 /// Ships in part: the FPS journal and the clocks it reads (2008); the rest is `dev` (1173).
 mod perf;
+mod character_shadow;
 mod pipe_warm;
 mod player;
 mod poi_marker;
@@ -111,6 +114,7 @@ mod run_mode;
 mod screen_fade;
 mod screenshot;
 mod shaders;
+mod shadow_core;
 
 mod game_tip;
 mod name_persist;
@@ -202,8 +206,10 @@ mod ui_unit;
 mod ui_world_map;
 mod video;
 mod vplates;
+mod torch_shadow;
 mod weapon_trail;
 mod world_backdrop;
+mod world_shadow;
 mod world_state;
 mod world_state_ui;
 

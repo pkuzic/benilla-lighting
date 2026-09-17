@@ -20,7 +20,7 @@ use crate::mesh_tag::alpha_bits;
 use crate::model_fade::DoodadFade;
 use crate::model_render::{model_material, MaterialCache, ShadeSel};
 use crate::model_render::{ModelKind, ModelPart};
-use benilla_assets::materials::WowModelMaterial;
+use benilla_assets::materials::{TorchBinds, WowModelMaterial};
 
 /// What one placement's animation host armed, for the consumers that spawn alongside its submeshes.
 /// All fields are *per placement*, not per model: the anchors are this instance's, and `arm` is
@@ -87,6 +87,8 @@ pub fn spawn_model_entities(
     mat_cache: &mut MaterialCache,
     materials: &mut Assets<WowModelMaterial>,
     light: &Buffer,
+    // MONKEY (torch shadows Phase 3A): the shared torch bindings, beside the light buffer.
+    torch: &TorchBinds,
     submeshes: &[ModelSubmesh],
     // The model's app-built render forms (decision 0834), index-parallel with `submeshes`: the
     // static handle + its build-time `Aabb` per batch, and the skinned twins when this model's
@@ -337,6 +339,7 @@ pub fn spawn_model_entities(
             sub.window,
             false, // the world streamer never spawns a skybox
             light,
+            torch,
             seq_owner,
         );
         // The blend twin for the distance-fade feather pass (reuse the cutout when already blend, or when
@@ -381,6 +384,7 @@ pub fn spawn_model_entities(
                 sub.window,
                 false, // the world streamer never spawns a skybox
                 light,
+                torch,
                 seq_owner,
             )
         };
@@ -495,8 +499,11 @@ pub fn spawn_model_entities(
                         (class.never_fade || fade_seed.is_some())
                             .then_some((*owner, None, None, fade_seed))
                     }
-                    crate::static_gx::GxSite::Wmo { instance, groups }
-                        if is_wmo && class.merges() =>
+                    crate::static_gx::GxSite::Wmo {
+                        instance,
+                        groups,
+                        bounds,
+                    } if is_wmo && class.merges() =>
                     {
                         groups.get(batch_idx).map(|&g| {
                             (
@@ -505,6 +512,22 @@ pub fn spawn_model_entities(
                                     instance: *instance,
                                     group: g,
                                     interior,
+                                    // MONKEY (ext-class night law): EXTERIOR-class at BUILDING
+                                    // scale — the same eligibility the exterior lane's strict
+                                    // claim term uses, so a group that may be lit by a room's
+                                    // fixtures is exactly the group that stops reading as sky.
+                                    ext_night: bounds
+                                        .get(usize::from(g))
+                                        .is_some_and(benilla_formats::room_claim::ext_building_scale),
+                                    // MONKEY (enclosed day floor): this batch's group is a ROOM
+                                    // INSIDE A BUILDING -- an interior-class group whose centre
+                                    // sits in a building-scale exterior shell of the same root.
+                                    // Same place, same table, same argument as `ext_night` above:
+                                    // this is the last point at which the model's group table is
+                                    // in hand, and the answer rides to the shader as a record bit.
+                                    enclosed: benilla_formats::room_claim::enclosed_by_building_shell(
+                                        bounds, g,
+                                    ),
                                     class: sub.wmo_batch,
                                     sidn: sub.sidn,
                                     window: sub.window,

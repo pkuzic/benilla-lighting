@@ -2153,6 +2153,9 @@ mod tests {
                 visibility_off: false,
             },
             bone_pivot: [0.0; 3],
+            synthetic: false,
+            flame: false,
+            spell: None,
         }
     }
 

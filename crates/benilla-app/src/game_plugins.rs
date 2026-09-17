@@ -133,7 +133,10 @@ impl PluginGroup for GamePlugins {
             .add(CreatureAnimPlugin)
             // The unit blob shadow: the dark ground oval under every unit, sized from the playing
             // animation's box (the byte-verified law — wow-re unit-blob-shadow RE), on the same
-            // surface-decal projector as the selection ring.
+            // surface-decal projector as the selection ring. `worldShadows 0` — the shipped default,
+            // the faithful 1.12 frame — draws it exactly as the reference does; while `worldShadows 1`
+            // the realtime shadow-map path owns unit shadows and this lane hides (the gate inside
+            // `update_shadows`), so a unit never wears the oval underneath its cast shadow.
             .add(BlobShadowPlugin)
             // Footprint decals (B212, decision 1006): the prints a walking unit leaves on snow/sand,
             // spawn-once projections on the same decal projector, fading off the effect stream.
@@ -225,6 +228,17 @@ impl PluginGroup for GamePlugins {
             // The video knobs the CVar host writes into (today: `gxVSync`). Before CvarPlugin so the
             // resource exists when `load_config` applies the saved value at Startup.
             .add(crate::video::VideoPlugin)
+            // MONKEY (shadows): the shared rig (loads first) + the independent lane plugins. Here,
+            // between `VideoPlugin` and `RealmlistPlugin`, because every one of them registers cvars
+            // that `CvarPlugin` (two lines down) must already see when `load_config` applies the
+            // saved values at Startup — the same edge that pins the two knob plugins around them.
+            .add(crate::shadow_core::ShadowCorePlugin)
+            .add(crate::character_shadow::CharacterShadowPlugin)
+            .add(crate::world_shadow::WorldShadowPlugin)
+            .add(crate::torch_shadow::TorchShadowPlugin)
+            // MONKEY (dynamic interiors): the fixture-lit interior lane's cvar bridge — independent
+            // of the shadow lanes, a plain drop-in.
+            .add(crate::dynamic_interior::DynamicInteriorPlugin)
             // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
             // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
             .add(crate::realmlist::RealmlistPlugin)
@@ -866,7 +880,38 @@ pub(crate) mod schedule_tests {
     }
 
     /// `PostUpdate`, 181 systems: `GlobalTransform` and the particle `EffectQuads` are most of it.
-    const POST_UPDATE_CEILING: usize = 351;
+    ///
+    /// **375 (MONKEY, the dynamic light and shadow system)** — upstream's own number is 351; this
+    /// branch adds **+24**, and the pairs were READ off the dump rather than reasoned about (the
+    /// lesson the `UPDATE_ACTIONABLE_CEILING` paragraphs paid for). `WOW_AMBIGUITY_DUMP_POST=1`
+    /// on this test prints them; three systems carry every one:
+    ///
+    /// - `entities::carried_light::track_carried_light_motion` (12 pairs) — the system that walks
+    ///   a torch's light to its carrier's hand. It meets `billboard::face_billboards`,
+    ///   `billboard_joint_palette`, `particles::{sim, model}`, `ribbons::simulate_ribbons`,
+    ///   `rig_anim::compose::finalize_rig_worlds`, the four sky/sun/moon/star followers,
+    ///   `nameplates::place_nameplates` and `raid_marks::place_raid_marks`.
+    /// - `lighting::global_light::classify_light_lanes` (12 pairs) — the interior/exterior lane
+    ///   classifier, against the same family for the same reason.
+    /// - `bevy_pbr::material::check_entities_needing_specialization` for the two shadow-proxy
+    ///   materials (`shadow_core::ShadowCasterMaterial`, `world_shadow::CutoutShadowCasterMaterial`)
+    ///   against `straddle::sync_straddle_twins` (2 pairs).
+    ///
+    /// **Every one of the 24 is over `GlobalTransform` (22) or `Mesh3d` (2), and both of ours are
+    /// READS.** Neither lighting system writes a transform: they ask where a light already is and
+    /// then write their own state (a `WorldPointLight`'s position, a `LightLane`). So the
+    /// undeclared order decides only whether a light is placed from this frame's pose or the last
+    /// one — the `AreaSpiritHealer` poll's class exactly (the 3,288 paragraph): both are
+    /// **level**-triggered, re-deriving from scratch every frame, so a frame-late read is a light
+    /// trailing a walking carrier by one stride, re-corrected on the next frame and invisible at
+    /// any frame rate the client runs at. The `Mesh3d` pair is Bevy's own specialization check
+    /// against a straddle twin, which is a read of the mesh handle on both sides.
+    ///
+    /// Declaring the orders instead would mean pinning two lighting systems after eleven unrelated
+    /// animation, particle and celestial-follow systems to buy a one-frame-fresher transform that
+    /// nothing can see — a real serialisation cost for no observable difference. Raised, with the
+    /// reason, as the failure message offers.
+    const POST_UPDATE_CEILING: usize = 375;
     const POST_UPDATE_SLACK: usize = 20;
     /// The **actionable** pairs in `Update` — two systems with conflicting access and no
     /// declared order, where [`Classes`] explains none of what they share, so the executor
@@ -1014,6 +1059,33 @@ pub(crate) mod schedule_tests {
                         update.name(*b),
                         what.iter()
                             .map(|id| update.component(*id))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })
+                .collect();
+            rows.sort();
+            for r in rows {
+                eprintln!("{r}");
+            }
+        }
+        // MONKEY (lighting): the `PostUpdate` half of the dump, which upstream's `Update`-only
+        // lever had no equivalent of — and without which `POST_UPDATE_CEILING` could only ever be
+        // raised by reasoning about what the new pairs must be, the exact mistake the ceiling's
+        // own comments record. Its own env var, not `WOW_AMBIGUITY_DUMP`, because `PostUpdate`
+        // prints every pair (there is no `Classes` pass over it) and 375 rows would bury the
+        // actionable `Update` list this test is usually run for.
+        if std::env::var_os("WOW_AMBIGUITY_DUMP_POST").is_some() {
+            let mut rows: Vec<String> = post
+                .conflicts
+                .iter()
+                .map(|(a, b, what)| {
+                    format!(
+                        "POST  {}  <->  {}\n      on {}",
+                        post.name(*a),
+                        post.name(*b),
+                        what.iter()
+                            .map(|id| post.component(*id))
                             .collect::<Vec<_>>()
                             .join(", ")
                     )

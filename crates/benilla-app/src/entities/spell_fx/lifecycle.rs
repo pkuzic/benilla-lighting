@@ -59,6 +59,8 @@ use benilla_assets::ModelAnimations;
 use bevy::animation::{graph::AnimationNodeIndex, RepeatAnimation};
 use bevy::prelude::*;
 
+use benilla_world::lighting::WorldPointLight;
+
 use crate::creature_anim::FxStage;
 
 /// `AnimationData.dbc` **158 `Hold`** — the sustained pulse leg (`0x9e` at `0x5ff188`/`0x5ff1bb`).
@@ -217,6 +219,188 @@ pub(crate) fn decay_span(anims: Option<&ModelAnimations>) -> Option<f32> {
     anims?.find(ANIM_DECAY).map(|c| c.duration)
 }
 
+// -------------------------------------------------------------------------------------------
+// MONKEY (spell light): the LIGHT a luminous effect throws, and the envelope it throws it on.
+// -------------------------------------------------------------------------------------------
+//
+// The synthesis — which effects are luminous at all (fire / holy / fel, never frost, nature,
+// arcane or shadow), what colour they burn and how far they reach — is
+// [`benilla_formats::fire_light`]'s spell route, decided once per MODEL at asset load. What lives
+// here is everything that is per-INSTANCE: when the light comes up, how it goes out, and how many
+// of them may exist at once.
+//
+// It sits in this file rather than beside the other carried lights because it is a LIFECYCLE, and
+// this file is where an effect instance's lifecycle lives (`Stand` → `Hold` → `Decay`). The light
+// is a child of the effect's own root, so the reap that despawns the root takes the light with it
+// and there is no orphaning path to get wrong; the envelope below only shapes the brightness
+// inside that life.
+
+/// Seconds a spell light takes to come up. Short enough to read as a flash rather than a fade-in —
+/// the point is only that a light never appears at full strength on a single frame, which reads as
+/// a rendering fault rather than as a spell.
+pub(crate) const SPELL_LIGHT_RAMP: f32 = 0.1;
+
+/// The default burst fade ([`SpellLightMode::Burst`]) when the caller knows no better span: an
+/// impact's flash. Long enough to see, short enough that a volley of them never overlaps into a
+/// standing glow.
+pub(crate) const SPELL_BURST_SPAN: f32 = 0.6;
+
+/// How fast a KIT light goes dark once its instance is reaped ([`FxDecay`]). Deliberately quicker
+/// than the model's own `Decay` sequence: the aura is over the moment the server said so, and a
+/// light that outlived the visual by a second would read as a stuck effect.
+pub(crate) const SPELL_REAP_FADE: f32 = 0.25;
+
+/// How many spell lights may be alive at once, across every lane. The shared point-light table is
+/// 512 rows packed from the 256 nearest sources every frame, and the whole feature is worth
+/// nothing if a raid's worth of casts can evict a city's torches: 24 is a generous ceiling for
+/// what one camera can see cast at once and still a small fraction of the pack.
+pub(crate) const SPELL_LIGHTS_MAX: usize = 24;
+
+/// MONKEY (spell light): the env kill switch, `WOW_SPELL_LIGHT=0`. Read ONCE — the value is
+/// latched on first call, so it cannot change under a running frame and costs one atomic load at
+/// each spawn site thereafter.
+///
+/// An env var and STILL not a cvar, now that `spellLightGain` exists beside `fireLightGain`
+/// (MONKEY (spellLightGain) — `cvars.rs`, folded at pack time in
+/// `benilla_world::lighting::global_light::build_light_data`). The two are different tools and both
+/// are wanted: the cvar is the live BRIGHTNESS dial, and its `0` darkens a spell light that is
+/// still spawned, still parented, still aged and still counted against
+/// [`SPELL_LIGHTS_MAX`]; this switch stops the lights being CREATED at all, which is what an A/B
+/// against the pre-feature build needs (`WOW_SPELL_LIGHT=0` costs the frame nothing, and takes the
+/// claim walk in `carried_light::claim_carried_light_rooms` with it).
+pub(crate) fn spell_lights_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("WOW_SPELL_LIGHT").as_deref(), Ok("0")))
+}
+
+/// Which lifecycle a spell light follows — the one thing its spawn site knows that the model
+/// cannot.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum SpellLightMode {
+    /// A kit/aura effect attached to a unit: up on the ramp, HELD for as long as the instance
+    /// stands, out on the reap ([`FxDecay`] → [`SPELL_REAP_FADE`]). Ice Barrier's shield holds,
+    /// Immolate burns for its duration, a precast glows while it is cast.
+    Kit,
+    /// A missile: constant while it flies. The light rides the projectile root, so it sweeps the
+    /// ground and the walls on the way — and the missile's own arrival despawn ends it, which is
+    /// the only ending a projectile has.
+    Missile,
+    /// An impact / destination effect / firework shell: full at onset, gone `span` seconds later.
+    /// The one shape whose *whole point* is that it does not persist.
+    Burst { span: f32 },
+}
+
+/// MONKEY (spell light): one live spell light. A child of the effect root it belongs to, so the
+/// effect's own despawn reaps it; this component only shapes its brightness while it lives.
+#[derive(Component)]
+pub(crate) struct SpellLight {
+    /// The `PointLight::intensity` this light sits at when the envelope is at full — captured at
+    /// spawn from the synthesised colour/intensity, never recomputed. The envelope only ever
+    /// SCALES this, so nothing downstream can drift the calibration.
+    base: f32,
+    /// Seconds from spawn before the light comes up — the emitter's own rate-track onset
+    /// (`benilla_formats::fire_light::emit_onset`). A firework shell detonates half a second into
+    /// its model's clip and a rocket that lit the sky on the way UP would be exactly backwards.
+    onset: f32,
+    /// The lifecycle ([`SpellLightMode`]).
+    mode: SpellLightMode,
+    /// Seconds alive. Also the budget's age ordering — the OLDEST spell light is the one dropped
+    /// when the ceiling is hit, because it is the one whose moment has most passed.
+    age: f32,
+    /// Seconds this light's HOST instance has been reaped ([`FxDecay`]), i.e. how far into
+    /// [`SPELL_REAP_FADE`] it is. Only ticks in [`SpellLightMode::Kit`].
+    reaped: f32,
+}
+
+impl SpellLight {
+    /// A fresh light at `base` intensity, coming up `onset` seconds from now.
+    pub(crate) fn new(base: f32, onset: f32, mode: SpellLightMode) -> Self {
+        Self {
+            base,
+            onset,
+            mode,
+            age: 0.0,
+            reaped: 0.0,
+        }
+    }
+
+    /// The envelope's current multiplier, `0..=1` — pure, so the shape is testable without a
+    /// world. Ramp in, then the mode's own decay, then the reap fade, multiplied.
+    fn envelope(&self) -> f32 {
+        let t = self.age - self.onset;
+        if t <= 0.0 {
+            return 0.0; // the flame this light stands for does not exist yet
+        }
+        let up = (t / SPELL_LIGHT_RAMP).min(1.0);
+        let down = match self.mode {
+            // The fade starts where the ramp ended, so a burst's peak is a real (if brief) plateau
+            // rather than a single-frame spike that a low frame rate could skip entirely.
+            SpellLightMode::Burst { span } => {
+                (1.0 - (t - SPELL_LIGHT_RAMP).max(0.0) / span.max(1e-3)).clamp(0.0, 1.0)
+            }
+            SpellLightMode::Kit | SpellLightMode::Missile => 1.0,
+        };
+        let reap = (1.0 - self.reaped / SPELL_REAP_FADE).clamp(0.0, 1.0);
+        up * down * reap
+    }
+}
+
+/// MONKEY (spell light): run every live spell light's envelope.
+///
+/// `Update`, beside the rest of the effect lane, and it writes `PointLight::intensity` ONLY — the
+/// packer reads that in `PostUpdate` (`lighting::build_light_data`), so a light's brightness is
+/// always this frame's. Deliberately NOT a `FlameFlicker`: that modulation exists to make a fire
+/// breathe, and a spell light already has a shape of its own; the two together read as the effect
+/// stuttering.
+///
+/// The KIT arm is the only one that has to look outside itself: a reaped instance
+/// ([`FxDecay`] on the effect root, written by the reap) must take its light down with it, and the
+/// light's parent IS that root.
+pub(crate) fn advance_spell_lights(
+    time: Res<Time>,
+    mut lights: Query<(&mut SpellLight, &mut WorldPointLight, Option<&ChildOf>)>,
+    reaped: Query<Has<FxDecay>>,
+) {
+    let dt = time.delta_secs();
+    for (mut light, mut point, parent) in &mut lights {
+        light.age += dt;
+        if light.mode == SpellLightMode::Kit
+            && parent.is_some_and(|c| reaped.get(c.parent()).unwrap_or(false))
+        {
+            light.reaped += dt;
+        }
+        let want = light.base * light.envelope();
+        // Write only on a real change: a held kit light sits at its plateau for the whole aura,
+        // and a per-frame write there would wake every change-detection consumer of `PointLight`
+        // for nothing.
+        if (point.intensity - want).abs() > 1e-3 {
+            point.intensity = want;
+        }
+    }
+}
+
+/// MONKEY (spell light): the ceiling ([`SPELL_LIGHTS_MAX`]) — drop the OLDEST beyond it.
+///
+/// Oldest rather than dimmest or furthest, for one reason: the lane exists to light what is
+/// HAPPENING, and the newest cast is the one the player is looking at. A dimness rule would evict
+/// the burst that is mid-fade (i.e. exactly the flash being watched) and a distance rule would
+/// fight the packer, which already sorts by distance and would then be given a hole it had no say
+/// in. Age is also the only ordering that is stable frame to frame, so the set does not churn.
+///
+/// Despawning the light alone never disturbs its effect: the light is a leaf child of the effect
+/// root and nothing reads back from it.
+pub(crate) fn budget_spell_lights(mut commands: Commands, lights: Query<(Entity, &SpellLight)>) {
+    let live = lights.iter().count();
+    if live <= SPELL_LIGHTS_MAX {
+        return;
+    }
+    let mut by_age: Vec<(Entity, f32)> = lights.iter().map(|(e, s)| (e, s.age)).collect();
+    by_age.sort_by(|a, b| b.1.total_cmp(&a.1)); // oldest first
+    for (light, _) in by_age.into_iter().take(live - SPELL_LIGHTS_MAX) {
+        commands.entity(light).try_despawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +488,50 @@ mod tests {
         let without = test_anims(&[clip(0, 0, false), clip(ANIM_HOLD, 1, true)]);
         assert_eq!(decay_span(Some(&without)), None);
         assert_eq!(decay_span(None), None);
+    }
+
+    /// MONKEY (spell light) — GOLDEN: the envelope's four legs, on the pure function so the shape
+    /// is pinned without a world. The ONSET leg is the one with a real bug behind it: a firework
+    /// shell detonates half a second into its clip, and a light lit at spawn flashes the rocket's
+    /// flight instead of its burst.
+    #[test]
+    fn the_spell_envelope_ramps_holds_and_bursts() {
+        let at = |mut l: SpellLight, age: f32| {
+            l.age = age;
+            l.envelope()
+        };
+
+        // A kit light: dark before its onset, ramped over SPELL_LIGHT_RAMP, then HELD.
+        let kit = || SpellLight::new(100.0, 0.0, SpellLightMode::Kit);
+        assert_eq!(at(kit(), 0.0), 0.0, "nothing on the spawn frame");
+        assert!((at(kit(), SPELL_LIGHT_RAMP * 0.5) - 0.5).abs() < 1e-3);
+        assert_eq!(at(kit(), SPELL_LIGHT_RAMP), 1.0);
+        assert_eq!(at(kit(), 30.0), 1.0, "an aura holds for as long as it stands");
+
+        // A missile is the same minus any ending of its own — the arrival despawn is the ending.
+        assert_eq!(at(SpellLight::new(1.0, 0.0, SpellLightMode::Missile), 5.0), 1.0);
+
+        // A burst peaks at the ramp's end and is gone `span` later; the plateau is real, not a
+        // one-frame spike a low frame rate could step over.
+        let burst = || SpellLight::new(1.0, 0.0, SpellLightMode::Burst { span: 0.6 });
+        assert_eq!(at(burst(), SPELL_LIGHT_RAMP), 1.0);
+        assert!((at(burst(), SPELL_LIGHT_RAMP + 0.3) - 0.5).abs() < 1e-3);
+        assert_eq!(at(burst(), SPELL_LIGHT_RAMP + 0.6), 0.0);
+        assert_eq!(at(burst(), 10.0), 0.0, "and stays gone");
+
+        // The ONSET: a firework's fuse. Dark for the whole flight, up at the detonation.
+        let fuse = || SpellLight::new(1.0, 1.5, SpellLightMode::Burst { span: 0.6 });
+        assert_eq!(at(fuse(), 1.4), 0.0);
+        assert_eq!(at(fuse(), 1.5 + SPELL_LIGHT_RAMP), 1.0);
+
+        // The reap fade: a kit light goes dark on its instance's `FxDecay`, quicker than the
+        // model's own Decay sequence — the aura is over the moment the server said so.
+        let mut reaped = kit();
+        reaped.age = 5.0;
+        reaped.reaped = SPELL_REAP_FADE * 0.5;
+        assert!((reaped.envelope() - 0.5).abs() < 1e-3);
+        reaped.reaped = SPELL_REAP_FADE;
+        assert_eq!(reaped.envelope(), 0.0);
     }
 
     fn test_anims(clips: &[AnimClip]) -> ModelAnimations {

@@ -213,9 +213,186 @@ pub(crate) fn boot_windowed_size() -> UVec2 {
 /// since 0294): the window literal resolves env-then-file for itself, `load_config` applies the
 /// file to this resource at `Startup`, and because both read the same key the reconcile is a no-op
 /// rather than a mode change one frame into the run.
-#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+// NB: no `Eq` — `shadow_distance` is an f32 (only `PartialEq` is needed, for `!=` change detection).
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
 pub(crate) struct VideoConfig {
     pub(crate) vsync: bool,
+    /// Whether the STATIC WORLD (trees, buildings, foliage) casts realtime shadows and baked MCSH
+    /// terrain shadows are suppressed. Independent of [`Self::character_shadows`] — either drives
+    /// the shared shadow rig (`character_shadow` / `world_shadow`).
+    pub(crate) world_shadows: bool,
+    /// Whether CHARACTERS (players, NPCs, creatures, mounts) cast realtime silhouettes instead of
+    /// the legacy oval blob. Independent of [`Self::world_shadows`].
+    pub(crate) character_shadows: bool,
+    /// Realtime-shadow render distance in yards (the `shadowDistance` slider) — the shadow-map
+    /// cascade range + caster reach. Clamped to `shadow_core::SHADOW_DISTANCE_RANGE`.
+    pub(crate) shadow_distance: f32,
+    /// MONKEY (sun shadow perf): the directional shadow map's edge in texels (`shadowMapSize`;
+    /// 1024/2048/4096, default 2048). The rig shipped a 4096 literal, and at 1080p the two sun
+    /// lanes measured ~5 ms/frame together — a shadow map is quadratic in this number, so halving
+    /// the edge quarters the pass's fill AND the depth texture (4096² D32 = 64 MB, 2048² = 16 MB).
+    /// 2048 over one 80 yd cascade is ~26 texels/yd, still finer than the receivers' Gaussian
+    /// kernel resolves. Applied to Bevy's `DirectionalLightShadowMap` resource, which
+    /// `extract_lights` re-publishes on change and `prepare_lights` re-keys the texture cache with
+    /// — so the map is genuinely re-created, live, with no restart.
+    pub(crate) shadow_map_size: u32,
+    /// MONKEY (sun shadow perf): the receivers' PCF kernel (`shadowFilter`; 0 = Hardware2x2, one
+    /// hardware comparison sample, 1 = Gaussian, nine). Default **1** — the current look — because
+    /// this one is a taste call the user A/Bs, not a free win: `0` is 9× fewer shadow-map fetches
+    /// per lit fragment (the RECEIVER half of the cost, where `shadowMapSize` is the caster half)
+    /// at the price of visibly stair-stepped edges. Applied BOTH to the world camera's
+    /// `ShadowFilteringMethod` (which keys every Bevy-material receiver — terrain, `wow_model`)
+    /// AND to the retained `static_gx` pipeline's shader def, which is specialized by hand and
+    /// would otherwise keep whichever branch was compiled in.
+    pub(crate) shadow_filter: u32,
+    /// MONKEY (sun shadow perf): Hz cap on the CHARACTER lane's proxy re-skin
+    /// (`characterShadowRate`, 0..120, default 30; `0` = every frame, the pre-cvar behaviour). The
+    /// lane CPU-skins every admitted unit and mutates a `Mesh` asset, which costs a full
+    /// vertex+index re-upload — the character lane's ~3 ms. The shadow MAP is still rendered every
+    /// frame from the last proxy, so a capped rate does not flicker; it only lets a running NPC's
+    /// silhouette lag by up to 1/rate s.
+    pub(crate) character_shadow_rate: u32,
+    /// MONKEY (sun shadow perf): the same cap for the WORLD lane's per-frame ENTITY caster
+    /// (`worldShadowRate`, 0..120, default 30) — gameobjects, distance-faded doodads, WMO props.
+    /// A SEPARATE row from [`Self::character_shadow_rate`] on purpose: its population is nearly
+    /// static (a swinging lamp, a fading doodad) where the character lane's is animated every
+    /// frame, so it tolerates a much lower rate — and one dial named for characters silently
+    /// governing the world lane is the kind of thing nobody finds again. The world lane's STATIC
+    /// casters are untouched: they already rebuild only on 16 yd camera drift.
+    pub(crate) world_shadow_rate: u32,
+    /// MONKEY (sun shadow perf): multiplier on the CASTER-COLLECTION reach (`shadowCasterReach`,
+    /// 0.25..2, default 1 = unchanged). Collection reaches past the resolve range on purpose (a
+    /// tree standing outside the cascade still throws a shadow into it), which at `shadowDistance`
+    /// 80 admits 112 yd of entities and up to 204 yd of statics, with `NoFrustumCulling` on the
+    /// proxies. Trimming it is the direct dial on caster POPULATION — the input to both lanes'
+    /// per-rebuild cost — at the risk of a tall caster's shadow popping in as you approach.
+    pub(crate) shadow_caster_reach: f32,
+    /// MONKEY (dynamic interiors): WMO interiors + their props light from the room's live fixtures
+    /// (`interiorLight`) instead of the baked path. The three knobs are `interiorAmbient` (base
+    /// ambient, 0..1), `interiorFill` (per-fixture bounce gain, 0..2) and `interiorExposure`
+    /// (light-budget multiplier, 0.25..8) — bridged to benilla-world by `dynamic_interior`.
+    pub(crate) interior_light: bool,
+    pub(crate) interior_ambient: f32,
+    pub(crate) interior_fill: f32,
+    pub(crate) interior_exposure: f32,
+    /// MONKEY (soft falloff): live scale on every interior fixture's AUTHORED attenuation window
+    /// (`interiorAttenScale`, 0..8) — the fixture's EFFECTIVE RADIUS is `authored end × this`. A
+    /// WMO MOLT record's `+0x2c` (an M2 source buckets by intensity, its authored pair being a
+    /// template default rather than a reach) is a "full brightness ends here" number, not a
+    /// "nothing past here" one, so `1` gave a hard-edged disc at exactly the authored end. The
+    /// default is **2.5**: a 5 yd candle now tails smoothly out to 12.5, reading ~⅓ of its 1 yd
+    /// brightness at the authored 5 and ~8 % at 10. `0` still means "no window" (the 48 yd lane).
+    /// Bridged to benilla-world's `DynamicInteriors::atten_scale`, which the light packer folds
+    /// into each interior entry's packed radius, so the dial moves the frame it changes.
+    pub(crate) interior_atten_scale: f32,
+    /// MONKEY (torch shadows, Stage B): whether interior fixtures cast real shadows (the nearest few
+    /// promoted to cube-map casters — `torch_shadow`). Only meaningful with `interior_light` on.
+    pub(crate) interior_shadows: bool,
+    /// MONKEY (outdoor torch shadows): whether EXTERIOR fire lights (campfires, braziers,
+    /// lampposts, bonfires — the point table's exterior half, colour row `.w == 0`) cast real
+    /// cube-map shadows onto WMO outdoor surfaces, doodads and models AT NIGHT (`exteriorShadows`,
+    /// default on). Deliberately NOT gated on `interior_light`: the exterior receivers were never
+    /// part of the dynamic-interior feature and draw identically with it off. By day the lane is
+    /// inert on both sides — no candidates, no maps, and the receivers' own `night_w` is exactly 0
+    /// — so this dial has no daylight effect to have.
+    ///
+    /// It shares `interior_shadow_casters`' sixteen resident cube slots, capped at half of them
+    /// (`torch_shadow::exterior_budget`) so a village square cannot evict an inn's candles.
+    pub(crate) exterior_shadows: bool,
+    /// MONKEY (static torch cache): resident fixture budget (1..16, default 12). Static
+    /// geometry renders only on promotion/residency changes; lowering this fades extra slots out.
+    pub(crate) interior_shadow_casters: u32,
+    /// MONKEY (static torch cache): nearest promoted fixtures with per-frame entity overlays
+    /// (0..16, default 4). Zero keeps all static shadows and disables only the moving casters.
+    pub(crate) interior_shadow_dynamic: u32,
+    /// MONKEY (torch lane perf): how often (Hz) the moving-caster mesh is REGATHERED
+    /// (`interiorShadowEntityRate`, 0..240, default 30; `0` = every frame, the pre-feature
+    /// behaviour). The gather CPU-skins every admitted unit inside the dynamic fixtures' reach and
+    /// then MUTATES the aggregate `Mesh` asset, which costs a full vertex+index re-extraction and
+    /// GPU re-upload plus an `AssetChanged<Mesh3d>` fan-out through material specialisation - a
+    /// fixed per-frame charge that neither `interiorShadowCasters` nor `interiorShadowDynamic`
+    /// could reduce (both were measured to change nothing). The six overlay passes still run EVERY
+    /// frame from the LAST mesh, so lowering this cannot blink a shadow off; it only ages the pose
+    /// the mesh was gathered at. At 30 Hz on a 46 fps frame that is "regather about two frames in
+    /// three", and a walking NPC's shadow lags its body by at most one frame's stride.
+    pub(crate) interior_shadow_entity_rate: u32,
+    /// MONKEY (torch caster selection): the PCF tap-radius scale for the torch maps
+    /// (`interiorShadowSoft`, 0.5..3, default **1.5**). A candle cluster casts many hard-edged
+    /// overlapping shadows; widening the 4-tap kernel is the cheap softening. Rides the torch
+    /// table's `count.y` (as `x100`, LOW half) rather than a `DynamicInteriors` field, because it
+    /// belongs to the shadow table's own bytes.
+    ///
+    /// MONKEY (pcss): it is now the CONTACT radius, not the radius everywhere — the projector's
+    /// blocker search grows the kernel with the receiver's distance from its caster and clamps at
+    /// 4x this. So this dial sets how sharp the sharpest edge in the scene is, and 1 (the old
+    /// default) now reads sharper at a contact than it used to read anywhere; 1.5 restores the
+    /// shipped softness at a contact and lets the penumbra open up from there.
+    pub(crate) interior_shadow_soft: f32,
+    /// MONKEY (shadow floor): how much of the DIRECT term a torch shadow removes
+    /// (`torchShadowStrength`, 0..1, default **0.7**). A torch map is the only occlusion the
+    /// direct arm has, so a blocked fragment used to lose all of it — the pitch-black razor-edged
+    /// "scars" the Darkmoon tents printed on the grass and the Darkshire chairs printed on the inn
+    /// floor. Nothing in this renderer bounces light, so the 30 % left standing at the default IS
+    /// the bounce. Rides the torch table's `count.y` HIGH half beside `interior_shadow_soft`, and
+    /// the receivers fold it into the slot's cross-fade weight (one multiply, no extra tap), so it
+    /// touches the direct arm only — fill and ambient never saw this factor. `1` restores the
+    /// shipped look exactly; `0` turns torch shadows off without disturbing the lane behind them.
+    pub(crate) torch_shadow_strength: f32,
+    /// MONKEY (room gate): whether an interior fixture may only light the ROOMS IT CLAIMS
+    /// (`interiorRoomGate`, default on). Off = the pre-gate behaviour, where every interior fixture
+    /// in range lights every interior surface in range and the only occlusion is the handful of
+    /// promoted cube-shadow casters — the live A/B for "did the gate darken this room, or was it
+    /// always unlit?". Bridged to benilla-world's `DynamicInteriors::room_gate`, which the light
+    /// packer applies at PACK time (an ungated pack is one `count = 0` head per light), so it moves
+    /// the frame it changes and costs the shader nothing.
+    pub(crate) interior_room_gate: bool,
+    /// MONKEY (interior debug): the interior-lane diagnostic overlay (`interiorDebug`, 0..4). See
+    /// [`benilla_world::lighting::DynamicInteriors::debug`].
+    pub(crate) interior_debug: u32,
+    /// MONKEY (darkness gains): the exterior night dim (`nightGain`, 0.2..1.5, default **0.8** =
+    /// nights 20 % darker). Bridged to `DynamicInteriors::night_gain`, which the light packer folds
+    /// into the packed ambient/diffuse/specular rows on a `mix(1, gain, night_w)` ramp — so it is
+    /// exactly inert while the sun is up and live the frame it changes after dark.
+    pub(crate) night_gain: f32,
+    /// MONKEY (lighting debug panel): the interior dim (`interiorGain`, 0.2..1.5, default **0.5** =
+    /// room inputs 50 % weaker). Bridged to `DynamicInteriors::interior_gain`, which scales the room
+    /// lane's INPUTS (base ambient, per-fixture fill, every interior fixture's colour) and not
+    /// `interiorExposure` — that stays the user's own dial, and this composes with it.
+    pub(crate) interior_gain: f32,
+    /// MONKEY (enclosed day floor): the DAYLIGHT floor a room inside a building gets by day
+    /// (`interiorDaylight`, 0..1, default **0.12**). Bridged to
+    /// [`benilla_world::lighting::DynamicInteriors::daylight`], packed into the free fraction of
+    /// the interior lane's on/off word, and added to the room law's ambient budget for batches the
+    /// record table flags as enclosed. `0` restores the pre-feature look exactly; the night look is
+    /// unaffected at any value (the term is scaled by the sun's own day envelope).
+    pub(crate) interior_daylight: f32,
+    /// MONKEY (bake floor): the share of a WMO interior batch's OWN MOCV bake every interior-lane
+    /// fragment keeps whether or not a fixture reaches it (`interiorBakeFloor`, 0..1, default
+    /// **0.12**). Bridged to [`benilla_world::lighting::DynamicInteriors::bake_floor`], packed
+    /// (times `interiorGain`) into the free fraction of the world-shadow lane, and added to the
+    /// room law's budget inside its rolloff. It is what stops a room the fixture table cannot
+    /// reach — the Lion's Pride Inn's east vestibule — rendering black; `0` restores the
+    /// pre-feature look exactly.
+    pub(crate) interior_bake_floor: f32,
+    /// MONKEY (fire GO lights): gain on every light SYNTHESISED from a fire prop's flame emitter
+    /// (`fireLightGain`, 0..4; `0` = the invented-light lane off). Bridged to benilla-world's
+    /// [`benilla_world::lighting::FireLightGain`] by `dynamic_interior`, and applied at PACK time
+    /// so it is live.
+    pub(crate) fire_light_gain: f32,
+    /// MONKEY (spellLightGain): gain on every light a SPELL EFFECT invented — a kit's aura glow, a
+    /// missile's core, an impact flash, a firework shell's burst (`spellLightGain`, 0..4; `0` = the
+    /// spell-light lane off). Bridged to benilla-world's
+    /// [`benilla_world::lighting::SpellLightGain`] by `dynamic_interior` and applied at PACK time,
+    /// so it is live. Deliberately NOT folded into `fireLightGain`: a spell light is tagged
+    /// synthetic too, and one dial over both would mean turning the world's hearths down darkened
+    /// every fireball in the game.
+    pub(crate) spell_light_gain: f32,
+    /// MONKEY (flame flicker): how strongly every FLAME's brightness wobbles (`fireFlicker`, 0..2;
+    /// `1` = the authored per-kind amplitudes, `0` = the pre-feature steady constants, `2` =
+    /// doubled). Bridged to `DynamicInteriors::flicker` and applied at PACK time, so it is live —
+    /// and separate from `fireLightGain`, which scales only the SYNTHESISED lane while a flicker
+    /// belongs to authored wall torches too.
+    pub(crate) fire_flicker: f32,
     pub(crate) display: DisplayMode,
     /// The windowed size, `gxResolution`. Kept while fullscreen so leaving it can restore it.
     pub(crate) windowed: UVec2,
@@ -225,6 +402,52 @@ impl Default for VideoConfig {
     fn default() -> Self {
         Self {
             vsync: !novsync_env(),
+            world_shadows: true,
+            character_shadows: true,
+            shadow_distance: crate::shadow_core::DEFAULT_SHADOW_DISTANCE,
+            // MONKEY (sun shadow perf): 2048, not the rig's old 4096 literal — see the field docs.
+            shadow_map_size: crate::shadow_core::DEFAULT_SHADOW_MAP_SIZE,
+            shadow_filter: crate::shadow_core::DEFAULT_SHADOW_FILTER,
+            character_shadow_rate: crate::shadow_core::DEFAULT_SHADOW_RATE,
+            world_shadow_rate: crate::shadow_core::DEFAULT_SHADOW_RATE,
+            shadow_caster_reach: 1.0,
+            // The cvar defaults are the source of truth at load; these only stand in until then.
+            interior_light: true,
+            interior_ambient: 0.015,
+            interior_fill: 0.08,
+            interior_exposure: 2.5,
+            // MONKEY (soft falloff): 2.5, not 1 — see the field doc.
+            interior_atten_scale: 1.6,
+            interior_shadows: true,
+            // MONKEY (outdoor torch shadows): on — a night campfire with no shadow is the thing
+            // this lane exists to fix, and it costs nothing whenever the sun is up.
+            exterior_shadows: true,
+            // MONKEY (static torch cache): 12 resident maps, four moving-caster overlays.
+            interior_shadow_casters: 12,
+            interior_shadow_dynamic: 4,
+            // MONKEY (torch lane perf): 30 Hz - see the field doc.
+            interior_shadow_entity_rate: 30,
+            // MONKEY (pcss): 1.5 — see the field doc; `soft` is now the CONTACT radius.
+            interior_shadow_soft: 1.5,
+            // MONKEY (shadow floor): 0.7 — a shadow takes 70 % of the direct term, not all of it.
+            torch_shadow_strength: 0.7,
+            // MONKEY (room gate): on — without it a building's fixtures light through its own
+            // floors and walls.
+            interior_room_gate: true,
+            interior_debug: 0,
+            // MONKEY (lighting debug panel): nights 20 % darker, interior inputs 50 % weaker.
+            night_gain: 0.45,
+            interior_gain: 0.5,
+            // MONKEY (enclosed day floor): calibrated so the Goldshire inn's entry floor reads
+            // ~50 % of the sunlit threshold beside it — see `lighting::DAYLIGHT_LANE_SCALE`.
+            interior_daylight: 0.0,
+            // MONKEY (bake floor): an eighth of the authored bake — measured to lift the inn's
+            // black door band from 0.019 to 0.108 x tex while moving candle-lit surfaces by
+            // under 10 % (see `lighting::DynamicInteriors::bake_floor`).
+            interior_bake_floor: 0.12,
+            fire_light_gain: 1.0,
+            spell_light_gain: 1.0,
+            fire_flicker: 1.0,
             display: if windowed_env() {
                 DisplayMode::Windowed
             } else {
@@ -284,6 +507,115 @@ pub(crate) fn on_cvar(
         // Display mode (1627) — the reference's own polarity: `1` is WINDOWED (the row is
         // "Windowed Mode"). `apply_window_mode` pushes it to the window when this moves.
         "gxwindow" => cfg.display = display_from_flag(v),
+        // ── MONKEY (lighting): the dynamic light + shadow system's 29 rows ────────────────────
+        // They live in THIS observer, and not in one of their own beside `shadow_core` /
+        // `dynamic_interior`, because of the law the arm above states: *each arm writes only its
+        // own resource*. Every one of these knobs IS a field of [`VideoConfig`] — the lanes read
+        // that resource per frame (`shadow_core::update_shadows`, `dynamic_interior::bridge`,
+        // `torch_shadow`), none of them owns a resource of its own — so a second observer beside
+        // them would be a second writer of this one resource for no gain, splitting one match
+        // over two files while dirtying exactly the same thing.
+        //
+        // What it DOES cost is the precision of `Res<VideoConfig>::is_changed()`: on upstream's
+        // struct that signal means "a Video Options row moved", and here it means "a video OR a
+        // lighting row moved". The one consumer that cares is `apply_present_mode`, which keeps
+        // 2303's retired value compare for exactly this reason — see its doc.
+        //
+        // Clamps are each row's own, stated beside it, exactly as for the reference rows above;
+        // the `ours(...)` entries in `cvars::REGISTERED` carry the matching defaults, and
+        // `cvars::tests::registered_defaults_mirror_the_code_truths` welds all 29 pairs.
+        "worldshadows" => cfg.world_shadows = ev.flag(),
+        "charactershadows" => cfg.character_shadows = ev.flag(),
+        "shadowdistance" => {
+            cfg.shadow_distance = v.clamp(
+                *crate::shadow_core::SHADOW_DISTANCE_RANGE.start(),
+                *crate::shadow_core::SHADOW_DISTANCE_RANGE.end(),
+            )
+        }
+        // MONKEY (sun shadow perf): the five cost dials, clamped at the edge like every numeric row
+        // here. `shadowMapSize` SNAPS onto the power-of-two ladder rather than clamping into a
+        // range — an off-ladder value is not a weaker setting, it is one Bevy silently rounds UP
+        // into a bigger and slower map than the one that was typed.
+        "shadowmapsize" => {
+            cfg.shadow_map_size = crate::shadow_core::clamp_shadow_map_size(v.max(0.0) as u32)
+        }
+        "shadowfilter" => {
+            cfg.shadow_filter = (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_FILTER)
+        }
+        // `0` is MEANINGFUL on both rate rows (the pre-cvar every-frame rebuild), so they floor at
+        // 0 rather than at 1 — the shadow off-switches are `characterShadows` / `worldShadows`.
+        "charactershadowrate" => {
+            cfg.character_shadow_rate =
+                (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_RATE)
+        }
+        "worldshadowrate" => {
+            cfg.world_shadow_rate = (v.max(0.0) as u32).min(crate::shadow_core::MAX_SHADOW_RATE)
+        }
+        "shadowcasterreach" => {
+            cfg.shadow_caster_reach = v.clamp(
+                *crate::shadow_core::CASTER_REACH_RANGE.start(),
+                *crate::shadow_core::CASTER_REACH_RANGE.end(),
+            )
+        }
+        // MONKEY (dynamic interiors): the interior lane's on/off + knobs, clamped at the edge like
+        // every other numeric row. `dynamic_interior::bridge` publishes them to benilla-world.
+        "interiorlight" => cfg.interior_light = ev.flag(),
+        "interiorambient" => cfg.interior_ambient = v.clamp(0.0, 1.0),
+        "interiorfill" => cfg.interior_fill = v.clamp(0.0, 2.0),
+        "interiorexposure" => cfg.interior_exposure = v.clamp(0.25, 8.0),
+        // MONKEY (interior attenuation): the authored-window scale. `0` is a MEANINGFUL value here
+        // (the window off), so the range floors at 0 rather than at a small positive.
+        "interiorattenscale" => cfg.interior_atten_scale = v.clamp(0.0, 8.0),
+        "interiorroomgate" => cfg.interior_room_gate = ev.flag(),
+        "interiorshadows" => cfg.interior_shadows = ev.flag(),
+        // MONKEY (outdoor torch shadows): a flag like every other checkbox here. Live — the lane
+        // reads `VideoConfig` every frame, so `0` fades the outdoor shadows out (the slots evict
+        // through the same cross-fade a walked-away fixture does) and `1` fades them back in.
+        "exteriorshadows" => cfg.exterior_shadows = ev.flag(),
+        // MONKEY (torch caster selection): the working-set size and the PCF radius, clamped at the
+        // edge like every other numeric row. `casters` floors at 1, not 0 — `interiorShadows 0` is
+        // already the off switch, and a 0 here would be a second, confusing one.
+        "interiorshadowcasters" => cfg.interior_shadow_casters = (v.max(1.0) as u32).clamp(1, 16),
+        // MONKEY (static torch cache): the live bank rank, 1..`MAX_TORCH_DYNAMIC`.
+        "interiorshadowdynamic" => {
+            cfg.interior_shadow_dynamic =
+                (v.max(1.0) as u32).clamp(1, crate::torch_shadow::MAX_TORCH_DYNAMIC as u32)
+        }
+        // MONKEY (torch lane perf): the moving-caster regather cadence in Hz. `0` is MEANINGFUL
+        // here (every frame -- the behaviour before the gate), so unlike `casters` this floors at
+        // 0 rather than at 1. Ceiling 240 so a typo cannot ask for a per-frame rebuild AND a
+        // divide by a huge number; anything at or above the frame rate is already "every frame".
+        "interiorshadowentityrate" => {
+            cfg.interior_shadow_entity_rate = (v.max(0.0) as u32).min(240)
+        }
+        "interiorshadowsoft" => cfg.interior_shadow_soft = v.clamp(0.5, 3.0),
+        // MONKEY (shadow floor): 0 IS meaningful (shadows off), so this floors at 0, not at a
+        // minimum-useful value; 1 is the pre-feature pitch black.
+        "torchshadowstrength" => cfg.torch_shadow_strength = v.clamp(0.0, 1.0),
+        "interiordebug" => cfg.interior_debug = (v.max(0.0) as u32).min(4),
+        // MONKEY (darkness gains): the two dim dials, clamped at the edge like every numeric row
+        // here. The floor is 0.2 rather than 0: a true 0 would be indistinguishable from a broken
+        // light pack (black world / black room), and the off switch people actually want is `1`.
+        "nightgain" => cfg.night_gain = v.clamp(0.2, 1.5),
+        "interiorgain" => cfg.interior_gain = v.clamp(0.2, 1.5),
+        // MONKEY (enclosed day floor): 0 IS meaningful here (it restores the pre-feature look
+        // exactly), unlike the two dim dials above whose 0 would be a broken-looking world.
+        "interiordaylight" => cfg.interior_daylight = v.clamp(0.0, 1.0),
+        // MONKEY (bake floor): 0 IS meaningful here too (it restores the pre-feature look exactly).
+        // The upper clamp matters more than usual: the packer multiplies this by `interiorGain`
+        // (up to 1.5) and rides the product in a lane fraction that must stay under 0.5 after
+        // scaling, so a value that escaped this clamp would reach the world-shadow flag it shares
+        // a lane with. `pack_bake_lane` clamps the product too — belt and braces, one at each end.
+        "interiorbakefloor" => cfg.interior_bake_floor = v.clamp(0.0, 1.0),
+        // MONKEY (fire GO lights): the synthesised-fire gain, clamped at the edge like the rest.
+        "firelightgain" => cfg.fire_light_gain = v.clamp(0.0, 4.0),
+        // MONKEY (spellLightGain): the spell lane's gain, same range and same edge clamp — and `0`
+        // is meaningful here (the lane off) exactly as it is for the fire gain above.
+        "spelllightgain" => cfg.spell_light_gain = v.clamp(0.0, 4.0),
+        // MONKEY (flame flicker): 0..2 — the amplitudes are authored at 1, and 2 is the deliberate
+        // over-drive for judging the shape. Clamped at the edge like every knob here.
+        "fireflicker" => cfg.fire_flicker = v.clamp(0.0, 2.0),
+        // ── end MONKEY (lighting) ─────────────────────────────────────────────────────────────
         "farclip" => view.farclip = v.clamp(*FARCLIP_RANGE.start(), *FARCLIP_RANGE.end()),
         // The reference REFUSES an out-of-range write here rather than clamping (`0x688d90`
         // echoes "NearClip must be in range 0.01 - 0.33" and returns 0). We clamp, which is the
@@ -723,15 +1055,25 @@ fn display_session() -> String {
 /// First sight deliberately does **not** just arm: an inserted resource reads as changed on its
 /// first frame, and `load_config` applies the saved value at `Startup`, after the window already
 /// exists at its boot mode — so the first run is the one that reconciles them.
+///
+/// **MONKEY (lighting): the value compare 2303 retired is kept here, on top of `is_changed()`.**
+/// Upstream could drop it because on ITS `VideoConfig` every row is a Video Options row, so
+/// "the resource moved" and "a display row moved" are the same fact. This branch hangs 29
+/// lighting knobs off the same resource (`interiorGain`, `torchShadowStrength`, …), each written
+/// by its own arm of [`on_cvar`] — so `is_changed()` alone would let a `SetCVar("interiorGain")`
+/// re-assert the present mode, and the inner `!=` guard below would then happily undo exactly the
+/// probe override this gate exists to protect (a probe writes `AutoNoVsync` on the window while
+/// `cfg.vsync` still says on). `is_changed()` stays as the cheap pre-filter.
 fn apply_present_mode(
     cfg: Res<VideoConfig>,
     restarts: Res<GxRestarts>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut last: Local<Option<bool>>,
     mut last_restart: Local<u32>,
 ) {
     // A `RestartGx()` re-asserts even when nothing moved — that is what the caller asked for.
     let forced = std::mem::replace(&mut *last_restart, restarts.0) != restarts.0;
-    if !cfg.is_changed() && !forced {
+    if (!cfg.is_changed() || last.replace(cfg.vsync) == Some(cfg.vsync)) && !forced {
         return;
     }
     let want = present_mode(cfg.vsync);
@@ -861,8 +1203,13 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(VideoConfig {
             vsync: true,
+            world_shadows: false,
+            character_shadows: false,
+            shadow_distance: 80.0,
             display: DisplayMode::Fullscreen,
             windowed: UVec2::new(1024, 768),
+            // MONKEY (review fixes): this window test inherits unrelated lighting defaults.
+            ..Default::default()
         })
         // The plugin's resource, seated by hand because this test runs the one system rather than
         // the plugin — `apply_window_mode` reads it to know a `RestartGx()` asked for a re-assert.
