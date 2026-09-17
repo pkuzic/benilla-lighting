@@ -240,13 +240,23 @@ fn feed_death(
                 t.translation.distance_squared(self_t.translation) <= SPIRIT_HEALER_RANGE_SQ
             })
     });
+    // Resolved before the push, because the lookup borrows the VM and `set_death` needs it
+    // mutably.
+    let sickness = sickness_duration(store.0.unit_level().unwrap_or(0), &|key: &str| {
+        script
+            .lua()
+            .globals()
+            .get::<String>(key)
+            .ok()
+            .filter(|t| !t.is_empty())
+    });
     script.set_death(DeathUiState {
         release_remaining,
         recovery_delay,
         resurrect_sickness: death_net.resurrect.as_ref().is_some_and(|o| o.sickness),
         resurrect_has_timer: death_net.resurrect.as_ref().is_some_and(|o| o.has_timer),
         spirit_healer_in_range,
-        sickness_duration: sickness_duration(store.0.unit_level().unwrap_or(0)),
+        sickness_duration: sickness,
         // `HasSoulstone()` — see [`resolve_self_res`] for the three gates and their order. Not a
         // per-frame inventory walk in general: the dead gate is first, so while alive this is one
         // health read, and while dead-unreleased the walk only runs on a zero field.
@@ -334,7 +344,29 @@ fn feed_death(
     if death_net.spirit_healer.is_some() && memo.confirm_generation != death_net.confirm_generation
     {
         memo.confirm_generation = death_net.confirm_generation;
-        script.fire_event("CONFIRM_XP_LOSS", vec![]);
+        // **`arg1` is the XP the resurrection will cost** — byte-read at the fire site
+        // (`0x5df837`, `SignalEvent2(396, "%d", …)`), because the argument gate (2140) found this
+        // fired argless and the shapes table says one number:
+        //
+        // ```
+        // 5df80f  mov ecx,[ebx+0xe68]          ; the player's descriptor window
+        // 5df815  mov edx,[ecx+0x844]          ; +0x844 -> field 188 + 529 = PLAYER_NEXT_LEVEL_XP
+        // 5df81e  fild [ebp+8]
+        // 5df821  fmul ds:0x80ae90             ; 0.05f
+        // 5df827  call 0x40a2b0                ; _ftol — TRUNCATES, not rounds
+        // ```
+        //
+        // and `0x5df806`'s arm pushes **0** when the object is not the local player, which is why
+        // an absent field answers 0 here rather than suppressing the event.
+        //
+        // Nothing in 1.12 FrameXML reads it — `UIParent.lua:399` asks `GetResSicknessDuration()`
+        // instead — so this is fidelity for the callers that are not ours, exactly 1776's reason
+        // for settling `PLAYERBANKSLOTS_CHANGED`'s shape when nothing read that either.
+        let xp_cost = store
+            .0
+            .player_next_level_xp()
+            .map_or(0, |next| (f64::from(next) * 0.05) as i64);
+        script.fire_event("CONFIRM_XP_LOSS", vec![ScriptValue::Int(xp_cost)]);
     }
 
     // ── The corpse-run range gate (0308 §5): fires the reference's range events on the edges. ──
@@ -480,19 +512,31 @@ fn resolve_self_res(
 /// The sickness-duration string a spirit-healer res would apply at `level` — the verified server
 /// table (vmangos `Player::ResurrectPlayer` + `Death.SicknessLevel` 11, 0308 §6): nil below 11,
 /// `(level − 10)` minutes through 19, the aura's full 10 minutes from 20.
-fn sickness_duration(level: u32) -> Option<String> {
-    match level {
-        0..=10 => None,
-        11..=19 => {
-            let m = level - 10;
-            Some(if m == 1 {
-                "1 minute".into()
-            } else {
-                format!("{m} minutes")
-            })
-        }
-        _ => Some("10 minutes".into()),
-    }
+///
+/// **The wording is the `GENERIC_MIN`/`GENERIC_MIN_P1` pair, read off the player's own
+/// `GlobalStrings.lua`** (decision 2045). That is the reference's own key: `GetResSicknessDuration`
+/// (`0x51a3a0`) computes a millisecond duration off `Spell.dbc` 15007 × `SpellDuration.dbc` and
+/// hands it to the shared formatter `0x52fa50(ms, "GENERIC", 0, 1)`, whose minute arm is
+/// `GENERIC_MIN[_P1]` with `ms / 60000` (wow-re `ui/scratch/death-ui.md` §9). Every value this
+/// table can produce — 1 to 10 minutes — lands in that arm, so the day/hour/second arms have no
+/// case here and the ladder is not reproduced.
+///
+/// **What benilla still models differently, deliberately:** the *number* comes from vmangos's
+/// server-side table rather than from `Spell.dbc`'s `Base + PerLevel·level`, because the aura the
+/// server actually applies is what the dialog must warn about. The `≤ 999 ms → nil` gate the
+/// reference gets from that data is our `0..=10 => None` row.
+fn sickness_duration(level: u32, get: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let minutes = match level {
+        0..=10 => return None,
+        11..=19 => level - 10,
+        _ => 10,
+    };
+    // `GetText(token, nil, ordinal)`'s plural pick, through the shared primitive.
+    let template = benilla_ui::strings::plural("GENERIC_MIN", Some(minutes), get)?;
+    Some(benilla_ui::strings::fill(
+        &template,
+        &[benilla_ui::strings::Arg::D(i64::from(minutes))],
+    ))
 }
 
 /// Drive the ghost-world look (decision 0308 §7, all byte-VERIFIED): the FFXDeath screen pass
@@ -539,6 +583,7 @@ fn drain_death(
     net: Res<NetCommands>,
     targeting: crate::ui_action::cast_target::CastTargeting,
     mut ladder: crate::ui_action::CastLadder,
+    mut ui_errors: ResMut<crate::ui_action::UiErrorKeys>,
     // The soulstone leg is a real arm-290 caller in the reference's own census (wow-re
     // `bind-confirm-law.md`: 290 ← UseSoulstone · UseInventoryItem · UseAction · UseContainerItem),
     // so it goes through the shared send carrying the same bind gate every other item use does.
@@ -622,6 +667,7 @@ fn drain_death(
                             &mut script,
                             &mut gate,
                             false,
+                            &mut ui_errors,
                         );
                         Ok(())
                     }

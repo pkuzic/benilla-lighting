@@ -14,7 +14,10 @@ use super::{decode_id, draw_layer_from_str, frame_handle_of, frame_wrapper, stra
 
 /// Populate `m`'s visibility/hierarchy/strata/backdrop/mouse methods (see the module doc).
 pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
-    // Show / Hide / visibility
+    // Show / Hide / visibility. **`SetShown` is not here and must not come back**: the branchless
+    // setter belongs to a later expansion — no 1.12 method table registers it, and neither the
+    // stock chain nor either addon corpus calls it (decision 2142's census). A frame is shown or
+    // hidden by the two verbs the era has.
     m.set(
         "Show",
         lua.create_function(|lua, this: Table| set_shown(lua, &this, true))?,
@@ -23,21 +26,12 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         "Hide",
         lua.create_function(|lua, this: Table| set_shown(lua, &this, false))?,
     )?;
-    // SetShown(bool) — the live API's branchless Show/Hide (a consensus call across the 0068
-    // target addons; Lua truthiness, so SetShown(nil) hides).
-    m.set(
-        "SetShown",
-        lua.create_function(|lua, (this, shown): (Table, Value)| {
-            let show = !matches!(shown, Value::Nil | Value::Boolean(false));
-            set_shown(lua, &this, show)
-        })?,
-    )?;
     m.set(
         "IsShown",
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model.arena.frame(h).map(|f| f.shown).unwrap_or(false),
             ))
         })?,
@@ -47,7 +41,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model
                     .arena
                     .frame(h)
@@ -109,16 +103,16 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
     //    anything derived from the variant name — `format!("{:?}")` and friends — would hand
     //    addons `"SimpleHtml"`, and `GetObjectType` is compared with `==` (`IsObjectType`'s
     //    case-folding would hide it; the getter's would not).
-    //  · **`Cooldown` answers `"Model"`.** 1.12.1 has no `Cooldown` type — the census finds 23
-    //    type-name globals and none is that. The reference builds its cooldown as a `Model` playing
-    //    `UI-Cooldown-Indicator.mdx` (`CooldownFrameTemplate`), and OUR `FrameKind::Cooldown` is a
-    //    deliberate Era-shaped divergence that models the mechanism first-class (0137 phase 4). So
-    //    the faithful answer is what the reference's own cooldown widget IS. Answering `"Cooldown"`
-    //    would announce an Era type to a Lua ecosystem that branches on presence — precisely the
-    //    superset 1189 had to take back out.
+    //  · **There is no `Cooldown` type.** 1.12.1's census finds 23 type-name globals and none is
+    //    that: the reference builds its cooldown as a `Model` playing `UI-Cooldown-Indicator.mdx`
+    //    (`CooldownFrameTemplate`), and since decision 2019 so does this engine — the Era-shaped
+    //    `FrameKind::Cooldown` that modelled the mechanism first-class (0137 phase 4) is gone, so
+    //    `CreateFrame("Cooldown")` is the reference's own unknown-type refusal, never an announced
+    //    Era type to a Lua ecosystem that branches on presence (the superset 1189 took back out).
     fn type_chain(kind: FrameKind) -> &'static [&'static str] {
         match kind {
             FrameKind::Frame => &["Frame", "Region"],
+            FrameKind::WorldFrame => &["Frame", "Region"],
             FrameKind::Button => &["Button", "Frame", "Region"],
             FrameKind::CheckButton => &["CheckButton", "Button", "Frame", "Region"],
             // `CLootButton::IsObjectType 0x495af0` prepends its own name to the base's three
@@ -130,10 +124,12 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             FrameKind::Slider => &["Slider", "Frame", "Region"],
             FrameKind::ScrollFrame => &["ScrollFrame", "Frame", "Region"],
             FrameKind::Model => &["Model", "Frame", "Region"],
-            // 4 deep, and the ONLY frame chain in the roster that is: `PlayerModel` derives from
-            // `Model`, and `DressUpModel`/`TabardModel` (unbuilt) derive from it in turn, for a
-            // maximum depth of 5 (wow-re `ui/scratch/widget-type-identity.md` §6).
+            // 4 deep: `PlayerModel` derives from `Model`, and `DressUpModel` (1969) and
+            // `TabardModel` (1977) derive from it in turn, for the roster's maximum depth of 5
+            // (wow-re `ui/scratch/widget-type-identity.md` §6).
             FrameKind::PlayerModel => &["PlayerModel", "Model", "Frame", "Region"],
+            FrameKind::DressUpModel => &["DressUpModel", "PlayerModel", "Model", "Frame", "Region"],
+            FrameKind::TabardModel => &["TabardModel", "PlayerModel", "Model", "Frame", "Region"],
             FrameKind::MessageFrame => &["MessageFrame", "Frame", "Region"],
             FrameKind::ScrollingMessageFrame => &["ScrollingMessageFrame", "Frame", "Region"],
             FrameKind::ColorSelect => &["ColorSelect", "Frame", "Region"],
@@ -141,7 +137,6 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
             FrameKind::MovieFrame => &["MovieFrame", "Frame", "Region"],
             FrameKind::GameTooltip => &["GameTooltip", "Frame", "Region"],
             FrameKind::Minimap => &["Minimap", "Frame", "Region"],
-            FrameKind::Cooldown => &["Model", "Frame", "Region"],
         }
     }
     fn chain_of(lua: &Lua, this: &Table) -> mlua::Result<&'static [&'static str]> {
@@ -181,6 +176,74 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
                         .unwrap_or_else(|| "<unnamed>".to_string());
                     return Err(mlua::Error::runtime(format!(
                         "Usage: {who}:IsObjectType(\"TYPE\")"
+                    )));
+                }
+            };
+            Ok(if chain.iter().any(|t| want.eq_ignore_ascii_case(t)) {
+                Value::Number(1.0)
+            } else {
+                Value::Nil
+            })
+        })?,
+    )?;
+
+    // ── GetFrameType / IsFrameType: the FRAME-side spellings of the pair above (decision 2106) ──
+    //
+    // 1.12 registers the type-identity pair **twice, under two names**. The Region script
+    // (`CScriptRegion`) publishes `GetObjectType`/`IsObjectType` — that is the pair above, and its
+    // `IsObjectType` binding is `0x7a1290`. The *frame* script (`CSimpleFrameScript.cpp`,
+    // `__FILE__` `0x879504`) publishes `GetFrameType 0x773640` and `IsFrameType 0x773700` as well,
+    // and wow-5875-re carved both (`system/ui/scratch/item17-frameapi-batch1.md`, 76-entry
+    // registrar table verified at the bytes). `GetObjectType`/`IsObjectType` are what LATER
+    // clients kept; `GetFrameType`/`IsFrameType` are 1.12's own, and we shipped only the first
+    // pair. That is 1189's superset argument inverted — not an extra name we invented, a real one
+    // we were missing — and it cost the world map:
+    //
+    //     Cartographer 2.02, LookNFeel.lua:368, inside OnEnable:
+    //         if v:GetFrameType() == "Model" and not v:GetName() then self.playerModel = v end
+    //
+    // With the verb nil that line raised, AceAddon swallowed it, `self.playerModel` stayed nil,
+    // and the next `Cartographer_ChangeZone` → `SetAlpha` put a red script error on screen from
+    // `LookNFeel.lua:737` every time the map opened. FuBar's own `FuBar.lua:576`
+    // (`type(frame:GetFrameType()) ~= "string"`) is the same call.
+    //
+    // Both delegate to the same `type_chain` the `Object` pair reads: `GetFrameType` is
+    // `call [edx+0x1c]` — the identical per-class type-name slot `GetObjectType` reads — then
+    // `lua_pushstring`, one value, extra arguments ignored. `IsFrameType` walks the chain through
+    // `[eax+0x18]`, the same case-insensitive whole-string compare, and answers the NUMBER 1 or
+    // nil.
+    //
+    // **One edge is INFERRED and named rather than guessed silently:** wow-re's note glosses
+    // `IsFrameType`'s *absent-argument* branch as "pushes the frame's own typename (`call [eax+4]`
+    // GetName)", which is self-contradictory — a typename and a name are different slots — so the
+    // branch is not settled. We take the sibling's behaviour (the `Usage:` raise) pending a byte
+    // read. No caller in the 219-addon corpus, the director's AddOns, or the shipped FrameXML ever
+    // omits the argument: `JIM_toolbox/Config2/Pulse_Config.lua:118` is the corpus's only
+    // `IsFrameType` site and it passes `"Slider"`.
+    m.set(
+        "GetFrameType",
+        lua.create_function(|lua, this: Table| {
+            Ok(Value::String(lua.create_string(chain_of(lua, &this)?[0])?))
+        })?,
+    )?;
+    m.set(
+        "IsFrameType",
+        lua.create_function(|lua, (this, want): (Table, Value)| {
+            let chain = chain_of(lua, &this)?;
+            let want = match &want {
+                Value::String(s) => s.to_str()?.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Integer(i) => i.to_string(),
+                _ => {
+                    let h = frame_handle_of(lua, &this)?;
+                    let model = lua.app_data_ref::<Model>().expect("model");
+                    let who = model
+                        .arena
+                        .frame(h)
+                        .and_then(|f| f.name.clone())
+                        .unwrap_or_else(|| "<unnamed>".to_string());
+                    return Err(mlua::Error::runtime(format!(
+                        "Usage: {who}:IsFrameType(\"TYPE\")"
                     )));
                 }
             };
@@ -333,6 +396,16 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     .unwrap_or_else(|| "<unnamed>".to_string())
             };
             let parent_arg = it.next();
+            // `_G[name]` is read with no guard alive (`object::NamedTarget`), and **without**
+            // `$parent` expansion: `0x7a1550` calls `0x76c760` directly, and only the layout
+            // vtable's `0x76c700` runs the token.
+            let named = match &parent_arg {
+                Some(Value::String(s)) => Some(match s.to_str() {
+                    Ok(n) => super::prefetch_named_target(lua, n.as_ref(), None),
+                    Err(_) => super::NamedTarget::unreadable(),
+                }),
+                _ => None,
+            };
             let new_parent = {
                 let model = lua.app_data_ref::<Model>().expect("model");
                 match &parent_arg {
@@ -348,11 +421,18 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
                                 ))
                             })?,
                     ),
-                    Some(Value::String(s)) => {
-                        let n = s.to_str()?.to_string();
-                        Some(model.arena.lookup(&n).ok_or_else(|| {
+                    Some(Value::String(_)) => {
+                        // `_G[name]` + the **Frame** tag check — the reference's `0x76c760`
+                        // (`0x7a1550`'s NAME-string path) type-guards against `[0xcf0c10]`, the
+                        // narrow Frame id, not `SetPoint`'s root `[0xcf0c3c]`. So a global naming
+                        // a REGION fails here exactly as an absent one does.
+                        let nt = named.as_ref().expect("a String argument is prefetched");
+                        let hit = super::resolve_named_target(&model, nt)
+                            .and_then(|id| model.id_to_frame.get(&id).copied());
+                        Some(hit.ok_or_else(|| {
                             mlua::Error::runtime(format!(
-                                "{who}:SetParent(): Couldn't find region named '{n}'"
+                                "{who}:SetParent(): Couldn't find region named '{}'",
+                                nt.name
                             ))
                         })?)
                     }
@@ -431,10 +511,16 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, (this, level): (Table, i64)| {
             let h = frame_handle_of(lua, &this)?;
             let lvl = level.clamp(0, i64::from(u16::MAX)) as u16;
+            // **A script level change carries no children** — the binding `0x774560` calls
+            // `set_frame_level 0x76a4f0` with `propagate=0` (wow-re `ui/ui.md`, default levels).
+            // Only the toplevel raise shifts a subtree. Stock `BonusActionButtonTemplate` is written
+            // for this: it raises the button +2 and then its cooldown +2 by hand, landing the sweep
+            // one level over the button — carrying the children made it three, over the
+            // cooldown-count text an addon hangs at button + 2 (decision 2189).
             lua.app_data_mut::<Model>()
                 .expect("model")
                 .arena
-                .set_frame_level(h, lvl, true);
+                .set_frame_level(h, lvl, false);
             Ok(())
         })?,
     )?;
@@ -534,7 +620,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
     //    keep stale values a later `SetBackdropColor` changed.
     // 2. **No backdrop ⇒ ZERO Lua values, not `nil`** — the early bail is `xor eax,eax; ret`, which
     //    for a *return* path really is "no values" (contrast `binding_abi`'s note: the same two
-    //    bytes after a `luaL_error` are unreachable boilerplate). Observable through `select('#')`,
+    //    bytes after a `luaL_error` are unreachable boilerplate). Observable through the count,
     //    and it is the shape our `GetTitleRegion` will *not* have when it lands — that one pushes
     //    nil, i.e. one value. The client cannot distinguish "never set" from `SetBackdrop(nil)`.
     // 3. **A partial `SetBackdrop` omits nothing on the way out.** Every `SetBackdrop` allocates a
@@ -673,7 +759,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model.arena.is_mouse_enabled(h),
             ))
         })?,
@@ -709,7 +795,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model.arena.is_keyboard_enabled(h),
             ))
         })?,
@@ -777,7 +863,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model.arena.is_mouse_wheel_enabled(h),
             ))
         })?,
@@ -803,7 +889,7 @@ pub(super) fn install(lua: &Lua, m: &Table) -> mlua::Result<()> {
         lua.create_function(|lua, this: Table| {
             let h = frame_handle_of(lua, &this)?;
             let model = lua.app_data_ref::<Model>().expect("model");
-            Ok(crate::script::binding_abi::predicate(
+            Ok(crate::script::binding_abi::flag(
                 model.arena.is_clamped_to_screen(h),
             ))
         })?,

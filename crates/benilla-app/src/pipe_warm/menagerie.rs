@@ -306,6 +306,9 @@ pub(super) fn spawn_menagerie(
                 torch,
                 None, // the shared lane — see the note above
             );
+            // The warmer reads what it builds (`model_render::lazy` parks a built material
+            // until something visible binds it; the warmer's entities bind next frame).
+            benilla_world::model_render::lazy::realize_all(materials);
             if let Some(m) = materials.get(&plain) {
                 let mut m = m.clone();
                 m.extension.clutter_fade = Vec4::new(52.5, 70.0, 0.0, 1.0);
@@ -356,6 +359,7 @@ pub(super) fn spawn_menagerie(
                         torch,
                         None, // the shared lane — see the note above
                     );
+                    benilla_world::model_render::lazy::realize_all(materials);
                     if let Some(m) = materials.get(&h) {
                         let mut m = m.clone();
                         m.base.depth_bias = bucket;
@@ -602,6 +606,7 @@ fn far_twins_of(
     materials: &mut Assets<WowModelMaterial>,
     src: &[Handle<WowModelMaterial>],
 ) -> Vec<Handle<WowModelMaterial>> {
+    benilla_world::model_render::lazy::realize_all(materials);
     let twins: Vec<WowModelMaterial> = src
         .iter()
         .filter_map(|h| materials.get(h))
@@ -767,6 +772,9 @@ fn warm_quad(colors: bool, skinned: bool) -> RenderSubmesh {
         },
         interior: false,
         emissive: false,
+        icon_slot: false,
+        uv_rot_seq: None,
+        uv_scale_seq: None,
         sidn: None,
         window: false,
         additive: false,
@@ -796,6 +804,17 @@ mod tests {
     /// be named in the pipe_warm module, or this red-bars the build.
     #[test]
     fn every_custom_pipeline_lane_has_a_warm_contributor() {
+        // Lanes whose one pipeline compiles covered BY CONSTRUCTION, each with the reason:
+        // - UiGammaPipeline (`ui_gamma`, decision 2206): one variant, keyed on the swapchain's
+        //   view format, specialised in the first frame's prepare — pre-world, so covered
+        //   (`publish_cover`: `state != InWorld`) — and the surface's format never changes
+        //   after, so no later variant exists. Not a timing race like `UiQuadMaterial`'s: the
+        //   view exists from frame one, and the pipeline is what bevy's own output blit was.
+        //   (Its world-lane twin, benilla-world's `FfxCombinePipeline`, is outside this scan
+        //   and compiles under the same cover: the player-UI camera's backdrop pair is keyed on
+        //   that camera's own main texture and specialised on its first frame, pre-world, and a
+        //   bake's pair on the bake image's fixed format.)
+        let exempt = ["UiGammaPipeline"];
         let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let warm_src = std::fs::read_to_string(src_root.join("pipe_warm/mod.rs")).unwrap()
             + &std::fs::read_to_string(src_root.join("pipe_warm/menagerie.rs")).unwrap();
@@ -812,7 +831,7 @@ mod tests {
                         .chars()
                         .take_while(|c| c.is_alphanumeric() || *c == '_')
                         .collect();
-                    if !warm_src.contains(&ty) {
+                    if !exempt.contains(&ty.as_str()) && !warm_src.contains(&ty) {
                         missing.push(format!("{ty} (impl in {})", path.display()));
                     }
                 }

@@ -122,11 +122,16 @@ mod tokens;
 
 pub use cast_times::{load_spell_cast_times, SpellCastTime, SpellCastTimeCatalog};
 pub use dispel_types::{load_spell_dispel_types, SpellDispelTypes};
-pub use display::{FormRefusal, OpenLock, SpellDisplay};
+pub use display::{FormRefusal, LearnAnnouncement, OpenLock, SpellDisplay};
 pub use duration::{load_spell_durations, SpellDuration, SpellDurationCatalog};
 pub use forms::{load_shapeshift_forms, ShapeshiftForm};
+mod immunity;
+pub use immunity::{cc_exemption, grants_immunity, CcExemption};
 pub use radius::{load_spell_radii, SpellRadius, SpellRadiusCatalog};
-pub use ranges::{load_spell_ranges, SpellRange, SpellRangeCatalog};
+pub use ranges::{
+    load_spell_ranges, min_max_range, SpellRange, SpellRangeCatalog, COMBAT_REACH_ADD,
+    MELEE_RANGE_FLOOR, ON_NEXT_SWING_RANGE,
+};
 pub use tokens::{substitute, TokenContext};
 
 use std::collections::HashMap;
@@ -202,6 +207,9 @@ const COL_MODAL_NEXT_SPELL: usize = 38;
 /// spells; 0/0 for the GCD-free (Attack, Auto Shot, wand Shoot). Same 12-spell empirical pin.
 const COL_START_RECOVERY_CATEGORY: usize = 157;
 const COL_START_RECOVERY_TIME: usize = 158;
+/// `PreventionType` (`SpellRec+0x294`, `0x294/4 == 165`) — see [`SpellDisplay::prevention_type`]
+/// for the two-way pin that separates it from its `DmgClass` neighbour at 164.
+const COL_PREVENTION_TYPE: usize = 165;
 /// `Targets` (`SpellRec+0x34`, `0x34/4 == 13`) — the wire `TARGET_FLAG_*` seed mask the cast-arm
 /// loads into its targeting flag_word (`0x6e525a`, wow-re `wave-cast.md`, VERIFIED). Empirical
 /// pin against the binder's bit semantics: Resurrection 2006 = `0x8000` (corpse-ally bit 15),
@@ -214,6 +222,11 @@ const COL_TARGETS: usize = 13;
 /// Ice Armor 7302 / Feign Death 5384 = 1 (self — clears bit 10), Arcane Intellect 1459 / Lesser
 /// Heal 2050 = 21 (→ assist bit 8), Battle Shout 6673 = 20 (party-area — a no-op arm).
 const COL_IMPLICIT_TARGET_A1: usize = 82;
+/// `EffectImplicitTargetB[0]` (`SpellRec+0x154`, `0x154/4 == 85`) — the second implicit-target
+/// column, walked beside A by the hostility classifier `0x6ea280` ([`SpellDisplay::is_harmful`]).
+/// Empirical pin: Frost Nova 122 carries A = 22 (caster coordinates) and B = 15 (src-area enemy)
+/// — harmful through B alone.
+const COL_IMPLICIT_TARGET_B1: usize = 85;
 /// The usable-walk columns (`IsSpellUsableNow 0x6e3d60`'s §2a gate table, wow-re
 /// `action-button-state-api.md`, byte-verified 2026-07-10; column = SpellRec-offset/4).
 /// Empirical pins on the real 5875 data: Claw 1082 Stances `0x1` (cat = form 1), Ambush 8676
@@ -243,6 +256,12 @@ const COL_REQUIRES_SPELL_FOCUS: usize = 15;
 /// `Dispel` — the `SpellDispelType.dbc` id (`SpellRec+0x10`; the byte offset chain-locks it to
 /// `COL_CAST_UI` at `+0xc` and `COL_ATTRIBUTES` at `+0x18`). Decision 0257.
 const COL_DISPEL: usize = 4;
+/// `School` (`SpellRec+0x4`, `0x4/4 == 1`) — see [`SpellDisplay::school`].
+const COL_SCHOOL: usize = 1;
+/// `Mechanic` (`SpellRec+0x14`, `0x14/4 == 5`) — see [`SpellDisplay::mechanic`].
+const COL_MECHANIC: usize = 5;
+/// `EffectMechanic[0]` (`SpellRec+0x13c`, `0x13c/4 == 79`) — see [`SpellDisplay::effect_mechanic`].
+const COL_EFFECT_MECHANIC_1: usize = 79;
 const COL_ATTRIBUTES: usize = 6;
 /// `AttributesEx` (`SpellRec+0x1c` — chain-locked between `COL_ATTRIBUTES` at `+0x18` and
 /// `COL_ATTRIBUTES_EX2` at `+0x20`).
@@ -407,6 +426,11 @@ const ATTR_EX2_DO_NOT_RESET_COMBAT_TIMERS: u32 = 0x20000;
 /// (decision 0216 §8, `benilla-ui/src/script/spellbook.rs`) refuses it outright rather than
 /// sending a doomed cast the server would just reject.
 const ATTR_PASSIVE: u32 = 0x40;
+/// `Attributes` bit `0x10` — `SPELL_ATTR_ABILITY` (cmangos `SpellDefines.h`). The **only** thing
+/// the 1.12 client reads it for is the learn announcement's wording: `0x4b29a9 setne al` /
+/// `0x4b29b3 add eax,0x37` picks message id `0x37` `ERR_LEARN_SPELL_S` when the bit is clear and
+/// `0x38` `ERR_LEARN_ABILITY_S` when it is set. See [`SpellDisplay::learn_announcement`].
+const ATTR_ABILITY: u32 = 0x10;
 /// `Attributes` bit `0x80` — `SPELL_ATTR_DO_NOT_DISPLAY` (cmangos `SpellDefines.h`: "Hidden in
 /// Spellbook, Aura Icon, Combat Log"): THE spellbook add-gate (decision 0227) AND the `Attributes`
 /// half of the aura-bar display filter ([`SpellDisplay::hidden_from_aura_bar`] — the cache
@@ -751,6 +775,12 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 attributes_ex: u32_at(r, COL_ATTRIBUTES_EX).unwrap_or(0),
                 attributes_ex2: u32_at(r, COL_ATTRIBUTES_EX2).unwrap_or(0),
                 attributes_ex3: u32_at(r, COL_ATTRIBUTES_EX3).unwrap_or(0),
+                school: u32_at(r, COL_SCHOOL).unwrap_or(0),
+                mechanic: u32_at(r, COL_MECHANIC).unwrap_or(0),
+                effect_mechanic: std::array::from_fn(|i| {
+                    u32_at(r, COL_EFFECT_MECHANIC_1 + i).unwrap_or(0)
+                }),
+                prevention_type: u32_at(r, COL_PREVENTION_TYPE).unwrap_or(0),
                 passive: attributes & ATTR_PASSIVE != 0,
                 cast_ui: u32_at(r, COL_CAST_UI).unwrap_or(0),
                 effects: [0, 1, 2].map(|i| u32_at(r, COL_EFFECT_1 + i).unwrap_or(0)),
@@ -790,6 +820,12 @@ pub fn load_spell_catalog(chain: &mut Chain) -> Result<SpellCatalog> {
                 modal_next_spell: u32_at(r, COL_MODAL_NEXT_SPELL).unwrap_or(0),
                 targets: u32_at(r, COL_TARGETS).unwrap_or(0),
                 implicit_target_a1: u32_at(r, COL_IMPLICIT_TARGET_A1).unwrap_or(0),
+                effect_implicit_target_a: std::array::from_fn(|i| {
+                    u32_at(r, COL_IMPLICIT_TARGET_A1 + i).unwrap_or(0)
+                }),
+                effect_implicit_target_b: std::array::from_fn(|i| {
+                    u32_at(r, COL_IMPLICIT_TARGET_B1 + i).unwrap_or(0)
+                }),
                 stances: u32_at(r, COL_STANCES).unwrap_or(0),
                 stances_not: u32_at(r, COL_STANCES_NOT).unwrap_or(0),
                 caster_aura_state: u32_at(r, COL_CASTER_AURA_STATE).unwrap_or(0),

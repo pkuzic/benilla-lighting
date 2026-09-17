@@ -29,7 +29,7 @@
 
 use bevy::prelude::*;
 
-use benilla_ui::script::{PetStats, UiScript};
+use benilla_ui::script::{PetStats, ScriptValue, UiScript};
 
 use crate::names::NameCache;
 use crate::net::{NetCommands, ObjectStore};
@@ -317,13 +317,27 @@ fn feed_pet_stats(
     script.set_pet_stats(fresh.0, fresh.1);
     // Push before firing — dispatch runs the Lua handlers synchronously (the `ui_unit` rule).
     if happiness_moved {
-        script.fire_event("UNIT_HAPPINESS", vec![]);
+        // `%s` — the unit token, per the reference's own fire site (SignalEvent2, decision 1884).
+        // Every 1.12 `UNIT_*` event carries it, and its consumers gate on it: a handler's first
+        // line is `if ( arg1 == this.unit )`, so an argless fire reaches nobody.
+        script.fire_event("UNIT_HAPPINESS", vec![ScriptValue::Str("pet".into())]);
     }
+    // Both of these are the SAME bridge as `UNIT_HAPPINESS` above — named unit-descriptor fields
+    // (141/142 `PET_EXPERIENCE`/`PET_NEXT_LEVEL_EXP`, 149 `TRAINING_POINTS`), whose events the
+    // reference dispatches through `0x515e50`'s token fan-out, `SignalEvent2(id, "%s", token)`.
+    // They were argless here for months, two lines under a comment stating the law, and the cost
+    // was not theoretical: `PetPaperDollFrame_OnEvent` gives `UNIT_PET_EXPERIENCE` a named branch
+    // but routes `UNIT_PET_TRAINING_POINTS` to its final `elseif ( arg1 == "pet" )` catch-all
+    // (`PetPaperDollFrame.lua:44`), so an argless fire reached nobody and the pet page's training
+    // points never repainted off the event at all.
     if xp_moved {
-        script.fire_event("UNIT_PET_EXPERIENCE", vec![]);
+        script.fire_event("UNIT_PET_EXPERIENCE", vec![ScriptValue::Str("pet".into())]);
     }
     if training_moved {
-        script.fire_event("UNIT_PET_TRAINING_POINTS", vec![]);
+        script.fire_event(
+            "UNIT_PET_TRAINING_POINTS",
+            vec![ScriptValue::Str("pet".into())],
+        );
     }
 }
 

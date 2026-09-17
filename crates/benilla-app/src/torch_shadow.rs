@@ -63,7 +63,7 @@ use bevy::camera::primitives::Aabb;
 use benilla_world::lighting::{
     interior_reach, m2_light_reach, DaylightFixture, DynamicInteriors, FireLightGain, LightLane,
     LightLitRooms, LightReach, LightRooms, ShadowDistance, ShadowProxyLight, SyntheticFireLight,
-    WowLighting,
+    WorldPointLight, WowLighting,
 };
 // MONKEY (carried light stability): the settle verdict a carried light earns by standing still.
 // MONKEY (outdoor torch shadows): …and the marker that says a light is CARRIED BY A BODY.
@@ -741,7 +741,7 @@ fn update_torch_shadows(
     // `entities::carried_light`). It rides the candidate and then the slot, because the caster
     // gathers need it and they run far downstream of this query.
     torches: Query<
-        (Entity, &GlobalTransform, &PointLight, Option<&LightReach>, Option<&LightLane>,
+        (Entity, &GlobalTransform, &WorldPointLight, Option<&LightReach>, Option<&LightLane>,
          Has<LightRooms>, Has<LightLitRooms>, Has<SyntheticFireLight>, Has<ChildOf>,
          Has<HeldLight>, Option<&crate::entities::CarriedLightMotion>, Option<&LightOwner>),
         // MONKEY (daylight fixtures): a doorway's daylight source is NOT a caster candidate. It is
@@ -865,10 +865,10 @@ fn update_torch_shadows(
             // authored MOLT end or the M2 intensity bucket times `interiorAttenScale` — and an
             // exterior entry packs no reach at all, so applying it out here would size an outdoor
             // campfire's promotion window off a number no exterior receiver ever reads.
-            let c = pl.color.to_linear();
+            let c = pl.color;
             // Rec.709 luminance of the committed colour: ONE scalar for "how much light is this",
             // so a dim blue magic brazier cannot outrank a bright hearth on channel count.
-            let lum = (0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue).max(0.0) * base.max(0.0);
+            let lum = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).max(0.0) * base.max(0.0);
             // MONKEY (outdoor torch shadows): the lane split. It is the SAME verdict the light
             // packer writes into the colour row's `.w` (`LightLane` — a light is interior iff it
             // physically stands in an interior-class WMO group, with the old `LightRooms` rule as

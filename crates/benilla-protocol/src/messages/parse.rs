@@ -11,12 +11,12 @@ use crate::wire::{
 };
 
 use super::{
-    action_bar, area_trigger, attack, auction, bank, binder, broadcast, channel, chat, combat_log,
-    death, duel, gameobject, gm_ticket, gossip, group, guild, instance, items, loot, mail,
-    mirror_timer, monster_move, movement, opcode, page_text, pet, petition, progression, pvp,
-    quest, social, spellbook, spells, stable, summon, taxi, trade, trainer, update_object, vendor,
-    world_state, Character, CreatureQueryInfo, JumpInfo, MoveMode, ServerPacket, SpeedKind,
-    SplineMode,
+    action_bar, area_trigger, attack, auction, bank, battlefield, binder, broadcast, channel, chat,
+    combat_log, death, duel, gameobject, gm_ticket, gossip, group, guild, instance, items, loot,
+    mail, meeting_stone, mirror_timer, monster_move, movement, opcode, page_text, pet, petition,
+    progression, pvp, quest, social, spellbook, spells, stable, summon, tabard, taxi, trade,
+    trainer, tutorial, update_object, vendor, world_state, AttackSwingError, Character,
+    CreatureQueryInfo, JumpInfo, MoveMode, ServerPacket, SpeedKind, SplineMode,
 };
 
 /// Read one `SMSG_FORCE_*_SPEED_CHANGE` body — `[packed mover guid][u32 counter][f32 speed]`,
@@ -122,10 +122,21 @@ fn read_move_set_speed(kind: SpeedKind, r: &mut impl Read) -> io::Result<ServerP
     })
 }
 
-/// True for a relayed player-movement opcode — one the server rebroadcasts as
-/// `[packed guid][MovementInfo]` (every opcode bound to vmangos `HandleMovementOpcodes`, VERIFIED
-/// `Opcodes.cpp`). Excludes `MSG_MOVE_TELEPORT_ACK` / `MSG_MOVE_WORLDPORT_ACK`, which share the family
-/// but carry different bodies and are decoded by their own arms.
+/// True for a relayed movement opcode — one the server rebroadcasts as `[packed guid][MovementInfo]`.
+/// Two groups, one wire shape and one client handler (`0x603bb0`, wow-re `re/net/opcode-handlers.tsv`
+/// — 30 rows pointing at it, of which these are 23):
+///
+/// - the **echoed input stream**, every opcode bound to vmangos `HandleMovementOpcodes` (VERIFIED
+///   `Opcodes.cpp`): another player's walking, turning, jumping, swimming, facing;
+/// - the **observer leg of the movement-mode family** (decision 2061): root/unroot, hover,
+///   feather-fall, water-walk and the near-teleport, broadcast by
+///   `MovementPacketSender::Send{MovementFlagChange,Teleport}ToObservers` once the mover's own
+///   client has acked. Same body, no ack, and the apply/unapply direction rides the `MovementInfo`
+///   flags word rather than the opcode (see [`super::opcode`]'s block).
+///
+/// Excludes `MSG_MOVE_TELEPORT_ACK` / `MSG_MOVE_WORLDPORT_ACK`, which share the family but carry
+/// different bodies and are decoded by their own arms — note `MSG_MOVE_TELEPORT` (197) is the
+/// observer's teleport and is NOT `MSG_MOVE_TELEPORT_ACK` (199): no counter dword, so it parses here.
 const fn is_movement_relay(o: u16) -> bool {
     matches!(
         o,
@@ -155,10 +166,73 @@ const fn is_movement_relay(o: u16) -> bool {
             // need to: the server built that `MovementInfo` from the victim's own ack, so its jump
             // tail already IS the quad, and the arc replays from it like any other relayed jump.
             | opcode::MSG_MOVE_KNOCK_BACK
+            // The observer leg of the movement-mode family (decision 2061): somebody else was
+            // rooted, levitated (hover + feather fall + water walk), or blinked. The mode lands in
+            // the `MovementInfo` flags word this body already carries, so no arm of its own is
+            // needed — only the opcode's admission to the family.
+            | opcode::MSG_MOVE_ROOT
+            | opcode::MSG_MOVE_UNROOT
+            | opcode::MSG_MOVE_HOVER
+            | opcode::MSG_MOVE_FEATHER_FALL
+            | opcode::MSG_MOVE_WATER_WALK
+            | opcode::MSG_MOVE_TELEPORT
     )
 }
 
 /// Parse a server packet body (already decrypted + sized) by opcode.
+/// `SMSG_ADDON_INFO`'s record stream — **no count, no names, no trailer** (decision 2175).
+///
+/// The grammar is the one `AddOn_ReadAddonInfoReply 0x51da70` reads, per record (wow-re
+/// `system/net/scratch/cmsg-auth-session-addon-block.md` §6):
+///
+/// ```text
+/// u8  status              ; 2 -> [rec+0x29] = 1 (hidden from the Lua index space)
+///                         ; 0 -> [rec+0x24] = 2 (rejected)
+///                         ; else -> verify the .toc/Bindings.xml signature
+/// u8  infoProvided        ; persisted into the .pub and echoed next logon
+/// if infoProvided:
+///     u8 keyProvided
+///     if keyProvided: u8[256] modulus
+///     u32 revision
+/// u8  urlProvided
+/// if urlProvided: u8[256] url
+/// ```
+///
+/// The retail capture is the minimal form — 12 x 8 bytes of `{2, 1, 0, 0u32, 0}`.
+///
+/// **A truncated record ends the walk and keeps the records before it**, rather than failing the
+/// packet. Only a record that parsed whole contributes a status, so `statuses[i]` is always
+/// record *i*'s and the pairing against what we sent cannot slip. The stream is self-delimiting only if every field is read exactly right, so a grammar
+/// error here would otherwise turn a working login into an unparseable packet; the statuses we did
+/// read are still true, and a short read is visible as a count that does not match what we sent.
+fn read_addon_info(r: &mut &[u8]) -> Vec<u8> {
+    let mut statuses = Vec::new();
+    while !r.is_empty() {
+        let Ok(status) = read_u8(r) else { break };
+        let Ok(info_provided) = read_u8(r) else { break };
+        if info_provided != 0 {
+            let Ok(key_provided) = read_u8(r) else { break };
+            if key_provided != 0 && skip(r, 256).is_none() {
+                break;
+            }
+            if read_u32_le(r).is_err() {
+                break;
+            }
+        }
+        let Ok(url_provided) = read_u8(r) else { break };
+        if url_provided != 0 && skip(r, 256).is_none() {
+            break;
+        }
+        statuses.push(status);
+    }
+    statuses
+}
+
+/// Advance `r` by `n` bytes, or `None` when it holds fewer.
+fn skip(r: &mut &[u8], n: usize) -> Option<()> {
+    (r.len() >= n).then(|| *r = &r[n..])
+}
+
 pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
     let mut r = body;
     Ok(match opcode {
@@ -222,6 +296,9 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_CHAR_CREATE => ServerPacket::CharCreate {
             result: read_u8(&mut r)?,
         },
+        opcode::SMSG_CHARACTER_LOGIN_FAILED => ServerPacket::CharacterLoginFailed {
+            result: read_u8(&mut r)?,
+        },
         opcode::SMSG_UPDATE_OBJECT => ServerPacket::UpdateObject {
             objects: update_object::read_update_object(&mut r)?,
         },
@@ -244,7 +321,12 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_COMPRESSED_MOVES => ServerPacket::CompressedMoves {
             packets: read_compressed_moves(&mut r)?,
         },
-        opcode::SMSG_MONSTER_MOVE => monster_move::read_monster_move(&mut r)?,
+        opcode::MSG_MOVE_TIME_SKIPPED => {
+            let (guid, lag_ms) = movement::read_move_time_skipped(&mut r)?;
+            ServerPacket::MoveTimeSkipped { guid, lag_ms }
+        }
+        opcode::SMSG_MONSTER_MOVE => monster_move::read_monster_move(&mut r, false)?,
+        opcode::SMSG_MONSTER_MOVE_TRANSPORT => monster_move::read_monster_move(&mut r, true)?,
         opcode::MSG_MOVE_TELEPORT_ACK => {
             let guid = read_packed_guid(&mut r)?;
             let counter = read_u32_le(&mut r)?;
@@ -374,6 +456,78 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
                 trainer: ask.trainer,
                 cost: ask.cost,
             }
+        }
+        opcode::SMSG_PET_UNLEARN_CONFIRM => {
+            let ask = pet::read_pet_unlearn_confirm(&mut r)?;
+            ServerPacket::PetUnlearnConfirm {
+                trainer: ask.trainer,
+                cost: ask.cost,
+            }
+        }
+        opcode::SMSG_RAID_GROUP_ONLY => {
+            let boot = instance::read_raid_group_only(&mut r)?;
+            ServerPacket::RaidGroupOnly {
+                delay_ms: boot.delay_ms,
+                reason: boot.reason,
+            }
+        }
+        opcode::SMSG_AREA_SPIRIT_HEALER_TIME => {
+            let t = death::read_area_spirit_healer_time(&mut r)?;
+            ServerPacket::AreaSpiritHealerTime {
+                healer: t.healer,
+                ms: t.ms,
+            }
+        }
+        opcode::SMSG_BATTLEFIELD_STATUS => {
+            ServerPacket::BattlefieldStatus(battlefield::read_battlefield_status(&mut r)?)
+        }
+        opcode::MSG_PVP_LOG_DATA => {
+            ServerPacket::PvpLogData(battlefield::read_pvp_log_data(&mut r)?)
+        }
+        opcode::SMSG_BATTLEFIELD_LIST => {
+            ServerPacket::BattlefieldList(battlefield::read_battlefield_list(&mut r)?)
+        }
+        opcode::MSG_BATTLEGROUND_PLAYER_POSITIONS => {
+            ServerPacket::BattlefieldPositions(battlefield::read_battlefield_positions(&mut r)?)
+        }
+        opcode::MSG_TABARDVENDOR_ACTIVATE => {
+            ServerPacket::TabardVendorActivate(tabard::read_tabard_vendor_activate(&mut r)?)
+        }
+        opcode::MSG_SAVE_GUILD_EMBLEM => {
+            ServerPacket::SaveGuildEmblemResult(tabard::read_save_guild_emblem_result(&mut r)?)
+        }
+        opcode::SMSG_GROUP_JOINED_BATTLEGROUND => ServerPacket::GroupJoinedBattleground {
+            result: crate::wire::read_u32_le(&mut r)?,
+        },
+        opcode::SMSG_BATTLEGROUND_PLAYER_JOINED => ServerPacket::BattlegroundPlayer {
+            guid: crate::wire::read_u64_le(&mut r)?,
+            joined: true,
+        },
+        opcode::SMSG_BATTLEGROUND_PLAYER_LEFT => ServerPacket::BattlegroundPlayer {
+            guid: crate::wire::read_u64_le(&mut r)?,
+            joined: false,
+        },
+        opcode::SMSG_MEETINGSTONE_SETQUEUE => {
+            let q = meeting_stone::read_meeting_stone_set_queue(&mut r)?;
+            ServerPacket::MeetingStoneSetQueue {
+                area: q.area,
+                status: q.status,
+            }
+        }
+        opcode::SMSG_MEETINGSTONE_SUCCESS => {
+            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::Success)
+        }
+        opcode::SMSG_MEETINGSTONE_IN_PROGRESS => {
+            ServerPacket::MeetingStoneNotice(crate::messages::MeetingStoneNotice::InProgress)
+        }
+        opcode::SMSG_MEETINGSTONE_MEMBER_ADDED => ServerPacket::MeetingStoneNotice(
+            meeting_stone::read_meeting_stone_member_added(&mut r)?,
+        ),
+        opcode::SMSG_MEETINGSTONE_JOIN_FAILED => {
+            ServerPacket::MeetingStoneNotice(meeting_stone::read_meeting_stone_join_failed(&mut r)?)
+        }
+        opcode::SMSG_TUTORIAL_FLAGS => {
+            ServerPacket::TutorialFlags(tutorial::read_tutorial_flags(&mut r)?)
         }
         opcode::SMSG_PLAYERBOUND => {
             let bound = binder::read_player_bound(&mut r)?;
@@ -535,6 +689,21 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
             let (spell_id, outcome) = pet::read_pet_cast_failed(&mut r)?;
             ServerPacket::PetCastFailed { spell_id, outcome }
         }
+        opcode::SMSG_PET_TAME_FAILURE => ServerPacket::PetTameFailure {
+            reason: pet::read_pet_tame_failure(&mut r)?,
+        },
+        // Both bodies really are empty — the opcode is the whole message on either (vmangos's
+        // `AppendBodyTo` writes nothing, and the reference's handlers read nothing).
+        opcode::SMSG_PET_NAME_INVALID => ServerPacket::PetNameInvalid,
+        opcode::SMSG_PET_BROKEN => ServerPacket::PetBroken,
+        opcode::SMSG_PET_ACTION_SOUND => {
+            let (pet_guid, talk) = pet::read_pet_action_sound(&mut r)?;
+            ServerPacket::PetActionSound { pet_guid, talk }
+        }
+        opcode::SMSG_PET_DISMISS_SOUND => {
+            let (model_id, position) = pet::read_pet_dismiss_sound(&mut r)?;
+            ServerPacket::PetDismissSound { model_id, position }
+        }
         opcode::SMSG_ATTACKSTART => {
             let (attacker, victim) = attack::read_attack_start(&mut r)?;
             ServerPacket::AttackStart { attacker, victim }
@@ -546,6 +715,21 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
         opcode::SMSG_ATTACKERSTATEUPDATE => {
             ServerPacket::AttackerState(attack::read_attacker_state(&mut r)?)
         }
+        // The swing refusals — empty bodies, nothing read. `SMSG_ATTACKSWING_NOTSTANDING` (`0x147`)
+        // is deliberately absent: the reference never registers it and vmangos never sends it, so
+        // it falls to the unknown-opcode arm exactly as it does in the real client's dispatcher.
+        opcode::SMSG_ATTACKSWING_NOTINRANGE => {
+            ServerPacket::AttackSwingError(AttackSwingError::NotInRange)
+        }
+        opcode::SMSG_ATTACKSWING_BADFACING => {
+            ServerPacket::AttackSwingError(AttackSwingError::BadFacing)
+        }
+        opcode::SMSG_ATTACKSWING_DEADTARGET | opcode::SMSG_ATTACKSWING_CANT_ATTACK => {
+            ServerPacket::AttackSwingError(AttackSwingError::DeadOrUnattackable)
+        }
+        // The family's fourth arm, from the spell TU's registration — same empty body, same act.
+        opcode::SMSG_CANCEL_COMBAT => ServerPacket::CancelCombat,
+        opcode::SMSG_FEIGN_DEATH_RESISTED => ServerPacket::FeignDeathResisted,
         opcode::SMSG_AI_REACTION => {
             let (unit, reaction) = attack::read_ai_reaction(&mut r)?;
             ServerPacket::AiReaction { unit, reaction }
@@ -574,6 +758,10 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
                 item_guid,
                 spell_id,
             }
+        }
+        opcode::SMSG_ITEM_TIME_UPDATE => {
+            let (item_guid, seconds) = items::read_item_time(&mut r)?;
+            ServerPacket::ItemTime { item_guid, seconds }
         }
         opcode::SMSG_ITEM_ENCHANT_TIME_UPDATE => {
             let (item_guid, slot, seconds) = items::read_item_enchant_time(&mut r)?;
@@ -1461,6 +1649,9 @@ pub fn parse_server(opcode: u16, body: &[u8]) -> io::Result<ServerPacket> {
                 transport: info.transport,
             }
         }
+        opcode::SMSG_ADDON_INFO => ServerPacket::AddonInfo {
+            statuses: read_addon_info(&mut r),
+        },
         other => ServerPacket::Other { opcode: other },
     })
 }

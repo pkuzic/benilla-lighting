@@ -69,7 +69,7 @@ use bevy::prelude::*;
 
 use super::{
     DynamicInteriors, FireLightGain, LightLane, LightLitRooms, LightReach, SpellFxLight,
-    SpellLightGain, SyntheticFireLight, WowLighting,
+    SpellLightGain, SyntheticFireLight, WorldPointLight, WowLighting,
 };
 
 /// A `PointLight` that IS the daylight standing in one exterior-facing opening. Spawned with the
@@ -1013,7 +1013,7 @@ pub fn update_daylight_fixtures(
             Entity,
             &DaylightFixture,
             Option<&LightReach>,
-            Option<&mut PointLight>,
+            Option<&mut WorldPointLight>,
         ),
         Without<BleedFixture>,
     >,
@@ -1041,11 +1041,11 @@ pub fn update_daylight_fixtures(
         };
         match pl {
             Some(mut pl) if intensity > 1e-4 => {
-                pl.color = Color::linear_rgb(hue[0], hue[1], hue[2]);
+                pl.color = hue;
                 pl.intensity = 4.0 * std::f32::consts::PI * intensity;
             }
             Some(_) => {
-                commands.entity(e).remove::<PointLight>();
+                commands.entity(e).remove::<WorldPointLight>();
             }
             None if intensity > 1e-4 => {
                 commands
@@ -1097,14 +1097,12 @@ pub fn update_daylight_fixtures(
 /// and multiplies the linear colour by it, so the committed colour is exactly `hue * I` — which is
 /// what the calibration above solved for, and what the shader's `c_norm` reads back unchanged while
 /// `I <= 1`.
-pub fn daylight_point_light(hue: [f32; 3], intensity: f32) -> PointLight {
-    PointLight {
-        color: Color::linear_rgb(hue[0], hue[1], hue[2]),
+pub fn daylight_point_light(hue: [f32; 3], intensity: f32) -> WorldPointLight {
+    WorldPointLight {
+        color: hue,
         intensity: 4.0 * std::f32::consts::PI * intensity.max(0.0),
         // The 48 yd CANDIDACY constant every source packs — not a reach (that rides `LightReach`).
         range: 48.0,
-        shadows_enabled: false,
-        ..default()
     }
 }
 
@@ -1759,11 +1757,11 @@ pub fn update_bleed_fixtures(
         &BleedFixture,
         &GlobalTransform,
         Option<&LightReach>,
-        Option<&mut PointLight>,
+        Option<&mut WorldPointLight>,
     )>,
     sources: Query<
         (
-            &PointLight,
+            &WorldPointLight,
             &GlobalTransform,
             Option<&LightReach>,
             Option<&LightLitRooms>,
@@ -1807,7 +1805,7 @@ pub fn update_bleed_fixtures(
                 if !lane.map_or_else(|| rooms.is_some(), |l| l.interior) {
                     return None;
                 }
-                let c = pl.color.to_linear();
+                let c = pl.color;
                 let base = pl.intensity / (4.0 * std::f32::consts::PI);
                 // `fireLightGain` IS mirrored (a dial that darkens the hearth must darken what the
                 // doorway carries of it); the FLICKER deliberately is not.
@@ -1832,9 +1830,9 @@ pub fn update_bleed_fixtures(
                 // scale it, and the gain therefore has to be in the TARGET.
                 let g = if daylight { 1.0 } else { knobs.interior_gain };
                 let c_norm = commit_norm([
-                    (c.red * s * g).max(0.0),
-                    (c.green * s * g).max(0.0),
-                    (c.blue * s * g).max(0.0),
+                    (c[0] * s * g).max(0.0),
+                    (c[1] * s * g).max(0.0),
+                    (c[2] * s * g).max(0.0),
                 ]);
                 let r = reach
                     .map(|r| r.0)
@@ -1958,11 +1956,11 @@ pub fn update_bleed_fixtures(
         };
         match pl {
             Some(mut pl) if *intensity > 1e-4 => {
-                pl.color = Color::linear_rgb(hue[0], hue[1], hue[2]);
+                pl.color = *hue;
                 pl.intensity = 4.0 * std::f32::consts::PI * intensity;
             }
             Some(_) => {
-                commands.entity(r.e).remove::<PointLight>();
+                commands.entity(r.e).remove::<WorldPointLight>();
             }
             None if *intensity > 1e-4 => {
                 commands

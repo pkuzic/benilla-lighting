@@ -120,8 +120,16 @@ impl Plugin for DevProbesPlugin {
                 "WOW_PROBE_PITCH",
                 "WOW_PROBE_CHEST",
                 "WOW_PROBE_CLAM",
+                "WOW_PROBE_VENDOR_SWAP",
+                "WOW_PROBE_MODEL_CAMERA",
                 "WOW_RIG",
                 "WOW_LIVE_FPS",
+                // A screenshot burst and a pick burst are wall-clock schedules too, and on an
+                // occluded window they capture the same stale drawable over and over: a whole
+                // day of lamppost A/Bs on the Air read identical to the decimal because every
+                // frame in every burst was one frame (the halo record).
+                "WOW_LIVE_SHOT",
+                "WOW_PICK",
             ]
             .iter()
             .any(|k| std::env::var(k).is_ok())
@@ -133,8 +141,9 @@ impl Plugin for DevProbesPlugin {
             if std::env::var("WOW_PROBE_CHAT").is_ok() {
                 app.add_plugins(crate::capture::ProbeChatPlugin);
             }
-            // The probe-lua one-shot: `WOW_PROBE_LUA="CastSpell(…)"` runs a chunk in the live UI VM once
-            // in-world — the "press the button headlessly" instrument (see `capture::ProbeLuaPlugin`).
+            // The probe-lua driver: `WOW_PROBE_LUA="CastSpell(…)"` runs a chunk in the live UI VM once
+            // per world entry — the "press the button headlessly" instrument, re-armed across a relog
+            // so a probe can read the same value on both sides of one (see `capture::ProbeLuaPlugin`).
             if std::env::var("WOW_PROBE_LUA").is_ok() {
                 app.add_plugins(crate::capture::ProbeLuaPlugin);
             }
@@ -302,6 +311,13 @@ impl Plugin for DevProbesPlugin {
             if std::env::var("WOW_PROBE").as_deref() == Ok("guardpoi") {
                 app.add_plugins(crate::capture::ProbeGuardPoiPlugin);
             }
+            // The battleground-queue live probe: `WOW_PROBE_BGQUEUE=1` levels past the bracket
+            // floor, greets Stormwind's Warsong Gulch battlemaster on the real wire and queues
+            // through the guid his list carried — the fixture that makes "log in while queued"
+            // reproducible (decision 2232's unexercised shape; see `capture::ProbeBgQueuePlugin`).
+            if std::env::var("WOW_PROBE_BGQUEUE").is_ok() {
+                app.add_plugins(crate::capture::ProbeBgQueuePlugin);
+            }
             // The mail-arc live probe: `WOW_PROBE_MAIL=1` GM-mails the probe's own character, opens the
             // Goldshire mailbox on the real wire, and drives the inbox/take/send/delete surface through
             // the live Lua VM — decisions 0544/0548's end-to-end instrument (see `capture::ProbeMailPlugin`).
@@ -326,6 +342,28 @@ impl Plugin for DevProbesPlugin {
             // closes B249 (see `capture::ProbeBinderPlugin`).
             if std::env::var("WOW_PROBE_BINDER").is_ok() {
                 app.add_plugins(crate::capture::ProbeBinderPlugin);
+            }
+            // The NPC-service ladder live probe: `WOW_PROBE_SERVICE=1` walks four real NPCs, one per
+            // interesting `UNIT_NPC_FLAGS` shape, and reports the arm the shipped ladder takes and the
+            // window that actually opened — decision 1861's end-to-end instrument, and the standing
+            // answer to "does right-clicking a trainer open the trainer window or a gossip menu?"
+            // (see `capture::ProbeServicePlugin`).
+            if std::env::var("WOW_PROBE_SERVICE").is_ok() {
+                app.add_plugins(crate::capture::ProbeServicePlugin);
+            }
+            // The vendor-swap live probe: `WOW_PROBE_VENDOR_SWAP=1` stands between the Goldshire
+            // inn's two vendors, opens one over the other's window, and reads the `"npc"` token,
+            // the title and the round portrait at the `MERCHANT_SHOW` dispatch itself — decision
+            // 2022's instrument (see `capture::ProbeVendorSwapPlugin`).
+            if std::env::var("WOW_PROBE_VENDOR_SWAP").is_ok() {
+                app.add_plugins(crate::capture::ProbeVendorSwapPlugin);
+            }
+            // The `<Model>` perspective-leg live probe: `WOW_PROBE_MODEL_CAMERA=1` builds a plain
+            // pane on a camera-bearing file and reads the renderer's own camera and root back to
+            // check the three cancellations against an orthographic control (decision 2027's
+            // instrument; see `capture::ProbeModelCameraPlugin`, whose module doc is the recipe).
+            if std::env::var("WOW_PROBE_MODEL_CAMERA").is_ok() {
+                app.add_plugins(crate::capture::ProbeModelCameraPlugin);
             }
             // The GM trouble-ticket live probe: `WOW_PROBE_GMTICKET=1` drives the whole five-opcode
             // ticket wire through the live VM's own bindings — queue status, clean slate, file, edit,
@@ -354,6 +392,13 @@ impl Plugin for DevProbesPlugin {
             // see `capture::ProbeChestPlugin`).
             if std::env::var("WOW_PROBE_CHEST").is_ok() {
                 app.add_plugins(crate::capture::ProbeChestPlugin);
+            }
+            // The GameObject-questgiver live probe: `WOW_PROBE_GOQUEST=1` parks at the Goldshire
+            // wanted poster and reports the dialog status the server answers for it, below and
+            // above the quest's own MinLevel — the numeric answer to "quest objects are never
+            // status-queried" (decision 1872; see `capture::ProbeGoQuestPlugin`).
+            if std::env::var("WOW_PROBE_GOQUEST").is_ok() {
+                app.add_plugins(crate::capture::ProbeGoQuestPlugin);
             }
             // The openable-item live probe: `WOW_PROBE_CLAM=1` stocks a clam, right-clicks it
             // through the live VM's own `UseContainerItem` and reports whether a loot window opens
@@ -386,11 +431,9 @@ impl Plugin for DevProbesPlugin {
             app.add_plugins(crate::capture::ProbeLookPlugin);
             app.add_plugins(crate::capture::ProbePitchPlugin);
             app.add_plugins(crate::capture::ProbeCamPlugin);
-            // The FPS journal: `WOW_FPS_JOURNAL=<csv>` appends per-second position + frame-time rows on a
-            // director-driven run — "where does it dip" as coordinates (see `perf::FpsJournalPlugin`).
-            if std::env::var("WOW_FPS_JOURNAL").is_ok() {
-                app.add_plugins(crate::perf::FpsJournalPlugin);
-            }
+            // (The FPS journal — `WOW_FPS_JOURNAL=<csv>`, or the `fpsJournal` CVar — is
+            // registered from `lib.rs` in every build since 2008: it is the one instrument a
+            // player runs for us.)
         }
     }
 }

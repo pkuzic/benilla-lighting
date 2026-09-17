@@ -115,7 +115,7 @@ const WORD_WRAP_X: u32 = 65536u;    // 1 << 16
 const WORD_WRAP_Y: u32 = 131072u;   // 1 << 17
 const WORD_UNLIT: u32 = 262144u;    // 1 << 18
 const WORD_FOG_OFF: u32 = 524288u;  // 1 << 19
-const WORD_SHADE_LIT: u32 = 1048576u; // 1 << 20
+const WORD_SHADE_LIT: u32 = 1048576u; // 1 << 20 — no producer since 2050 (entities never divert here); kept, retiring it is a word-layout round
 const WORD_TEXTURED: u32 = 2097152u;  // 1 << 21
 // The WMO lane (slice 2) — the entity path's per-material facts as bits:
 const WORD_WMO: u32 = 4194304u;        // 1 << 22 — model_flags.x (the WMO surface laws)
@@ -128,7 +128,7 @@ const WORD_HAS_VC: u32 = 134217728u;   // 1 << 27 — the batch AUTHORED vertex 
 // The prop lane (B4). INTERIOR without WMO = an interior M2 prop — the entity shader's own
 // `interior_prop = flags.z && !flags.x` split: probe lighting, interior fog, zero live
 // point lights.
-const WORD_MATTE: u32 = 268435456u;    // 1 << 28 — exterior MODD prop: intensity FIXED 1.0
+const WORD_MATTE: u32 = 268435456u;    // 1 << 28 — EITHER doodad class (ADT MDDF or exterior MODD prop): intensity FIXED 1.0 (2050)
 
 // MONKEY (room gate): record column `w` bits 15..=26 — this item's ROOM KEY, packed as
 // `group + 1`, so **0 means the item names no room** and takes every fixture (a terrain-cell item,

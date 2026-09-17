@@ -108,6 +108,19 @@ pub(super) const UNIT_FLAG_LOOT_SUPPRESS: u32 = 0x1000_0000;
 /// and by `SMSG_MOUNTSPECIAL_ANIM` (observed riders; our own echo is dropped in the net drain).
 pub(crate) const MOUNT_SPECIAL: u16 = 94;
 
+/// The three ids whose arm takes the **base-animation lock** — `0x5fdba0`'s tail keyed on the id
+/// actually armed, byte table `0x5fdd90` (wow-re `base-anim-lock-knockdown.md` §2). While one of
+/// these holds bone 0, `PlayAnimation` refuses every base request outright, which is what lets a
+/// stunned victim's `Knockdown` play out over the root's own `Stand` recompute.
+///
+/// They are the clips with a definite start and end pose — the ones a re-pick mid-flight would
+/// leave the body wrong: knocked flat, or halfway off the ground.
+pub(crate) const KNOCKDOWN: u16 = 121;
+/// See [`KNOCKDOWN`] — the taxi/lift pair, which take the same lock under the reference's other bit.
+pub(crate) const LIFT_OFF: u16 = 192;
+/// See [`KNOCKDOWN`].
+pub(crate) const LAND: u16 = 200;
+
 /// Movement direction/mode flag bits, matching the client's CMovement `MOVEMENTFLAGS` (cached at
 /// `unit+0x9e8`; VERIFIED wow-5875-re RF-0057 + the jump §5 cross-check). The selector tests these
 /// exactly as the binary does, so a streamed unit can eventually drop the server's raw `u32` straight in.
@@ -190,6 +203,19 @@ pub(crate) mod move_flags {
     /// with no benilla analog. Every bit we *do* model besides `ON_TRANSPORT` — the direction and
     /// turn bits, walk mode, root, [`FALLING`]/[`FALLING_FAR`], swim, water-walk — is inside.
     pub const SERVER_AUTHORED: u32 = 0x75a0_7dff;
+
+    /// Merge a server-authored packet's `MOVEMENTFLAGS` into a mover's own — the reference's masked
+    /// merge (`0x618c30 @0x618de7-df3`: `new = old ^ ((old ^ wire) & 0x75a07dff)`), **not** an
+    /// assignment. One law, both movers: our own (`player::wire_in`'s self-addressed pose) and every
+    /// watched one (`net::motion::remote::apply_move`), because the reference runs this merge inside
+    /// the one scheduler both go through and the mask is arm-invariant across all thirty relay
+    /// opcodes (wow-re `collision/scratch/movement-relay-family-map.md`, decision 2064).
+    ///
+    /// The omission that bites is pinned by test on the self lane: [`ON_TRANSPORT`] sits **outside**
+    /// the mask, so a server-authored pose can relocate a rider but never board or deboard them.
+    pub const fn merge_server_authored(local: u32, wire: u32) -> u32 {
+        (local & !SERVER_AUTHORED) | (wire & SERVER_AUTHORED)
+    }
 
     /// Any horizontal-movement direction bit (forward/back/strafe) — the client's `[9e8] & 0xf` gate.
     pub const ANY_MOVE: u32 = FORWARD | BACKWARD | STRAFE_LEFT | STRAFE_RIGHT;
@@ -723,6 +749,25 @@ pub(super) fn defense_anim(victim_state: u32, main: Option<(u8, u8)>) -> Option<
             _ => None, // empty or non-weapon mainhand: bail
         },
         _ => None,
+    }
+}
+
+/// The **play-time unarmed-special substitution** — the third weapon substitution in the client,
+/// and the only one that lives inside `PlayAnimation` itself rather than in a selector
+/// (`0x5fe2f0` @ `0x5fe3cc`–`0x5fe3e9`, byte-verified: wow-re `disarm-weapon-gate-law.md` §7).
+/// A requested **Special1H(57) / Special2H(58)** — the weapon-remapped spin a spell kit asks for,
+/// Eviscerate's among them — becomes **SpecialUnarmed(118)** when `GetWeapon(0, 0)` *and*
+/// `GetWeapon(1, 0)` are both NULL, i.e. both hands are empty to the combat reading.
+/// `SpecialUnarmed`'s own `AnimationData.dbc` fallback column is 57, closing the ring.
+///
+/// The test is emptiness, not weapon-ness: a hand holding a non-weapon is non-NULL and keeps the
+/// armed clip. Because it sits at the play seam it covers every requester — a genuinely
+/// weaponless rogue and a disarmed one reach it by the same route (decision 1863).
+pub(super) fn unarmed_special(id: u16, main: Option<(u8, u8)>, off: Option<(u8, u8)>) -> u16 {
+    if matches!(id, 57 | 58) && main.is_none() && off.is_none() {
+        118
+    } else {
+        id
     }
 }
 

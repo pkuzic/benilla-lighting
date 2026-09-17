@@ -275,6 +275,10 @@ fn zone_audio(
     config: Res<SoundConfig>,
     clock: Res<GameClock>,
     time: Res<Time>,
+    // The stream watch's own clock — WALL, not the paced virtual one `time` carries (see
+    // `watch_glue_music`). Kept as a second param because `time` above schedules zone audio and
+    // wants the clock it already has.
+    real: Res<Time<bevy::time::Real>>,
     world: benilla_world::world_point::WorldPoint,
     interior: Res<super::interior::CurrentInterior>,
     weather: Res<super::weather::WeatherAmbience>,
@@ -445,7 +449,8 @@ fn zone_audio(
         if h.state() == kira::sound::PlaybackState::Stopped {
             zone.music = None;
             let zm = zone.zone_music;
-            zone.next_track_at = next_track_time(zone, &areas.0, zm, phase, now);
+            zone.next_track_at =
+                next_track_time(zone, &areas.0, zm, phase, now, config.zone_music_no_delay);
         }
     }
     // Silence elapsed → start the next track (same-zone cycle, the cold-start first track, or the
@@ -477,7 +482,7 @@ fn zone_audio(
     // isn't watched — under the load bursts that starve a decoder, the *playing* slot's watch is
     // the indicator either way (every stream decoder shares the same scheduling class).
     if let Some(h) = &zone.music {
-        zone.music_watch.feed(h, f64::from(time.delta_secs()));
+        zone.music_watch.feed(h, f64::from(real.delta_secs()));
     }
     // Ambience runs the incoming leg of its 5.0 s crossfade as a per-frame fade-in envelope (the
     // per-frame feed would otherwise stomp a handle-level ramp to full); it clears itself at full.
@@ -525,19 +530,33 @@ fn zone_music_row(cat: &AreaSoundCatalog, _id: u32) -> Option<&benilla_formats::
 
 /// When the NEXT track should start after this one ends — the client's `0x4601f0`, whose sole
 /// caller is the natural-end reap `0x4600b6`: `None` if the zone has no music; otherwise `now +`
-/// the row's randomized per-phase silence interval. (`SoundZoneMusicNoDelay`, the immediate path,
-/// is a "0" CVar we don't expose.) **Not a cold start** — `0x4601f0`'s `== 0 → now + 6000 ms` arm
-/// needs a *cleared* currently-playing row, which end-of-track flow never presents, and an entry
-/// never reaches this function at all (it takes the −1 "start now" path; module docs, 1553).
+/// the row's randomized per-phase silence interval — **unless `SoundZoneMusicNoDelay` is set, in
+/// which case the next track starts now** (`0x42c010`, the CVar's own branch, and the first of the
+/// function's three).
+///
+/// That branch is the whole of what the CVar does, and it is narrower than its options-panel
+/// label (*Loop Music*) suggests: it deletes the randomised `ZoneMusic.dbc` SilenceIntervalMin/Max
+/// wait between successive plays of the SAME zone's track. A zone CHANGE is immediate either way —
+/// the incoming track starts on the next tick while the outgoing fades over 4 s, an overlap rather
+/// than a gap (wow-re `zone-music-ambience-transition.md` Q1/Q2, which corrects an earlier framing
+/// of exactly this).
+///
+/// **Not a cold start** — `0x4601f0`'s `== 0 → now + 6000 ms` arm needs a *cleared* currently-playing
+/// row, which end-of-track flow never presents, and an entry never reaches this function at all
+/// (it takes the −1 "start now" path; module docs, 1553).
 fn next_track_time(
     zone: &mut ZoneAudio,
     cat: &AreaSoundCatalog,
     music_row: u32,
     phase: usize,
     now: f64,
+    no_delay: bool,
 ) -> Option<f64> {
     if music_row == 0 {
         return None;
+    }
+    if no_delay {
+        return Some(now);
     }
     // Read the min/max out from under the catalog borrow before the rng draw (which needs `zone`).
     let interval =

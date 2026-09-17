@@ -16,6 +16,7 @@ use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use benilla_ui::script::{TooltipTint, UiScript, UnitState};
+use benilla_ui::strings::Arg;
 
 use crate::items::Items;
 use crate::names::NameCache;
@@ -49,17 +50,37 @@ struct ViewCtx<'a> {
     home_area: Option<&'a str>,
     form: u8,
     store: Option<&'a ObjectStore>,
+    /// The caster's own `UNIT_FIELD_COMBATREACH`. 1.5 is the descriptor default, not a guess.
+    combat_reach: f32,
+    /// The reach of whoever the caster is currently auto-attacking, when it is auto-attacking —
+    /// the melee range arm's second term. The tooltip passes no target, but `0x6e3480`'s melee
+    /// arm resolves `[caster+0xc48]` itself, so this cell moves with the mob you are swinging at
+    /// and falls back to doubling the caster's own reach when nothing is engaged.
+    attack_target_reach: Option<f32>,
     items: &'a mut Items,
     commands: &'a NetCommands,
     sub_classes: Option<&'a benilla_formats::ItemSubClassCatalog>,
+    /// The VM's own `GlobalStrings.lua` (decision 2045) — every cell this builder composes is a
+    /// key, and this is where they resolve. `text` is the `%d`-filling twin the `$`-engine's
+    /// keyed tokens take (`benilla_formats::TokenContext::text`).
+    get: &'a dyn Fn(&str) -> Option<String>,
+    text: &'a dyn Fn(&str, &[i64]) -> Option<String>,
+}
+
+/// Fill a key's template out of the VM's own `GlobalStrings.lua`, or nothing at all when the
+/// chain has no string for it — the reference's data-suppression face, and the reason no cell
+/// here carries a fallback sentence (decision 2045).
+fn keyed(get: &dyn Fn(&str) -> Option<String>, key: &str, args: &[Arg<'_>]) -> Option<String> {
+    let text = benilla_ui::strings::fill(&get(key)?, args);
+    (!text.is_empty()).then_some(text)
 }
 
 /// Build one spell's tooltip view (decision 0274 P2) — the verified spell line law's inputs,
 /// every string resolved here where the catalogs live: the cost cell (the RESOLVED
 /// `power_cost` through the power-type key array, health fallback, `_PER_TIME` composite — law
 /// §3.3, 1074; rage prints wire-cost ÷ 10), the range cell ("N yd range", "N-M yd range" when
-/// the row's min is nonzero — the law's `"%d-%d"` fork; "Melee Range" for the melee family —
-/// INTERIM text, the proper source is SpellRange.dbc's own display-name column), the cast cell
+/// the resolved min is nonzero — the law's `"%d-%d"` fork; the melee family resolves through the
+/// same key off the caster's combat reach, and the on-next-swing class shows no cell at all), the cast cell
 /// (the full `52eb45` ladder: sec/min, the negative-base sentinel, "Next melee"/"Attack
 /// speed"/"Channeled", and the mana-keyed Instant fork — law §3.4, 1074; None = the law's
 /// passive gate, which omits the whole line), the cooldown cell
@@ -83,6 +104,7 @@ fn spell_tooltip_view(
         radii: &spells.radii,
         lookup: &|id| spells.catalog.get(id),
         home_area,
+        text: vctx.text,
     };
     // The cost cell (law §3.3, the `0x52e8ad` caller): the RESOLVED cost — `GetPowerCost`'s
     // number, the same `power_cost` the usable walk compares (0948) — through the power-type key
@@ -100,7 +122,9 @@ fn spell_tooltip_view(
         .store
         .map_or(d.mana_cost, |s| crate::ui_action::usable::power_cost(d, s));
     let cost = {
-        let div = if d.power_type == 1 { 10 } else { 1 };
+        // The one `0x6e7130` table, not a local `if power_type == 1` — decision 2117 found three
+        // hand-rolled copies of it and one of them had been applied at a single site out of four.
+        let div = benilla_protocol::messages::power_display_scale(d.power_type);
         let unit = match d.power_type {
             0 => "Mana",
             1 => "Rage",
@@ -121,20 +145,46 @@ fn spell_tooltip_view(
             Some(format!("{} {unit}", resolved_cost / div))
         }
     };
-    let range = spells.ranges.get(d.range_index).and_then(|r| {
-        if r.is_melee() {
-            Some("Melee Range".to_string())
-        } else if r.max > 0.0 {
-            // The law's fork (`0x854fb4`): a nonzero min prints the "%d-%d" pair (Charge: 8-25).
-            Some(if r.min > 0.0 {
-                format!("{}-{} yd range", r.min as i32, r.max as i32)
+    // The range cell (law §3.3 / wow-re `tooltip-globalstring-key-resolves.md` §A3, VERIFIED):
+    // two attribute gates, then `GetMinMaxRange 0x6e3480` with **`target = NULL`** (`0x52e9c2`),
+    // then a third gate on the resolved `max <= 0`.
+    //
+    // **There is no melee wording anywhere in the client** — `SPELL_RANGE_AREA` is not in
+    // `WoW.exe` at all, and the melee family is not a display name either: a melee spell is one
+    // whose `SpellRange` row sets flags bit 0 (the single shipped such row is id 2 "Combat
+    // Range", 813 spells), and the resolver hands back `max(reach + casterReach + 1.3333334,
+    // 5.0)` — which then prints through the SAME `SPELL_RANGE` + `"%d"` path as every other
+    // range, normally **"5 yd range"** (decision 2080 named this cell; it printed the invented
+    // "Melee Range" until it was converted).
+    //
+    // The tooltip passes no target, but that does NOT make both reaches the caster's: the melee
+    // arm resolves the caster's own `attack_target_guid` and uses that unit's reach, so the cell
+    // reads wider while you are auto-attacking something big.
+    let range = (!d.tooltip_omits_range_line())
+        .then(|| {
+            let (min, max) = benilla_formats::min_max_range(
+                d,
+                spells.ranges.get(d.range_index),
+                vctx.combat_reach,
+                vctx.attack_target_reach,
+            )?;
+            if max <= 0.0 {
+                return None;
+            }
+            // `SPELL_RANGE = "%s yd range"` — and its hole is a **string**, which is what makes
+            // the law's pair fork (`0x854fb4`'s `"%d-%d"`, Charge: 8-25) expressible at all: the
+            // number cell is composed by a nested `SStrPrintf` first and handed over whole. Both
+            // holes are `fistp` conversions — round-to-nearest, never truncation (the melee sum
+            // is the only value that is ever fractional).
+            let yd = |v: f32| f64::from(v).round_ties_even() as i64;
+            let yards = if min > 0.0 {
+                format!("{}-{}", yd(min), yd(max))
             } else {
-                format!("{} yd range", r.max as i32)
-            })
-        } else {
-            None
-        }
-    });
+                format!("{}", yd(max))
+            };
+            keyed(vctx.get, "SPELL_RANGE", &[Arg::S(&yards)])
+        })
+        .flatten();
     // Law §3.4's own gate — wider than the spellbook's `passive`: a TRADE_SKILL or ATTACK
     // Effect[0] omits the line too ([`SpellDisplay::tooltip_omits_cast_line`]). The arm order is
     // the byte ladder `0x52eb45-0x52ec90` (1074): a positive time prints sec/min at the 60 s
@@ -151,37 +201,49 @@ fn spell_tooltip_view(
             .get(d.casting_time_index)
             .map(|c| c.base_ms as i32)
             .unwrap_or(0);
-        Some(if base > 0 {
-            if base >= 60_000 {
-                format!("{} min cast", trim_secs(f64::from(base) / 60_000.0))
+        // Each arm is a key. The two timed ones are `%.3g` templates — significant digits, not
+        // decimals — so the seconds are handed over as a real and the shipped string decides how
+        // it reads (decision 2080); this used to round to one decimal on our side.
+        if base > 0 {
+            let (key, v) = if base >= 60_000 {
+                ("SPELL_CAST_TIME_MIN", f64::from(base) / 60_000.0)
             } else {
-                format!("{} sec cast", trim_secs(f64::from(base) / 1000.0))
-            }
-        } else if base < 0 {
-            "Instant cast".to_string()
-        } else if d.on_next_swing() {
-            "Next melee".to_string()
-        } else if d.tooltip_on_next_ranged() {
-            "Attack speed".to_string()
-        } else if d.tooltip_channeled() {
-            "Channeled".to_string()
-        } else if d.power_type == 0 && resolved_cost > 0 {
-            "Instant cast".to_string()
+                ("SPELL_CAST_TIME_SEC", f64::from(base) / 1000.0)
+            };
+            keyed(vctx.get, key, &[Arg::F(v)])
         } else {
-            "Instant".to_string()
-        })
+            let key = if base < 0 {
+                "SPELL_CAST_TIME_INSTANT"
+            } else if d.on_next_swing() {
+                "SPELL_ON_NEXT_SWING"
+            } else if d.tooltip_on_next_ranged() {
+                "SPELL_ON_NEXT_RANGED"
+            } else if d.tooltip_channeled() {
+                "SPELL_CAST_CHANNELED"
+            } else if d.power_type == 0 && resolved_cost > 0 {
+                "SPELL_CAST_TIME_INSTANT"
+            } else {
+                // "Instant" without the "cast" — its own key, and the reason the mana fork above
+                // exists at all.
+                "SPELL_CAST_TIME_INSTANT_NO_MANA"
+            };
+            keyed(vctx.get, key, &[])
+        }
     };
     // The cooldown cell reads BOTH recovery columns (law §3.4: `max([+0x4c],[+0x50])>0` —
     // Charge's 15 s is CategoryRecoveryTime; its RecoveryTime is 0).
     let recovery_ms = d.recovery_ms.max(d.category_recovery_ms);
-    let cooldown = (recovery_ms > 0).then(|| {
-        let secs = f64::from(recovery_ms) / 1000.0;
-        if secs >= 60.0 {
-            format!("{} min cooldown", trim_secs(secs / 60.0))
-        } else {
-            format!("{} sec cooldown", trim_secs(secs))
-        }
-    });
+    let cooldown = (recovery_ms > 0)
+        .then(|| {
+            let secs = f64::from(recovery_ms) / 1000.0;
+            let (key, v) = if secs >= 60.0 {
+                ("SPELL_RECAST_TIME_MIN", secs / 60.0)
+            } else {
+                ("SPELL_RECAST_TIME_SEC", secs)
+            };
+            keyed(vctx.get, key, &[Arg::F(v)])
+        })
+        .flatten();
     // The required-form line (law §3.6): the Stances mask's form names off
     // SpellShapeshiftForm.dbc, joined; bit b = form id b+1. Met against the CURRENT form.
     //
@@ -209,7 +271,15 @@ fn spell_tooltip_view(
                 .filter_map(|b| spells.forms.get(&(b + 1)).map(|f| f.name.as_str()))
                 .filter(|n| !n.is_empty())
                 .collect();
-            (!names.is_empty()).then(|| format!("Requires {}", names.join(", ")))
+            (!names.is_empty())
+                .then(|| {
+                    keyed(
+                        vctx.get,
+                        "SPELL_REQUIRED_FORM",
+                        &[Arg::S(&names.join(", "))],
+                    )
+                })
+                .flatten()
         })
         .flatten();
     let form_met = form != 0 && d.stances & (1u32 << (u32::from(form) - 1)) != 0;
@@ -225,7 +295,7 @@ fn spell_tooltip_view(
                 .requirement_name(d.equipped_item_class as u32, d.equipped_item_subclass_mask)
         })
         .flatten()
-        .map(|name| format!("Requires {name}"));
+        .and_then(|name| keyed(vctx.get, "SPELL_EQUIPPED_ITEM", &[Arg::S(&name)]));
     // The chance-to-X line (law line 10, §3-CHANCE): `Effect[0]` picks which of the player's four
     // avoidance/crit percentages to print, and — except for ATTACK, which bypasses the gate — the
     // spell must be passive. The percentages are already percents on the wire.
@@ -322,15 +392,6 @@ fn chance_line(d: &benilla_formats::SpellDisplay, store: Option<&ObjectStore>) -
     Some(format!("{percentage:.2}% chance to {label}"))
 }
 
-/// The `%.3g`-style terse seconds (1.5 → "1.5", 2.0 → "2") — the SPELL_CAST_TIME/RECAST shape.
-fn trim_secs(v: f64) -> String {
-    if (v - v.round()).abs() < 1e-9 {
-        format!("{}", v.round() as i64)
-    } else {
-        format!("{v:.1}")
-    }
-}
-
 /// The push loop's change detectors — everything a view SNAPSHOTS at build time. A change to any
 /// of them means every pushed view is stale, so the loop re-pushes the lot (the reference simply
 /// re-runs its builder on every hover, so a stale snapshot is a benilla-only failure mode).
@@ -347,6 +408,10 @@ struct SpellFeedMemory {
     /// The player's block/dodge/parry/crit percentages, as raw bit patterns so the diff needs no
     /// float comparison (law line 10's printed value — it moves with gear, buffs and talents).
     avoidance: Option<[u32; 4]>,
+    /// The two reaches the melee range cell reads, as raw bit patterns — the caster's own
+    /// (which moves with scale and shapeshift) and its auto-attack target's (which changes with
+    /// the mob).
+    combat_reach: Option<(Option<u32>, Option<u32>)>,
     /// Per reagent entry currently on show: `(owned count, item name resolved)` — law §3.8's
     /// inline red plus the ask-once template landing.
     reagents: std::collections::BTreeMap<u32, (u32, bool)>,
@@ -367,6 +432,9 @@ fn feed_spell_tooltips(
     selection: Res<crate::target::Selection>,
     stores: Query<&ObjectStore>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    // Who the player is auto-attacking, if anyone — the melee range cell's second reach.
+    engaged_q: Query<&crate::creature_anim::Engaged, With<SelfPlayer>>,
+    guids: Res<crate::net::GuidIndex>,
     home_bind: Option<Res<crate::net::HomeBind>>,
     area_names: Option<Res<crate::ui_quest_log::QuestHeaderNamesRes>>,
     mut items: ResMut<Items>,
@@ -483,6 +551,22 @@ fn feed_spell_tooltips(
         memory.avoidance = avoidance;
         wanted.extend(memory.pushed.drain());
     }
+    // …and so does the range cell's melee arm, whose inputs are the caster's own reach and the
+    // reach of whatever it is auto-attacking (`0x6e3480` resolves the latter itself).
+    let attack_target_reach = engaged_q
+        .single()
+        .ok()
+        .and_then(|e| guids.0.get(&e.0))
+        .and_then(|&e| stores.get(e).ok())
+        .map(|s| s.0.unit_combat_reach());
+    let reaches = (
+        self_store.map(|s| s.0.unit_combat_reach().to_bits()),
+        attack_target_reach.map(f32::to_bits),
+    );
+    if memory.combat_reach != Some(reaches) {
+        memory.combat_reach = Some(reaches);
+        wanted.extend(memory.pushed.drain());
+    }
     let watched: Vec<u32> = memory.reagents.keys().copied().collect();
     let reagent_state: std::collections::BTreeMap<u32, (u32, bool)> = watched
         .into_iter()
@@ -498,34 +582,49 @@ fn feed_spell_tooltips(
         memory.reagents = reagent_state;
         wanted.extend(memory.pushed.drain());
     }
-    let mut vctx = ViewCtx {
-        home_area: home_area.as_deref(),
-        form,
-        store: self_store,
-        items: &mut items,
-        commands: &commands,
-        sub_classes: sub_classes.as_deref().map(|c| &c.0),
-    };
-    for id in wanted {
-        if let Some(view) = spell_tooltip_view(id, spells, &mut vctx) {
-            // Register this spell's reagents in the watch set, seeded with the state the view was
-            // just built against — so the next recompute re-pushes on a REAL change only.
-            if let Some(d) = spells.catalog.get(id) {
-                for (entry, _) in d.reagents.iter().copied().filter(|&(e, _)| e != 0) {
-                    if let std::collections::btree_map::Entry::Vacant(slot) =
-                        memory.reagents.entry(entry)
-                    {
-                        let named = vctx.items.template(entry, 0, vctx.commands).is_some();
-                        let owned = vctx.store.map_or(0, |s| {
-                            count_of(&s.0, vctx.items, entry, InventoryScope::CARRIED)
-                        });
-                        slot.insert((owned, named));
+    // The string table is read while the views are BUILT and the store is written when they are
+    // PUSHED, so the two passes are split — one borrow of the VM cannot be both, and the build's
+    // borrow ends with this block.
+    let mut built: Vec<(u32, benilla_ui::script::SpellTooltipView)> = Vec::new();
+    {
+        let get = |key: &str| benilla_ui::strings::global(script.lua(), key);
+        let text = crate::ui_script::token_text(&script);
+        let mut vctx = ViewCtx {
+            home_area: home_area.as_deref(),
+            form,
+            store: self_store,
+            combat_reach: self_store.map_or(1.5, |s| s.0.unit_combat_reach()),
+            attack_target_reach,
+            items: &mut items,
+            commands: &commands,
+            sub_classes: sub_classes.as_deref().map(|c| &c.0),
+            get: &get,
+            text: &text,
+        };
+        for id in wanted {
+            if let Some(view) = spell_tooltip_view(id, spells, &mut vctx) {
+                // Register this spell's reagents in the watch set, seeded with the state the view was
+                // just built against — so the next recompute re-pushes on a REAL change only.
+                if let Some(d) = spells.catalog.get(id) {
+                    for (entry, _) in d.reagents.iter().copied().filter(|&(e, _)| e != 0) {
+                        if let std::collections::btree_map::Entry::Vacant(slot) =
+                            memory.reagents.entry(entry)
+                        {
+                            let named = vctx.items.template(entry, 0, vctx.commands).is_some();
+                            let owned = vctx.store.map_or(0, |s| {
+                                count_of(&s.0, vctx.items, entry, InventoryScope::CARRIED)
+                            });
+                            slot.insert((owned, named));
+                        }
                     }
                 }
+                built.push((id, view));
+                memory.pushed.insert(id);
             }
-            script.set_spell_tooltip(id, view);
-            memory.pushed.insert(id);
         }
+    }
+    for (id, view) in built {
+        script.set_spell_tooltip(id, view);
     }
 }
 
@@ -543,6 +642,27 @@ enum LastHover {
 
 /// The snapshot fields the unit tooltip's LINES read (everything except the bar's
 /// health/power) — the rebuild key: a change here means the rendered lines are stale.
+/// The world-hover driver's own memory, bundled — which plate it put up, the line-affecting fields
+/// that plate was built from, and the headless probe's say-once-on-change trace line (2255).
+///
+/// One [`SystemParam`](bevy::ecs::system::SystemParam) rather than three parameters for the reason
+/// [`crate::target::hover::GoPickSet`] is one: [`drive_mouseover_tooltip`] sits at Bevy's 16-param
+/// function-system ceiling. A bare tuple did the same job and tripped `clippy::type_complexity`,
+/// which is the lint asking for exactly this.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct HoverMemo<'s> {
+    /// Which world plate is currently up — the driver's "do not rebuild this every frame" memo.
+    /// **Faithful**: on an unchanged mouseover the reference makes no call at all (`0x482090`
+    /// returns at `0x4820b5`), so a plate Lua takes mid-hover staying gone is reference behaviour
+    /// and not a bug to fix here. See 2255.
+    last: Local<'s, crate::ui_script::VmMemo<LastHover>>,
+    /// The line-affecting fields the current unit plate was built from, so a late-arriving name or
+    /// creature-info rebuilds it under the same hover.
+    last_lines: Local<'s, crate::ui_script::VmMemo<Option<UnitState>>>,
+    /// The headless probe's last trace line, so a stationary probe says it once (2255).
+    trace: Local<'s, String>,
+}
+
 fn lines_view(s: &UnitState) -> UnitState {
     UnitState {
         health: 0,
@@ -551,18 +671,6 @@ fn lines_view(s: &UnitState) -> UnitState {
         max_power: 0,
         ..s.clone()
     }
-}
-
-/// `LockType` index → the requirement word (the `LOCKED_WITH_SPELL[_KNOWN]` "Requires %s" text
-/// for skill locks — vanilla's small fixed vocabulary; item-key locks name the item instead).
-fn lock_type_word(index: u32) -> Option<&'static str> {
-    Some(match index {
-        1 => "Lockpicking",
-        2 => "Herbalism",
-        3 => "Mining",
-        4 => "Disarm Trap",
-        _ => return None,
-    })
 }
 
 /// The **"Locked" line's colour** (`0x52ab03`-`0x52ab43`, decision 0770).
@@ -614,8 +722,7 @@ fn drive_mouseover_tooltip(
     player_actions: Res<crate::ui_action::PlayerActions>,
     // The cursor seat crosses the VM seam (0582/0584): the anchor below is UI units, not px.
     ui_scale: Res<crate::ui_script::UiScaleCvar>,
-    mut last: Local<crate::ui_script::VmMemo<LastHover>>,
-    mut last_lines: Local<crate::ui_script::VmMemo<Option<UnitState>>>,
+    mut memo: HoverMemo,
     // `ChrClasses.dbc` field 16 — `UnitHasRelicSlot`'s only input. Absent when the client data
     // failed to load, in which case no class reads as having a relic slot.
     classes: Option<Res<crate::chr_classes::ChrClassTable>>,
@@ -623,6 +730,7 @@ fn drive_mouseover_tooltip(
     let Some(mut script) = script else {
         return;
     };
+    let (last, last_lines, trace) = (&mut memo.last, &mut memo.last_lines, &mut *memo.trace);
     let last = last.get(&script);
     let last_lines = last_lines.get(&script);
     let self_store = self_q.iter().next();
@@ -718,7 +826,16 @@ fn drive_mouseover_tooltip(
         let Some(name) = names.resolve(owner, &commands).map(str::to_string) else {
             return;
         };
-        script.world_tooltip_gameobject(&format!("Corpse of {name}"), &[], None);
+        // `CORPSE_TOOLTIP = "Corpse of %s"` — the builder's own key (`0x52aef0`). No string, no
+        // plate, which is the reference's data-suppression face.
+        let Some(plate) = keyed(
+            &|key: &str| benilla_ui::strings::global(script.lua(), key),
+            "CORPSE_TOOLTIP",
+            &[Arg::S(&name)],
+        ) else {
+            return;
+        };
+        script.world_tooltip_gameobject(&plate, &[], None);
         *last = LastHover::Corpse(guid);
         return;
     }
@@ -733,6 +850,15 @@ fn drive_mouseover_tooltip(
         // pick out the same set here. They diverge only for the three always-eligible types
         // (SPELL_FOCUS 8 / DUEL_ARBITER 16 / FISHINGHOLE 25), which is exactly where a pin would
         // settle it. Flagged INTERIM in 0766 rather than presented as verified.
+        //
+        // **THE PIN HAS ARRIVED, AND IT IS NARROWER THAN THIS LINE** (2255): `[vtbl+0x5c]` is
+        // `0x5f8630` = `template.data[0x621b00(type, 0x13)] != 0`, and semantic key `0x13` exists
+        // on exactly ONE of the 31 types — GENERIC(5), at `data[0]`. So the cursor arm is "GENERIC
+        // **with `data[0]` set**", and a GENERIC with it clear is corner-seated; the three
+        // always-eligible types above are corner-seated too, so 0766's "GENERIC" reading wins over
+        // its "not interactable" one. Applying it moves 190 of the 1387 hoverable type-5 templates
+        // from the cursor to the corner — a visible change, so it is its own slice and not a
+        // passenger on a bug fix (2255 carries the counts and the reasoning).
         let cursor_seated =
             stores.get(entity).map(|s| s.0.gameobject_type_id()) == Ok(GO_TYPE_GENERIC);
         // Window px → the VM's y-up 768-virtual units (÷s, the input seam's own conversion) —
@@ -742,12 +868,26 @@ fn drive_mouseover_tooltip(
             .then(|| {
                 window.iter().next().and_then(|w| {
                     let s = crate::ui_script::seam_scale(w.height(), ui_scale.0);
+                    // The headless probe's aim stands in for a cursor the window does not have
+                    // (2250), so an automated run can carry a GENERIC plate — which is
+                    // cursor-seated — all the way to the screen. A person's pointer always wins.
                     w.cursor_position()
+                        .or_else(crate::target::hover_probe_point)
                         .map(|c| (c.x / s, (w.height() - c.y) / s))
                 })
             })
             .flatten();
         if *last == LastHover::Go(guid) {
+            if crate::target::hover_probe_armed() {
+                let line = format!(
+                    "held Go({guid:#x}) — plate up {}",
+                    script.world_tooltip_up()
+                );
+                if *trace != line {
+                    info!("hover probe/tooltip: {line}");
+                    *trace = line;
+                }
+            }
             // The cursor arm follows the pointer; the corner arm has nothing to re-seat.
             if let Some((x, y)) = cursor_ui {
                 script.world_tooltip_move(x, y);
@@ -756,6 +896,13 @@ fn drive_mouseover_tooltip(
         }
         if cursor_seated && cursor_ui.is_none() {
             return; // cursor off-window: nothing to seat the pointer-anchored plate against
+        }
+        if crate::target::hover_probe_armed() {
+            info!(
+                "hover probe/tooltip: guid {guid:#x} cursor_seated {cursor_seated} cursor_ui \
+                 {cursor_ui:?} template {:?}",
+                go_inputs.templates.get(guid).map(|t| t.name.clone()),
+            );
         }
         let Some(template) = go_inputs.templates.get(guid).cloned() else {
             // Template in flight: ask once and retry next frame (`last` stays, so the show
@@ -793,6 +940,9 @@ fn drive_mouseover_tooltip(
             .filter(|_| template.lock_id != 0)
             .and_then(|l| l.0.slots(template.lock_id));
         let mut lines: Vec<(String, TooltipTint)> = Vec::new();
+        // The lock lines' string table, taken for the length of the build. Every one of them is a
+        // key whose enUS value is "Requires %s" and whose identity only the binary settles.
+        let go_get = |key: &str| benilla_ui::strings::global(script.lua(), key);
         if flag_locked {
             // **The "Locked" line is coloured by whether you can actually open it** (director-
             // reported: a door you hold the key for read red). The builder sets red `0xc0d3a8` as
@@ -820,7 +970,9 @@ fn drive_mouseover_tooltip(
                     &mut matched,
                 )
             });
-            lines.push(("Locked".to_string(), locked_line_tint(outcome)));
+            if let Some(text) = keyed(&go_get, "LOCKED", &[]) {
+                lines.push((text, locked_line_tint(outcome)));
+            }
         }
         if let Some(slot0) = slots
             .map(|s| s[0])
@@ -829,7 +981,12 @@ fn drive_mouseover_tooltip(
             match slot0.key_type {
                 benilla_formats::LOCK_KEY_ITEM => {
                     if let Some(t) = go_inputs.items.template(slot0.index, 0, &commands) {
-                        lines.push((format!("Requires {}", t.name), TooltipTint::White));
+                        // `LOCKED_WITH_ITEM`, resolved at `0x52acb8` — one of eleven 1.12 keys
+                        // whose enUS value is exactly "Requires %s", and the only one this arm
+                        // reaches (wow-re `tooltip-globalstring-key-resolves.md` §B).
+                        if let Some(text) = keyed(&go_get, "LOCKED_WITH_ITEM", &[Arg::S(&t.name)]) {
+                            lines.push((text, TooltipTint::White));
+                        }
                     }
                 }
                 // The opener-*known* arm additionally wants the reference's skill-margin colour
@@ -837,8 +994,23 @@ fn drive_mouseover_tooltip(
                 // model is the unknown arm, which is what a hovering player almost always is. A
                 // flagged object stays silent there, exactly as the binary does.
                 benilla_formats::LOCK_KEY_SKILL if !flag_locked => {
-                    if let Some(word) = lock_type_word(slot0.index) {
-                        lines.push((format!("Requires {word}"), TooltipTint::Red));
+                    // **`LOCKED_WITH_SPELL`, not `LOCKED_WITH_SPELL_KNOWN`** — the two are the
+                    // same sentence in enUS and the byte test between them is a pure MEMBERSHIP
+                    // one: `0x5f83d0` writes a non-zero spell id into its first out-param iff the
+                    // player knows *any* spell that opens this LockType, and `0x52abcb` branches
+                    // on that. This is the not-known arm (the flag-clear leg at `0x52ac04`);
+                    // skill *sufficiency* never changes the key, only the colour.
+                    //
+                    // The `%s` is `LockType.dbc`'s own localized `Name` — "Pick Lock", not
+                    // "Lockpicking", which is what a hand-typed table here used to say.
+                    let word = go_inputs
+                        .lock_types
+                        .as_deref()
+                        .and_then(|c| c.0.name(slot0.index));
+                    if let Some(text) =
+                        word.and_then(|w| keyed(&go_get, "LOCKED_WITH_SPELL", &[Arg::S(w)]))
+                    {
+                        lines.push((text, TooltipTint::Red));
                     }
                 }
                 _ => {}

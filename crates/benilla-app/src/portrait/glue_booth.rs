@@ -26,13 +26,13 @@ use benilla_assets::m2_url;
 use benilla_assets::materials::WowModelMaterial;
 
 use super::framing::{
-    attachment_point, diag_to_vert, glue_scene_framing, ArtExtent, GLUE_AUTHORED_ASPECT,
-    PORTRAIT_ASPECT,
+    attachment_point, diag_to_vert, glue_box_aspect, glue_box_physical, glue_scene_framing,
+    ArtExtent, GLUE_AUTHORED_ASPECT, PORTRAIT_ASPECT,
 };
 use super::{
     aim, body_frame, new_target_image, spawn_booth_effects, spawn_booth_model, Booth,
     BoothBillboardSpec, BoothCam, BoothEffects, BoothInstance, BoothLight, BoothMotion, BoothPart,
-    BoothRider, BoothTwins, Booths, PortraitImages, PortraitSource, GLUE_LAYER,
+    BoothRider, BoothTwins, Booths, PortraitImages, PortraitSource, VariantLane, GLUE_LAYER,
 };
 
 /// The glue booth slot token (its key in [`super::PortraitImages`] / [`Booths`]).
@@ -198,11 +198,19 @@ pub(crate) struct CreateScene {
     cam: Option<benilla_assets::PortraitCamera>,
     /// How far the scene's art paints around that camera — the shipped scene's measured extent
     /// ([`benilla_formats::shipped_glue_art_extent`], decision 1619) — the ceiling on the framing
-    /// law's widening ([`glue_scene_framing`]). `None` with no scene.
+    /// law's opening UPWARD on a narrow window ([`glue_scene_framing`]). `None` with no scene.
+    /// The wide leg stopped reading it under 2187: one frame for every scene, so its width is
+    /// [`super::framing::GLUE_BOX_ASPECT`]'s, not this stage's. It is still what says the frame
+    /// is safe there (the spawn log below, and the test that pins the constant).
     art: Option<ArtExtent>,
-    /// `Some(aspect)` while the framing law pillarboxes the scene (the window is wider than the
-    /// art can fill at the zoom floor): the booth camera renders into a centred viewport of this
-    /// aspect, black either side ([`pillarbox_glue_scene`]). `None`: the whole window.
+    /// `Some(aspect)` while the frame pillarboxes the scene — the window is wider than
+    /// [`super::framing::GLUE_BOX_ASPECT`]: the booth camera renders into a centred viewport of
+    /// this aspect, black either side ([`pillarbox_glue_scene`]). `None`: the whole window.
+    ///
+    /// A property of the **window**, not of the scene (decision 2187) — set from the window while
+    /// any glue screen is up, cleared only when the booth is torn down. It is what the chrome's
+    /// canvas insets by (2091), and 1619's per-scene box is why that canvas used to jump as the
+    /// roster selection moved between races.
     viewport_aspect: Option<f32>,
     /// The character's stage spot — scene attachment 0 (Bevy model space), `ZERO` with no scene.
     /// (Verified for select too: the body seats on attachment **0**, `0x473039` — attachment 1 is
@@ -890,6 +898,13 @@ pub(super) fn sync_glue_scene(
     // The booth target follows the window while the screen is up — the scene is a fullscreen
     // render, so the bake wants window-native resolution (the fallback character-only render
     // shares it; its projection is aspect-aware).
+    //
+    // …and so does the **frame** (decision 2187). One box for every scene means the box is a
+    // property of the window alone, so it is set here — from the window, before a token is even
+    // resolved — and not down in the camera block with the scene's own fov. Two consequences, and
+    // both are the point: the chrome's canvas ([`crate::glue::GlueCanvas`]) cannot move when the
+    // selected character's race changes the stage, and it cannot flicker out to the full window
+    // for the frames a stage swap is in flight.
     if let Ok(w) = window.single() {
         resize_target(
             &mut images,
@@ -897,6 +912,10 @@ pub(super) fn sync_glue_scene(
             w.physical_width().max(1),
             w.physical_height().max(1),
         );
+        let box_aspect = glue_box_aspect(w.width() / w.height().max(1.0));
+        if scene.viewport_aspect != box_aspect {
+            scene.viewport_aspect = box_aspect;
+        }
     }
 
     let token = scene_token(which);
@@ -961,7 +980,9 @@ pub(super) fn sync_glue_scene(
         scene.spawned = false;
         scene.cam = None;
         scene.art = None;
-        scene.viewport_aspect = None;
+        // `viewport_aspect` is deliberately NOT cleared: the frame is the window's, not this
+        // stage's (2187), and clearing it here is what made the chrome jump out to the full
+        // window for the frames between two stages.
         scene.char_spot = Vec3::ZERO;
         clear_pet(&mut commands, &mut scene);
         commands.entity(scene.root).despawn_related::<Children>();
@@ -1135,14 +1156,23 @@ pub(super) fn sync_glue_scene(
         scene.art = benilla_formats::shipped_glue_art_extent(token);
         if let (Some(art), Some(cam)) = (scene.art, model.camera0.as_ref()) {
             let t0 = benilla_formats::authored_half_height(cam.fov);
+            // Where the frame's edge lands on THIS stage's art (2187): the constant is derived
+            // from the seven shipped scenes, so on the shipped chain this reads "inside" for six
+            // of them and a hair past the night elves' 4:3 sky card. A patched or replaced scene
+            // that paints narrower would say so here.
+            let frame = super::framing::GLUE_BOX_ASPECT * super::framing::glue_zoom_floor(cam.fov);
             info!(
                 "create scene: UI_{token} art extent — half_w {:.4} (widens to {:.2}:1), half_h {:.4} \
-                 (opens to 1:{:.2}); boxes past {:.2}:1",
+                 (opens to 1:{:.2}); the frame ends at {frame:.4} — {}",
                 art.half_w,
                 art.half_w / t0,
                 art.half_h,
                 art.half_h / (t0 * GLUE_AUTHORED_ASPECT),
-                art.half_w.max(t0 * GLUE_AUTHORED_ASPECT) / super::framing::glue_zoom_floor(cam.fov),
+                if frame <= art.half_w.max(t0 * GLUE_AUTHORED_ASPECT) {
+                    "inside the art"
+                } else {
+                    "PAST the art (void at the frame's edges)"
+                },
             );
         }
         scene.char_spot = stage;
@@ -1198,14 +1228,11 @@ pub(super) fn sync_glue_scene(
         // a 1.55× zoom at 21:9 that crops head and feet (B242). [`glue_scene_framing`] pins the
         // authored 4:3 view box instead; its doc carries the law. Far kept generous: fog is not
         // rendered yet, so the authored far (27.8 on Orc) would slice unfogged geometry.
-        let framing = glue_scene_framing(cam.fov, aspect, scene.art);
-        if scene.viewport_aspect != framing.viewport_aspect {
-            scene.viewport_aspect = framing.viewport_aspect;
-        }
+        let vert_fov = glue_scene_framing(cam.fov, aspect, scene.art);
         let rig = (
             Transform::from_translation(cam.eye).looking_at(cam.target, up),
             Projection::from(PerspectiveProjection {
-                fov: framing.vert_fov,
+                fov: vert_fov,
                 near: cam.near,
                 far: cam.far.max(1000.0),
                 ..default()
@@ -1229,15 +1256,18 @@ pub(super) fn pillarbox_glue_scene(
     let Ok(w) = window.single() else {
         return;
     };
-    let (full_w, full_h) = (w.physical_width().max(1), w.physical_height().max(1));
-    let viewport = scene.viewport_aspect.map(|aspect| {
-        let box_w = ((full_h as f32 * aspect).round() as u32).clamp(1, full_w);
-        bevy::camera::Viewport {
-            physical_position: UVec2::new((full_w - box_w) / 2, 0),
-            physical_size: UVec2::new(box_w, full_h),
-            ..default()
-        }
-    });
+    let full_h = w.physical_height().max(1);
+    // The SAME arithmetic the chrome's canvas insets by ([`glue_box_physical`], decision 2091) —
+    // one function, so the frame the camera renders and the frame the chrome lays out in cannot
+    // round apart.
+    let viewport =
+        glue_box_physical(w.physical_width(), full_h, scene.viewport_aspect).map(|(x, box_w)| {
+            bevy::camera::Viewport {
+                physical_position: UVec2::new(x, 0),
+                physical_size: UVec2::new(box_w, full_h),
+                ..default()
+            }
+        });
     for (booth, mut cam) in cams.iter_mut() {
         if booth.0 != GLUE_SLOT {
             continue;
@@ -1378,10 +1408,14 @@ pub(super) fn sync_glue_booth(
                 // The glue screens keep the old fallback deliberately: the create/select scene has
                 // its own lifecycle (no map-scope teardown under it) and no parts-key retry to
                 // ride, so waiting here would leave the pane empty instead of merely mislit.
-                (Some(buf), Some(s)) => {
-                    super::material_variant(&mut s.variants, buf, material, materials, true)
-                        .unwrap_or_else(|| material.clone())
-                }
+                (Some(buf), Some(s)) => super::material_variant(
+                    &mut s.variants,
+                    buf,
+                    material,
+                    materials,
+                    VariantLane::RigUnfogged,
+                )
+                .unwrap_or_else(|| material.clone()),
                 _ => booth_light.studio.variant(material, materials),
             }
         };
@@ -1652,8 +1686,14 @@ pub(super) fn sync_glue_pet(
         AssetId<WowModelMaterial>,
         Handle<WowModelMaterial>,
     >| {
-        super::material_variant(variants, &light, material, &mut materials, true)
-            .unwrap_or_else(|| material.clone())
+        super::material_variant(
+            variants,
+            &light,
+            material,
+            &mut materials,
+            VariantLane::RigUnfogged,
+        )
+        .unwrap_or_else(|| material.clone())
     };
     let booth_parts: Vec<BoothPart> = pet
         .parts

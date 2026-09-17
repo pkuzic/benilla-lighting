@@ -29,6 +29,7 @@ use bevy::prelude::*;
 use benilla_world::interior::{InteriorAnchor, WmoResidency};
 use benilla_world::lighting::{
     LightLane, LightLitRooms, LightRooms, ShadowProxyLight, SpellFxLight, SyntheticFireLight,
+    WorldPointLight,
 };
 use benilla_world::static_gx::LightOwner;
 use benilla_world::terrain_stream::{carried_light_claims, point_light, CarriedClaimSet};
@@ -257,7 +258,7 @@ fn spawn_spell_light_child(
     let base = lit.intensity;
     let glow = commands
         .spawn((
-            PointLight {
+            WorldPointLight {
                 intensity: 0.0,
                 ..lit
             },
@@ -357,7 +358,7 @@ pub(crate) fn track_carried_light_motion(
     time: Res<Time>,
     mut lights: Query<
         (Entity, &GlobalTransform, Option<&mut CarriedLightMotion>),
-        (With<PointLight>, With<ChildOf>, Without<ShadowProxyLight>),
+        (With<WorldPointLight>, With<ChildOf>, Without<ShadowProxyLight>),
     >,
 ) {
     let dt = time.delta_secs();
@@ -580,7 +581,7 @@ fn may_claim(spell: bool, motion: Option<&CarriedLightMotion>) -> bool {
 /// - **The faithful gate.** A torch in a portal-culled room stops lighting the hillside outside it
 ///   ([`LightRooms`], decision 0689) — until now a placed brazier GameObject lit through walls
 ///   because it claimed no room at all and `room_admits` admits `None` unconditionally.
-/// - **Shadow eligibility.** `torch_shadow`'s caster query is `With<PointLight>, With<LightRooms>`,
+/// - **Shadow eligibility.** `torch_shadow`'s caster query is `With<WorldPointLight>, With<LightRooms>`,
 ///   so a roomless light can never be promoted to a cube-map caster however deep indoors it stands.
 ///   A GM-placed brazier in the Lion's Pride Inn now throws real shadows like a MOLT fixture.
 ///
@@ -649,7 +650,7 @@ pub(crate) fn claim_carried_light_rooms(
             // O(placements) walk for every carried light in the world (Orgrimmar: ~150) into the
             // frame's tightest stage to buy 0.4 yd on 24 of them.
             &GlobalTransform,
-            &PointLight,
+            &WorldPointLight,
             Option<&CarriedLightMotion>,
             Option<&mut ClaimedRoom>,
             Option<&mut CarriedClaims>,
@@ -865,7 +866,12 @@ mod tests {
 
         let mut spawned: Vec<(Entity, Vec3, Entity)> = app
             .world_mut()
-            .query::<(Entity, &PointLight, &Transform, &ChildOf)>()
+            .query::<(
+                Entity,
+                &WorldPointLight,
+                &Transform,
+                &ChildOf,
+            )>()
             .iter(app.world())
             .map(|(e, _, t, c)| (e, t.translation, c.parent()))
             .collect();
@@ -888,12 +894,11 @@ mod tests {
         let pl = app
             .world()
             .entity(spawned[0].0)
-            .get::<PointLight>()
+            .get::<WorldPointLight>()
             .unwrap();
-        let lin = pl.color.to_linear();
         let recovered = pl.intensity / (4.0 * std::f32::consts::PI);
         assert!(
-            (lin.red * recovered - 1.4).abs() < 1e-3,
+            (pl.color[0] * recovered - 1.4).abs() < 1e-3,
             "colour × intensity survives the packing"
         );
     }
@@ -917,7 +922,7 @@ mod tests {
             app.world_mut().flush();
             let marked = app
                 .world_mut()
-                .query::<(&PointLight, Has<HeldLight>)>()
+                .query::<(&WorldPointLight, Has<HeldLight>)>()
                 .iter(app.world())
                 .map(|(_, h)| h)
                 .collect::<Vec<_>>();
@@ -950,7 +955,7 @@ mod tests {
 
         let spawned: Vec<(Vec3, Entity)> = app
             .world_mut()
-            .query::<(&PointLight, &Transform, &ChildOf)>()
+            .query::<(&WorldPointLight, &Transform, &ChildOf)>()
             .iter(app.world())
             .map(|(_, t, c)| (t.translation, c.parent()))
             .collect();
@@ -984,7 +989,11 @@ mod tests {
         let light = app
             .world_mut()
             .spawn((
-                PointLight::default(),
+                WorldPointLight {
+                    color: [1.0, 1.0, 1.0],
+                    intensity: 0.0,
+                    range: 48.0,
+                },
                 Transform::IDENTITY,
                 GlobalTransform::IDENTITY,
                 ChildOf(bearer),

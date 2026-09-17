@@ -319,7 +319,7 @@ pub(super) fn dump_booth_target(
 ///
 /// `None` on an unexpected format, so a future target-format change is a loud warning rather than a
 /// garbled PNG.
-fn encode_target_readback(shot: &Image) -> Option<Image> {
+pub(crate) fn encode_target_readback(shot: &Image) -> Option<Image> {
     use bevy::asset::RenderAssetUsages;
     use bevy::render::render_resource::{TextureDimension, TextureFormat};
 
@@ -328,8 +328,8 @@ fn encode_target_readback(shot: &Image) -> Option<Image> {
     }
     let src = shot.data.as_ref()?;
     let mut out = Vec::with_capacity(src.len() / 2);
-    for texel in src.chunks_exact(8) {
-        for (c, half_pair) in texel.chunks_exact(2).enumerate() {
+    for texel in src.as_chunks::<8>().0 {
+        for (c, half_pair) in texel.as_chunks::<2>().0.iter().enumerate() {
             let v = half::f16::from_le_bytes([half_pair[0], half_pair[1]]).to_f32();
             // The sRGB transfer function for colour (channel 3 is plain coverage, never encoded) —
             // the same curve the swapchain's `…Srgb` write applies to the live frame.

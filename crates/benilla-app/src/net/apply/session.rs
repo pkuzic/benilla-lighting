@@ -21,10 +21,11 @@ use crate::ui_taxi::TaxiState;
 use crate::ui_trainer::TrainerOpen;
 
 use super::super::{
-    CharActionResultMessage, CharListMessage, CinematicTriggeredMessage, DisconnectedMessage,
-    DroppedOpcodes, EnteredWorldMessage, GameTime, GuidIndex, KnockBackMessage, LoggedOutMessage,
-    LoginFailedMessage, LoginStageMessage, NetStatus, PendingTransfer, Reputations, SelfGuid,
-    ServerTime, ServerWallClock, TeleportMessage, WorldportMessage,
+    CharActionResultMessage, CharListMessage, CharacterLoginFailedMessage,
+    CinematicTriggeredMessage, DisconnectedMessage, DroppedOpcodes, EnteredWorldMessage, GameTime,
+    GuidIndex, KnockBackMessage, LoggedOutMessage, LoginFailedMessage, LoginStageMessage,
+    NetStatus, PendingTransfer, Reputations, SelfGuid, ServerTime, ServerWallClock,
+    TeleportMessage, WorldportMessage,
 };
 
 /// The pre-logon handshake reached a new stage (decision 0539) — the login screen's dialog reads it.
@@ -82,6 +83,16 @@ pub(super) fn character_list(
     char_lists.write(CharListMessage { characters, realm });
 }
 
+/// The server refused the character we picked (`SMSG_CHARACTER_LOGIN_FAILED`) — the entry
+/// announced a moment ago is void. `crate::char_select` takes the screen back and says why.
+pub(super) fn character_login_failed(
+    result: u8,
+    out: &mut MessageWriter<CharacterLoginFailedMessage>,
+) {
+    warn!("net: character login refused (result {result:#04x})");
+    out.write(CharacterLoginFailedMessage { result });
+}
+
 /// A cinematic sequence was triggered (`SMSG_TRIGGER_CINEMATIC`) — hand it to
 /// [`crate::cinematic`], which plays it and owns the ack.
 ///
@@ -101,10 +112,14 @@ pub(super) fn cinematic_triggered(
 
 /// We are in the world (the IO thread's first in-world event): record our guid, flip the status,
 /// and seed the name cache with our own name.
+#[allow(clippy::too_many_arguments)] // the login's whole hand-off
 pub(super) fn connected(
     guid: u64,
     name: String,
     billing_time_rested: u32,
+    tutorial_flags: Option<Vec<u8>>,
+    addon_info: Option<Vec<String>>,
+    addon_reply: &mut crate::net::AddonInfoReply,
     self_guid: &mut SelfGuid,
     status: &mut NetStatus,
     names: &mut NameCache,
@@ -114,10 +129,21 @@ pub(super) fn connected(
     status.connected = true;
     status.last_reason = None;
     info!("net: in world as {name} (guid {guid})");
+    // **The reference's world-session wipe, first** (`0x555740`'s `0x5557ad` arm): the player-name
+    // and pet-name stores are cleared at every world entry, because a guid names one character and
+    // a pet number one spawn, and nothing on the wire says either has been handed to somebody else
+    // since we last looked (decision 2223 — a wiped server's new character wearing a deleted one's
+    // name, B386). Creature templates are keyed by an entry that means the same thing forever and
+    // survive this, exactly as they survive the process.
+    names.clear_world_session();
     // Our own name came with the login — seed the cache so "player" never queries.
     names.insert_player(guid, name, None);
+    // Seated before the world-entry UI load reads it (2175), and overwritten every login so a
+    // server that answers nothing cannot inherit the previous one's verdict.
+    addon_reply.0 = addon_info;
     entered_world.write(EnteredWorldMessage {
         billing_time_rested,
+        tutorial_flags,
     });
 }
 
@@ -176,6 +202,7 @@ pub(super) fn disconnected(
     social: &mut crate::ui_social::SocialState,
     guild: &mut crate::ui_guild::GuildState,
     gm_ticket: &mut crate::ui_gm_ticket::GmTicketState,
+    cooldowns: &mut crate::cooldowns::Cooldowns,
     pending_transfer: &mut PendingTransfer,
     disconnects: &mut MessageWriter<DisconnectedMessage>,
 ) {
@@ -252,8 +279,10 @@ pub(super) fn disconnected(
     *duel = crate::ui_duel::DuelState::default();
     // The friend/ignore lists and the last `/who` are session state too (decision 0668): the
     // server re-pushes both lists at the next login, and a stale ignore list would silence the
-    // wrong guids after a reconnect renumbers nothing but re-streams everything.
-    *social = crate::ui_social::SocialState::default();
+    // wrong guids after a reconnect renumbers nothing but re-streams everything. The `/who` sort
+    // chain is the one thing that survives — it is per-PROCESS in the reference, not per-login
+    // (decision 2030), which is why this is a `clear_session` and not a `default()`.
+    social.clear_session();
     // The guild session is login-scoped the same way (decision 1257) — and more strictly, because
     // the next login may be a *different character*, whose guild id, rank, rights and roster share
     // nothing with this one's. The identity cache goes too: it is keyed by guild id, so it would
@@ -266,6 +295,13 @@ pub(super) fn disconnected(
     // counters go with it, so the first `SMSG_GMTICKET_GETTICKET` of the new session re-fires
     // `UPDATE_TICKET` rather than being diffed away against the old character's answer count.
     gm_ticket.clear_session();
+    // The cooldown list is session-scoped for the same reason and had been missing from this
+    // sweep since it was built (decision 2116). `SMSG_INITIAL_SPELLS` carries every cooldown
+    // still running at every world entry and `seed_initial` APPENDS, so a list that outlives the
+    // socket answers the old session's records: a second login on the same character reads its
+    // own stale copy over the wire's fresh remainder, and a login on a different character
+    // inherits cooldowns that were never theirs.
+    cooldowns.clear_session();
     // The death stores are session-scoped too: a reclaim expiry, resurrect offer, or corpse
     // marker must not survive the socket (the reconnect re-sends the reclaim delay when dead).
     *death_net = crate::death::DeathNet::default();

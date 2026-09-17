@@ -59,6 +59,8 @@ use benilla_assets::ModelAnimations;
 use bevy::animation::{graph::AnimationNodeIndex, RepeatAnimation};
 use bevy::prelude::*;
 
+use benilla_world::lighting::WorldPointLight;
+
 use crate::creature_anim::FxStage;
 
 /// `AnimationData.dbc` **158 `Hold`** — the sustained pulse leg (`0x9e` at `0x5ff188`/`0x5ff1bb`).
@@ -356,7 +358,7 @@ impl SpellLight {
 /// light's parent IS that root.
 pub(crate) fn advance_spell_lights(
     time: Res<Time>,
-    mut lights: Query<(&mut SpellLight, &mut PointLight, Option<&ChildOf>)>,
+    mut lights: Query<(&mut SpellLight, &mut WorldPointLight, Option<&ChildOf>)>,
     reaped: Query<Has<FxDecay>>,
 ) {
     let dt = time.delta_secs();

@@ -6,19 +6,20 @@
 //! at its fixed position ([`LootState::remove_slot`] — the layout never compacts while open);
 //! `SMSG_LOOT_CLEAR_MONEY` → the coin row becomes the same kind of gap
 //! ([`LootState::clear_money`]); `SMSG_LOOT_RELEASE_RESPONSE` → the window closes
-//! ([`LootState::clear`]); the error shape → [`LootErrors`]; `SMSG_ITEM_PUSH_RESULT` → a queued
-//! "You receive loot" line ([`LootState::receives`]). A removal that empties the window arms the
-//! client-authoritative **auto-close** ([`LootState::auto_release`] — the real engine's
-//! close-on-last-slot), released by [`drain_loot`].
+//! ([`LootState::clear`]); the error shape → a red line by GlobalStrings key, raised straight from
+//! the bridge ([`crate::net::apply::loot::loot_error`] — it needs no queue on this side);
+//! `SMSG_ITEM_PUSH_RESULT` → a queued "You receive loot" line ([`LootState::receives`]). A removal
+//! that empties the window arms the client-authoritative **auto-close**
+//! ([`LootState::auto_release`] — the real engine's close-on-last-slot), released by
+//! [`drain_loot`].
 //!
-//! Each frame [`feed_loot`] surfaces the errors + receive lines on the red UI error line (the
-//! equip-error path's exact shape — an ErrorsFrame-style v1 stopgap that migrates to the chat frame
-//! next arc), resolves each wire [`LootItem`] to a Lua-facing [`LootRow`] (icon straight from the
-//! wire `display_info_id` through the same `ItemDisplayInfo.dbc` catalog the bags use — no template
-//! wait; name + quality via the ask-once item-template cache, `None`/re-fed while in flight),
-//! prepends the synthesized coin row when the loot carries gold, pushes the snapshot
-//! ([`benilla_ui::script::UiScript::set_loot`]), and fires `LOOT_OPENED` on open / `LOOT_UPDATE` on a
-//! content change / `LOOT_CLOSED` on clear. [`drain_loot`] pulls the Lua intents back out: `LootSlot`
+//! Each frame [`feed_loot`] surfaces the receive lines, resolves each wire [`LootItem`] to a
+//! Lua-facing [`LootRow`] (icon straight from the wire `display_info_id` through the same
+//! `ItemDisplayInfo.dbc` catalog the bags use — no template wait; name + quality via the ask-once
+//! item-template cache, `None`/re-fed while in flight), prepends the synthesized coin row when the
+//! loot carries gold, pushes the snapshot ([`benilla_ui::script::UiScript::set_loot`]), and fires
+//! `LOOT_OPENED` on open / `LOOT_UPDATE` on a content change / `LOOT_CLOSED` on clear.
+//! [`drain_loot`] pulls the Lua intents back out: `LootSlot`
 //! → coin ? [`ClientCommand::LootMoney`] : [`ClientCommand::AutostoreLootItem`] (the clicked 1-based
 //! row mapped to the item's **wire** loot slot); `CloseLoot` → [`ClientCommand::LootRelease`].
 
@@ -49,14 +50,6 @@ use crate::ui_script::UiInput;
 /// The icon *order* is the client's own and it is not the numeric one — `_05, _06, _03, _04, _01,
 /// _02` as the amount climbs. What each of the six pieces of art depicts is not claimed here; the
 /// ladder is byte-derived and the art is whatever the reference picks at that step.
-const COIN_ICONS: [(u32, &str); 6] = [
-    (10, "Interface\\Icons\\INV_Misc_Coin_05"),
-    (100, "Interface\\Icons\\INV_Misc_Coin_06"),
-    (1_000, "Interface\\Icons\\INV_Misc_Coin_03"),
-    (10_000, "Interface\\Icons\\INV_Misc_Coin_04"),
-    (100_000, "Interface\\Icons\\INV_Misc_Coin_01"),
-    (u32::MAX, "Interface\\Icons\\INV_Misc_Coin_02"),
-];
 /// `item_template.bonding == BIND_WHEN_PICKED_UP` — the first of the two conjuncts that defer a
 /// loot take behind the LOOT_BIND confirm (VERIFIED vmangos `ItemPrototype.h`'s `ItemBondingType`:
 /// `NO_BIND` 0, `BIND_WHEN_PICKED_UP` 1, `BIND_WHEN_EQUIPPED` 2, `BIND_WHEN_USE` 3, `QUEST_ITEM` 4;
@@ -200,8 +193,9 @@ pub(crate) struct LootState {
     receives: Vec<PendingReceive>,
     /// A wire removal just emptied the open window (last item taken / coin line cleared with no
     /// items left) — the client-authoritative auto-close is due: the real client closes the loot
-    /// itself when the last slot clears (the server never initiates a creature-loot release —
-    /// vmangos `LootHandler.cpp` releases only in `HandleLootReleaseOpcode`; and the 1.12
+    /// itself when the last slot clears (the server never initiates the last-slot release —
+    /// vmangos `LootHandler.cpp` releases only in `HandleLootReleaseOpcode`, and its one
+    /// unprompted release is the movement handler's, see [`LootMoveStart`]; the 1.12
     /// `LootFrame.lua` `LOOT_SLOT_CLEARED` handler only hides buttons, so the close is engine-side).
     /// Set only on the *transition* to empty via [`LootState::remove_slot`]/[`LootState::clear_money`],
     /// never at open — an empty-at-open window stays up (the reference `LootFrame_OnShow` even has a
@@ -229,6 +223,10 @@ pub(crate) struct LootState {
     /// rather than writing `master_candidates` directly is what keeps one window's list from
     /// leaking into the next window opened under a different loot method.
     pending_master_candidates: Vec<u64>,
+    /// The wire `loot_type` the window opened with (`SMSG_LOOT_RESPONSE`'s byte, the reference's
+    /// `0x4c2740` read). The move-start close reads it: a **non-empty DISENCHANT window** (type 4)
+    /// survives movement (`0x48f24a`–`0x48f25a`, decision 2097).
+    loot_type: u8,
 }
 
 /// The master-loot candidate array's fixed width — 40 slots of 8 bytes at `0xc4dc38`, zeroed at
@@ -266,6 +264,7 @@ impl LootState {
         self.taken.clear();
         self.auto_release = false; // empty-at-open stays open — only a removal auto-closes
         self.pending_bind_confirm = None; // ref `0x4c1df5`: the copier resets the stash to -1
+        self.loot_type = loot_type;
         self.fishing = loot_type == benilla_protocol::messages::loot_type::FISHING;
         // The master-loot candidate list arrives just AHEAD of this response (the server sends it
         // from inside `SendLoot`), so the window claims whatever was staged and leaves the staging
@@ -306,10 +305,7 @@ impl LootState {
     /// Arm the client-authoritative auto-close when a removal just left the open window with
     /// nothing lootable — every item taken and no coin left (see [`LootState::auto_release`]).
     fn arm_auto_release(&mut self) {
-        if self.source.is_some()
-            && !self.has_coin()
-            && self.items.iter().all(|it| self.taken.contains(&it.slot))
-        {
+        if self.source.is_some() && self.is_empty() {
             self.auto_release = true;
         }
     }
@@ -348,6 +344,7 @@ impl LootState {
         self.taken.clear();
         self.auto_release = false;
         self.fishing = false;
+        self.loot_type = 0;
         self.pending_bind_confirm = None;
         self.master_candidates.clear();
         self.pending_master_candidates.clear();
@@ -379,6 +376,12 @@ impl LootState {
     /// server's release on the last item).
     pub(crate) fn source(&self) -> Option<u64> {
         self.source
+    }
+
+    /// Nothing lootable left — every item taken and no coin (the reference's `0x4c2a70`
+    /// empty-check). The auto-close edge and the disenchant exemption both read it.
+    fn is_empty(&self) -> bool {
+        !self.has_coin() && self.items.iter().all(|it| self.taken.contains(&it.slot))
     }
 
     /// Resolve a clicked 1-based display row to its action: the coin pile (position 1 when the
@@ -455,11 +458,6 @@ impl LootState {
             .flatten()
     }
 }
-
-/// A loot refusal (`SMSG_LOOT_RESPONSE`'s error shape) queued by the net bridge for the UI error line
-/// — the loot twin of [`crate::ui_merchant::MerchantErrors`]. Carries the wire `u8` `LootError` code.
-#[derive(Resource, Default)]
-pub(crate) struct LootErrors(pub Vec<u8>);
 
 /// The loot player knob (decision 0961): `autoLootDefault` — era's Controls-page checkbox (no
 /// 1.12 CVar exists; vanilla only had the shift-click), settable from the Options window
@@ -601,15 +599,32 @@ impl LootLatch {
     }
 }
 
+/// The controller's report that a **loot-closing movement START** happened this frame — the
+/// reference's guard `0x60e990`, which every player-initiated movement-START emitter calls first
+/// and whose tail (`arg2 == 0`) closes an open loot: forward/back, strafe, keyboard-turn and pitch
+/// START, pitch STOP, `SetPitch`, and Jump. Mouse-look `SetFacing` passes `arg2 = 1` and does not.
+/// Written by `player::control` beside the cast bar's [`crate::ui_cast::LocalMoveStart`] (a
+/// different mask — the cast's `0x10f0` excludes TURN, this one includes it), consumed and cleared
+/// by [`drain_loot`] the next frame, which runs `CloseInteraction 0x48f200(cl=1, dl=1, 0)`: the
+/// kneel latch clears, `CMSG_LOOT_RELEASE` goes out, the frame closes, and a dead corpse that is
+/// also the selection is deselected — at distance zero, on the first step. Decision 2097.
+///
+/// **The loot window has no distance leash at all** (wow-re `loot-window-leash.md`, a §5 that
+/// refuted 2094 and the 1741 census row it rested on: that row is a dead lottery kiosk). vmangos
+/// happens to release on every movement opcode too (`MovementHandler.cpp:1108`), which is why the
+/// missing client-side close was invisible on the local server and plain on cmangos (B381).
+#[derive(Resource, Default)]
+pub(crate) struct LootMoveStart(pub(crate) bool);
+
 pub(crate) struct UiLootPlugin;
 
 impl Plugin for UiLootPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LootState>()
-            .init_resource::<LootErrors>()
             .init_resource::<LootConfig>()
             .init_resource::<LootLatch>()
             .init_resource::<LootKneel>()
+            .init_resource::<LootMoveStart>()
             .add_systems(
                 Update,
                 (
@@ -623,32 +638,6 @@ impl Plugin for UiLootPlugin {
                     resolve_loot_kneel.after(benilla_world::schedule::WorldStage::Net),
                 ),
             );
-    }
-}
-
-/// The client's message string for a `LootError` refusal (`SMSG_LOOT_RESPONSE`'s error shape); values
-/// from [`benilla_protocol::messages::loot_error`] (VERIFIED vmangos `LootMgr.h`). Only the
-/// subset a plain `CMSG_LOOT` can surface is spelled out; the rest print their code.
-fn loot_error_text(reason: u8) -> String {
-    use benilla_protocol::messages::loot_error as e;
-    match reason {
-        e::DIDNT_KILL => "You don't have permission to loot that corpse.".into(),
-        e::TOO_FAR => "You are too far away to loot that.".into(),
-        e::BAD_FACING => "You can't loot that from there.".into(),
-        e::LOCKED => "Someone is already looting that corpse.".into(),
-        e::NOTSTANDING => "You need to be standing up to loot.".into(),
-        e::STUNNED => "You can't do that while stunned.".into(),
-        e::PLAYER_NOT_FOUND => "You can't loot that right now.".into(),
-        e::ALREADY_PICKPOCKETED => "Those pockets are already empty.".into(),
-        // The master looter's three refusals (decision 1675). These reach only the master looter,
-        // in answer to a `CMSG_LOOT_MASTER_GIVE` the server would not honour
-        // (`LootHandler.cpp:718-729`), and unlike the lines above they are QUOTED from 1.12's own
-        // GlobalStrings (l.1679-1681) rather than composed — the reference has real strings for
-        // exactly this trio.
-        e::MASTER_INV_FULL => "That player's inventory is full".into(),
-        e::MASTER_UNIQUE_ITEM => "Player has too many of that item already".into(),
-        e::MASTER_OTHER => "Can't assign item to that player".into(),
-        other => format!("You can't loot that ({other})."),
     }
 }
 
@@ -677,14 +666,10 @@ fn format_money(copper: u32) -> String {
     parts.join(" ")
 }
 
-/// The coin-pile icon for a copper amount — the reference's six-step ladder, see [`COIN_ICONS`].
-/// `u32::MAX` is the last step's bound, so the `map_or` fallback is unreachable and is there only
-/// because the table is data rather than a match.
+/// The coin-pile icon for a copper amount — the reference's six-step ladder, one table for the
+/// loot slot, `GetCoinIcon` and the money cursor's bitmap (`benilla_ui::script::coin_icon`, 1965).
 fn coin_icon(copper: u32) -> &'static str {
-    COIN_ICONS
-        .iter()
-        .find(|(below, _)| copper < *below)
-        .map_or(COIN_ICONS[5].1, |(_, icon)| icon)
+    benilla_ui::script::coin_icon(i64::from(copper))
 }
 
 /// Resolve one wire [`LootItem`] into the Lua-facing [`LootRow`]: the icon comes straight from the
@@ -965,7 +950,6 @@ fn feed_loot(
     mut items: ResMut<Items>,
     icons: Option<Res<ItemDisplays>>,
     commands: Res<NetCommands>,
-    mut errors: ResMut<LootErrors>,
     mut chat: ResMut<crate::ui_chat::ChatLog>,
     mut last: Local<crate::ui_script::VmMemo<Option<LootSnapshot>>>,
     cfg: Res<LootConfig>,
@@ -988,15 +972,6 @@ fn feed_loot(
         props: props.as_deref(),
         enchants: enchants.as_deref(),
     };
-    // Loot refusals + "You receive …" lines migrate to the chat window (decision 0084's chat arc):
-    // refusals as informational SYSTEM-yellow lines, receive lines as LOOT-green. The ErrorsFrame
-    // keeps only the cast/equip red toasts.
-    for reason in errors.0.drain(..) {
-        chat.push_event(crate::ui_chat::ChatEvent::text_only(
-            crate::ui_chat::ChatEventKind::System,
-            loot_error_text(reason),
-        ));
-    }
     drain_receives(
         &mut loot,
         &mut items,
@@ -1111,11 +1086,10 @@ fn feed_loot(
                     script.fire_event("LOOT_SLOT_CLEARED", vec![ScriptValue::Int(i as i64 + 1)]);
                 }
             }
-            script.fire_event("LOOT_UPDATE", vec![]);
-            // The reference keeps the two apart: `LOOT_UPDATE` repaints the rows, while a changed
-            // candidate list refreshes the open dropdown in place without re-toggling it
-            // (`LootFrame_OnEvent`'s `UIDropDownMenu_Refresh(GroupLootDropDown)`,
-            // `LootFrame.lua:63`). Firing it only on a real change keeps a closed menu untouched.
+            // A changed candidate list refreshes the open dropdown in place without re-toggling
+            // it — `LootFrame_OnEvent`'s `UIDropDownMenu_Refresh(GroupLootDropDown)`, which the
+            // reference hangs off `UPDATE_MASTER_LOOT_LIST` (`LootFrame.lua:62-64`). Firing it
+            // only on a real change keeps a closed menu untouched.
             if before.master_candidates != after.master_candidates {
                 script.fire_event("UPDATE_MASTER_LOOT_LIST", vec![]);
             }
@@ -1138,6 +1112,46 @@ fn bind_confirm_required(items: &mut Items, commands: &NetCommands, item_id: u32
         .is_some_and(|t| t.bonding == BIND_WHEN_PICKED_UP && t.quality >= BIND_CONFIRM_MIN_QUALITY)
 }
 
+/// `CloseInteraction 0x48f200(cl=1, dl=1, 0)` off the movement-START guard (decision 2097),
+/// transcribed per loot-target type from wow-re `loot-window-leash.md` §5:
+///
+/// | open loot | on the first movement start |
+/// |---|---|
+/// | nothing open (`0x48f23f`) | nothing |
+/// | wire type 4 DISENCHANT **and** rows left (`0x48f24a`, `0x48f25a`) | survives — the window stays |
+/// | an ITEM guid — a lockbox (`0x48f2ab`–`0x48f2b5`) | survives, unreleased |
+/// | a creature corpse, player bones, a GameObject chest/node, a fishing bobber | latch cleared (`0x48f2c9`), `CMSG_LOOT_RELEASE` sent (`0x48f2da`), frame closed (`0x48f33d`) |
+/// | …and a dead UNIT that is also the selection (`0x48f34f`–`0x48f369`) | deselected too — `0x493910(guid, 1)` |
+///
+/// The deselect is asked of the target module ([`crate::target::DeselectGuid`]) rather than done
+/// here: the teardown owns the attack-stop and the wire clear. A PICKPOCKET target is a live
+/// unit (health above the `<= 1` gate) and keeps its selection.
+fn close_on_move_start(
+    loot: &mut LootState,
+    latch: &mut LootLatch,
+    commands: &NetCommands,
+    deselect: &mut MessageWriter<crate::target::DeselectGuid>,
+) {
+    use benilla_protocol::guid;
+    use benilla_protocol::messages::loot_type;
+    let Some(source) = loot.source() else {
+        return;
+    };
+    if loot.loot_type == loot_type::DISENCHANTING && !loot.is_empty() {
+        return;
+    }
+    if guid::is_item(source) {
+        return;
+    }
+    debug!("ui_loot: movement started with {source:#x} open — release");
+    latch.clear_for(source);
+    let _ = commands.0.send(ClientCommand::LootRelease { guid: source });
+    if guid::is_creature_or_pet(source) && loot.loot_type != loot_type::PICKPOCKETING {
+        deselect.write(crate::target::DeselectGuid(source));
+    }
+    loot.clear();
+}
+
 /// Drain the Lua intents: a picked row → coin (`CMSG_LOOT_MONEY`) or the item's wire slot
 /// (`CMSG_AUTOSTORE_LOOT_ITEM`); a close → `CMSG_LOOT_RELEASE` + a client-authoritative local clear
 /// (the window is already hidden by its `OnHide`; the release is fire-and-forget, and the server's
@@ -1150,6 +1164,7 @@ fn bind_confirm_required(items: &mut Items, commands: &NetCommands, item_id: u32
 /// `CLootButton`'s arm) and `LootSlot` is the LOOT_BIND confirmation continuation (`flag == 1`,
 /// which sends only for the pending slot). Keeping them apart is what makes a second click on a
 /// bind-on-pickup row re-raise the confirm instead of looting behind it.
+#[allow(clippy::too_many_arguments)] // one Bevy system's full input set
 fn drain_loot(
     script: Option<NonSendMut<UiScript>>,
     mut loot: ResMut<LootState>,
@@ -1162,7 +1177,14 @@ fn drain_loot(
     // by then in every reachable case — the snapshot asks for it to put a NAME on the row, and a
     // row with no name is a row nobody has clicked.
     mut items: ResMut<Items>,
+    // The controller's move-start report (decision 2097) and the selection teardown the close
+    // asks for — ahead of the VM check below, because neither depends on Lua.
+    mut move_start: ResMut<LootMoveStart>,
+    mut deselect: MessageWriter<crate::target::DeselectGuid>,
 ) {
+    if std::mem::take(&mut move_start.0) {
+        close_on_move_start(&mut loot, &mut latch, &commands, &mut deselect);
+    }
     let Some(mut script) = script else {
         return;
     };
@@ -1430,8 +1452,10 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         app.add_message::<crate::sound::LootPickupSound>()
+            .add_message::<crate::target::DeselectGuid>()
             .init_resource::<LootState>()
             .init_resource::<LootLatch>()
+            .init_resource::<LootMoveStart>()
             .init_resource::<GroupState>()
             .init_resource::<Items>()
             .insert_resource(NetCommands(tx));
@@ -1499,7 +1523,6 @@ mod tests {
             let mut app = App::new();
             app.add_message::<crate::sound::LootPickupSound>()
                 .init_resource::<LootState>()
-                .init_resource::<LootErrors>()
                 .init_resource::<crate::ui_chat::ChatLog>()
                 .init_resource::<GroupState>()
                 .init_resource::<NameCache>()
@@ -1765,7 +1788,6 @@ mod tests {
         let mut app = App::new();
         app.add_message::<crate::sound::LootPickupSound>()
             .init_resource::<LootState>()
-            .init_resource::<LootErrors>()
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<GroupState>()
             .init_resource::<NameCache>()
@@ -2480,5 +2502,103 @@ mod tests {
         assert_eq!(page2, vec![4, 5]);
         // 4 items ⇒ a single page of 4, no pager.
         assert_eq!(if 4u32 > 4 { 3 } else { 4 }, 4);
+    }
+
+    /// **Movement closes the loot** (2097): the controller's move-start report makes the drain
+    /// run `CloseInteraction` — latch cleared, the release on the wire once, the window gone, a
+    /// dead-corpse selection torn down — with no server help and no VM. The exemptions the bytes
+    /// carve stay open: an item-guid loot (a lockbox) and a disenchant window with rows left; an
+    /// emptied disenchant closes like the rest. A GameObject (a fishing bobber) closes too — it
+    /// takes the same path as a corpse.
+    #[test]
+    fn a_movement_start_closes_and_releases_the_open_loot() {
+        use bevy::ecs::message::Messages;
+        const CORPSE: u64 = 0xF130_0000_0000_0042;
+        const BOBBER: u64 = 0xF110_0000_0000_0011;
+        const LOCKBOX: u64 = 0x4000_0000_0000_0007;
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = App::new();
+        app.add_message::<crate::sound::LootPickupSound>()
+            .add_message::<crate::target::DeselectGuid>()
+            .init_resource::<LootState>()
+            .init_resource::<LootLatch>()
+            .init_resource::<LootMoveStart>()
+            .init_resource::<GroupState>()
+            .init_resource::<Items>()
+            .insert_resource(NetCommands(tx))
+            .add_systems(Update, drain_loot);
+        // No UiScript mounted: the move-start leg must not depend on the VM.
+        let deselects = |app: &mut App| -> Vec<u64> {
+            app.world_mut()
+                .resource_mut::<Messages<crate::target::DeselectGuid>>()
+                .drain()
+                .map(|d| d.0)
+                .collect()
+        };
+        let open = |app: &mut App, guid: u64, kind: u8, rows: Vec<LootItem>| {
+            app.world_mut()
+                .resource_mut::<LootState>()
+                .open(guid, kind, 0, rows);
+            app.world_mut().resource_mut::<LootLatch>().0 = Some(guid);
+        };
+        let step = |app: &mut App| {
+            app.world_mut().resource_mut::<LootMoveStart>().0 = true;
+            app.update();
+        };
+
+        // A corpse, standing still: nothing happens.
+        open(&mut app, CORPSE, loot_type::CORPSE, vec![item(0, 117, 1)]);
+        app.update();
+        assert_eq!(app.world().resource::<LootState>().source(), Some(CORPSE));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing goes out without a move start"
+        );
+
+        // The first step: closed, released once, unlatched, the corpse deselected.
+        step(&mut app);
+        assert_eq!(app.world().resource::<LootState>().source(), None);
+        assert_eq!(app.world().resource::<LootLatch>().0, None);
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientCommand::LootRelease { guid }) if guid == CORPSE),
+            "the move-start close owes the wire the release"
+        );
+        assert!(rx.try_recv().is_err(), "and sends it once");
+        assert_eq!(deselects(&mut app), vec![CORPSE]);
+
+        // A fishing bobber is a GameObject: the same path, minus the unit deselect.
+        open(&mut app, BOBBER, loot_type::FISHING, vec![]);
+        step(&mut app);
+        assert_eq!(app.world().resource::<LootState>().source(), None);
+        assert!(matches!(rx.try_recv(), Ok(ClientCommand::LootRelease { guid }) if guid == BOBBER));
+        assert!(deselects(&mut app).is_empty());
+
+        // A lockbox survives movement, unreleased and still latched-as-it-was.
+        open(&mut app, LOCKBOX, loot_type::CORPSE, vec![item(0, 117, 1)]);
+        step(&mut app);
+        assert_eq!(app.world().resource::<LootState>().source(), Some(LOCKBOX));
+        assert!(rx.try_recv().is_err());
+        app.world_mut().resource_mut::<LootState>().clear();
+
+        // A disenchant with rows left survives; once emptied, the step closes it.
+        open(
+            &mut app,
+            CORPSE,
+            loot_type::DISENCHANTING,
+            vec![item(0, 117, 1)],
+        );
+        step(&mut app);
+        assert_eq!(app.world().resource::<LootState>().source(), Some(CORPSE));
+        assert!(rx.try_recv().is_err());
+        app.world_mut().resource_mut::<LootState>().remove_slot(0);
+        // The emptying armed the auto-release; take it so the step's close is the one measured.
+        assert!(app
+            .world_mut()
+            .resource_mut::<LootState>()
+            .take_auto_release());
+        step(&mut app);
+        assert_eq!(app.world().resource::<LootState>().source(), None);
+        assert!(matches!(rx.try_recv(), Ok(ClientCommand::LootRelease { guid }) if guid == CORPSE));
     }
 }

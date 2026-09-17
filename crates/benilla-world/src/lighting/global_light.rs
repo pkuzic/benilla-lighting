@@ -73,7 +73,7 @@ use crate::view::WorldCamera;
 /// allows. Keeping the probes out of this struct keeps it stack-cheap: the ExtractResource clone
 /// runs every frame, and a ~900 KB by-value blob overflowed a render-thread stack (measured live).
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightStd430 {
     rows: [[f32; 4]; LIGHT_HEADER_ROWS],
     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
@@ -232,7 +232,7 @@ impl LightRooms {
     /// interior classifier rather than from a WMO's own MODD/MOLR tables. Without a constructor the
     /// tuple field's `pub(crate)` made the component unbuildable in benilla-app, so a GameObject's
     /// torch could never carry a room — and therefore could never be promoted to a cube-map shadow
-    /// caster (`torch_shadow`'s candidate query is `With<PointLight>, With<LightRooms>`).
+    /// caster (`torch_shadow's candidate query is `With<WorldPointLight>, With<LightRooms>`).
     pub fn new(rooms: crate::wmo_portal::WmoGroupVis) -> Self {
         Self(rooms)
     }
@@ -623,6 +623,28 @@ impl Default for ShadowFilterGaussian {
     }
 }
 
+/// **An authored WoW point light source** — an M2 light, a WMO MOLT omni, a carried torch —
+/// as the packed light table reads it. This used to be Bevy's `PointLight`, kept purely as a
+/// data carrier: [`build_light_data`] was its only reader in the engine, every lit surface
+/// takes its lights from the shared table (0273/0285), and no shader here consumes Bevy's
+/// clustered lights at all. Bevy nonetheless ran its whole light lane over every one of them
+/// each frame — `assign_objects_to_clusters` (a `Vec` rebuilt per frame with a `RenderLayers`
+/// clone per light, even with the world camera's `ClusterConfig::None`), `extract_lights`,
+/// `prepare_lights`, the light visibility check — a city of lamps' worth of work for nothing,
+/// ~2 % of the alone frame on the crowd rig's sampled profile (decision 1945). The fields keep
+/// the `PointLight` numbers exactly (`intensity` in the same 4π-scaled units), so the packing
+/// below and every recipe are unchanged.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct WorldPointLight {
+    /// Linear RGB, hue preserved.
+    pub color: [f32; 3],
+    /// `4π × authored intensity` — the `PointLight` convention, so the packer's `/(4π)` reads
+    /// the authored product back.
+    pub intensity: f32,
+    /// The ≤3-nearest selection-candidacy radius (yd) — see `terrain_stream::point_light`.
+    pub range: f32,
+}
+
 /// Main-world resource holding the packed light for this frame; extracted into the render world where
 /// [`upload_light`] writes it. Rebuilt every frame by [`build_light_data`] (cheap — one std430 pack).
 #[derive(Resource, Clone, Copy, ExtractResource)]
@@ -709,8 +731,8 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
 
 /// The full byte size of the shared light BUFFER: the per-frame blob ([`LightStd430`] — 19 header
 /// rows + the point-light table) PLUS the interior-prop probe region PLUS the skin-palette
-/// regions (rig slot table + tint table + rig-origin table + palette rows — decisions
-/// 0720/0812/0974) at the tail. **Every buffer bound as
+/// regions (rig slot table + tint table + rig-origin table + mat-anim table + straddle clip
+/// table + palette rows — decisions 0720/0812/0974/1381/2188) at the tail. **Every buffer bound as
 /// `wow_light` must be at least this big** — `wow_model.wgsl` declares the whole layout,
 /// and wgpu validates bound size against the shader's struct at draw time. The portrait booth's
 /// frozen studio-light buffer sizes itself with this (its table regions stay zeroed ⇒ no scene
@@ -1112,8 +1134,8 @@ fn build_light_data(
     debug: Res<DebugState>,
     view: Res<ViewDistance>,
     cam: Query<&GlobalTransform, With<WorldCamera>>,
-    // `Without<ShadowProxyLight>`: the torch-shadow proxies are `PointLight`s too, but they exist
-    // only to cast a cube map — never to light benilla's receivers (see [`ShadowProxyLight`]).
+    // `Without<ShadowProxyLight>`: the torch-shadow proxies are `WorldPointLight`s too, but they
+    // exist only to cast a cube map — never to light benilla's receivers (see [`ShadowProxyLight`]).
     // MONKEY (fire GO lights): `Has<SyntheticFireLight>` rides along so the live `fireLightGain`
     // can scale exactly the invented sources at PACK time — no respawn, no per-spawn bake.
     // MONKEY (interior attenuation): `Option<&LightReach>` too — a MOLT fixture's authored
@@ -1123,7 +1145,7 @@ fn build_light_data(
     // fail-safe lane for the frame or two before the classifier has answered).
     lights_q: Query<
         (
-            &PointLight,
+            &WorldPointLight,
             &GlobalTransform,
             Option<&LightRooms>,
             Has<SyntheticFireLight>,
@@ -1190,8 +1212,11 @@ fn build_light_data(
     // Per-kind water swatches (shallow/deep rgb + alpha). River/lake use the non-ocean path.
     let (rs, rd, rsa, rda) = l.water_colors(LiquidKind::Still);
     let (os, od, osa, oda) = l.water_colors(LiquidKind::Ocean);
-    data.0.rows = [[0.0; 4]; LIGHT_HEADER_ROWS];
-    let rows = &mut data.0.rows;
+    // Built in a scratch copy and written through `ResMut` only when a row moved: the extract
+    // clones this 8.5 KB blob every frame it reads as changed, and a parked frame changes nothing.
+    let mut fresh = data.0;
+    fresh.rows = [[0.0; 4]; LIGHT_HEADER_ROWS];
+    let rows = &mut fresh.rows;
     // MONKEY (darkness gains): the specular row takes the night dim because it IS the sun — the
     // DBC sun-halo colour driving the terrain sheen. The FOG rows below do not (fog colour is the
     // horizon backdrop the world is seen AGAINST, and dimming it would paint a dark world under a
@@ -1313,7 +1338,8 @@ fn build_light_data(
             let p = gt.translation();
             let d2 = p.distance_squared(cam_pos);
             (d2 < POINT_PACK_RADIUS * POINT_PACK_RADIUS).then(|| {
-                let c = pl.color.to_linear();
+                // MONKEY (merge): `WorldPointLight::color` is already linear RGB.
+                let c = pl.color;
                 // The authored intensity, BEFORE the fire gain: the pool's geometry must not move
                 // when the user dims the invented lights, only its brightness.
                 let base = pl.intensity / (4.0 * std::f32::consts::PI);
@@ -1346,7 +1372,7 @@ fn build_light_data(
                     f.at(now_secs, dynamic_interiors.flicker)
                 });
                 let s = s * fm.intensity;
-                let rgb = commit_raw([c.red * s, c.green * s, c.blue * s * fm.blue]);
+                let rgb = commit_raw([c[0] * s, c[1] * s, c[2] * s * fm.blue]);
                 // MONKEY (light lane by position): a light is INTERIOR iff it PHYSICALLY STANDS in
                 // an interior-class WMO group — the verdict [`classify_light_lanes`] (static) or
                 // the carried-light claim (entities) wrote onto it. Claiming a room is no longer
@@ -1417,15 +1443,15 @@ fn build_light_data(
     // 4), and folding a dim into it would have the two knobs fight over the same number. A gain on
     // the INPUTS composes with whatever exposure is set to. The strict exterior-batch `ext_room`
     // term and the ext-class night blend read these same packed lanes, so they follow for free.
-    data.0.rows[20] = [
+    fresh.rows[20] = [
         pts.len() as f32,
         dynamic_interiors.ambient * dynamic_interiors.interior_gain,
         dynamic_interiors.fill * dynamic_interiors.interior_gain,
         dynamic_interiors.exposure,
     ];
     for (i, (_, p, range, rgb, _, lane, claim, _)) in pts.iter().enumerate() {
-        data.0.points[2 * i] = [p.x, p.y, p.z, *range];
-        data.0.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], *lane];
+        fresh.points[2 * i] = [p.x, p.y, p.z, *range];
+        fresh.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], *lane];
         claim.write(&mut claims.0[i * ROOM_CLAIM_STRIDE..][..ROOM_CLAIM_STRIDE]);
     }
     // Entries past the count are stale in the point table by design (the count row guards every
@@ -1445,8 +1471,14 @@ fn build_light_data(
     // alternate frame to frame, which a 1 Hz sample cannot see at all. Reading a per-second dump as
     // evidence of per-frame stability is how that light was cleared once already (0665's parked
     // culling test made the same mistake with a different instrument).
-    if let Some(mode) = std::env::var_os("WOW_POINTS_DUMP") {
-        let every = if mode == *"frame" { 0.0 } else { 1.0 };
+    static POINTS_DUMP: std::sync::OnceLock<Option<std::ffi::OsString>> =
+        std::sync::OnceLock::new();
+    if let Some(mode) = POINTS_DUMP.get_or_init(|| std::env::var_os("WOW_POINTS_DUMP")) {
+        let every = if mode.as_os_str() == "frame" {
+            0.0
+        } else {
+            1.0
+        };
         let now = time.elapsed_secs_f64();
         if now - *last_dump >= every {
             *last_dump = now;
@@ -1542,13 +1574,17 @@ fn build_light_data(
     // can still be moving. A dump of selected rows would answer "did ambient move?"; only the full
     // set answers "did ANY shading input move?", and that is the question worth a run. Rows are
     // printed as raw f32 bits, so a change far below a printed decimal cannot hide.
-    if let Some(mode) = std::env::var_os("WOW_LIGHT_DUMP") {
-        let every = if mode == *"frame" { 0.0 } else { 1.0 };
+    static LIGHT_DUMP: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+    if let Some(mode) = LIGHT_DUMP.get_or_init(|| std::env::var_os("WOW_LIGHT_DUMP")) {
+        let every = if mode.as_os_str() == "frame" {
+            0.0
+        } else {
+            1.0
+        };
         let now = time.elapsed_secs_f64();
         if now - *last_rows_dump >= every {
             *last_rows_dump = now;
-            let hash = data
-                .0
+            let hash = fresh
                 .rows
                 .iter()
                 .flatten()
@@ -1556,7 +1592,7 @@ fn build_light_data(
                     (h ^ u64::from(v.to_bits())).wrapping_mul(0x1000_0000_01b3)
                 });
             eprintln!("[light] rows {hash:#018x}");
-            for (i, r) in data.0.rows.iter().enumerate() {
+            for (i, r) in fresh.rows.iter().enumerate() {
                 eprintln!(
                     "  {i:2} {:08x} {:08x} {:08x} {:08x}   {:9.5} {:9.5} {:9.5} {:9.5}",
                     r[0].to_bits(),
@@ -1570,6 +1606,9 @@ fn build_light_data(
                 );
             }
         }
+    }
+    if data.0 != fresh {
+        data.0 = fresh;
     }
 }
 
@@ -1607,7 +1646,7 @@ pub fn classify_light_lanes(
     lights: Query<
         (Entity, &GlobalTransform, Option<&LightRooms>, Option<&LightLane>),
         (
-            With<PointLight>,
+            With<WorldPointLight>,
             Without<ShadowProxyLight>,
             Without<ChildOf>,
         ),
