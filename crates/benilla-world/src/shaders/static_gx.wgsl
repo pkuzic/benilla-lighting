@@ -332,6 +332,16 @@ const TORCH_BIAS: f32 = 0.001;
 //        named rather than hidden: a knee-high fixture's OUTER pool can still acne, and the honest
 //        cure for that is a slope-scaled bias or a grazing-angle clamp on the PCF radius, not a
 //        bigger constant (which detaches every real shadow - see TORCH_BIAS).
+//
+// MONKEY (slope bias): that RESIDUAL is now fixed - and TWO numbers above are wrong, so do not
+// re-derive from them. The table prices depth in yards along the RAY, but the compare reads
+// `ndc.z` on a cube FACE, which is a function of the VIEW-SPACE Z (the component along the face
+// AXIS). So (a) a floor is on the DOWN face while `r < h`, where its depth is the constant `h` and
+// acne is impossible, and crosses to a SIDE face after that, where the gradient is `2A/(f*h)` per
+// unit uv and does NOT grow with `r`; and (b) `0.15*(h/t)` is inverted - on a grazing floor this
+// offset moves the ray's own floor hit by `0.15*(t/h)`. Re-measured exactly, the offset holds a
+// h = 1 yd fixture clean to r = 10.1 yd, not 2.1. `shadow_hook::TORCH_SLOPE_MAX` carries the
+// corrected table and the receiver-plane bias that closes the rest.
 const TORCH_NORMAL_OFFSET: f32 = 0.15;
 // MONKEY (torch caster selection): the live PCF tap-radius scale, unpacked from the table's
 // `count.y`'s LOW 16 bits (stored x100 because the row is `vec4<u32>`; the high half is the
@@ -416,7 +426,10 @@ fn torch_face(d: vec3<f32>) -> u32 {
 // promoted it. `0` = the interior/legacy `ndc.z` fade, unchanged bit-for-bit; `> 0` = the exterior
 // world-distance fade `1 − smoothstep(0.8R, R, d)` measured from the FIXTURE (not from the camera:
 // this is "how far does this fire's shadow carry", a property of the fire).
-fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, fade_radius: f32) -> f32 {
+// MONKEY (slope bias): `N` rides along purely so the projector can bias against the RECEIVER'S
+// PLANE. `P` is the already-offset point, `N` the normal it was offset along, and this function
+// makes no other use of it - the correlation, the face pick and the fades are unchanged.
+fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>, fade_radius: f32) -> f32 {
 #ifdef TORCH_SHADOWS
     // MONKEY (torch lane perf): the whole table is empty far more often than not (no promoted
     // fixture in range, or the lane switched off while the shader-def is still compiled in). Say so
@@ -444,8 +457,8 @@ fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, fade_radius: f32) -> f32 {
                 fade_radius > 0.0,
             );
             let s = shadow_hook::torch_map_shadow(
-                torch_table.view_projs[layer], i32(depth_layer), P, torch_depth, torch_samp, TORCH_BIAS,
-                torch_soft(), fade);
+                torch_table.view_projs[layer], i32(depth_layer), P, N, torch_depth, torch_samp,
+                TORCH_BIAS, torch_soft(), fade);
             // MONKEY (torch caster selection): `.w` is the slot's FADE WEIGHT. A slot ramps 0 -> 1
             // over ~1/3 s when it is promoted and 1 -> 0 before it is reused, and `mix` turns that
             // into the shadow appearing/dissolving instead of switching. Without it the selection
@@ -468,7 +481,7 @@ fn torch_map_at(light_pos: vec3<f32>, P: vec3<f32>, fade_radius: f32) -> f32 {
 // BEFORE `torch_face`, so a fragment right on a cube-face boundary picks the same face its
 // neighbour does). See TORCH_NORMAL_OFFSET for the texel-vs-bias arithmetic this is the answer to.
 fn torch_surface_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
-    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, 0.0);
+    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, N, 0.0);
 }
 
 // MONKEY (outdoor torch shadows): the EXTERIOR lane's call — the campfire/brazier/lamppost pool on
@@ -477,7 +490,7 @@ fn torch_surface_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32
 // terrain/entity receivers — an outdoor WMO floor under a low fire (a campfire on a porch) has the
 // same grazing-angle PCF acne as the imp's floor; see TORCH_NORMAL_OFFSET for the arithmetic.
 fn torch_exterior_shadow(light_pos: vec3<f32>, P: vec3<f32>, N: vec3<f32>) -> f32 {
-    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, TORCH_EXT_FADE_YD);
+    return torch_map_at(light_pos, P + N * TORCH_NORMAL_OFFSET, N, TORCH_EXT_FADE_YD);
 }
 
 // MONKEY (torch debug, interiorDebug 2): the MIN raw depth-map shadow factor over EVERY promoted map
@@ -497,9 +510,10 @@ fn torch_debug_factor(P: vec3<f32>, N: vec3<f32>) -> f32 {
         // MONKEY (live bank rank): debug samples the same compact bank as the lit path.
         let rank = countOneBits(torch_table.count.z & ((1u << i) - 1u));
         let depth_layer = select(layer, 96u + 6u * rank + face, (torch_table.count.z & (1u << i)) != 0u);
+        // MONKEY (slope bias): same plane as the lit path, so `interiorDebug 2` stays honest.
         let raw = shadow_hook::torch_map_shadow(
-            torch_table.view_projs[layer], i32(depth_layer), Ps, torch_depth, torch_samp, TORCH_BIAS,
-            torch_soft(), -1.0);
+            torch_table.view_projs[layer], i32(depth_layer), Ps, N, torch_depth, torch_samp,
+            TORCH_BIAS, torch_soft(), -1.0);
         // MONKEY (torch caster selection): the WEIGHTED factor, so the debug view shows what the
         // real render shows - a fading slot greys out here too, and a slot stuck at w = 0 (never
         // ramping in) is visible as a map that contributes nothing.
@@ -518,8 +532,8 @@ fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
     return select(vec3<f32>(0.0), normalize(v), l2 > 1e-12);
 }
 
-// MONKEY (outdoor torch shadows): the ≤`EXT_SEL_K`-nearest EXTERIOR selection, packed into TWO
-// u32s as eight 8-bit indices (rank 0 in the low byte of `.x`), `EXT_SEL_EMPTY` for an unfilled
+// MONKEY (outdoor torch shadows): the ≤`EXT_SEL_K`-nearest EXTERIOR selection, packed into FOUR
+// u32s as twelve 8-bit indices (rank 0 in the low byte of `.x`), `EXT_SEL_EMPTY` for an unfilled
 // rank.
 //
 // WHY the selection is packed and TRAVELS from the vertex stage: the exterior point term is chosen
@@ -530,7 +544,7 @@ fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
 // boundary, where the interpolated vertex term has none. So the vertex stage publishes its choice
 // and the fragment stage only re-EVALUATES it (and shadows it).
 //
-// MONKEY (ext light k8) - **WHY K WENT 3 -> 8.** Three is the reference FFP's own commit limit (GL
+// MONKEY (ext light k12) - **WHY K WENT 3 -> 8.** Three is the reference FFP's own commit limit (GL
 // slots 1-3; wow-re `wmo-surface-dynamic-light` sections 4/6) and it was the right number for the
 // reference's SPARSE, hand-authored light set: with two or three authored lights in a village the
 // nearest three IS all of them, and no two draw units can disagree. benilla does not have that set
@@ -542,39 +556,70 @@ fn wow_normalize(v: vec3<f32>) -> vec3<f32> {
 // threes; and because the boundary between draw units is a straight line - an MCNK cell edge, or
 // the jump from a cell-anchored chunk to the origin-anchored bench standing on it - the
 // disagreement reads as a HARD STRAIGHT EDGE across a torch's pool of light (the director's
-// "scars"), and as a bench lit by a firework over ground that is not. Eight slots cover every
-// fixture that can meaningfully reach a unit in these set pieces, so neighbouring units agree and a
-// pool ends where the FALLOFF ends instead of where the cell does.
+// "scars"), and as a bench lit by a firework over ground that is not. More slots make neighbouring
+// units AGREE, so a pool ends where the FALLOFF ends instead of where the cell does; the only open
+// question is how many is enough, and the next paragraph answers it with the measurement.
 //
 // 8 bits per rank caps the LIVE table at 255 real entries, `EXT_SEL_EMPTY` = 255 being the
 // sentinel; `global_light::MAX_LIVE_POINT_LIGHTS` enforces that CPU-side. The buffer still carries
 // 256 slots, so `LightStd430` keeps its 8528 B and no mirror struct moves.
 //
-// RAISING K: `ext_sel_get` and the pack tail index the selection vector dynamically
+// MONKEY (ext light k12) - **AND WHY 8 -> 12, one round later.** Eight was MARGINAL the day it
+// landed and the note here said so. The Darkmoon Faire's densest chunk holds THIRTEEN candidates
+// and EIGHT of them stand strictly inside its own 33.33 yd cell, so a torch 2.5 yd outside the edge
+// - lighting the grass right at the seam - cannot win a slot under any ranking, and that chunk goes
+// on disagreeing with its neighbour about it. On that particular seam K=8 did not help, it made
+// things WORSE (0.198 -> 0.356 of a falloff unit): raising K let the SPARSE neighbour take in
+// lights the dense chunk still had no room for, so the two sets grew further apart, not closer.
+// Twelve is the first K at which every chunk around the player keeps everything it can see bar one:
+//
+//   worst ABSOLUTE seam jump, the four chunks meeting at the corner nearest WoW (-9557, 99)
+//   (`k12_table.py` in the scratchpad; falloff units, colour and N.L factored out, the byte-verified
+//   `1/(0.7d + 0.03d^2)`, 200 samples along each shared edge)
+//     seam                     cands      K=3      K=8     K=12     K=16
+//     (-288,2)|(-288,3)         6 | 2   0.0418   0.1117   0.1117   0.1117
+//     (-288,2)|(-287,2)        6 | 13   0.6425   0.0882   0.0669   0.1281
+//     (-288,3)|(-287,3)         2 | 7   0.2888   0.0862   0.0862   0.0862
+//     (-287,2)|(-287,3)        13 | 7   0.1980   0.3556   0.1144   0.1406
+//     WORST                            0.6425   0.3556   0.1144   0.1406
+//
+// Read the last two columns together. At K>=13 every chunk keeps ALL its candidates, so 0.1406 is
+// the CANDIDACY BOX's own floor - the residual disagreement two chunks have because their gather
+// boxes are centred 33 yd apart - and no K can touch it (widening the box is a separate change, and
+// it is the byte-verified one). K=12 measures 0.1144, slightly UNDER that floor, because the dense
+// chunk drops exactly one far candidate its neighbour also barely weights. So twelve ENDS this line
+// of attack: 16 is not better, only wider.
+//
+// The own-origin case in the same table - a bench standing on the ground, ranking from its own
+// position, against the chunk under it - goes 79 % / 71 % / 52 % apart at K=3, to 31 % / 27 % / 5 %
+// at K=8, to 3 % / 1 % / 5 % at K=12. That is the "bench lit by a firework over dark grass" closing.
+//
+// RAISING K FURTHER: `ext_sel_get` and the pack tail index the selection vector dynamically
 // (`sel[s >> 2u]`) and the rank arrays are zero-constructed and filled, so K is not spelled out
-// anywhere but here. K=16 = swap `vec2<u32>` for `vec4<u32>` at its five type sites plus the
-// interstage field, set this to `16u`, and give `EXT_SEL_NONE` its two extra words. Worth knowing
-// because the Darkmoon Faire measurement is MARGINAL at 8: one 33.33 yd chunk there holds exactly
-// eight fixtures strictly inside its own cell, so a ninth standing 2.5 yd outside the edge cannot
-// win a slot under any ranking, and that chunk still disagrees with its neighbour about it. Eight
-// takes the worst measured seam jump there from 0.64 to 0.36 of a falloff unit (and the everyday
-// Goldshire/Stormwind case to zero); twelve would take it to 0.11, against a hard floor of ~0.14
-// set by the candidacy box itself, which is a separate change.
-const EXT_SEL_K: u32 = 8u;
+// anywhere but here. The vector is `vec4<u32>` now and holds SIXTEEN rank slots, so K = 13..16 is
+// this constant ALONE - no type site, no interstage field, no `EXT_SEL_NONE` edit. Past 16 the next
+// step is a second `vec4<u32>` (four more interstage components) and `ext_sel_get` learning which
+// vector to read, which is a real change rather than a constant.
+const EXT_SEL_K: u32 = 12u;
 const EXT_SEL_EMPTY: u32 = 255u;
-// Eight empty ranks. MONKEY (ext light k8): two words now, so it can no longer be a scalar literal.
-const EXT_SEL_NONE: vec2<u32> = vec2<u32>(4294967295u, 4294967295u);
+// Twelve empty ranks. MONKEY (ext light k12): FOUR words - the vector holds sixteen 8-bit rank
+// slots and only the first `EXT_SEL_K` are ever read, so filling all four with the sentinel costs
+// nothing and leaves no word that could be mistaken for a real index if K is raised again. (The
+// PACK tail below builds its `vec4<u32>` from ZERO and writes only ranks 0..K-1, so its unused high
+// word reads as index 0 rather than the sentinel - harmless, because no loop here ever looks past
+// `EXT_SEL_K`.)
+const EXT_SEL_NONE: vec4<u32> = vec4<u32>(4294967295u, 4294967295u, 4294967295u, 4294967295u);
 
-// MONKEY (ext light k8): how many of the `EXT_SEL_K` ranks pay for a CUBE-MAP OCCLUSION lookup in
+// MONKEY (ext light k12): how many of the `EXT_SEL_K` ranks pay for a CUBE-MAP OCCLUSION lookup in
 // the night lane. The ranking is by distance, so ranks 0..2 are the three fixtures whose term
-// dominates this fragment; ranks 3..7 are the long tail that fixes the SELECTION (the scars) and
+// dominates this fragment; ranks 3..11 are the long tail that fixes the SELECTION (the scars) and
 // contribute a soft, low-amplitude wash where a hard-edged shadow would not be legible anyway.
 // Holding the shadowed count at the OLD K pins the per-fragment cost of the night lane at exactly
-// what it was - three table scans and their taps - while the selection itself gets eight deep.
+// what it was - three table scans and their taps - while the selection itself gets twelve deep.
 const EXT_SEL_SHADOWED: u32 = 3u;
 
-// Unpack rank `s` (0..`EXT_SEL_K`-1) from the two-word selection. MIRRORED - keep in sync.
-fn ext_sel_get(sel: vec2<u32>, s: u32) -> u32 {
+// Unpack rank `s` (0..`EXT_SEL_K`-1) from the four-word selection. MIRRORED - keep in sync.
+fn ext_sel_get(sel: vec4<u32>, s: u32) -> u32 {
     return (sel[s >> 2u] >> (8u * (s & 3u))) & 255u;
 }
 
@@ -583,7 +628,7 @@ fn ext_sel_get(sel: vec2<u32>, s: u32) -> u32 {
 // inserts, so an equal distance leaves the earlier table index at the better rank) so the sum can
 // be re-evaluated later against the identical choice.
 //
-// MONKEY (ext light k8): `box` is the draw unit's HORIZONTAL half-extent in yards, and it changes
+// MONKEY (ext light k12): `box` is the draw unit's HORIZONTAL half-extent in yards, and it changes
 // what "nearest" MEANS - ranking is by the distance from the light to the unit's AABB, not to the
 // unit's anchor POINT. A cell-anchored unit (terrain's 33.33 yd MCNK chunk, clutter, an
 // exterior-class WMO street) passes `MCNK_CELL_HALF`: a torch standing 2 yd outside a cell's edge
@@ -598,7 +643,7 @@ fn ext_sel_get(sel: vec2<u32>, s: u32) -> u32 {
 //
 // CANDIDACY deliberately stays on the anchor POINT (`dc2` below): it is the byte-verified gather
 // test, and widening it is a different question from how the survivors are ordered.
-fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec2<u32> {
+fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec4<u32> {
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, EXT_SEL_K>();
     var sd = array<f32, EXT_SEL_K>();
@@ -620,11 +665,11 @@ fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec2<u32> {
         if (dc2 > pos_range.w * pos_range.w) {
             continue;
         }
-        // MONKEY (ext light k8): rank by the distance to the draw unit's BOX (see the header
+        // MONKEY (ext light k12): rank by the distance to the draw unit's BOX (see the header
         // note). With `box = 0` both `max`es are identities and this is exactly the old `dc2`.
         let e = max(abs(dv.xz) - vec2<f32>(box), vec2<f32>(0.0));
         let d2 = dot(e, e) + dv.y * dv.y;
-        // MONKEY (ext light k8): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
+        // MONKEY (ext light k12): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
         // 3-deep cascade. Both loops are bounded by a module const, so the compiler unrolls them;
         // the comparison is strictly-less, which keeps the old tie order (first-found wins).
         //
@@ -655,7 +700,7 @@ fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec2<u32> {
     }
     // Pack low-byte-first, `EXT_SEL_EMPTY` for a rank nothing reached. No real index can collide
     // with the sentinel: the live table caps at 255 (`MAX_LIVE_POINT_LIGHTS`).
-    var packed = vec2<u32>(0u, 0u);
+    var packed = vec4<u32>(0u, 0u, 0u, 0u);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = select(EXT_SEL_EMPTY, sel[s], sd[s] <= 9.9e29);
         packed[s >> 2u] |= idx << (8u * (s & 3u));
@@ -666,10 +711,10 @@ fn point_light_pick(anchor: vec3<f32>, box: f32) -> vec2<u32> {
 // The evaluation half — the byte-verified falloff `1/(0.7d + 0.03d²)` × `max(N·L, 0)` × the
 // committed colour, in rank order, stopping at the first empty rank exactly as the old
 // `sd[s] > 9.9e29` break did. Shared by both pickers (their sum loops were already identical).
-// MONKEY (ext light k8): up to `EXT_SEL_K` terms now, still Gouraud (per vertex) and still linear
+// MONKEY (ext light k12): up to `EXT_SEL_K` terms now, still Gouraud (per vertex) and still linear
 // in the falloff, so nothing about the day lane's FORM changed — a unit simply stops dropping the
 // fixtures its neighbour kept.
-fn point_light_eval(sel: vec2<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+fn point_light_eval(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = ext_sel_get(sel, s);
@@ -693,13 +738,13 @@ fn point_light_eval(sel: vec2<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
 // actually looks like). Reached only under `torch_ext_on()`, so nothing here executes in daylight
 // or with `exteriorShadows 0`.
 //
-// MONKEY (ext light k8): the SUM runs to `EXT_SEL_K`, but only the first `EXT_SEL_SHADOWED` ranks
+// MONKEY (ext light k12): the SUM runs to `EXT_SEL_K`, but only the first `EXT_SEL_SHADOWED` ranks
 // pay for an occlusion lookup, so the per-fragment cost of this lane is pinned at exactly what it
-// was before the widening while the selection itself got eight deep. Ranks 3..7 are the
+// was before the widening while the selection itself got twelve deep. Ranks 3..11 are the
 // distance-ordered tail — the terms that make a torch's pool agree across a draw-unit boundary —
 // and they arrive unshadowed, which at their amplitude is not a look the eye can separate from a
 // shadowed one.
-fn point_light_eval_shadowed(sel: vec2<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = ext_sel_get(sel, s);
@@ -766,13 +811,13 @@ fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
     return vec3<f32>((ix + 0.5) * cell - half, P.y, (iz + 0.5) * cell - half);
 }
 
-// MONKEY (ext light k8): the MCNK cell's HORIZONTAL half-extent (yd) - the `box` a cell-anchored
+// MONKEY (ext light k12): the MCNK cell's HORIZONTAL half-extent (yd) - the `box` a cell-anchored
 // draw unit ranks by. The same grid constant as above, halved: 533.33333/16/2 = 16.666666. An
 // own-origin unit passes 0 instead. MIRRORED in terrain.wgsl - keep in sync.
 const MCNK_CELL_HALF: f32 = 533.33333 / 32.0;
 // MONKEY (outdoor torch shadows): the ranking half, split out for the same reason as
 // `point_light_pick` — the fragment stage must re-evaluate the VERTEX's choice, not make its own.
-fn wmo_exterior_pick(P: vec3<f32>) -> vec2<u32> {
+fn wmo_exterior_pick(P: vec3<f32>) -> vec4<u32> {
     let anchor = mcnk_cell_anchor(P);
     let count = u32(wow_light.point_count.x);
     var sel = array<u32, EXT_SEL_K>();
@@ -792,12 +837,12 @@ fn wmo_exterior_pick(P: vec3<f32>) -> vec2<u32> {
         if (max(abs(dv.x), abs(dv.z)) > WMO_EXT_REACH) {
             continue;
         }
-        // MONKEY (ext light k8): rank by the distance to the MCNK cell's BOX, not to its centre -
+        // MONKEY (ext light k12): rank by the distance to the MCNK cell's BOX, not to its centre -
         // see `point_light_pick`. This is the term that makes a street and the road it runs into
         // agree about a torch standing on the seam between them.
         let e = max(abs(dv.xz) - vec2<f32>(MCNK_CELL_HALF), vec2<f32>(0.0));
         let d2 = dot(e, e) + dv.y * dv.y;
-        // MONKEY (ext light k8): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
+        // MONKEY (ext light k12): an `EXT_SEL_K`-deep insertion in place of the hand-unrolled
         // 3-deep cascade. Both loops are bounded by a module const, so the compiler unrolls them;
         // the comparison is strictly-less, which keeps the old tie order (first-found wins).
         //
@@ -828,7 +873,7 @@ fn wmo_exterior_pick(P: vec3<f32>) -> vec2<u32> {
     }
     // Pack low-byte-first, `EXT_SEL_EMPTY` for a rank nothing reached. No real index can collide
     // with the sentinel: the live table caps at 255 (`MAX_LIVE_POINT_LIGHTS`).
-    var packed = vec2<u32>(0u, 0u);
+    var packed = vec4<u32>(0u, 0u, 0u, 0u);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = select(EXT_SEL_EMPTY, sel[s], sd[s] <= 9.9e29);
         packed[s >> 2u] |= idx << (8u * (s & 3u));
@@ -1236,14 +1281,15 @@ struct GxVsOut {
     @location(4) point_lit: vec3<f32>,
     @location(5) color: vec4<f32>,
     // MONKEY (outdoor torch shadows; ext light k8): WHICH ≤`EXT_SEL_K` exterior table entries
-    // `point_lit` was summed from, packed 8 bits each across TWO u32s (see `EXT_SEL_NONE` /
+    // `point_lit` was summed from, packed 8 bits each across FOUR u32s (see `EXT_SEL_NONE` /
     // `ext_sel_get`). FLAT, because it is a choice, not a quantity — interpolating packed indices
     // would produce a different, meaningless one. `EXT_SEL_NONE` on every lane that takes no
     // exterior point term (interior WMO surfaces, interior props, the collapsed exile vertex),
     // which makes the fragment lane a no-op there by construction. Widened from ONE u32 of three
-    // 10-bit ranks to TWO u32s of eight 8-bit ranks — one extra interstage component — see
+    // 10-bit ranks to TWO u32s of eight 8-bit ranks and then to FOUR u32s of twelve — three extra
+    // interstage components in all (21 for this struct, against a 60-component limit) — see
     // `EXT_SEL_K`.
-    @location(6) @interpolate(flat) ext_sel: vec2<u32>,
+    @location(6) @interpolate(flat) ext_sel: vec4<u32>,
 }
 
 @vertex
@@ -1311,7 +1357,7 @@ fn vertex(v: GxVertex) -> GxVsOut {
         out.ext_sel = sel;
         out.point_lit = point_light_eval(sel, world, v.normal);
     } else {
-        // MONKEY (ext light k8): `box = 0` — an exterior doodad/MODD prop is its own draw unit and
+        // MONKEY (ext light k12): `box = 0` — an exterior doodad/MODD prop is its own draw unit and
         // ranks from its baked PLACEMENT origin, exactly as it did before the widening.
         let sel = point_light_pick(v.anchor, 0.0);
         out.ext_sel = sel;

@@ -68,8 +68,8 @@ use benilla_formats::{PortalGraph, WmoGroupInfo};
 use bevy::prelude::*;
 
 use super::{
-    DynamicInteriors, FireLightGain, LightLane, LightLitRooms, LightReach, SyntheticFireLight,
-    WowLighting,
+    DynamicInteriors, FireLightGain, LightLane, LightLitRooms, LightReach, SpellFxLight,
+    SpellLightGain, SyntheticFireLight, WowLighting,
 };
 
 /// A `PointLight` that IS the daylight standing in one exterior-facing opening. Spawned with the
@@ -137,10 +137,15 @@ pub struct DaylightSeed {
     pub pos: [f32; 3],
     /// The opening's bounding-box diagonal (yd) — the reach formula's input.
     pub diag: f32,
-    /// The opening's area (yd^2) — the BUDGET rank key (largest first).
+    /// The opening's area (yd^2) — the rank key WITHIN a quota round (largest first).
     pub area: f32,
     /// The seed's height above the opening's bottom edge (yd) — the calibration geometry.
     pub hz: f32,
+    /// MONKEY (daylight quota): which ROUND of [`quota_select`] bought this slot — 0 = "this room
+    /// had no fixture yet", 1 = "its second opening", and so on. Carried on the seed rather than
+    /// returned beside it because the spawner consumes `Vec<DaylightSeed>` by value and the dump
+    /// wants the reason; 0 until the quota runs.
+    pub round: u8,
 }
 
 /// How far INTO the interior group an opening's fixture stands (yd). Far enough that the light is
@@ -223,10 +228,74 @@ const SEAM_MIN_XY_EXTENT: f32 = 1.0;
 /// are 338 yd^2 and a stitched threshold is tens. So the guard costs the city nothing it was
 /// keeping, and buys back the hitch.
 const SEAM_VERT_BUDGET: usize = 300_000;
-/// Openings per placement. The rank is by AREA, so what survives a cap is the building's real
-/// doorways and its largest windows. Eight is a whole facade's worth and still far under the
-/// 256-slot packed table, which a city's placements share.
+/// Openings per placement — **a BUILDING's budget, and now the floor of [`daylight_budget`]**. The
+/// rank is by AREA within each quota round, so what survives a cap is the building's real doorways
+/// and its largest windows. Eight is a whole facade's worth and still far under the 256-slot packed
+/// table, which a city's placements share.
 pub const MAX_DAYLIGHT_PER_PLACEMENT: usize = 8;
+/// MONKEY (daylight quota): the interior-group count above which a placement stops being a BUILDING
+/// and starts being a DISTRICT — past it [`daylight_budget`] scales with the rooms instead of
+/// holding at [`MAX_DAYLIGHT_PER_PLACEMENT`].
+///
+/// Not a taste number: MEASURED over the whole shipped WMO corpus (`benilla-extract wmolights` run
+/// on all 1 211 root `.wmo`s, 2026-09-13), the interior-group count is bimodal and the gap is wide.
+/// **1 183 of 1 211 roots (97.7 %) author 32 interior groups or fewer** — 1 049 author five or
+/// fewer, the Lion's Pride Inn authors 10, Northshire abbey 11 — and every one of those keeps the
+/// eight-slot budget it was calibrated on, unchanged. The 28 roots above the line are the cities and
+/// the raid interiors: Undercity 200, Stormwind 190, alphairon 146, Orgrimmar 129, Sunken Temple
+/// 122, Ironforge 103, Stratholme 91, Diremaul 74. Nothing in the corpus sits between 74 and 32.
+const DAYLIGHT_DISTRICT_ROOMS: usize = 32;
+/// MONKEY (daylight quota): the hard ceiling on one placement's fixtures, however many rooms it
+/// authors. The resource it protects is the 255-row packed point table (`global_light`'s
+/// `MAX_LIVE_POINT_LIGHTS`), which a city's own MOLT fixtures already contest — MEASURED, Stormwind
+/// puts up to 392 of its 606 MOLT lights inside `POINT_PACK_RADIUS` (300 yd) of one camera.
+///
+/// What makes 160 affordable rather than reckless is that **spawned is not packed**. A daylight
+/// fixture carries `LightRooms` naming its own group, so the packer admits it only when that room is
+/// in this frame's portal PVS or the fixture is within `INTERIOR_NEAR_ADMIT` (90 yd) of the camera.
+/// MEASURED over the whole selection, per placement (10 yd camera grid over each city): the worst
+/// 90 yd neighbourhood anywhere in the corpus holds **31** daylight rows — Stormwind, of the 154
+/// fixtures it spawns — against the **133** MOLT rows that same neighbourhood already packs. Undercity
+/// 19 of 74, Ironforge 15 of 71, Orgrimmar 10 of 48. So the per-frame cost of a whole city is ~20 %
+/// on top of its own torches, and the truncation that guards the 255-row cap is nearest-camera-first:
+/// what a full table drops is the FARTHEST fixture, whose ~20 yd pool was sub-pixel anyway.
+///
+/// 160 rather than 154 leaves the measured worst case (Stormwind, the largest seed list in the
+/// corpus) inside the ceiling with room to spare, so what decides a city's daylight is its ROOMS and
+/// not this constant. Lower it and the rooms that fall off are the ones with the narrowest openings.
+const DAYLIGHT_BUDGET_MAX: usize = 160;
+
+/// MONKEY (daylight quota): **how many openings THIS placement may seed** — the fix for a city
+/// being handed a building's budget.
+///
+/// MEASURED, and this is the whole argument (`benilla-extract wmolights` on
+/// `World\wmo\Azeroth\Buildings\Stormwind\Stormwind.wmo`, 2026-09-13): the city is ONE placement of
+/// 306 groups, **190 of them interior-class**, authoring 96 daylight seeds (71 portal + 25 aperture)
+/// and 58 bleed seeds across **136 distinct rooms**. Against a flat eight-slot budget ranked by
+/// area, the whole city's daylight is four 338 yd² canal-mouth portals (p233-p236, into g187-g190),
+/// two ~115 yd² apertures (g241 Dwarf01, g65) and two cathedral portals (g286, g183) — **eight
+/// fixtures in eight rooms, while 128 other rooms with an authored exterior doorway get nothing**.
+/// Every tavern and shop interior in the round-3 list (g21 Old Town, g44 Taventrance13, g57 Trade
+/// District, g58 BM02, g66 NEM02, g67/g69 The Canals, g68 NEH02) is in the losing 128: their
+/// doorways are 8-16 yd², two orders under a district portal, so no AREA rank can ever reach them —
+/// which is why the ranking changes too ([`quota_select`]) and not just the number.
+///
+/// The budget scales with ROOMS because a room is what a fixture is spent on, and one per room is
+/// the quota's own unit. Below [`DAYLIGHT_DISTRICT_ROOMS`] nothing moves at all; above it the
+/// placement gets one slot per interior group, capped at [`DAYLIGHT_BUDGET_MAX`].
+///
+/// What it produces: Goldshire inn 8 (and its eight are byte-identical to the old merge's — MEASURED,
+/// see [`quota_select`]), Northshire abbey 8, Ironforge 103, Stormwind 160. At Stormwind that budget
+/// takes the WHOLE seed list — 154 fixtures, 145 of them round-0, covering all 136 seedable rooms —
+/// so the ceiling binds nowhere in the corpus; Ironforge's whole list is 71 against a budget of 103.
+pub fn daylight_budget(groups: &[WmoGroupInfo]) -> usize {
+    let rooms = groups.iter().filter(|g| g.interior).count();
+    if rooms <= DAYLIGHT_DISTRICT_ROOMS {
+        MAX_DAYLIGHT_PER_PLACEMENT
+    } else {
+        rooms.min(DAYLIGHT_BUDGET_MAX)
+    }
+}
 
 /// The EFFECTIVE reach (yd) of an opening `diag` yards across — the radius `R` the shader actually
 /// windows the pool with: `clamp(1.5*diag + 4, 6, 20)`. The linear term says a wide doorway throws
@@ -447,8 +516,9 @@ fn nudge_inward(from: [f32; 3], g: &WmoGroupInfo, plane_n: Option<[f32; 3]>) -> 
 }
 
 /// **THE SELECTION RULE** — every exterior-facing opening of one WMO root, in WMO model space,
-/// ranked by area and capped at [`MAX_DAYLIGHT_PER_PLACEMENT`]. See the module doc for the two
-/// seeds and the corpus measurement behind having both.
+/// ranked and capped by the same quota the live path uses ([`quota_select`] over
+/// [`daylight_budget`]) with the bleed lane empty. See the module doc for the two seeds and the
+/// corpus measurement behind having both.
 ///
 /// `batches` is `(absolute group index, EXT-class?, the batch's model-space positions)` for every
 /// render batch of the root — the aperture seed's input, passed as an iterator so the caller can
@@ -462,9 +532,10 @@ pub fn daylight_seeds<'a, I>(
 where
     I: IntoIterator<Item = (u16, bool, &'a [[f32; 3]])>,
 {
-    let mut out = daylight_seeds_ranked(groups, portals, batches);
-    out.truncate(MAX_DAYLIGHT_PER_PLACEMENT);
-    out
+    let ranked = daylight_seeds_ranked(groups, portals, batches);
+    // MONKEY (daylight quota): the quota, not a truncate — so this entry point and
+    // [`placement_openings`] can never answer the same root differently.
+    quota_select(&ranked, &[], daylight_budget(groups)).0
 }
 
 /// MONKEY (portal bleed): the same rule, RANKED but not capped — the budget is now shared with the
@@ -542,6 +613,7 @@ where
             area: benilla_formats::room_claim::portal_area(&portals, *portal)
                 .unwrap_or_else(|| opening_area(lo, hi)),
             hz,
+            round: 0,
         });
     }
     let portal_seeds = out.len();
@@ -582,6 +654,7 @@ where
                 diag,
                 area: opening_area(lo, hi),
                 hz,
+                round: 0,
             });
         }
     }
@@ -622,12 +695,14 @@ where
                 // tall as it is wide, so its run squared is the honest comparable.
                 area: diag * diag,
                 hz,
+                round: 0,
             });
         }
     }
 
-    // Largest opening first: what a placement keeps once the shared budget cuts is its real
-    // doorways and its widest windows, and what it drops is the trim.
+    // Largest opening first. MONKEY (daylight quota): this is now the rank WITHIN one quota round
+    // (and the deterministic order [`quota_select`]'s index tie-break inherits) rather than the
+    // budget's own cut — what a room keeps is its widest opening, and what it drops is the trim.
     out.sort_by(|a, b| b.area.total_cmp(&a.area));
     out
 }
@@ -1171,8 +1246,12 @@ pub struct BleedSeed {
     /// fixture IS the opening.
     pub pos: [f32; 3],
     pub diag: f32,
-    /// The portal polygon's area — the shared budget's rank key.
+    /// The portal polygon's area — the rank key WITHIN a quota round.
     pub area: f32,
+    /// MONKEY (daylight quota): the round of [`quota_select`] that bought this slot. A bleed seed
+    /// serves BOTH its rooms, so its round is the LOWER of the two — a doorway into a room that has
+    /// nothing yet is a round-0 candidate even when its neighbour is already lit.
+    pub round: u8,
 }
 
 /// Every portal of one root whose BOTH sides are interior-class groups, ranked by area — the bleed
@@ -1252,6 +1331,7 @@ pub fn bleed_seeds(groups: &[WmoGroupInfo], portals: PortalGraph<'_>) -> Vec<Ble
             pos,
             diag,
             area,
+            round: 0,
         });
     }
     // Deterministic, largest first — the shared budget TRUNCATES, so an unstable order would give
@@ -1261,19 +1341,21 @@ pub fn bleed_seeds(groups: &[WmoGroupInfo], portals: PortalGraph<'_>) -> Vec<Ble
 }
 
 /// **THE ONE SELECTION ENTRY POINT** a placement calls: every opening of one WMO root that gets a
-/// fixture, daylight and bleed together, sharing the [`MAX_DAYLIGHT_PER_PLACEMENT`] budget and
-/// ranked against each other by AREA.
+/// fixture, daylight and bleed together, sharing one budget ([`daylight_budget`]) and ranked against
+/// each other by the [`quota_select`] rule.
 ///
 /// One budget rather than two because the resource being spent is the same one — slots in the packed
 /// point table, and fragments walked by every interior pixel of the building — and because the
-/// ranking question is the same question: which of this building's openings matter. A city's district
-/// portals (338 yd^2) still take every slot; the Lion's Pride Inn's eight begin with the hall doorway
-/// p2 (20.5, bleed), its porch door p0 (17.3, daylight) and the vestibule doorway p1 (17.3, bleed) —
-/// i.e. both halves of its entrance chain fit, because the two portals that used to outrank them
-/// (95.9 and 35.1 yd^2) are SPLIT cuts the bleed seed now refuses.
+/// ranking question is the same question: which of this placement's openings matter.
 ///
-/// Ties go to DAYLIGHT (`d < b` is what promotes a bleed): the sun standing in an opening is the
-/// bigger visual fact, and the inn's p0/p1 pair is exactly a tie at 17.34 yd^2.
+/// The Lion's Pride Inn's eight are unchanged by the quota (10 interior groups is under
+/// [`DAYLIGHT_DISTRICT_ROOMS`], and its openings are spread roughly one per room anyway): the hall
+/// doorway p2 (20.5, bleed), its porch door p0 (17.3, daylight) and the vestibule doorway p1 (17.3,
+/// bleed) — both halves of its entrance chain, because the two portals that used to outrank them
+/// (95.9 and 35.1 yd^2) are SPLIT cuts the bleed seed refuses.
+///
+/// Ties go to DAYLIGHT: the sun standing in an opening is the bigger visual fact, and the inn's
+/// p0/p1 pair is exactly a tie at 17.34 yd^2.
 pub fn placement_openings<'a, I>(
     groups: &[WmoGroupInfo],
     portals: PortalGraph<'_>,
@@ -1284,28 +1366,162 @@ where
 {
     let day = daylight_seeds_ranked(groups, portals, batches);
     let bleed = bleed_seeds(groups, portals);
-    // Two descending-by-area lists merged into one budget. A plain interleave rather than a
-    // concat-and-sort so each rule's own tie-break survives (both are already deterministic).
-    let (mut di, mut bi) = (0usize, 0usize);
+    quota_select(&day, &bleed, daylight_budget(groups))
+}
+
+/// MONKEY (daylight quota): **one fixture per ROOM before any room gets a second** — the ranking
+/// half of the city fix, and the reason raising the budget alone would not have been enough.
+///
+/// THE BUG THE OLD RANK HAD. Both lanes arrived sorted by opening AREA and were merged straight into
+/// the budget, so the budget went to the placement's biggest HOLES rather than to its rooms. That is
+/// the right question for a building — a facade's openings are all in a room or two, and area really
+/// does say which one matters — and exactly the wrong one for a district, where the areas span two
+/// orders of magnitude across rooms that are all equally dark inside their own door. MEASURED at
+/// Stormwind (see [`daylight_budget`]): four canal-mouth portals at 338 yd^2 took HALF the city's
+/// budget for four groups of one canal, while 68 interior groups holding an authored exterior portal
+/// — every tavern, shop and vestibule — sat at 8-16 yd^2 and could never rank. Raising the cap alone
+/// does not fix that: at a cap of 40 the next 32 winners are still 29-115 yd^2 apertures in the
+/// cathedral and the wine shop, and the taverns are still last.
+///
+/// THE RULE. Round-robin over rooms. A candidate's ROUND is how many fixtures its room already holds
+/// ON ITS OWN LANE (for a bleed, the LOWER of its two rooms — a doorway into a room with no bleed yet
+/// is a round-0 candidate even when its neighbour has one, because it is that room's first). Take the
+/// lowest round; break ties by area descending, then daylight over bleed, then seed order. So every
+/// room gets its best opening before any room gets a second, and WITHIN a round the old area rank is
+/// untouched — which is why a placement whose openings all share one room gets a byte-identical
+/// answer to the old merge's.
+///
+/// TWO BOOKS, NOT ONE, and the Lion's Pride Inn is why. A daylight fixture and a bleed fixture serve
+/// DIFFERENT HOURS: the sun in a doorway is gone after dark (`update_daylight_fixtures` strips its
+/// `PointLight` outright), and a doorway carrying the next room's candles is worth nothing at noon
+/// beside the sun. So a room holding one is not served against the other, and charging both to one
+/// counter mis-ranks exactly the case the bleed feature was built for. MEASURED: with ONE counter
+/// the inn loses `p1`, the vestibule doorway — its two rooms `g0` and `g1` are both already
+/// "served", `g0` by the porch DAYLIGHT portal `p0` and `g1` by the hall bleed `p2` — and the
+/// vestibule goes back to `interiorAmbient` at 20:50, the exact frame the owner photographed. With
+/// separate books `p1` is still a round-0 bleed and **the inn's eight come out identical to the old
+/// area merge's, fixture for fixture**. Northshire abbey moves by one swap (its `g7<->g2` doorway,
+/// which is the SECOND bleed of both its rooms, for `g9<->g8`, which is `g8`'s first).
+///
+/// COST. `O(budget x candidates)` with no allocation per step: 154 x 154 = 23 716 float compares for
+/// Stormwind, once, on the frame its placement spawns — against the 162 ms the boundary pass costs on
+/// the same root (and which [`SEAM_VERT_BUDGET`] already refuses). A linear rescan per slot rather
+/// than a heap because the key CHANGES as rooms fill, which is the thing a heap cannot express.
+pub fn quota_select(
+    day: &[DaylightSeed],
+    bleed: &[BleedSeed],
+    budget: usize,
+) -> (Vec<DaylightSeed>, Vec<BleedSeed>) {
+    // How many fixtures each room already holds, **keyed by `(group, daylight?)`** — the two books of
+    // the rule above. A `HashMap` rather than a `Vec` indexed by group: the caller's group ids are
+    // absolute indices into a root that may have 306 of them while eight rooms are ever touched —
+    // and nothing here ITERATES the map, so its non-deterministic order can never reach the output.
+    let mut taken: HashMap<(u16, bool), u8> = HashMap::new();
+    let mut used_day = vec![false; day.len()];
+    let mut used_bleed = vec![false; bleed.len()];
     let (mut day_keep, mut bleed_keep) = (Vec::new(), Vec::new());
-    while day_keep.len() + bleed_keep.len() < MAX_DAYLIGHT_PER_PLACEMENT {
-        match (day.get(di).map(|s| s.area), bleed.get(bi).map(|c| c.area)) {
-            (Some(d), Some(b)) if d < b => {
-                bleed_keep.push(bleed[bi]);
-                bi += 1;
+    while day_keep.len() + bleed_keep.len() < budget {
+        // The comparison key, smallest wins: `(round, -area, lane, index)`. `lane` is 0 for daylight
+        // and 1 for bleed — the tie the inn's p0/p1 pair lands on. `index` makes the order TOTAL, so
+        // two identical openings can never swap between launches.
+        let mut best: Option<(u8, f32, u8, usize, bool)> = None;
+        let consider = |round: u8, area: f32, lane: u8, i: usize, is_day: bool, best: &mut Option<(u8, f32, u8, usize, bool)>| {
+            let key = (round, -area, lane, i);
+            if best.is_none_or(|b| key < (b.0, b.1, b.2, b.3)) {
+                *best = Some((key.0, key.1, key.2, key.3, is_day));
             }
-            (Some(_), _) => {
-                day_keep.push(day[di]);
-                di += 1;
+        };
+        for (i, s) in day.iter().enumerate() {
+            if used_day[i] {
+                continue;
             }
-            (None, Some(_)) => {
-                bleed_keep.push(bleed[bi]);
-                bi += 1;
+            let round = taken.get(&(s.group, true)).copied().unwrap_or(0);
+            consider(round, s.area, 0, i, true, &mut best);
+        }
+        for (i, s) in bleed.iter().enumerate() {
+            if used_bleed[i] {
+                continue;
             }
-            (None, None) => break,
+            // The LOWER of the two rooms, on the BLEED book — see THE RULE above.
+            let round = s
+                .sides
+                .iter()
+                .map(|g| taken.get(&(*g, false)).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            consider(round, s.area, 1, i, false, &mut best);
+        }
+        let Some((round, _, _, i, is_day)) = best else {
+            break; // every candidate spent
+        };
+        // The round is stamped on the KEPT copy (the dump's `q<n>` column) and the rooms it serves
+        // are charged for it, which is what moves the next pick on to the rooms still at zero.
+        if is_day {
+            used_day[i] = true;
+            let mut s = day[i];
+            s.round = round;
+            *taken.entry((s.group, true)).or_default() += 1;
+            day_keep.push(s);
+        } else {
+            used_bleed[i] = true;
+            let mut s = bleed[i];
+            s.round = round;
+            // BOTH rooms are charged: the doorway lights the pair, so neither of them is still
+            // waiting for its first one.
+            for g in s.sides {
+                *taken.entry((g, false)).or_default() += 1;
+            }
+            bleed_keep.push(s);
         }
     }
+    quota_dump(&day_keep, &bleed_keep, day.len() + bleed.len(), budget);
     (day_keep, bleed_keep)
+}
+
+/// MONKEY (daylight quota): the selection's own `WOW_POINTS_DUMP` block — WHY each opening got a
+/// slot, printed once when the placement spawns.
+///
+/// It rides here rather than on the per-frame `DAYLIGHT` lines because the round is a SELECTION-time
+/// fact and `DaylightFixture` is read (and struct-literal-built) by `global_light.rs`, another
+/// agent's file this round — a new field there would be a merge conflict for a readout. The format
+/// is the same family as [`update_daylight_fixtures`]'s: a header with the totals, then one indented
+/// row per fixture. `q<n>` is the reason: **`q0` = the first light this room has ever had** (the
+/// rule's whole point, and what a city's shop interiors now win on), `q1+` = its room was already
+/// served and this is its second opening. In a city an all-`q0` block IS the quota working; a block
+/// full of `q1`/`q2` on one group is the old failure mode coming back.
+fn quota_dump(day: &[DaylightSeed], bleed: &[BleedSeed], candidates: usize, budget: usize) {
+    if std::env::var_os("WOW_POINTS_DUMP").is_none() || day.is_empty() && bleed.is_empty() {
+        return;
+    }
+    let rooms: HashSet<u16> = day
+        .iter()
+        .map(|s| s.group)
+        .chain(bleed.iter().flat_map(|s| s.sides))
+        .collect();
+    eprintln!(
+        "[daylight] quota: {} of {candidates} opening(s) kept on a budget of {budget} — {} daylight + {} bleed over {} room(s)",
+        day.len() + bleed.len(),
+        day.len(),
+        bleed.len(),
+        rooms.len(),
+    );
+    for s in day {
+        eprintln!(
+            "  QUOTA q{}  g{}  {}{}  area {:7.2} yd^2  diag {:5.2}",
+            s.round,
+            s.group,
+            s.how.tag(),
+            s.portal.map_or(String::new(), |p| format!(" p{p}")),
+            s.area,
+            s.diag,
+        );
+    }
+    for s in bleed {
+        eprintln!(
+            "  QUOTA q{}  g{} <-> g{}  bleed p{}  area {:7.2} yd^2  diag {:5.2}",
+            s.round, s.sides[0], s.sides[1], s.portal, s.area, s.diag,
+        );
+    }
 }
 
 /// `entry * (1 - smoothstep(0, radius, max(|P - center| - slack, 0)))` — the CPU mirror of
@@ -1534,6 +1750,9 @@ pub fn update_bleed_fixtures(
     mut commands: Commands,
     knobs: Res<DynamicInteriors>,
     fire_gain: Res<FireLightGain>,
+    // MONKEY (spellLightGain): the spell lane's own dial, mirrored here for the same reason the fire
+    // one is — a doorway carries what its neighbour room is WORTH after the dials, not before.
+    spell_gain: Res<SpellLightGain>,
     mut bleeds: Query<(
         Entity,
         &DaylightFixture,
@@ -1552,6 +1771,10 @@ pub fn update_bleed_fixtures(
             Option<&super::LightRooms>,
             Has<SyntheticFireLight>,
             Has<DaylightFixture>,
+            // MONKEY (spellLightGain): last, and it OVERRIDES the synthetic bit below — every spell
+            // light also carries [`SyntheticFireLight`], so testing fire first would put a fireball
+            // on the hearth dial.
+            Has<SpellFxLight>,
         ),
         Without<BleedFixture>,
     >,
@@ -1573,7 +1796,7 @@ pub fn update_bleed_fixtures(
     let src: Vec<BleedSource<'_>> = if on && !live.is_empty() {
         sources
             .iter()
-            .filter_map(|(pl, gt, reach, lit_rooms, lane, rooms, synthetic, daylight)| {
+            .filter_map(|(pl, gt, reach, lit_rooms, lane, rooms, synthetic, daylight, spell)| {
                 if lit_rooms.is_some_and(|c| {
                     !c.rooms.groups.is_empty() && !live.contains(&c.rooms.instance)
                 }) {
@@ -1588,7 +1811,21 @@ pub fn update_bleed_fixtures(
                 let base = pl.intensity / (4.0 * std::f32::consts::PI);
                 // `fireLightGain` IS mirrored (a dial that darkens the hearth must darken what the
                 // doorway carries of it); the FLICKER deliberately is not.
-                let s = base * if synthetic { fire_gain.0.max(0.0) } else { 1.0 };
+                //
+                // MONKEY (spellLightGain): and the spell dial the same way, in the same ORDER the
+                // packer folds them (`global_light::build_light_data` ~:1328) — spell first, fire
+                // second, because a spell light carries BOTH markers and the two dials answer
+                // different questions (a hearth's brightness vs how hard combat may strobe a room).
+                // Without the mirror a player who turned `spellLightGain` to 0 would still see the
+                // fireball's light arrive through the doorway while its own row was dark.
+                let s = base
+                    * if spell {
+                        spell_gain.0.max(0.0)
+                    } else if synthetic {
+                        fire_gain.0.max(0.0)
+                    } else {
+                        1.0
+                    };
                 // …and `interiorGain`, which the packer applies to every interior fixture EXCEPT a
                 // `DaylightFixture`. Mirroring that exclusion here is what keeps the doorway from
                 // being dimmed twice: a bleed fixture IS a `DaylightFixture`, so the packer will not
@@ -1947,6 +2184,166 @@ mod tests {
             "smallest survivor {:?}",
             seeds.last().unwrap().area
         );
+    }
+
+    /// MONKEY (daylight quota): **a room's FIRST opening outranks any room's second** — the rule
+    /// that stops a district spending its whole budget on one canal.
+    ///
+    /// Twelve rooms, each with two windows, sized so the area rank INTERLEAVES them: room `i` has a
+    /// big window of `26 - 2i` yd^2 and a small one of `23 - 2i`, so by pure area the order runs
+    /// g0-big (26), g1-big (24), g0-small (23), g2-big (22), g1-small (21)… and the old rank's top
+    /// eight covered only FIVE rooms while three of them got two lights each. This is the shape of
+    /// Stormwind's failure in miniature (four canal portals, one canal, half the city's budget).
+    #[test]
+    fn the_quota_gives_every_room_one_before_any_room_two() {
+        // Room `i` is a 16 x 10 x 10 box centred at x = 10i, its windows on the y = -5 wall.
+        let groups: Vec<WmoGroupInfo> = (0..12)
+            .map(|i| {
+                let x = i as f32 * 10.0;
+                group(true, [x - 8.0, -5.0, 0.0], [x + 8.0, 5.0, 10.0])
+            })
+            .collect();
+        // `opening_area` is the two largest extents multiplied, so a `w x 0.1 x 2` slab on the wall
+        // is exactly `2w` yd^2 — the areas above, spelled as widths.
+        let window = |cx: f32, area: f32| {
+            let hw = 0.5 * (area / 2.0);
+            [
+                [cx - hw, -5.0, 1.0],
+                [cx + hw, -5.0, 1.0],
+                [cx + hw, -4.9, 3.0],
+                [cx - hw, -4.9, 3.0],
+            ]
+        };
+        let quads: Vec<(u16, [[f32; 3]; 4])> = (0..12u16)
+            .flat_map(|i| {
+                let x = i as f32 * 10.0;
+                let big = 26.0 - 2.0 * i as f32;
+                [(i, window(x - 4.0, big)), (i, window(x + 4.0, big - 3.0))]
+            })
+            .collect();
+        let batches = || quads.iter().map(|(g, q)| (*g, true, &q[..]));
+
+        // THE CONTROL: the uncapped, area-ranked list really does interleave the rooms — its first
+        // eight cover five rooms, three of them twice. Without this the test below could pass on a
+        // corpus the old rule would have handled just as well.
+        let ranked = daylight_seeds_ranked(&groups, PortalGraph::default(), batches());
+        assert_eq!(ranked.len(), 24, "every window seeds: {ranked:?}");
+        let by_area: HashSet<u16> = ranked[..MAX_DAYLIGHT_PER_PLACEMENT]
+            .iter()
+            .map(|s| s.group)
+            .collect();
+        assert_eq!(by_area.len(), 5, "pure area doubles up: {by_area:?}");
+
+        // THE RULE, through the live entry point. Twelve interior groups is under
+        // `DAYLIGHT_DISTRICT_ROOMS`, so the budget is still the building floor of eight — and those
+        // eight now land in eight DIFFERENT rooms, every one of them a room's first light.
+        assert_eq!(daylight_budget(&groups), MAX_DAYLIGHT_PER_PLACEMENT);
+        let kept = daylight_seeds(&groups, PortalGraph::default(), batches());
+        assert_eq!(kept.len(), MAX_DAYLIGHT_PER_PLACEMENT);
+        let rooms: HashSet<u16> = kept.iter().map(|s| s.group).collect();
+        assert_eq!(rooms.len(), MAX_DAYLIGHT_PER_PLACEMENT, "one each: {kept:?}");
+        assert!(kept.iter().all(|s| s.round == 0), "all first lights: {kept:?}");
+        // …and the eight rooms are the ones with the WIDEST first opening, in that order: within a
+        // round the old area rank is untouched.
+        for (n, s) in kept.iter().enumerate() {
+            assert_eq!(s.group, n as u16);
+            assert!((s.area - (26.0 - 2.0 * n as f32)).abs() < 1e-3, "{s:?}");
+        }
+
+        // THE SECOND ROUND, and the cap. With twenty slots every room takes its big window first
+        // (twelve round-0 picks), and only then do eight rooms take their small one — nothing
+        // reaches a third opening because no room has one.
+        let (day, _) = quota_select(&ranked, &[], 20);
+        assert_eq!(day.len(), 20);
+        assert_eq!(day.iter().filter(|s| s.round == 0).count(), 12);
+        assert_eq!(day.iter().filter(|s| s.round == 1).count(), 8);
+        assert!(day.iter().all(|s| s.round < 2));
+        assert_eq!(
+            day.iter().map(|s| s.group).collect::<HashSet<_>>().len(),
+            12,
+            "every room served in round 0"
+        );
+        // The budget TRUNCATES, at any size, and a budget of zero spends nothing.
+        assert_eq!(quota_select(&ranked, &[], 5).0.len(), 5);
+        assert_eq!(quota_select(&ranked, &[], 0).0.len(), 0);
+        assert_eq!(quota_select(&ranked, &[], 999).0.len(), 24, "runs out of seeds, not slots");
+    }
+
+    /// MONKEY (daylight quota): the budget itself — a building holds at eight, a district scales
+    /// with its rooms, and nothing scales past the ceiling.
+    #[test]
+    fn the_budget_scales_only_past_a_district() {
+        let rooms = |n: usize, interior: bool| -> Vec<WmoGroupInfo> {
+            (0..n)
+                .map(|_| group(interior, [0.0; 3], [10.0, 10.0, 10.0]))
+                .collect()
+        };
+        // The whole small-building corpus (1 183 of 1 211 shipped roots) is on this arm, the inn
+        // (10 interior groups) and the abbey (11) included: nothing moves.
+        assert_eq!(daylight_budget(&rooms(0, true)), MAX_DAYLIGHT_PER_PLACEMENT);
+        assert_eq!(daylight_budget(&rooms(10, true)), MAX_DAYLIGHT_PER_PLACEMENT);
+        assert_eq!(
+            daylight_budget(&rooms(DAYLIGHT_DISTRICT_ROOMS, true)),
+            MAX_DAYLIGHT_PER_PLACEMENT
+        );
+        // One room past the line it is a district and pays per room — Ironforge's 103 interior
+        // groups, Stormwind's 190 against the 128 ceiling.
+        assert_eq!(daylight_budget(&rooms(DAYLIGHT_DISTRICT_ROOMS + 1, true)), 33);
+        assert_eq!(daylight_budget(&rooms(103, true)), 103);
+        assert_eq!(daylight_budget(&rooms(190, true)), DAYLIGHT_BUDGET_MAX);
+        // EXTERIOR groups are not rooms: Stormwind's 116 exterior-class groups buy nothing, which is
+        // why the count is `g.interior` and not `groups.len()`.
+        assert_eq!(daylight_budget(&rooms(200, false)), MAX_DAYLIGHT_PER_PLACEMENT);
+    }
+
+    /// MONKEY (daylight quota): a BLEED serves TWO rooms, so its round is the lower of them — a
+    /// doorway into a room with nothing yet beats a second opening of an already-lit room, even
+    /// when that second opening is five times its area.
+    #[test]
+    fn a_bleed_ranks_by_its_darker_room() {
+        let seed = |group: u16, area: f32| DaylightSeed {
+            group,
+            portal: None,
+            how: DaylightHow::Aperture,
+            pos: [0.0, 0.0, 0.0],
+            diag: 4.0,
+            area,
+            hz: 1.0,
+            round: 0,
+        };
+        let day = [seed(0, 100.0), seed(0, 50.0)];
+        let bleed = [BleedSeed {
+            sides: [0, 1],
+            portal: 7,
+            pos: [0.0, 0.0, 0.0],
+            diag: 4.0,
+            area: 10.0,
+            round: 0,
+        }];
+        let (d, b) = quota_select(&day, &bleed, 2);
+        // Slot 1: g0's 100 yd^2 aperture (every candidate is round 0; area decides).
+        assert_eq!(d.len(), 1);
+        assert!((d[0].area - 100.0).abs() < 1e-3);
+        // Slot 2: g0's own 50 yd^2 aperture is now a ROUND-1 candidate, while the doorway is still
+        // round 0 — g1 has nothing. The doorway wins on round, not on area.
+        assert_eq!(b.len(), 1, "the doorway into the dark room took the slot");
+        assert_eq!(b[0].round, 0);
+        // Slot 3 is what is left, and its round shows the TWO BOOKS: the doorway charged g0's BLEED
+        // book, not its daylight one, so g0's second aperture comes in at daylight-round 1 — not 2.
+        // One shared counter would say 2 here, and that off-by-one is exactly what costs the inn its
+        // vestibule doorway (see [`quota_select`]).
+        let (d3, b3) = quota_select(&day, &bleed, 3);
+        assert_eq!(d3.len() + b3.len(), 3);
+        assert_eq!(d3.last().unwrap().round, 1, "{d3:?}");
+
+        // …and the mirror of the same fact: a room served only by a DOORWAY still has a round-0
+        // DAYLIGHT candidate, because the sun it is missing by day is not the candles it borrows by
+        // night. g1 has the doorway above and one small window; both come in at round 0.
+        let day2 = [seed(0, 100.0), seed(1, 5.0)];
+        let (d4, b4) = quota_select(&day2, &bleed, 3);
+        assert_eq!(b4.len(), 1);
+        assert!(d4.iter().all(|s| s.round == 0), "{d4:?}");
+        assert!(d4.iter().any(|s| s.group == 1), "g1's window is a first light: {d4:?}");
     }
 
     /// MONKEY (daylight fixtures: boundary): the stitched-threshold seed — it finds the shared

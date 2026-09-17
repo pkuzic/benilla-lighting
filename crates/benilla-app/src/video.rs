@@ -378,6 +378,14 @@ pub(crate) struct VideoConfig {
     /// [`benilla_world::lighting::FireLightGain`] by `dynamic_interior`, and applied at PACK time
     /// so it is live.
     pub(crate) fire_light_gain: f32,
+    /// MONKEY (spellLightGain): gain on every light a SPELL EFFECT invented — a kit's aura glow, a
+    /// missile's core, an impact flash, a firework shell's burst (`spellLightGain`, 0..4; `0` = the
+    /// spell-light lane off). Bridged to benilla-world's
+    /// [`benilla_world::lighting::SpellLightGain`] by `dynamic_interior` and applied at PACK time,
+    /// so it is live. Deliberately NOT folded into `fireLightGain`: a spell light is tagged
+    /// synthetic too, and one dial over both would mean turning the world's hearths down darkened
+    /// every fireball in the game.
+    pub(crate) spell_light_gain: f32,
     /// MONKEY (flame flicker): how strongly every FLAME's brightness wobbles (`fireFlicker`, 0..2;
     /// `1` = the authored per-kind amplitudes, `0` = the pre-feature steady constants, `2` =
     /// doubled). Bridged to `DynamicInteriors::flicker` and applied at PACK time, so it is live —
@@ -437,6 +445,7 @@ impl Default for VideoConfig {
             // under 10 % (see `lighting::DynamicInteriors::bake_floor`).
             interior_bake_floor: 0.12,
             fire_light_gain: 1.0,
+            spell_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
                 DisplayMode::Windowed

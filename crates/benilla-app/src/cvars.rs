@@ -792,6 +792,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own: brightness of lights synthesised from fire props' flame emitters (0 = off)",
     ),
+    // MONKEY (spellLightGain): the same dial for the SPELL lane — a kit's aura glow, a missile's
+    // core, an impact flash, a firework's burst. A separate knob from the one above it because the
+    // two are separate judgements: that one tunes SCENERY (how bright is the invented campfire),
+    // this one tunes COMBAT (how hard does a fight flash the room), and a spell light carries both
+    // markers, so one dial over both would mean dimming the world's hearths to calm a fireball.
+    // `0` is this lane's kill switch and reaches nothing else.
+    ours(
+        "spellLightGain",
+        "1",
+        "benilla's own: brightness of spell, missile and impact lights (0 = off)",
+    ),
     // MONKEY (flame flicker): how hard every FLAME breathes — candles fast and shallow, bonfires
     // slow and shallower still (`benilla_world::lighting::FlameKind`). Live like the gain beside
     // it, and `0` restores the steady constants every fire had before the feature, which is the
@@ -1366,6 +1377,9 @@ fn apply_to_knobs(name: &str, value: &str, knobs: &mut Knobs) -> bool {
         "interiorbakefloor" => knobs.video.interior_bake_floor = v.clamp(0.0, 1.0),
         // MONKEY (fire GO lights): the synthesised-fire gain, clamped at the edge like the rest.
         "firelightgain" => knobs.video.fire_light_gain = v.clamp(0.0, 4.0),
+        // MONKEY (spellLightGain): the spell lane's gain, same range and same edge clamp — and `0`
+        // is meaningful here (the lane off) exactly as it is for the fire gain above.
+        "spelllightgain" => knobs.video.spell_light_gain = v.clamp(0.0, 4.0),
         // MONKEY (flame flicker): 0..2 — the amplitudes are authored at 1, and 2 is the deliberate
         // over-drive for judging the shape. Clamped at the edge like every knob here.
         "fireflicker" => knobs.video.fire_flicker = v.clamp(0.0, 2.0),
@@ -1671,7 +1685,7 @@ fn sync_cvars(
                 .collect(),
         );
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-        let session: [(&str, String); 72] = [
+        let session: [(&str, String); 73] = [
             ("MasterVolume", sound.master.to_string()),
             ("SoundVolume", sound.sfx.to_string()),
             ("MusicVolume", sound.music.to_string()),
@@ -1750,6 +1764,7 @@ fn sync_cvars(
             ("interiorDaylight", video.interior_daylight.to_string()),
             ("interiorBakeFloor", video.interior_bake_floor.to_string()),
             ("fireLightGain", video.fire_light_gain.to_string()),
+            ("spellLightGain", video.spell_light_gain.to_string()),
             ("fireFlicker", video.fire_flicker.to_string()),
             // The reference's polarity: the CVar is `gxWindow`, so `1` is the WINDOWED state.
             (
@@ -2191,6 +2206,13 @@ mod tests {
         // surfaces under +10 %) is only true at this number.
         assert_eq!(d["interiorBakeFloor"], shadows.interior_bake_floor);
         assert_eq!(d["interiorBakeFloor"], 0.12);
+        // MONKEY (fire GO lights) / MONKEY (spellLightGain): the two invented-light gains weld the
+        // same way. Both ship at 1 — the point of each is that it is a DIAL, not a default look —
+        // and the pin below is what keeps a tuning session from leaving one of them shipped at the
+        // value it was last dragged to in the debug panel.
+        assert_eq!(d["fireLightGain"], shadows.fire_light_gain);
+        assert_eq!(d["spellLightGain"], shadows.spell_light_gain);
+        assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
         // Render scale (1639) welds to OFF. Not a taste default: the whole tree of visual

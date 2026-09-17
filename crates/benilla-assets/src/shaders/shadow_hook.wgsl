@@ -108,6 +108,77 @@ const TORCH_PCSS_MAX: f32 = 4.0;
 // Above this filter radius (texels) the 4-tap box is too sparse and earns the second ring.
 const TORCH_PCSS_WIDE: f32 = 1.5;
 
+// MONKEY (slope bias): the per-tap RECEIVER-PLANE correction's ceiling, in multiples of the
+// constant `bias`. A PCF/PCSS tap `n` texels off centre lands on a piece of the SAME surface whose
+// stored depth differs by the receiver plane's own depth gradient times `n`; `torch_map_shadow`
+// walks that tap's compare reference along the plane by exactly that much, so a tap on the
+// receiver's own plane compares equal-to-equal and can never fail, at any grazing angle. What the
+// correction must NOT do is walk so far that a tap on a real OCCLUDER also passes - that is
+// peter-panning, a shadow lifting off its contact - so it is clamped at `TORCH_SLOPE_MAX * bias`.
+//
+// THE ARITHMETIC - and a CORRECTION to round 3's. The receivers' `TORCH_NORMAL_OFFSET` note prices
+// all of this in "yards of RAY distance", which is not what `textureSampleCompareLevel` compares:
+// the stored value is `ndc.z` on the cube FACE the fragment lands in, and under a perspective
+// projection that is a function of the VIEW-SPACE Z - the component along the FACE AXIS - not of
+// the ray length. Two things follow that the round-3 table cannot show:
+//
+//   · a floor directly under a fixture lands in the DOWN face, where its view-space Z is the
+//     constant `h`, so its stored depth is CONSTANT across that whole face and there is no
+//     gradient to clear at all - acne is impossible there. It begins the moment `r > h` and the
+//     fragment crosses into a SIDE face, whose view-space Z is the HORIZONTAL distance and along
+//     which the floor runs away from the eye. On a side face the gradient works out to `2A/(f*h)`
+//     per unit uv (`A = near*far/(far-near)`, `f = 1/tan(fov/2)`) - i.e. it depends on the
+//     fixture's HEIGHT and not at all on `r`: the same at 3 yd out as at 30.
+//   · the note's normal-offset term `0.15*(h/t)` is INVERTED. Moving the sample point 0.15 yd up
+//     off a grazing floor moves the place where its own shadow ray meets that floor by
+//     `0.15*(t/h)` - amplified by the grazing angle, not reduced by it. So the offset is worth
+//     about `(t/h)^2` times what round 3 credited it with, which is why a knee-high fixture's pool
+//     was in fact clean to ~10 yd rather than to ~2.1.
+//
+// Re-measured exactly (scratchpad `slopebias_exact.py`: the real reverse-Z cube face, the real
+// `torch_face` pick on the OFFSET point, the widened kernel's 8 taps at 3 and 6 texels, each
+// SNAPPED to its texel centre, compared against the real floor plane). BREAK RADIUS = how far a
+// fixture `h` yd above a flat floor lights before its own worst tap starts to fail:
+//
+//     h (yd)      before        after
+//     4.0         clean         clean        a chandelier, a lamppost head
+//     3.0         clean         clean        a WALL TORCH - always was fine, and stays fine
+//     2.0        25.8 yd        clean        a brazier
+//     1.5        14.1 yd        clean
+//     1.0        10.1 yd        clean        the IMP's hand flame - the reported case
+//     0.5         7.3 yd        clean        a candle standing on the floor
+//     0.25        7.1 yd       11.7 yd       CLAMPED - see below
+//
+// "clean" = no tap fails anywhere out to the projection's usable 46 yd, i.e. the acne is GONE and
+// not merely pushed outward. Where a tap was already passing the margin simply widens, at h = 1 yd:
+// +3.5e-4 -> +2.3e-3 at r = 9, +1.7e-3 -> +3.6e-3 at r = 5; and where it was failing, -5.1e-4 ->
+// +1.5e-3 at r = 15. The h = 3 wall-torch rows move 1.0x-2.7x in the same direction and never
+// change verdict, which is the "forge floor unchanged, still attached at contact" requirement.
+//
+// The BLOCKER SEARCH matters as much as the taps. At h = 1, r = 15 its own 3-texel taps were
+// self-detecting (-5.1e-4). That darkens nothing, but it hands `TORCH_PCSS_K` a blocker ratio made
+// entirely of bias error - a pool going soft with nothing in it. Corrected: +1.5e-3.
+//
+// WHY 4 AND NOT MORE. The correction the outermost tap WANTS is 2.8e-3 at h = 1 and 6.8e-3 at
+// h = 0.5, against the `4*bias` = 4e-3 ceiling: free at h = 1, clamped at h = 0.5 - and clamped is
+// still enough there (+3.5e-3 at r = 9). It only falls short under a QUARTER-yard fixture, a light
+// effectively lying on the ground, where the surface is near-edge-on to it, `max(N.L, 0)` has
+// already taken the term toward zero, and refusing to move further is the conservative answer. A
+// TILTED receiver wants LESS, not more (2.7e-4 at 45 deg, 3.0e-4 at 75 deg: the face pick swings
+// back to the DOWN face and the gradient collapses), so raising the ceiling would buy nothing
+// anywhere except the one case where it is deliberately declining to act, while starting to lift
+// genuine contact shadows - the single failure mode a shadow bias must never have.
+const TORCH_SLOPE_MAX: f32 = 4.0;
+
+// MONKEY (slope bias): ONE tap's compare reference - the centre reference walked along the RECEIVER
+// PLANE by `dot(grad, off)` and bounded at +/-`lim`. `grad` is `d(ndc.z)/d(uv)` restricted to that
+// plane (built once per call in `torch_map_shadow`), `off` is the tap's uv displacement from the
+// centre. Three ALU and a clamp, no texture read. It is a function rather than four inline
+// expressions so a tap's OFFSET and its REFERENCE cannot drift apart - they are the same argument.
+fn torch_plane_ref(ref_depth: f32, grad: vec2<f32>, off: vec2<f32>, lim: f32) -> f32 {
+    return ref_depth + clamp(dot(grad, off), -lim, lim);
+}
+
 // MONKEY (pcss): one RAW depth texel of a torch map — the blocker search's read. `textureLoad`
 // takes no sampler and imposes no uniformity requirement, which is what makes the search legal
 // inside the receivers' per-fixture loop. The clamp is the border rule: a search that walks off the
@@ -129,8 +200,17 @@ fn torch_map_depth(
 //   - `view_proj`  the fixture's down-looking reverse-Z matrix.
 //   - `layer`      which array layer (fixture index) to sample.
 //   - `world_pos`  the receiving fragment's world position.
+//   - `normal`     MONKEY (slope bias): the receiving surface's world-space normal, used ONLY to
+//                  build the receiver plane whose depth gradient each tap's compare reference is
+//                  walked along (see `TORCH_SLOPE_MAX`). It need not be unit and may be the zero
+//                  vector - the M2 corpus authors those, and a zero normal simply switches the
+//                  slope term off, leaving the constant bias exactly as it was. Callers pass the
+//                  SAME normal they already offset `world_pos` along (`TORCH_NORMAL_OFFSET`), so
+//                  the offset point and the plane through it agree by construction.
 //   - `depth_tex`/`comp`  the group-3 depth array + `GreaterEqual` comparison sampler.
 //   - `bias`       reverse-Z receiver bias (nudges the compare ref up to kill self-shadow acne).
+//                  MONKEY (slope bias): still a CONSTANT floor under every tap - the slope term is
+//                  added on top of it per tap, never in place of it.
 //   - `soft`       MONKEY (torch caster selection): the BASE PCF tap-radius scale
 //                  (`interiorShadowSoft`, 0.5..3, carried in the table's `count.y` LOW half as
 //                  `soft x 100`). The four taps sit at ±0.5 texel × this; 1 is the historical
@@ -173,10 +253,16 @@ fn torch_map_depth(
 // Cost: 4 unfiltered loads, then 4 comparison taps (the shipped kernel, unchanged) whenever the
 // search finds no blocker — which is every fully-lit fragment, i.e. most of a pool — or 8 when the
 // widened radius earns them. Worst case 8 compares + 4 loads per fixture per fragment.
+// MONKEY (slope bias) adds NO texture read at all: ~90 ALU once per call (two crosses, two
+// `mat4x4 * vec4`, a 2x2 solve) to build the receiver-plane gradient, then a dot-clamp-add — about
+// 5 ALU — on each of the 4 search taps and 4 or 8 PCF taps. The gradient cannot hoist out of the
+// receivers' per-fixture loop (it depends on the fixture's own face matrix), but it is bounded by
+// `EXT_SEL_SHADOWED` there exactly as the taps are.
 fn torch_map_shadow(
     view_proj: mat4x4<f32>,
     layer: i32,
     world_pos: vec3<f32>,
+    normal: vec3<f32>,
     depth_tex: texture_depth_2d_array,
     comp: sampler_comparison,
     bias: f32,
@@ -198,10 +284,69 @@ fn torch_map_shadow(
     // a scale still samples a real (hard) box rather than four copies of one texel.
     let base = max(soft, 0.05);
     // Reverse-Z: the fragment is lit iff its own depth is at least the stored nearest depth, so the
-    // compare ref is `ndc.z + bias` against `GreaterEqual`. UNCHANGED bias semantics: the same
-    // biased reference decides both the blocker test and every comparison tap, so a surface can no
-    // more blocker-detect itself than it could shadow itself.
+    // compare ref is `ndc.z + bias` against `GreaterEqual`. UNCHANGED bias semantics: this is the
+    // CENTRE reference, and the blocker test and every comparison tap are derived from this one
+    // expression, so a surface can no more blocker-detect itself than it could shadow itself.
+    // MONKEY (slope bias): "derived from" rather than "is" - each tap now adds its own
+    // receiver-plane term on top (`torch_plane_ref` below), which strengthens that property rather
+    // than weakening it: the taps that used to self-detect were exactly the off-centre ones.
     let ref_depth = ndc.z + bias;
+
+    // MONKEY (slope bias) — RECEIVER-PLANE DEPTH BIAS. `bias` is a constant and the thing it has to
+    // clear is not: a tap `n` texels off centre reads a piece of the SAME surface whose stored depth
+    // differs by the receiver plane's own gradient times `n`, and on a floor lit from a low angle
+    // that gradient is the whole problem (`TORCH_SLOPE_MAX` has the measured numbers — a knee-high
+    // flame's floor starts losing to it past 10 yd, a candle's past 7, and the taps that fail
+    // print as faint rings out at the rim of the pool where the term is still visible). So every
+    // tap gets its OWN reference, walked along the receiver's plane by what
+    // that plane does over that tap's displacement: a tap sitting on the plane then compares
+    // equal-to-equal and cannot fail at any grazing angle, while a tap on a real occluder is
+    // untouched — the occluder is not on this plane, which is what makes it an occluder.
+    //
+    // `grad` is `d(ndc.z)/d(uv)` restricted to the plane through `world_pos` with normal `normal`,
+    // computed ANALYTICALLY rather than from `dpdx`/`dpdy` of the ndc. Two reasons, both hard:
+    //   · every call site is inside a receiver's per-fixture table scan, with data-dependent
+    //     `continue`s and an early `return` (`torch_map_at`, `torch_terrain_shadow`,
+    //     `torch_entity_shadow_at`) — NON-UNIFORM control flow, where WGSL's derivative-uniformity
+    //     rule makes `dpdx` a diagnostic at best and a neighbouring-fixture read at worst;
+    //   · screen-space derivatives are a QUAD difference, so they are wrong by construction on a
+    //     two-pixel-wide sliver and along every silhouette — exactly the geometry (fence rails,
+    //     chair legs, tent ropes) this lane spends its taps on.
+    // The analytic form needs no quad and no uniformity, and is EXACT for a plane.
+    //
+    // Any two independent vectors IN the plane give the same gradient, so the tangents are left
+    // un-normalised and `normal` need not be unit: only the plane's direction SPACE matters and the
+    // 2x2 solve is invariant to how it is spanned. `a` picks the axis the normal is least aligned
+    // with, so the first cross is never near-degenerate. A ZERO normal (the M2 corpus authors them
+    // — see `wow_normalize` in the receivers) leaves `grad` at zero, i.e. the old constant-bias
+    // behaviour, bit-for-bit.
+    var grad = vec2<f32>(0.0);
+    if (dot(normal, normal) > 1e-12) {
+        let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0),
+                       abs(normal.x) > abs(normal.z));
+        let t1 = cross(normal, a);
+        let t2 = cross(normal, t1);
+        // d(clip) along each tangent, then through the perspective divide:
+        // `d(ndc) = (d(clip).xyz - ndc * d(clip).w) / clip.w`.
+        let c1 = view_proj * vec4<f32>(t1, 0.0);
+        let c2 = view_proj * vec4<f32>(t2, 0.0);
+        let inv_w = 1.0 / clip.w;
+        let g1 = (c1.xyz - ndc * c1.w) * inv_w;
+        let g2 = (c2.xyz - ndc * c2.w) * inv_w;
+        let u1 = g1.xy * vec2<f32>(0.5, -0.5);   // the same ndc -> uv flip `uv` above uses
+        let u2 = g2.xy * vec2<f32>(0.5, -0.5);
+        // Solve `dot(grad, u_i) = g_i.z` for i = 1, 2. `det` collapses only as the plane goes
+        // EDGE-ON to the fixture, where the plane projects to a line in the map, `max(N·L, 0)` has
+        // already taken the lit term to zero, and a zero gradient is the right answer anyway.
+        let det = u1.x * u2.y - u1.y * u2.x;
+        if (abs(det) > 1e-9) {
+            let inv = 1.0 / det;
+            grad = vec2<f32>((g1.z * u2.y - u1.y * g2.z) * inv,
+                             (u1.x * g2.z - g1.z * u2.x) * inv);
+        }
+    }
+    // …and the ceiling on what any one tap may be moved by. See `TORCH_SLOPE_MAX`.
+    let slope_lim = TORCH_SLOPE_MAX * bias;
 
     // MONKEY (pcss) 1/3 — BLOCKER SEARCH. Four raw reads on the diagonals of a box of half-width
     // `soft * TORCH_PCSS_SEARCH` texels, averaging the depths that lie IN FRONT of the receiver.
@@ -209,16 +354,26 @@ fn torch_map_shadow(
     // caster near me, and roughly how far in front", and denser searching costs more than the extra
     // precision buys on a 512² face whose texels are ~10 cm at a candle's range.
     let search = base * TORCH_PCSS_SEARCH * inv_dims;
-    let b0 = torch_map_depth(depth_tex, layer, uv + vec2<f32>(-1.0, -1.0) * search, dims);
-    let b1 = torch_map_depth(depth_tex, layer, uv + vec2<f32>( 1.0, -1.0) * search, dims);
-    let b2 = torch_map_depth(depth_tex, layer, uv + vec2<f32>(-1.0,  1.0) * search, dims);
-    let b3 = torch_map_depth(depth_tex, layer, uv + vec2<f32>( 1.0,  1.0) * search, dims);
+    // MONKEY (slope bias): the offsets are NAMED so the search's reference and its sample are the
+    // same displacement, exactly as in the PCF kernel below.
+    let s0 = vec2<f32>(-1.0, -1.0) * search;
+    let s1 = vec2<f32>( 1.0, -1.0) * search;
+    let s2 = vec2<f32>(-1.0,  1.0) * search;
+    let s3 = vec2<f32>( 1.0,  1.0) * search;
+    let b0 = torch_map_depth(depth_tex, layer, uv + s0, dims);
+    let b1 = torch_map_depth(depth_tex, layer, uv + s1, dims);
+    let b2 = torch_map_depth(depth_tex, layer, uv + s2, dims);
+    let b3 = torch_map_depth(depth_tex, layer, uv + s3, dims);
     var blocker = 0.0;
     var blockers = 0.0;
-    if (b0 > ref_depth) { blocker += b0; blockers += 1.0; }
-    if (b1 > ref_depth) { blocker += b1; blockers += 1.0; }
-    if (b2 > ref_depth) { blocker += b2; blockers += 1.0; }
-    if (b3 > ref_depth) { blocker += b3; blockers += 1.0; }
+    // MONKEY (slope bias): the SEARCH is plane-corrected too, and it has to be. Left on the flat
+    // reference, a grazing floor detects ITSELF as its own blocker, and the penumbra width below is
+    // then estimated from a depth difference that is pure bias error — a pool that goes soft with
+    // nothing in it. Same law, same `grad`, same clamp as the taps.
+    if (b0 > torch_plane_ref(ref_depth, grad, s0, slope_lim)) { blocker += b0; blockers += 1.0; }
+    if (b1 > torch_plane_ref(ref_depth, grad, s1, slope_lim)) { blocker += b1; blockers += 1.0; }
+    if (b2 > torch_plane_ref(ref_depth, grad, s2, slope_lim)) { blocker += b2; blockers += 1.0; }
+    if (b3 > torch_plane_ref(ref_depth, grad, s3, slope_lim)) { blocker += b3; blockers += 1.0; }
 
     // MONKEY (pcss) 2/3 — PENUMBRA WIDTH. `radius` stays at `base` when the search found nothing: a
     // caster thinner than the search box (a chair leg, a tent rope, a candlestick) must NOT be
@@ -241,17 +396,36 @@ fn torch_map_shadow(
     // past it that box would alias into four separate soft bands, so a second ring of four cardinal
     // taps at the full radius fills the area in.
     let texel = inv_dims * radius;
+    // MONKEY (slope bias): every tap carries its OWN plane-corrected reference. With `grad` zero -
+    // a receiver square-on to the fixture, or a zero normal - `torch_plane_ref` returns `ref_depth`
+    // unchanged and this kernel is the shipped one bit-for-bit.
+    let p0 = vec2<f32>(-0.5, -0.5) * texel;
+    let p1 = vec2<f32>( 0.5, -0.5) * texel;
+    let p2 = vec2<f32>(-0.5,  0.5) * texel;
+    let p3 = vec2<f32>( 0.5,  0.5) * texel;
     var sum = 0.0;
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>(-0.5, -0.5) * texel, layer, ref_depth);
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.5, -0.5) * texel, layer, ref_depth);
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>(-0.5,  0.5) * texel, layer, ref_depth);
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.5,  0.5) * texel, layer, ref_depth);
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + p0, layer,
+                                     torch_plane_ref(ref_depth, grad, p0, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + p1, layer,
+                                     torch_plane_ref(ref_depth, grad, p1, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + p2, layer,
+                                     torch_plane_ref(ref_depth, grad, p2, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + p3, layer,
+                                     torch_plane_ref(ref_depth, grad, p3, slope_lim));
     var pcf = sum * 0.25;
     if (radius > TORCH_PCSS_WIDE) {
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>(-1.0,  0.0) * texel, layer, ref_depth);
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 1.0,  0.0) * texel, layer, ref_depth);
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.0, -1.0) * texel, layer, ref_depth);
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + vec2<f32>( 0.0,  1.0) * texel, layer, ref_depth);
+        let p4 = vec2<f32>(-1.0,  0.0) * texel;
+        let p5 = vec2<f32>( 1.0,  0.0) * texel;
+        let p6 = vec2<f32>( 0.0, -1.0) * texel;
+        let p7 = vec2<f32>( 0.0,  1.0) * texel;
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + p4, layer,
+                                         torch_plane_ref(ref_depth, grad, p4, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + p5, layer,
+                                         torch_plane_ref(ref_depth, grad, p5, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + p6, layer,
+                                         torch_plane_ref(ref_depth, grad, p6, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + p7, layer,
+                                         torch_plane_ref(ref_depth, grad, p7, slope_lim));
         pcf = sum * 0.125;
     }
     // Phase 5: the six cube faces tile the whole sphere, so there is no cone edge to soften — a fade

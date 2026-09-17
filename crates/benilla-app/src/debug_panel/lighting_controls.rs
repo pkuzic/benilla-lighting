@@ -61,6 +61,10 @@ const GROUPS: &[(&str, &[Knob])] = &[
     ("Interior light", INTERIOR),
     ("Fire", &[
         knob!("fireLightGain", fire_light_gain, Slider(0.0..=4.0), "Brightness of lights synthesized from flame emitters."),
+        // MONKEY (spellLightGain): in the "Fire" group because a spell light IS one of the invented
+        // sources this group tunes — it is just the one whose brightness is a combat setting rather
+        // than a scenery one, which is exactly why it needs its own dial and not the one above it.
+        knob!("spellLightGain", spell_light_gain, Slider(0.0..=4.0), "Brightness of spell, missile and impact lights."),
         knob!("fireFlicker", fire_flicker, Slider(0.0..=2.0), "0 steady, 1 default, 2 pronounced."),
     ]),
     ("Torch shadows", &[

@@ -258,9 +258,14 @@ pub(crate) const SPELL_LIGHTS_MAX: usize = 24;
 /// latched on first call, so it cannot change under a running frame and costs one atomic load at
 /// each spawn site thereafter.
 ///
-/// An env var and not a cvar on purpose: this pass adds no cvar (the lighting cvars are another
-/// lane's file this session). The natural home for a live `spellLightGain` is the packer, beside
-/// `fireLightGain` — see the report note.
+/// An env var and STILL not a cvar, now that `spellLightGain` exists beside `fireLightGain`
+/// (MONKEY (spellLightGain) — `cvars.rs`, folded at pack time in
+/// `benilla_world::lighting::global_light::build_light_data`). The two are different tools and both
+/// are wanted: the cvar is the live BRIGHTNESS dial, and its `0` darkens a spell light that is
+/// still spawned, still parented, still aged and still counted against
+/// [`SPELL_LIGHTS_MAX`]; this switch stops the lights being CREATED at all, which is what an A/B
+/// against the pre-feature build needs (`WOW_SPELL_LIGHT=0` costs the frame nothing, and takes the
+/// claim walk in `carried_light::claim_carried_light_rooms` with it).
 pub(crate) fn spell_lights_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !matches!(std::env::var("WOW_SPELL_LIGHT").as_deref(), Ok("0")))

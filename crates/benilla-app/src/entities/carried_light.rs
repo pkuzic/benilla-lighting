@@ -28,7 +28,7 @@ use bevy::prelude::*;
 
 use benilla_world::interior::{InteriorAnchor, WmoResidency};
 use benilla_world::lighting::{
-    LightLane, LightLitRooms, LightRooms, ShadowProxyLight, SyntheticFireLight,
+    LightLane, LightLitRooms, LightRooms, ShadowProxyLight, SpellFxLight, SyntheticFireLight,
 };
 use benilla_world::static_gx::LightOwner;
 use benilla_world::terrain_stream::{carried_light_claims, point_light, CarriedClaimSet};
@@ -218,12 +218,20 @@ pub(super) fn spawn_spell_light(
 ///
 /// The tag set is three separate promises, and each one is load-bearing:
 /// - [`SyntheticFireLight`] — this light was INVENTED, not authored, so the packer's synthetic gain
-///   owns it (and a future `spellLightGain` would find it here).
+///   owns it and the `WOW_POINTS_DUMP` census counts it as one.
+/// - [`SpellFxLight`] — MONKEY (spellLightGain): the world-side twin of [`SpellLight`], and the
+///   one thing benilla-world is told about a spell light. It OVERRIDES the tag above in the
+///   packer's gain fold: a spell row takes `spellLightGain`, never `fireLightGain` (they compose
+///   nowhere — see [`benilla_world::lighting::SpellFxLight`] for why the marker is world-side
+///   rather than `SpellLight` itself moving down).
 /// - [`HeldLight`] — **never** an exterior torch-shadow caster. A spell light moves (a missile), is
 ///   born and dies inside a second, and would churn the cube-shadow cache at frame rate for a
 ///   shadow nobody could resolve in the time it exists. The marker is that lane's refusal.
 /// - [`SpellLight`] — the envelope and the budget ([`advance_spell_lights`] /
-///   [`budget_spell_lights`]), and the handle any future per-school gain or kill switch targets.
+///   [`budget_spell_lights`]), the handle any future per-school gain targets, and (MONKEY (spell
+///   light lane)) what [`claim_carried_light_rooms`] reads to let this light claim rooms while it
+///   MOVES: a missile can never settle, and a light with no claims takes the exterior lane, which
+///   the room shaders never read.
 ///
 /// No [`FlameFlicker`](benilla_world::lighting::FlameFlicker), deliberately: the flicker makes a
 /// fire breathe, and a spell light already has a shape of its own. The two together read as the
@@ -256,6 +264,7 @@ fn spawn_spell_light_child(
             Transform::from_translation(wow_to_bevy(local)),
             Visibility::default(),
             SyntheticFireLight,
+            SpellFxLight,
             HeldLight,
             SpellLight::new(base, fx.onset, mode),
             // The same owner exclusion every carried light takes: the flame sits INSIDE the thing
@@ -528,6 +537,39 @@ fn claims_at(
     })
 }
 
+/// MONKEY (spell light lane): **may this light claim rooms this frame?**
+///
+/// The settle rule ([`CarriedLightMotion::settled`]) exists to keep an O(groups) box scan per
+/// resident placement off a WALKING bearer: a pet's torch would rebuild its set every frame for a
+/// set that is about to be wrong again, so an unsettled carried light simply carries no claims and
+/// falls back to the single-anchor-room behaviour it had before claims existed.
+///
+/// A SPELL light inverts every term of that trade, so it is exempt:
+///
+/// * **It never settles, by construction.** A missile flies from the caster's hand to the target
+///   and is despawned on arrival; it can never hold still for [`STILL_HOLD`], so under the settle
+///   rule it could never claim a room for a single frame of its life. The gap is not a tuning
+///   question — an indoor fireball lit *nothing* on the way down a corridor, and only the impact's
+///   own burst (which IS momentarily still, at a dest anchor) ever reached a wall.
+/// * **The fallback it would take is empty.** An unsettled carried light still has its bearer's
+///   anchor room to fall back on; a missile is a FREE world entity with no `InteriorAnchor`
+///   anywhere above it ([`owner_lane`] walks to the top and answers `(None, 0.0)`), so "no claims"
+///   means the EXTERIOR lane — and the exterior lane is the one `interior_room_light` never reads,
+///   which is why the bolt lit no walls at all.
+/// * **The cost it was protecting against is bounded.** Spell lights are capped at
+///   [`SPELL_LIGHTS_MAX`](super::spell_fx::SPELL_LIGHTS_MAX) = 24 across every lane, and each lives
+///   for about a second. The claim walk is still change-gated by [`CarriedClaims::fresh`] — a light
+///   that has not drifted past [`CLAIM_DRIFT`] since it was measured keeps its set — so the worst
+///   case is 24 lights × (resident placements) containment scans in a frame, each of which
+///   early-outs on an AABB test per group and does no portal work at all unless some box holds the
+///   light. That is the same walk ~150 of Orgrimmar's brazier GameObjects run on their first frame.
+///
+/// Settling is still what the SHADOW lane reads, and this function does not touch it: a spell light
+/// is [`HeldLight`] and unsettled, so it is refused a cube-shadow slot exactly as before.
+fn may_claim(spell: bool, motion: Option<&CarriedLightMotion>) -> bool {
+    spell || motion.is_some_and(CarriedLightMotion::settled)
+}
+
 /// MONKEY (fire GO lights): give a CARRIED light the room its owner was classified into.
 ///
 /// A world-baked light gets its rooms at spawn from the building's own MODR/MOLR tables. An
@@ -568,12 +610,20 @@ fn claims_at(
 /// gated when the set was built, or every claim in the world would rebuild on a slider drag.
 ///
 /// **Gated on four things**, because the walk is an O(groups) box scan per resident placement and
-/// Orgrimmar has ~150 of these lights: the light must be SETTLED
-/// ([`CarriedLightMotion::settled`] — a walking pet's light re-claims no more often than the settle
-/// cadence, and while it is unsettled and off its build point it carries NO claims, i.e. exactly
-/// the single-anchor-room behaviour it had before this change), and the set is rebuilt only when
-/// the light drifts past [`CLAIM_DRIFT`], when [`WmoResidency`] ticks, or when the bearer's room
-/// changes ([`CarriedClaims::fresh`]).
+/// Orgrimmar has ~150 of these lights: the light must be allowed to claim ([`may_claim`] — SETTLED
+/// for an ordinary carried light, so a walking pet's light re-claims no more often than the settle
+/// cadence and while it is unsettled and off its build point it carries NO claims, i.e. exactly the
+/// single-anchor-room behaviour it had before this change; a SPELL light is exempt and claims while
+/// it flies), and the set is rebuilt only when the light drifts past [`CLAIM_DRIFT`], when
+/// [`WmoResidency`] ticks, or when the bearer's room changes ([`CarriedClaims::fresh`]).
+///
+/// MONKEY (spell light lane): and the LANE half is what makes a moving claim worth anything. A
+/// missile has no [`InteriorAnchor`] above it at all, so `want` is `None` and the bearer half of
+/// the lane verdict can never fire; it reaches the interior lane purely through [`lane_worthy`]'s
+/// claim half, which is the path an anchorless GameObject in an exterior-class canyon group already
+/// took. Without it the bolt packs on the EXTERIOR lane, whose entries `interior_room_light` skips
+/// outright (`static_gx.wgsl` drops every row with colour-row `.w < 0.5`) — the room's walls never
+/// see it, and only the impact's own burst, which lands still at a dest anchor, ever lit anything.
 ///
 /// Every component write below is change-gated on [`ClaimedRoom`]/[`CarriedClaims`]: a settled
 /// light is one hierarchy walk and three compares per frame, and nothing is written, so the light's
@@ -589,12 +639,23 @@ pub(crate) fn claim_carried_light_rooms(
             Entity,
             // MONKEY (GO room claims): the light's own WORLD position (the claim rule's input) and
             // its intensity (which sizes the portal hop). `Update` reads last frame's propagation,
-            // which is this frame's answer for anything settled — and only settled lights claim.
+            // which is this frame's answer for anything settled.
+            // MONKEY (spell light lane): a MOVING spell light now claims too, so for that one case
+            // this position is one frame stale — at a missile's ~25 yd/s that is ~0.4 yd at 60 Hz.
+            // Accepted rather than re-scheduled: the answer it feeds is ROOM MEMBERSHIP, whose
+            // smallest feature is a doorway a yard wide, and the light's brightness at a wall
+            // changes by nothing measurable over that distance. The alternative — moving this
+            // system into `PostUpdate` between `Propagate` and the packer — would put a full
+            // O(placements) walk for every carried light in the world (Orgrimmar: ~150) into the
+            // frame's tightest stage to buy 0.4 yd on 24 of them.
             &GlobalTransform,
             &PointLight,
             Option<&CarriedLightMotion>,
             Option<&mut ClaimedRoom>,
             Option<&mut CarriedClaims>,
+            // MONKEY (spell light lane): is this a spell light? It is the one carried light that
+            // claims while MOVING — see [`may_claim`].
+            Has<SpellLight>,
         ),
         (With<ChildOf>, Without<ShadowProxyLight>),
     >,
@@ -606,7 +667,7 @@ pub(crate) fn claim_carried_light_rooms(
     residency: Res<WmoResidency>,
 ) {
     let generation = residency.generation();
-    for (light, gt, pl, motion, mut claimed, mut claims) in &mut lights {
+    for (light, gt, pl, motion, mut claimed, mut claims, spell) in &mut lights {
         let (room, lane) = owner_lane(light, &parents, &anchors);
         // The room to claim IF we are on the interior lane: the one the anchor names this frame,
         // else the last one it named (the ramp-down window described on `ClaimedRoom::seen`).
@@ -621,7 +682,7 @@ pub(crate) fn claim_carried_light_rooms(
             .is_some_and(|c| c.fresh(at, generation, want));
         let set = if fresh {
             None
-        } else if motion.is_some_and(CarriedLightMotion::settled) {
+        } else if may_claim(spell, motion) {
             // The prop lane's own sizing: the intensity bucket (`PointLight` premultiplied 4π at
             // spawn, so this inverts it exactly) through the DEFAULT atten scale.
             let reach = benilla_formats::room_claim::claim_reach(
@@ -629,6 +690,11 @@ pub(crate) fn claim_carried_light_rooms(
                     pl.intensity / (4.0 * std::f32::consts::PI),
                 ),
             );
+            // MONKEY (spell light lane): for a spell light the FIRST entry is usually `None` —
+            // a missile has no bearer anchor to name a placement — so the steady-state probe is
+            // the SECOND: the building it claimed last frame. A bolt flying down a corridor stays
+            // in the building it was cast in, so that probe hits on every frame after the first
+            // and the full placement scan runs once per spell light, at birth.
             let prefer = [
                 want.map(|r| r.instance),
                 claims
@@ -639,7 +705,9 @@ pub(crate) fn claim_carried_light_rooms(
             Some(claims_at(&wmos, &placements, prefer, at, reach))
         } else {
             // Moved off its build point and not standing still: drop to the pre-claims behaviour
-            // rather than assert a set for a position it was not measured at.
+            // rather than assert a set for a position it was not measured at. A SPELL light never
+            // reaches here ([`may_claim`]) — for it the "position it was measured at" is simply
+            // re-measured, one frame late (see the `GlobalTransform` note on the query).
             Some(None)
         };
         // The set that stands THIS frame: the one just decided, else the one already applied. Read
@@ -994,6 +1062,86 @@ mod tests {
         assert!(
             !held.fresh(held.at, 7, None),
             "the bearer left the building"
+        );
+    }
+
+    /// GOLDEN — MONKEY (spell light lane). A SPELL light claims rooms **while it is moving**; every
+    /// other carried light must hold still first.
+    ///
+    /// This is the whole of the missile fix in one predicate. A projectile is despawned on arrival
+    /// and can never satisfy [`STILL_HOLD`], so under the settle rule it claimed nothing for its
+    /// entire life — and with no [`InteriorAnchor`] above it either, "no claims" left it on the
+    /// EXTERIOR lane, which `interior_room_light` never reads. An indoor fireball therefore lit no
+    /// wall at any point of its flight; only its impact, which lands still, ever did.
+    ///
+    /// The exemption is deliberately NOT "everything unsettled claims": the settle rule still keeps
+    /// a walking pet's torch from rebuilding an O(groups) scan per resident placement every frame.
+    /// It is bought for the spell lane alone, where the population is capped
+    /// ([`super::spell_fx::SPELL_LIGHTS_MAX`]) and each light lives about a second.
+    #[test]
+    fn a_spell_light_claims_while_it_flies_and_a_torch_still_must_settle() {
+        let moving = CarriedLightMotion {
+            last: Vec3::ZERO,
+            still_for: 0.0,
+        };
+        let parked = CarriedLightMotion {
+            last: Vec3::ZERO,
+            still_for: STILL_HOLD,
+        };
+        assert!(
+            may_claim(true, Some(&moving)),
+            "a missile's light claims mid-flight — the whole point"
+        );
+        assert!(
+            may_claim(true, None),
+            "and on its very first frame, before the motion tracker has seen it at all"
+        );
+        assert!(
+            !may_claim(false, Some(&moving)),
+            "a walking bearer's torch still waits: the scan it would run is about to be stale"
+        );
+        assert!(
+            may_claim(false, Some(&parked)),
+            "a placed brazier settles and claims exactly as before"
+        );
+        assert!(
+            !may_claim(false, None),
+            "born moving is not a licence to claim"
+        );
+    }
+
+    /// GOLDEN — MONKEY (spell light lane). The LANE half: a claim set with no bearer room behind it
+    /// still earns the INTERIOR lane, which is the only lane whose entries the room shaders read.
+    ///
+    /// A missile is a free world entity — [`owner_lane`] finds no [`InteriorAnchor`] above its
+    /// light and answers `(None, 0.0)` — so `want` is `None` and the bearer half of the lane
+    /// verdict can never fire for it. Everything therefore rests on [`lane_worthy`], and on both of
+    /// its conditions holding their meaning: a real room moves the light onto the interior lane,
+    /// and a district-scale exterior shell (Stormwind's districts, Orgrimmar's valley) does NOT —
+    /// a bolt flying over open cobbles must keep lighting them through `point_light_sum` rather
+    /// than be handed to a lane that would not reach them.
+    #[test]
+    fn an_anchorless_spell_light_takes_the_interior_lane_from_its_claims_alone() {
+        let set = |groups: &[u16], any_interior| CarriedClaimSet {
+            instance: Entity::PLACEHOLDER,
+            groups: groups.to_vec().into(),
+            fades: Vec::new().into(),
+            any_interior,
+        };
+        assert!(
+            lane_worthy(&set(&[3, 4], true)),
+            "a corridor and the room past its doorway: the walls must see the bolt"
+        );
+        assert!(
+            !lane_worthy(&set(&[3, 4], false)),
+            "an all-exterior set reaches no room lane, so moving onto it would only lose the pool"
+        );
+        assert!(
+            !lane_worthy(&set(
+                &[3, 4 | benilla_world::lighting::LIT_ROOM_EXT_DENY],
+                true
+            )),
+            "one district-scale shell in the set and the light stays on the cobbles it lights"
         );
     }
 }

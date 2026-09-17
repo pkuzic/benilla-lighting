@@ -534,6 +534,44 @@ impl Default for FireLightGain {
     }
 }
 
+/// MONKEY (spellLightGain): marks a `PointLight` that a SPELL EFFECT invented — a kit's aura glow,
+/// a missile's core, an impact flash, a firework shell's burst. The app's own
+/// `entities::spell_fx::SpellLight` carries the envelope, the mode and the budget; this is the
+/// two-word shadow of it the PACKER needs.
+///
+/// A world-side marker rather than moving `SpellLight` down here, deliberately. `SpellLight` is a
+/// LIFECYCLE — it reads `FxDecay` off the effect root, it knows `SpellLightMode::{Kit, Missile,
+/// Burst}`, it is aged and evicted by the effect lane's own budget — and every one of those
+/// concepts belongs to benilla-app's effect layer, which benilla-world knows nothing about and must
+/// not learn. What the packer needs is one bit ("scale this row by `spellLightGain`, not by
+/// `fireLightGain`"), so one bit is what crosses the crate boundary; the app inserts it at the one
+/// spawn site that makes a spell light (`carried_light::spawn_spell_light_child`), beside the other
+/// three markers it already stamps there.
+///
+/// Every spell light also carries [`SyntheticFireLight`] (it IS an invented source, and the census
+/// counts it as one). This marker OVERRIDES that one in the gain fold — see [`build_light_data`].
+#[derive(Component)]
+pub struct SpellFxLight;
+
+/// MONKEY (spellLightGain): the live gain on every spell-effect light (`spellLightGain`, default
+/// 1.0), bridged from benilla-app's cvars exactly as [`FireLightGain`] is, and applied at the same
+/// place for the same reason (a dial that needed a respawn to retune is not a dial).
+///
+/// Separate from `fireLightGain` because the two answer different questions. The fire gain tunes a
+/// CONTENT HEURISTIC — "how bright should the light we invented for this campfire prop be" — and
+/// its `0` is the kill switch for a lane that is not byte-verified against anything. This one tunes
+/// a GAMEPLAY lane: spell lights are short, bright and numerous, they are the one light source that
+/// can strobe a room during a fight, and a player who wants combat flashes turned down must not
+/// have to put out every hearth in the world to get it.
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+pub struct SpellLightGain(pub f32);
+
+impl Default for SpellLightGain {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
 /// MONKEY (torch shadows, Stage B): marks a `PointLight` that exists ONLY to render a cube shadow
 /// map (`benilla_app::torch_shadow`'s promoted fixtures). Such a proxy must NOT enter the
 /// `wow_light` light table — benilla's receivers would treat it as a real fixture and its nominal
@@ -622,6 +660,8 @@ pub(super) fn register(app: &mut App) {
         .init_resource::<DynamicInteriors>()
         // MONKEY (fire GO lights): the live gain on synthesised fire lights.
         .init_resource::<FireLightGain>()
+        // MONKEY (spellLightGain): and the one on spell-effect lights, which overrides it.
+        .init_resource::<SpellLightGain>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<RoomClaimTable>::default())
@@ -1098,6 +1138,10 @@ fn build_light_data(
             // MONKEY (darkness gains): the daylight-fixture marker — an interior-lane entry that
             // is the SUN standing in a doorway, not a candle, so `interiorGain` must skip it.
             Has<super::DaylightFixture>,
+            // MONKEY (spellLightGain): the spell-effect marker ([`SpellFxLight`]). Last in the
+            // tuple so every positional destructuring below keeps its index — and read for one
+            // thing only: WHICH live gain owns this row.
+            Has<SpellFxLight>,
         ),
         Without<ShadowProxyLight>,
     >,
@@ -1116,6 +1160,8 @@ fn build_light_data(
     dynamic_interiors: Res<DynamicInteriors>,
     // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
     fire_gain: Res<FireLightGain>,
+    // MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
+    spell_gain: Res<SpellLightGain>,
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -1245,7 +1291,7 @@ fn build_light_data(
     // the interior lane, so `claims 4` beside `EXT` is the readout of exactly that trade.
     let mut pts: Vec<(f32, Vec3, f32, [f32; 3], bool, f32, RoomClaim, usize)> = lights_q
         .iter()
-        .filter(|(_, gt, rooms, _, _, _, _, _, _)| {
+        .filter(|(_, gt, rooms, _, _, _, _, _, _, _)| {
             // The ROOM term (decision 0689's law, fourth lane — see [`LightRooms`]). Not a
             // visibility test bolted onto a faithful gather: the reference's register walk has no
             // such term either, it simply never has a culled room's torch to register. Ungated for
@@ -1263,7 +1309,7 @@ fn build_light_data(
                 && gt.translation().distance_squared(cam_pos)
                     < INTERIOR_NEAR_ADMIT * INTERIOR_NEAR_ADMIT)
         })
-        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms, flicker, daylight)| {
+        .filter_map(|(pl, gt, rooms, synthetic, reach, lane_of, lit_rooms, flicker, daylight, spell)| {
             let p = gt.translation();
             let d2 = p.distance_squared(cam_pos);
             (d2 < POINT_PACK_RADIUS * POINT_PACK_RADIUS).then(|| {
@@ -1274,7 +1320,19 @@ fn build_light_data(
                 // MONKEY (fire GO lights): the live `fireLightGain` folds in HERE, over the
                 // recovered colour×intensity, and only for a synthesised source. At spawn it
                 // would need a world respawn to retune; here the dial moves the frame it changes.
-                let s = base * if synthetic { fire_gain.0.max(0.0) } else { 1.0 };
+                // MONKEY (spellLightGain): …and the spell lane's own gain INSTEAD of it on a
+                // spell row. Every spell light is also tagged synthetic (it is an invented source
+                // and the census counts it as one), so the arms must be ordered, not summed: a
+                // fireball scaled by both dials would darken when the player turned the hearths
+                // down, which is precisely the coupling the second cvar exists to cut.
+                let s = base
+                    * if spell {
+                        spell_gain.0.max(0.0)
+                    } else if synthetic {
+                        fire_gain.0.max(0.0)
+                    } else {
+                        1.0
+                    };
                 // MONKEY (flame flicker): the fire wobble, folded in at the very last moment — over
                 // the committed colour and NOWHERE else. Deliberately downstream of `base`, which
                 // still feeds the reach/lane below unmodulated: a breathing REACH would move the
@@ -1427,7 +1485,7 @@ fn build_light_data(
             // exterior lane should never have seen — a number, printed per row below as INT/EXT.
             let interior = pts.iter().filter(|(.., lane, _, _)| *lane > 0.5).count();
             eprintln!(
-                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, {flames} flickering, gain {:.2}, atten x{:.2}, flicker x{:.2}, night x{:.2}, interior x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
+                "[points] {} packed ({interior} INT / {} EXT, {synth} synthetic, {flames} flickering, gain {:.2}, atten x{:.2}, flicker x{:.2}, night x{:.2}, interior x{:.2}, spell x{:.2}), cam {cam_pos:.1?} — this chunk's candidates: {boxed} (was {sphere} at the 48 yd sphere), 3 slots",
                 pts.len(),
                 pts.len() - interior,
                 fire_gain.0,
@@ -1438,6 +1496,10 @@ fn build_light_data(
                 // the question this line exists to answer without a rebuild.
                 dynamic_interiors.night_gain,
                 dynamic_interiors.interior_gain,
+                // MONKEY (spellLightGain): beside them for the same reason — "is that fireball
+                // dark because the dial is 0 or because its model synthesised no light at all" is
+                // one number away, and the two causes look identical on screen.
+                spell_gain.0,
             );
             for (d2, p, _, rgb, synthetic, lane, claim, lit_n) in pts.iter().take(8) {
                 eprintln!(
@@ -1782,6 +1844,7 @@ mod tests {
             .init_resource::<ShadowDistance>()
             .init_resource::<DynamicInteriors>()
             .init_resource::<FireLightGain>()
+            .init_resource::<SpellLightGain>()
             .add_systems(Update, build_light_data);
         app.world_mut()
             .spawn((crate::view::WorldCamera, GlobalTransform::IDENTITY));
@@ -2008,6 +2071,60 @@ mod tests {
         let data = app.world().resource::<WowLightData>().0;
         assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "gain 0 = lane off");
         assert!((data.points[1][0] - 2.0).abs() < 1e-4, "authored unaffected");
+    }
+
+    /// GOLDEN — MONKEY (spellLightGain): a SPELL light takes `spellLightGain` **instead of**
+    /// `fireLightGain`, not as well as it.
+    ///
+    /// Every spell light is tagged [`SyntheticFireLight`] too — it IS an invented source, and the
+    /// census must keep counting it as one — so the two arms overlap on every row this dial exists
+    /// for. If they composed, turning the world's hearths down would darken every fireball in the
+    /// game, and `spellLightGain 0` would still leave combat flashes on wherever a player had
+    /// raised `fireLightGain`. Both halves are asserted: the spell row moves with ONE dial and is
+    /// deaf to the other, and the plain synthetic row beside it is unmoved by the new one.
+    #[test]
+    fn the_spell_gain_overrides_the_fire_gain_on_a_spell_light() {
+        let mut app = packer_app();
+        let recipe = || crate::terrain_stream::point_light([1.0, 0.5, 0.25], 2.0);
+        // A campfire's invented light…
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::X),
+            SyntheticFireLight,
+        ));
+        // …and a fireball's, which carries BOTH tags exactly as the spawn site stamps them.
+        app.world_mut().spawn((
+            recipe(),
+            GlobalTransform::from_translation(Vec3::new(2.0, 0.0, 0.0)),
+            SyntheticFireLight,
+            SpellFxLight,
+        ));
+        app.world_mut().insert_resource(FireLightGain(0.5));
+        app.world_mut().insert_resource(SpellLightGain(2.0));
+        app.update();
+
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.rows[20][0], 2.0, "both packed");
+        let fire = data.points[1];
+        let spell = data.points[3];
+        assert!(
+            (fire[0] - 1.0).abs() < 1e-4,
+            "the campfire takes the fire gain alone: {fire:?}"
+        );
+        assert!(
+            (spell[0] - 4.0).abs() < 1e-4,
+            "the spell light takes 2x, NOT 2x0.5: {spell:?}"
+        );
+
+        // Zero is this lane's own kill switch, and it reaches nothing else.
+        app.world_mut().insert_resource(SpellLightGain(0.0));
+        app.update();
+        let data = app.world().resource::<WowLightData>().0;
+        assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "spell gain 0 = spell lights off");
+        assert!(
+            (data.points[1][0] - 1.0).abs() < 1e-4,
+            "the campfire still burns at its own gain"
+        );
     }
 
     /// GOLDEN — MONKEY (flame flicker): the wobble reaches the packed COLOUR and nothing else.

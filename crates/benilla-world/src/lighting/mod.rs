@@ -41,6 +41,9 @@ pub use global_light::{
     ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
     WorldShadowActive,
 };
+// MONKEY (spellLightGain): the spell lane's marker + its live gain — the two-word world-side
+// shadow of benilla-app's own `SpellLight` lifecycle, and the dial the packer folds over it.
+pub use global_light::{SpellFxLight, SpellLightGain};
 pub use global_light::{
     room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,
 };

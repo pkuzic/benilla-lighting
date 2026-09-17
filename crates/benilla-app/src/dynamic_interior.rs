@@ -13,7 +13,10 @@
 //! [`benilla_world::lighting::FireLightGain`]. Same shape, same guard, same liveness requirement —
 //! and `fireLightGain 0` is the kill switch for the synthesised-fire lane the way `interiorLight 0`
 //! is for this one.
-use benilla_world::lighting::{DynamicInteriors, FireLightGain};
+//!
+//! MONKEY (spellLightGain): and `spellLightGain` → [`benilla_world::lighting::SpellLightGain`],
+//! the third of the same shape.
+use benilla_world::lighting::{DynamicInteriors, FireLightGain, SpellLightGain};
 use bevy::prelude::*;
 
 use crate::video::VideoConfig;
@@ -36,9 +39,19 @@ fn bridge(
     video: Res<VideoConfig>,
     mut out: ResMut<DynamicInteriors>,
     mut fire: ResMut<FireLightGain>,
+    // MONKEY (spellLightGain): the spell lane's own gain rides the same bridge as the fire gain,
+    // for the same reasons — same shape (a live video cvar → a benilla-world resource the packer
+    // reads), same one-line guard, and a third plugin to carry a second `f32` is not worth its
+    // wiring. Kept a SEPARATE resource rather than a field on `DynamicInteriors` because it is not
+    // an interior knob at all: a fireball down a street takes it exactly as one down a corridor
+    // does, and `FireLightGain` beside it already stands as the precedent for that.
+    mut spell: ResMut<SpellLightGain>,
 ) {
     if fire.0 != video.fire_light_gain {
         fire.0 = video.fire_light_gain;
+    }
+    if spell.0 != video.spell_light_gain {
+        spell.0 = video.spell_light_gain;
     }
     let want = DynamicInteriors {
         enabled: video.interior_light,
