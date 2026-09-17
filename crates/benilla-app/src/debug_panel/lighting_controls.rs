@@ -28,7 +28,8 @@ struct Knob {
 }
 
 // MONKEY (lighting debug panel): keep names, typed reads and presentation together. The numeric
-// bounds mirror `cvars::apply_to_knobs` (including its wider ambient/fill/attenuation ranges);
+// bounds mirror `video::on_cvar`'s MONKEY (lighting) arms — the registry's change-callback
+// observer since 2303 — including their wider ambient/fill/attenuation ranges;
 // shared shadow constants follow the setter directly. Casting the booleans through u32 keeps
 // the descriptor read-only without inventing a parallel configuration type.
 macro_rules! knob {

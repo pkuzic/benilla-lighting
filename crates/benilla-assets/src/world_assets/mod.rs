@@ -662,8 +662,6 @@ impl WorldAssets {
     /// A `StandardMaterial` for a model submesh, deduped by (texture, blend) so submeshes/models
     /// sharing a texture share one material handle (enabling draw-call batching). A missing/failed
     /// texture falls back to a single shared untextured material.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn model_material(
         &mut self,
         texture: Option<&str>,

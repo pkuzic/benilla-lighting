@@ -76,7 +76,6 @@ type SpawnTables<'w> = (
     crate::static_gx::TorchShared<'w>,
 );
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_loaded_placements(
     mut commands: Commands,
     placements: ResMut<Placements>,
