@@ -123,7 +123,7 @@ struct WowLight {
     light_sun: vec4<f32>,     // xyz sun TRAVEL dir (to-light = −xyz); w = directional-light enable (>0.5)
     light_spec: vec4<f32>,    // rgb spec color; w = shininess (terrain's — unused by the matte model path)
     fog_color: vec4<f32>,     // rgb row-7 fog (gamma); w = enable (>0.5)
-    fog_params: vec4<f32>,    // x=start y=end z=linear-lighting A/B flag w=farclip wall
+    fog_params: vec4<f32>,    // x=start y=end z=signed +sun / -moon shadow weight w=farclip wall
     // The global Model2.bls SH rows (6-12): the scene day/night light as an order-2 probe at
     // intensity 1 — DC (ambient, `.w` of c10) + the sun's linear/quad bands in c10.xyz / c13 /
     // c16.xyz, the disassembled closed form (wow-re model2-bls-vertex-sh.md). Every sun band is
@@ -1800,9 +1800,14 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // MONKEY (shadow hook): the realtime shadow (fetch + edge/night fade) is computed by
     // `benilla::shadow_hook`. This lane keeps only the rig-skin SAMPLE-POINT choice + the
     // interior/rig exclusion + ambient-preserving apply below.
+    // MONKEY (moon shadows): the NIGHT arm of the same one fetch — 1.0 (inert) by day, by feature-off
+    // and in the sun-down/moon-not-yet-up window. See `shadow_hook::realtime_shadow_terms`.
     var player_shadow = 1.0;
+    var player_moon = 1.0;
     let view_z = (view.view_from_world * in.world_position).z;
     let shadow_cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
+    let sun_lane_w = shadow_hook::sun_shadow_w(wow_light.fog_params.z);
+    let moon_lane_w = shadow_hook::moon_shadow_w(wow_light.fog_params.z);
 #ifdef WOW_RIG_SKIN
     // A skinned UNIT samples the map ONCE at its rig origin (between the feet), nudged 2.5 units
     // TOWARD the sun, and dims uniformly — the reference's per-unit response. Per-fragment sampling
@@ -1815,24 +1820,30 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
             wow_light.rig_origin[(fade_tag >> 19u) & 0x7ffu].xyz - 2.5 * sun_ray,
             1.0,
         );
-        player_shadow = shadow_hook::realtime_shadow(
+        let terms_rig = shadow_hook::realtime_shadow_terms(
             anchor,
             vec3<f32>(0.0, 1.0, 0.0),
             view_z,
             shadow_cam_dist,
             wow_light.wmo_fog_params.z,
-            wow_light.fog_params.z,
+            sun_lane_w,
+            moon_lane_w,
         );
+        player_shadow = terms_rig.x;
+        player_moon = terms_rig.y;
     }
 #else
-    player_shadow = shadow_hook::realtime_shadow(
+    let terms_frag = shadow_hook::realtime_shadow_terms(
         in.world_position,
         wow_normalize(in.world_normal),
         view_z,
         shadow_cam_dist,
         wow_light.wmo_fog_params.z,
-        wow_light.fog_params.z,
+        sun_lane_w,
+        moon_lane_w,
     );
+    player_shadow = terms_frag.x;
+    player_moon = terms_frag.y;
 #endif
     // The realtime map blocks only the directional sun. Preserve the authored ambient/probe
     // contribution instead of multiplying the whole lighting result; the latter makes interiors,
@@ -1844,7 +1855,7 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // arm keeps `worldShadows 0` (and a fully sunlit fragment) byte-identical: `ambient +
     // (lit − ambient) × 1.0` is not guaranteed to round back to `lit`.
     let shadow_term = mix(SHADOW_SUN_FLOOR, 1.0, player_shadow);
-    let lit_with_shadow = select(
+    var lit_with_shadow = select(
         lit,
         clamp(
             wow_light.light_ambient.rgb + (lit - wow_light.light_ambient.rgb) * shadow_term,
@@ -1853,6 +1864,16 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         ),
         !is_interior && !is_rig && player_shadow < 0.999,
     );
+    // MONKEY (moon shadows): the night sky includes ambient AND the directional/SH lobe.
+    // Scale its UNCLAMPED value; points join below, then the combine saturates. A saturated
+    // torch must never lose energy to the moon. Interiors/authored rigs and the exact off path
+    // retain their old expressions; no multiply-by-one round trip on daylight or strength zero.
+    if (player_moon < 1.0 && !is_interior && !is_rig) {
+        let sky = select(wow_light.light_ambient.rgb + wow_light.light_diffuse.rgb * ndotl,
+            sun_lobe, use_doodad_shade);
+        lit_with_shadow = sky * player_moon;
+    }
+
     // Gamma-space albedo — the lane (0161): the buffer holds bytes, lighting math runs on the
     // authored values. (The old fog_params.z linear-space A/B is dead — settled by the lane.)
     // `m.tint` is the animated M2Color RGB (identity 1 for static batches) — the same per-batch

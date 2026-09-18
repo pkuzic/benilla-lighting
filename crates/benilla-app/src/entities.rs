@@ -51,6 +51,9 @@ use carried_light::spawn_carried_lights;
 // firework throws, hung on the effect's own root so the effect's death reaps it. Used by the kit,
 // missile and dest-anchored lanes.
 use carried_light::spawn_spell_light;
+// MONKEY (area spell light): and the same file's PERSISTENT GROUND spawner — one light per
+// DynamicObject area effect, hung on the anchor so the server's destroy is what ends it.
+use carried_light::spawn_area_spell_light;
 // MONKEY (carried light stability): `torch_shadow` needs the settle verdict to refuse a MOVING
 // carried light a cube-shadow slot.
 pub(crate) use carried_light::CarriedLightMotion;

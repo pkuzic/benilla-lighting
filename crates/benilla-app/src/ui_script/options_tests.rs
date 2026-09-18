@@ -1968,6 +1968,321 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
 
+// ── MONKEY (advanced graphics): the Advanced Graphics page ───────────────────────────────────
+
+/// The name every row on the new page is derived from.
+const ADVGFX: &str = "BenillaOptionsFrameContainerBodyAdvancedGraphics";
+
+#[test]
+fn advanced_graphics_fire_and_spell_sliders_read_and_write_the_full_range() {
+    let mut s = audio_harness();
+    s.set_cvar_host("fireLightGain", "3.25");
+    s.set_cvar_host("spellLightGain", "3.25");
+    let mut s = harness_on(s);
+    s.run("ShowUIPanel(BenillaOptionsFrame) \
+           BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+    let _ = s.take_cvar_changes();
+    for (row, cvar) in [("RowFireLight", "fireLightGain"), ("RowSpellLights", "spellLightGain")] {
+        assert_eq!(s.eval::<f32>(&format!(
+            "return {ADVGFX}{row}ControlSlider:GetValue()"
+        )).unwrap(), 3.25);
+        assert_eq!(s.eval::<String>(&format!(
+            "return {ADVGFX}{row}ControlValue:GetText()"
+        )).unwrap(), "325%");
+        for value in ["4", "2.75"] {
+            s.run(&format!("{ADVGFX}{row}ControlSlider:SetValue({value})")).unwrap();
+            assert!(s.take_cvar_changes().contains(&(cvar.to_string(), value.to_string())));
+            assert_eq!(s.cvar(cvar).as_deref(), Some(value));
+        }
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+#[test]
+fn advanced_graphics_selects_its_locale_at_load_including_yards() {
+    for (locale, title, distance) in [
+        ("enUS", "Advanced Graphics", "80 yd"),
+        ("ruRU", "Расширенная графика", "80 ярд."),
+        ("deDE", "Advanced Graphics", "80 yd"),
+    ] {
+        let s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
+        let s = harness_on(s);
+        s.run("ShowUIPanel(BenillaOptionsFrame) \
+               BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+            .unwrap();
+        assert_eq!(s.eval::<String>(
+            "return BenillaOptionsFrameContainerTitle:GetText()"
+        ).unwrap(), title);
+        assert_eq!(s.eval::<String>(&format!(
+            "return {ADVGFX}RowShadowDistanceControlValue:GetText()"
+        )).unwrap(), distance);
+        assert!(s.eval::<bool>(
+            "return BENILLA_TOOLTIP_NIGHT_DARKNESS == BENILLA_ADVGFX.tips.NIGHT_DARKNESS"
+        ).unwrap());
+        assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    }
+}
+
+/// **The page reads the lighting CVars on select** — every control flavour on it at once, which
+/// is the point of checking one page rather than one row: this is the first page in the window
+/// carrying a dropdown, a checkbox and four sliders whose store is a benilla CVar with no
+/// reference counterpart, and the first whose labels come out of a table rather than a literal.
+///
+/// The three rows that moved here off Graphics are checked BOTH ways: present here, and gone from
+/// there. A row that was copied rather than moved would show up as two live controls over one
+/// CVar, which nothing else in this file would catch.
+#[test]
+fn the_advanced_graphics_page_reads_the_lighting_cvars_on_select() {
+    let mut s = audio_harness();
+    s.set_cvar_host("shadowMapSize", "4096");
+    s.set_cvar_host("interiorShadows", "0");
+    let s = harness_on(s);
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+
+    assert!(s
+        .eval::<bool>(&format!("return {ADVGFX}:IsVisible()"))
+        .unwrap());
+    assert_eq!(
+        s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
+            .unwrap(),
+        "Advanced Graphics",
+        "the page title is the category row's label"
+    );
+    assert!(
+        s.eval::<bool>("return BenillaOptionsFrameContainerDefaults:IsEnabled() ~= 0")
+            .unwrap(),
+        "Defaults is live on a page with rows"
+    );
+
+    // The dropdowns: the ladder reads the registered default, the resolution reads the seed.
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowLightingQualityDropdownText:GetText()"))
+            .unwrap(),
+        "High",
+        "a fresh registry is the High preset, member for member (cvars::tests)"
+    );
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowShadowResolutionDropdownText:GetText()"))
+            .unwrap(),
+        "4096"
+    );
+    // The checkboxes read the table, not a restated default.
+    assert!(s
+        .eval::<bool>(&format!("return {ADVGFX}RowCharacterShadowsCheck:GetChecked()"))
+        .unwrap());
+    assert!(!s
+        .eval::<bool>(&format!("return {ADVGFX}RowInteriorShadowsCheck:GetChecked()"))
+        .unwrap());
+    // The sliders, each on its own registry clamp with its own readout grammar.
+    for (row, text) in [
+        ("RowShadowDistance", "80 yd"),
+        ("RowMoonShadows", "35%"),
+        ("RowFireFlicker", "100%"),
+        ("RowSpellLights", "100%"),
+    ] {
+        assert_eq!(
+            s.eval::<String>(&format!("return {ADVGFX}{row}ControlValue:GetText()"))
+                .unwrap(),
+            text,
+            "{row}"
+        );
+    }
+    // The labels come out of the bilingual table (enUS here — benilla's `GetLocale` answers
+    // nothing else yet).
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowInteriorLightLabel:GetText()"))
+            .unwrap(),
+        "Dynamic Interior Lighting"
+    );
+
+    // MOVED, not copied: the Graphics page has no shadow rows left.
+    for row in ["RowCharacterShadows", "RowWorldShadows", "RowShadowDistance"] {
+        assert!(
+            !s.eval::<bool>(&format!(
+                "return BenillaOptionsFrameContainerBodyGraphics{row} ~= nil"
+            ))
+            .unwrap(),
+            "{row} is still seated on the Graphics page"
+        );
+    }
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The Lighting Quality row writes ONE CVar** — and that is the whole of its contract with this
+/// window. The preset's members are the host's to write (`cvars::LIGHTING_PRESETS`), so a page
+/// that wrote them here would be a second copy of that table, silently drifting from the one the
+/// console and the native panel use. What this pins is the boundary: one write, the engine's own
+/// spelling, and nothing else queued.
+#[test]
+fn the_lighting_quality_row_writes_one_cvar_and_leaves_the_members_to_the_host() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+    let _ = s.take_cvar_changes();
+
+    // The entry click's own body (`OptionsDropdownEntry_OnClick`), which is the row's Set
+    // followed by the capsule's redisplay — driven directly so the test does not depend on the
+    // shared dropdown kit's list geometry.
+    s.run(&format!(
+        "OptionsRow_Set({ADVGFX}RowLightingQuality, \"Low\") \
+         OptionsDropdown_ShowValue({ADVGFX}RowLightingQuality)"
+    ))
+    .unwrap();
+    assert_eq!(
+        s.take_cvar_changes(),
+        vec![("lightingQuality".to_string(), "Low".to_string())],
+        "one write, and the value is the engine's own string — never the localised label"
+    );
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowLightingQualityDropdownText:GetText()"))
+            .unwrap(),
+        "Low"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The two darkness dials read backwards, and that is the bug this row shape exists to avoid.**
+/// Their store is a GAIN — `nightGain` 0.2..1.5, where 0.2 is the darkest — while the rows are
+/// named for the darkness. Left is darker either way; without the `darkness` readout the NUMBER
+/// beside the label would climb as the world got lighter, under a label that says "Darkness".
+#[test]
+fn the_darkness_sliders_read_out_so_that_left_is_darker() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+
+    // The registered default, 0.45 of 0.2..1.5, is (1.5 − 0.45) / 1.3 = 81 % of the way dark.
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowNightDarknessControlValue:GetText()"))
+            .unwrap(),
+        "81%"
+    );
+    // The darkest gain reads 100 %, the brightest 0 %; the reference night is gain 1.0.
+    for (value, text) in [("0.2", "100%"), ("1.5", "0%"), ("1.0", "38%"), ("0.85", "50%")] {
+        s.run(&format!(
+            "{ADVGFX}RowNightDarknessControlSlider:SetValue({value})"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.eval::<String>(&format!("return {ADVGFX}RowNightDarknessControlValue:GetText()"))
+                .unwrap(),
+            text,
+            "nightGain {value}"
+        );
+    }
+    // …and the STORE keeps the gain, unchanged — the readout is a readout.
+    assert!(
+        s.take_cvar_changes()
+            .contains(&("nightGain".to_string(), "0.85".to_string())),
+        "the slider writes the gain the engine reads, not the percentage it shows"
+    );
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowInteriorDarknessControlValue:GetText()"))
+            .unwrap(),
+        "77%",
+        "interiorGain 0.5 of 0.2..1.5"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The page's dependencies**, in the reference's own shape: a master's switch greys what it
+/// gates, and the CVars keep their values throughout so turning the master back on finds its
+/// children where they were left.
+#[test]
+fn the_advanced_graphics_masters_grey_what_they_gate() {
+    let s = harness_on(audio_harness());
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+
+    // A greyed row wears the DISABLE font — 1.12's own signal, and the one `OptionsRow_SetEnabled`
+    // sets on every flavour of row whatever else it does to the control. Compared as an OBJECT,
+    // not a name: `GetFontObject` answers the object (`script::font`).
+    let live = |s: &UiScript, row: &str| -> bool {
+        s.eval::<bool>(&format!(
+            "return {ADVGFX}{row}Label:GetFontObject() == GameFontNormal"
+        ))
+        .unwrap()
+    };
+    assert!(live(&s, "RowInteriorShadows"));
+    assert!(live(&s, "RowShadowResolution"));
+
+    // Dynamic Interior Lighting off greys the indoor torch row — the CVar's own documented
+    // dependency ("needs interiorLight").
+    s.run(&format!("{ADVGFX}RowInteriorLightCheck:Click()"))
+        .unwrap();
+    assert!(!live(&s, "RowInteriorShadows"));
+    // Both sun lanes off leave nothing for the cascade rows to size.
+    s.run(&format!("{ADVGFX}RowCharacterShadowsCheck:Click()"))
+        .unwrap();
+    s.run(&format!("{ADVGFX}RowWorldShadowsCheck:Click()"))
+        .unwrap();
+    assert!(!live(&s, "RowShadowResolution"));
+    assert!(!live(&s, "RowShadowDistance"));
+    // …and one of them back on wakes them, with their values untouched.
+    s.run(&format!("{ADVGFX}RowWorldShadowsCheck:Click()"))
+        .unwrap();
+    assert!(live(&s, "RowShadowResolution"));
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowShadowDistanceControlValue:GetText()"))
+            .unwrap(),
+        "80 yd"
+    );
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
+/// **The page follows a write it did not make.** This is the one page in the window whose CVars
+/// move from outside it — the Lighting Quality row's members are written by the host a frame or
+/// two after the click, and the console and the dev lighting panel reach the same rows while the
+/// page is open. Without the poll the player would pick a preset and watch nothing below it move.
+#[test]
+fn the_page_repaints_when_a_host_write_moves_a_row_under_it() {
+    let mut s = harness_on(audio_harness());
+    s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
+    s.run("BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
+        .unwrap();
+    // The page has to be effectively visible before its OnUpdate is in the sweep at all.
+    s.resolve();
+    assert!(s
+        .eval::<bool>(&format!("return {ADVGFX}RowExteriorShadowsCheck:GetChecked()"))
+        .unwrap());
+
+    // What the host does when a preset's members land: a mirror write, with no CVAR_UPDATE and no
+    // Lua write behind it.
+    s.set_cvar_host("exteriorShadows", "0");
+    s.set_cvar_host("moonShadowStrength", "0");
+    // Under the poll interval: nothing has happened yet.
+    s.tick(0.1);
+    assert!(s
+        .eval::<bool>(&format!("return {ADVGFX}RowExteriorShadowsCheck:GetChecked()"))
+        .unwrap());
+    // Past it: one refresh, and the page tells the truth again.
+    s.tick(0.2);
+    assert!(!s
+        .eval::<bool>(&format!("return {ADVGFX}RowExteriorShadowsCheck:GetChecked()"))
+        .unwrap());
+    assert_eq!(
+        s.eval::<String>(&format!("return {ADVGFX}RowMoonShadowsControlValue:GetText()"))
+            .unwrap(),
+        "0%"
+    );
+    // The refresh writes NOTHING back — it is a read of the table, not a round trip.
+    assert!(
+        s.take_cvar_changes().is_empty(),
+        "the poll must never write a CVar"
+    );
+    // …and a settled page costs nothing: the signature has not moved, so no further refresh runs.
+    s.tick(0.3);
+    assert!(s.take_cvar_changes().is_empty());
+    assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+}
+
 /// Controls is the DEFAULT page and has rows since 0961: opening the window lands on it with
 /// Defaults armed, and the rows read the table — Sticky Targeting INVERTED (checked when
 /// `deselectOnClick` is "0", the 1.12 interface panel's own arm), the plain flags direct.
@@ -2560,9 +2875,66 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "AudioRowBackgroundSound",
             ),
             ("BENILLA_TOOLTIP_BRIGHTNESS", "GraphicsRowBrightness"),
-            ("BENILLA_TOOLTIP_CHARACTER_SHADOWS", "GraphicsRowCharacterShadows"),
-            ("BENILLA_TOOLTIP_WORLD_SHADOWS", "GraphicsRowWorldShadows"),
-            ("BENILLA_TOOLTIP_SHADOW_DISTANCE", "GraphicsRowShadowDistance"),
+            // MONKEY (advanced graphics): the whole Advanced Graphics page. Every row on it is
+            // benilla's own mechanism — 1.12 has no realtime shadow, no fixture-lit interior and
+            // no invented light — so there is no `OPTION_TOOLTIP_*` any of them could resolve,
+            // and each carries a `BENILLA_` key for the same reason the four above it do. The
+            // first three are the rows that MOVED here off the Graphics page: same keys, same
+            // texts, new seat, which is why they read `AdvancedGraphicsRow…` now.
+            (
+                "BENILLA_TOOLTIP_CHARACTER_SHADOWS",
+                "AdvancedGraphicsRowCharacterShadows",
+            ),
+            (
+                "BENILLA_TOOLTIP_WORLD_SHADOWS",
+                "AdvancedGraphicsRowWorldShadows",
+            ),
+            (
+                "BENILLA_TOOLTIP_SHADOW_DISTANCE",
+                "AdvancedGraphicsRowShadowDistance",
+            ),
+            (
+                "BENILLA_TOOLTIP_LIGHTING_QUALITY",
+                "AdvancedGraphicsRowLightingQuality",
+            ),
+            (
+                "BENILLA_TOOLTIP_SHADOW_RESOLUTION",
+                "AdvancedGraphicsRowShadowResolution",
+            ),
+            (
+                "BENILLA_TOOLTIP_MOON_SHADOWS",
+                "AdvancedGraphicsRowMoonShadows",
+            ),
+            (
+                "BENILLA_TOOLTIP_INTERIOR_LIGHT",
+                "AdvancedGraphicsRowInteriorLight",
+            ),
+            (
+                "BENILLA_TOOLTIP_INTERIOR_SHADOWS",
+                "AdvancedGraphicsRowInteriorShadows",
+            ),
+            (
+                "BENILLA_TOOLTIP_EXTERIOR_SHADOWS",
+                "AdvancedGraphicsRowExteriorShadows",
+            ),
+            ("BENILLA_TOOLTIP_TORCH_SOFT", "AdvancedGraphicsRowTorchSoft"),
+            ("BENILLA_TOOLTIP_FIRE_LIGHT", "AdvancedGraphicsRowFireLight"),
+            (
+                "BENILLA_TOOLTIP_FIRE_FLICKER",
+                "AdvancedGraphicsRowFireFlicker",
+            ),
+            (
+                "BENILLA_TOOLTIP_SPELL_LIGHTS",
+                "AdvancedGraphicsRowSpellLights",
+            ),
+            (
+                "BENILLA_TOOLTIP_NIGHT_DARKNESS",
+                "AdvancedGraphicsRowNightDarkness",
+            ),
+            (
+                "BENILLA_TOOLTIP_INTERIOR_DARKNESS",
+                "AdvancedGraphicsRowInteriorDarkness",
+            ),
         ];
         if let Some((_, want_row)) = BENILLA_OWNED.iter().find(|(k, _)| *k == key) {
             assert_eq!(row, *want_row, "{row}: not this row's string");
@@ -2623,7 +2995,12 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // 21-step grey ramp, which this page does not have (see the guard above). 77 -> 78.
     // MONKEY (world shadows): +3 for Real Character Shadows, World Shadows and the Shadow
     // Distance slider (all benilla-owned keys, carved out in BENILLA_OWNED above). 78 -> 81.
-    assert_eq!(checked, 81, "every tipped row carries a live key");
+    // MONKEY (advanced graphics): +12, the rows the new page ADDS — Lighting Quality, Shadow
+    // Resolution, Moon Shadows, Dynamic Interior Lighting, Indoor and Outdoor Torch Shadows,
+    // Torch Shadow Softness, Fire Light Brightness, Fire Flicker, Spell Lights, Night Darkness
+    // and Interior Darkness. The three rows that MOVED onto it are already in the 81: a row
+    // changing pages does not change this count, only its entry in BENILLA_OWNED. 81 -> 93.
+    assert_eq!(checked, 93, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -2674,6 +3051,9 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
         "Controls",
         "Audio",
         "Graphics",
+        // MONKEY (advanced graphics): the tenth category, and the one with the most
+        // benilla-owned descriptions on it — every row here raises a `BENILLA_TOOLTIP_*`.
+        "AdvancedGraphics",
         "Nameplates",
         "Combat",
         "Interface",
@@ -2745,7 +3125,11 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // sliders.
     // MONKEY (world shadows): +3 for Real Character Shadows, World Shadows and the Shadow
     // Distance slider (all benilla-owned keys, carved out in BENILLA_OWNED above). 78 -> 81.
-    assert_eq!(raised, 81, "every row but Auto Loot raises a description");
+    // MONKEY (advanced graphics): +12 for the rows the new page ADDS (the three it inherits were
+    // already counted, on their old page). 81 -> 93 — and the page is where this test's own
+    // teeth bite hardest, since it is the first one to seat a dropdown, a checkbox and a slider
+    // whose descriptions are all benilla's.
+    assert_eq!(raised, 93, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a
@@ -3705,7 +4089,11 @@ fn the_defaults_button_is_armed_by_rows_not_by_a_category() {
         .split(',')
         .map(str::to_string)
         .collect();
-    assert_eq!(keys.len(), 9, "the nine 1.15.9 categories: {keys:?}");
+    // MONKEY (advanced graphics): ten, not nine — the era's own tree has no Advanced Graphics
+    // page, because the era client has no dynamic light and shadow system to put on one. It is
+    // benilla's own category, seated under Graphics in the System group, and it is held to the
+    // same bar as the era's nine: it opens onto rows, and Defaults is live on it.
+    assert_eq!(keys.len(), 10, "the nine 1.15.9 categories + ours: {keys:?}");
     for key in &keys {
         let has_rows = s
             .eval::<bool>(&format!(

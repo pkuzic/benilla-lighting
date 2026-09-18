@@ -250,6 +250,31 @@ pub(crate) const SPELL_BURST_SPAN: f32 = 0.6;
 /// light that outlived the visual by a second would read as a stuck effect.
 pub(crate) const SPELL_REAP_FADE: f32 = 0.25;
 
+/// MONKEY (area spell light): the AREA mode's ramp — longer than [`SPELL_LIGHT_RAMP`] on purpose.
+/// The 0.1 s ramp exists to keep a FLASH from appearing on one frame; a ground effect is a thing
+/// that CATCHES, and a patch of terrain that reaches full brightness in a tenth of a second reads
+/// as a light being switched on rather than as a fire spreading over it.
+pub(crate) const SPELL_AREA_RAMP: f32 = 0.25;
+
+/// MONKEY (area spell light): how fast an area light goes dark once the DynamicObject it belongs to
+/// is destroyed. Slower than the kit's [`SPELL_REAP_FADE`] because the thing ending is bigger — a
+/// 24 yd pool snapping off in a quarter second is a visible pop across a whole clearing — and still
+/// far inside the ~2 s the anchor's own teardown fade takes, so the light is long gone before the
+/// burning decal it lit has finished fading out.
+pub(crate) const SPELL_AREA_FADE: f32 = 0.4;
+
+/// MONKEY (area spell light): the area light's BREATHING — depth (fraction of base) and rate (Hz).
+///
+/// Explicitly NOT [`FlameFlicker`](benilla_world::lighting::FlameFlicker), which is the fire lane's
+/// fast noisy wobble: at 8 % and 0.7 Hz this is a slow swell, under the threshold where the eye
+/// reads it as the light *changing* rather than as the fire on the ground being alive. Something is
+/// needed, though — an 8-second Flamestrike patch whose light is a perfectly constant disc is the
+/// one thing that gives the whole effect away as a light source, and the model under it is
+/// animating the entire time.
+pub(crate) const SPELL_AREA_BREATH_DEPTH: f32 = 0.08;
+/// See [`SPELL_AREA_BREATH_DEPTH`].
+pub(crate) const SPELL_AREA_BREATH_HZ: f32 = 0.7;
+
 /// How many spell lights may be alive at once, across every lane. The shared point-light table is
 /// 512 rows packed from the 256 nearest sources every frame, and the whole feature is worth
 /// nothing if a raid's worth of casts can evict a city's torches: 24 is a generous ceiling for
@@ -288,6 +313,53 @@ pub(crate) enum SpellLightMode {
     /// An impact / destination effect / firework shell: full at onset, gone `span` seconds later.
     /// The one shape whose *whole point* is that it does not persist.
     Burst { span: f32 },
+    /// MONKEY (area spell light): a PERSISTENT GROUND EFFECT — one light for a whole
+    /// DynamicObject's life (Flamestrike's burning patch, Rain of Fire's storm, Consecration's
+    /// ground, a hunter's Flare). Up on the slower [`SPELL_AREA_RAMP`], held with a slow
+    /// [`SPELL_AREA_BREATH_DEPTH`] swell for as long as the area object stands, out over
+    /// [`SPELL_AREA_FADE`] when the server destroys it.
+    ///
+    /// It is a mode of its own rather than a [`Self::Kit`] with a different fade because the two
+    /// differ in every part: the ending is driven by a `DespawnFade` on a net entity instead of an
+    /// `FxDecay` on an effect instance, the hold is modulated, and the ceiling treats it as the one
+    /// spell light that must NOT be evicted (see [`budget_spell_lights`]) — a strobe of impact
+    /// flashes must never be able to push the standing pool out of the table.
+    ///
+    /// `phase` staggers the breathing per light (seeded from the anchor), so two overlapping
+    /// patches swell out of step rather than pulsing the clearing in unison.
+    Area { phase: f32 },
+}
+
+impl SpellLightMode {
+    /// Seconds this mode takes to come up.
+    fn ramp(self) -> f32 {
+        match self {
+            Self::Area { .. } => SPELL_AREA_RAMP,
+            _ => SPELL_LIGHT_RAMP,
+        }
+    }
+
+    /// Seconds this mode takes to go dark once its host has been reaped.
+    fn reap_fade(self) -> f32 {
+        match self {
+            Self::Area { .. } => SPELL_AREA_FADE,
+            _ => SPELL_REAP_FADE,
+        }
+    }
+}
+
+/// MONKEY (area spell light): the marker on a live area light, carrying the AoE footprint
+/// (`DYNAMICOBJECT_RADIUS`, yd) the wire gave it.
+///
+/// Two readers, and neither wants it on [`SpellLight`] itself:
+/// - the DEDUPE ([`super::super::dest_fx`]) — a repeating impact that lands inside a live area
+///   light's footprint spawns no light of its own, which is the whole of why Rain of Fire is one
+///   steady pool instead of five flashes a second;
+/// - the BUDGET below, which evicts area lights last.
+#[derive(Component)]
+pub(crate) struct AreaSpellLight {
+    /// The wire AoE radius (yd), horizontal — the dedupe's own test radius.
+    pub(crate) radius: f32,
 }
 
 /// MONKEY (spell light): one live spell light. A child of the effect root it belongs to, so the
@@ -331,17 +403,32 @@ impl SpellLight {
         if t <= 0.0 {
             return 0.0; // the flame this light stands for does not exist yet
         }
-        let up = (t / SPELL_LIGHT_RAMP).min(1.0);
+        let ramp = self.mode.ramp();
+        let up = (t / ramp).min(1.0);
         let down = match self.mode {
             // The fade starts where the ramp ended, so a burst's peak is a real (if brief) plateau
             // rather than a single-frame spike that a low frame rate could skip entirely.
             SpellLightMode::Burst { span } => {
-                (1.0 - (t - SPELL_LIGHT_RAMP).max(0.0) / span.max(1e-3)).clamp(0.0, 1.0)
+                (1.0 - (t - ramp).max(0.0) / span.max(1e-3)).clamp(0.0, 1.0)
+            }
+            // MONKEY (area spell light): a hold that BREATHES. Deliberately allowed above 1.0 —
+            // the swell is centred on the calibrated base, so clamping the top half would turn a
+            // symmetric ±8 % into a one-sided dimming and leave every area light reading 4 %
+            // darker than the rung it was filed on.
+            SpellLightMode::Area { phase } => {
+                1.0 + SPELL_AREA_BREATH_DEPTH
+                    * (std::f32::consts::TAU * SPELL_AREA_BREATH_HZ * t + phase).sin()
             }
             SpellLightMode::Kit | SpellLightMode::Missile => 1.0,
         };
-        let reap = (1.0 - self.reaped / SPELL_REAP_FADE).clamp(0.0, 1.0);
+        let reap = (1.0 - self.reaped / self.mode.reap_fade()).clamp(0.0, 1.0);
         up * down * reap
+    }
+
+    /// MONKEY (area spell light): has this light finished going dark after its host was reaped?
+    /// Only an AREA light asks — see the despawn note in [`advance_spell_lights`].
+    fn reap_complete(&self) -> bool {
+        self.reaped >= self.mode.reap_fade()
     }
 }
 
@@ -357,17 +444,40 @@ impl SpellLight {
 /// ([`FxDecay`] on the effect root, written by the reap) must take its light down with it, and the
 /// light's parent IS that root.
 pub(crate) fn advance_spell_lights(
+    mut commands: Commands,
     time: Res<Time>,
-    mut lights: Query<(&mut SpellLight, &mut WorldPointLight, Option<&ChildOf>)>,
-    reaped: Query<Has<FxDecay>>,
+    mut lights: Query<(
+        Entity,
+        &mut SpellLight,
+        &mut WorldPointLight,
+        Option<&ChildOf>,
+    )>,
+    // MONKEY (area spell light): the reap signal now has TWO sources, one per persistent mode.
+    // `FxDecay` is written on an effect INSTANCE by the kit lane's own reap; `DespawnFade` is
+    // written on a NET ENTITY by `SMSG_DESTROY_OBJECT` (`net::apply::objects`), which is the only
+    // notice a DynamicObject's end ever gives. That the anchor fades rather than popping is what
+    // makes an area fade possible at all: the child light outlives the server's destroy by the
+    // ~2 s the anchor's geometry teardown takes, and needs only 0.4 of them.
+    reaped: Query<(Has<FxDecay>, Has<benilla_world::model_fade::DespawnFade>)>,
 ) {
     let dt = time.delta_secs();
-    for (mut light, mut point, parent) in &mut lights {
+    for (entity, mut light, mut point, parent) in &mut lights {
         light.age += dt;
-        if light.mode == SpellLightMode::Kit
-            && parent.is_some_and(|c| reaped.get(c.parent()).unwrap_or(false))
-        {
+        let host = parent.and_then(|c| reaped.get(c.parent()).ok());
+        let ended = match light.mode {
+            SpellLightMode::Kit => host.is_some_and(|(decay, _)| decay),
+            SpellLightMode::Area { .. } => host.is_some_and(|(_, fade)| fade),
+            SpellLightMode::Missile | SpellLightMode::Burst { .. } => false,
+        };
+        if ended {
             light.reaped += dt;
+            // An area light's anchor lingers for its own teardown fade, several times longer than
+            // the light's. Give the slot back the moment the pool is dark rather than holding one
+            // of the 24 for a light nobody can see — the kit lane has no such gap, because its
+            // instance despawns on the heels of its `FxDecay`.
+            if matches!(light.mode, SpellLightMode::Area { .. }) && light.reap_complete() {
+                commands.entity(entity).try_despawn();
+            }
         }
         let want = light.base * light.envelope();
         // Write only on a real change: a held kit light sits at its plateau for the whole aura,
@@ -389,14 +499,23 @@ pub(crate) fn advance_spell_lights(
 ///
 /// Despawning the light alone never disturbs its effect: the light is a leaf child of the effect
 /// root and nothing reads back from it.
-pub(crate) fn budget_spell_lights(mut commands: Commands, lights: Query<(Entity, &SpellLight)>) {
+pub(crate) fn budget_spell_lights(
+    mut commands: Commands,
+    lights: Query<(Entity, &SpellLight, Has<AreaSpellLight>)>,
+) {
     let live = lights.iter().count();
     if live <= SPELL_LIGHTS_MAX {
         return;
     }
-    let mut by_age: Vec<(Entity, f32)> = lights.iter().map(|(e, s)| (e, s.age)).collect();
-    by_age.sort_by(|a, b| b.1.total_cmp(&a.1)); // oldest first
-    for (light, _) in by_age.into_iter().take(live - SPELL_LIGHTS_MAX) {
+    let mut order: Vec<(Entity, bool, f32)> =
+        lights.iter().map(|(e, s, area)| (e, area, s.age)).collect();
+    // MONKEY (area spell light): AREA lights go LAST, whatever their age — and an area light is
+    // always among the oldest, because it is the only spell light that stands for seconds. Under
+    // pure age ordering a Rain of Fire's own impact flashes would evict the very pool they are
+    // landing in, i.e. the ceiling would delete the steady light and keep the strobe. Within each
+    // class the rule is unchanged: oldest first, for the reasons above.
+    order.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.total_cmp(&a.2)));
+    for (light, _, _) in order.into_iter().take(live - SPELL_LIGHTS_MAX) {
         commands.entity(light).try_despawn();
     }
 }
@@ -532,6 +651,68 @@ mod tests {
         assert!((reaped.envelope() - 0.5).abs() < 1e-3);
         reaped.reaped = SPELL_REAP_FADE;
         assert_eq!(reaped.envelope(), 0.0);
+    }
+
+    /// MONKEY (area spell light) — GOLDEN: the AREA envelope's four legs, which differ from every
+    /// other mode's in all four. The slower ramp, the BREATHING hold (the leg that exists so an
+    /// 8-second Flamestrike patch is not a frozen disc), and the slower removal fade that the
+    /// anchor's own ~2 s teardown leaves room for.
+    #[test]
+    fn an_area_light_ramps_slowly_breathes_and_fades_out() {
+        let at = |mut l: SpellLight, age: f32| {
+            l.age = age;
+            l.envelope()
+        };
+        let area = || SpellLight::new(100.0, 0.0, SpellLightMode::Area { phase: 0.0 });
+        // The swell is a factor on the WHOLE envelope, ramp included — it is what the light is
+        // doing, not a decoration on the hold — so the expected values carry it.
+        let swell = |t: f32| {
+            1.0 + SPELL_AREA_BREATH_DEPTH
+                * (std::f32::consts::TAU * SPELL_AREA_BREATH_HZ * t).sin()
+        };
+
+        // The ramp is the AREA one — at the flash ramp's 0.1 s an area light is well short of up.
+        assert!(at(area(), SPELL_LIGHT_RAMP) < 0.5, "not a flash");
+        let half = SPELL_AREA_RAMP * 0.5;
+        assert!((at(area(), half) - 0.5 * swell(half)).abs() < 1e-3);
+        assert!((at(area(), SPELL_AREA_RAMP) - swell(SPELL_AREA_RAMP)).abs() < 1e-3);
+
+        // The hold BREATHES: a full period later it is back at its base, a quarter period past
+        // that it is at the top of the swell, and it never wanders outside ±depth. (Every mark
+        // below is past the ramp, so `up` is 1 and the swell is the whole of the value.)
+        let period = 1.0 / SPELL_AREA_BREATH_HZ;
+        assert!((at(area(), period) - 1.0).abs() < 1e-3, "one period, back to base");
+        assert!(
+            (at(area(), period * 1.25) - (1.0 + SPELL_AREA_BREATH_DEPTH)).abs() < 1e-3,
+            "the swell is centred on the base, not clamped below it"
+        );
+        assert!(
+            (at(area(), period * 1.75) - (1.0 - SPELL_AREA_BREATH_DEPTH)).abs() < 1e-3
+        );
+        for step in 0..200 {
+            let v = at(area(), 1.0 + step as f32 * 0.05);
+            assert!(
+                (1.0 - SPELL_AREA_BREATH_DEPTH - 1e-3..=1.0 + SPELL_AREA_BREATH_DEPTH + 1e-3)
+                    .contains(&v),
+                "the hold never drifts off its base: {v}"
+            );
+        }
+
+        // Removal: the area fade, not the kit's — and `reap_complete` is what hands the budget
+        // slot back rather than waiting out the anchor's own teardown.
+        let mut ending = area();
+        ending.age = 8.0;
+        ending.reaped = SPELL_AREA_FADE * 0.5;
+        assert!(!ending.reap_complete());
+        assert!(ending.envelope() < 0.55 && ending.envelope() > 0.45);
+        ending.reaped = SPELL_AREA_FADE;
+        assert_eq!(ending.envelope(), 0.0);
+        assert!(ending.reap_complete());
+        // A KIT light of the same age is NOT finished at the area fade's length — the two clocks
+        // are genuinely separate.
+        let mut kit_ending = SpellLight::new(1.0, 0.0, SpellLightMode::Kit);
+        kit_ending.reaped = SPELL_REAP_FADE * 0.5;
+        assert!(!kit_ending.reap_complete());
     }
 
     fn test_anims(clips: &[AnimClip]) -> ModelAnimations {

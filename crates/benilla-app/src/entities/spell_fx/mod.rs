@@ -83,9 +83,11 @@ pub(super) use lifecycle::advance_fx_anim;
 // switch and the mode each lane spawns it in. Exported at `pub(crate)` because the spawners live
 // outside this module: `entities::carried_light` holds the one spawn helper (and the firework
 // GameObject's own branch), and `entities.rs` registers the two systems.
+// MONKEY (area spell light): plus the persistent ground lane's marker, which `dest_fx` reads for
+// the impact dedupe and the budget reads to evict a standing pool last.
 pub(crate) use lifecycle::{
-    advance_spell_lights, budget_spell_lights, spell_lights_enabled, SpellLight, SpellLightMode,
-    SPELL_BURST_SPAN,
+    advance_spell_lights, budget_spell_lights, spell_lights_enabled, AreaSpellLight, SpellLight,
+    SpellLightMode, SPELL_BURST_SPAN,
 };
 use lifecycle::{decay_span, FxAnimLife, FxDecay};
 

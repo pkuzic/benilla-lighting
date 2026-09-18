@@ -43,6 +43,7 @@ macro_rules! knob {
 
 use Widget::{Choice, Integer, Slider};
 
+// This developer-only panel intentionally keeps its labels and help text in English.
 const INTERIOR: &[Knob] = &[
     knob!(flag "interiorLight", interior_light, "Fixture-lit interiors; off restores the baked path."),
     knob!("interiorGain", interior_gain, Slider(0.2..=1.5), "Overall room input brightness."),
@@ -89,6 +90,10 @@ const GROUPS: &[(&str, &[Knob])] = &[
     ]),
     ("Night", &[
         knob!("nightGain", night_gain, Slider(0.2..=1.5), "Exterior night brightness; inert by day."),
+        // MONKEY (moon shadows): in "Night" rather than beside the sun dials, because that is
+        // where both its cost and its taste question live — it is inert by day, and what it buys
+        // is "the world is not flat after dark" for a second shadowed directional term.
+        knob!("moonShadowStrength", moon_shadow_strength, Slider(0.0..=1.0), "How dark a moon-shadowed fragment gets at night; 0 = no moon shadow."),
     ]),
     ("Debug", &[
         knob!("interiorDebug", interior_debug, Choice(&[0, 1, 2, 3, 4]), "0 off, 1 classification, 2 shadow, 3 caster count, 4 WMO lane map."),
@@ -147,8 +152,29 @@ pub(super) fn section(ui: &mut egui::Ui, video: &VideoConfig, script: Option<&mu
         ui.weak("Lighting controls are available once the UI session is ready.");
         return;
     };
+    // MONKEY (advanced graphics): the `lightingQuality` ladder — the same row the player reaches
+    // on the Advanced Graphics page, so this panel and that window cannot show different answers.
+    // The rungs are `cvars::LIGHTING_PRESETS`, never a second table here; the CURRENT name is read
+    // off the VM mirror rather than derived locally, because the registry's own per-frame
+    // derivation is the one authority on it and a second derivation would be a second opinion.
     ui.horizontal(|ui| {
-        ui.label("Presets");
+        ui.label("Lighting quality")
+            .on_hover_text("Writes the member rows below; reads back Custom when they match no rung.");
+        let current = script.cvar("lightingQuality").unwrap_or_default();
+        for (name, _) in crate::cvars::LIGHTING_PRESETS {
+            if ui
+                .selectable_label(current.eq_ignore_ascii_case(name), *name)
+                .clicked()
+            {
+                script.set_cvar_engine("lightingQuality", name);
+            }
+        }
+        if current.eq_ignore_ascii_case(crate::cvars::LIGHTING_CUSTOM) {
+            ui.weak(crate::cvars::LIGHTING_CUSTOM);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Interior presets");
         for (label, values) in [
             // MONKEY (bake floor): the fourth value is `interiorBakeFloor`, and it rides the
             // presets because it is a room BRIGHTNESS INPUT exactly like the three beside it.

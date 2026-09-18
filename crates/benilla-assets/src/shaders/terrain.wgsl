@@ -63,7 +63,7 @@ struct WowLight {
     light_sun: vec4<f32>,     // xyz = world-space sun TRAVEL direction (to-light = −xyz); w unused.
     light_spec: vec4<f32>,    // rgb = row 9 specular color; w = shininess (20). rgb == 0 disables.
     fog_color: vec4<f32>,     // rgb = row 7 fog (raw, gamma 0..1); w = enable (>0.5 ⇒ blend).
-    fog_params: vec4<f32>,    // x = fog_start yd; y = fog_end yd; z unused; w = farclip wall.
+    fog_params: vec4<f32>,    // x = fog_start yd; y = fog_end yd; z = signed +sun / -moon shadow weight; w = farclip wall.
     _sh: array<vec4<f32>, 6>, // rows 6-11: the model SH coeffs (live in wow_model.wgsl, 0354) — unread by terrain.
     sh_c16: vec4<f32>,        // row 12: xyz the models' c16 quad band; .w a FREE lane (the 0273 point gain is retired).
     _water: array<vec4<f32>, 4>, // rows 13-16: the liquid swatches — unread by terrain.
@@ -281,6 +281,8 @@ struct TerrainVsOut {
     // reads `primary` and is therefore bit-identical. Unclamped is safe to interpolate: it is
     // linear in `N.L` and the clamp that used to bound it is re-applied per fragment.
     @location(9) base_lit: vec3<f32>,
+    // MONKEY (moon shadows): preserve the point sum BEFORE saturation; primary cannot recover it.
+    @location(10) point_lit: vec3<f32>,
 }
 
 // Terrain's point-light **candidacy half-width** (yd): the reference's guaranteed covered box is
@@ -611,6 +613,7 @@ fn vertex(in: Vertex) -> TerrainVsOut {
     let sel = point_light_pick(mcnk_cell_anchor(out.world_position.xyz), MCNK_CELL_HALF);
     out.ext_sel = sel;
     let points = point_light_eval(sel, out.world_position.xyz, n);
+    out.point_lit = points;
     let sun_lighting = wow_light.light_diffuse.rgb * ndotl;
     // The sun/ambient half on its own slot, UNCLAMPED (see `base_lit`) - the night lane's only way
     // back to a `primary` that does not already have the unshadowed point term baked into it.
@@ -693,18 +696,24 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // MCSH fade-back.
     let view_z = (view.view_from_world * in.world_position).z;
     let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let sun_shadow_strength = wow_light.fog_params.z;
+    // MONKEY (moon shadows): the lane is SIGNED now — `+` the sun's weight, `-` the moon's (see
+    // `shadow_hook::sun_shadow_w`). `max(z, 0)` is the identity on every value this lane ever held
+    // before the feature, so the name, the MCSH gate and the torch-lane decode below are unchanged.
+    let sun_shadow_strength = shadow_hook::sun_shadow_w(wow_light.fog_params.z);
+    let moon_shadow_strength = shadow_hook::moon_shadow_w(wow_light.fog_params.z);
     // Hoisted out of the `realtime_shadow` call (same expression, same bits) because the torch lane
     // below needs the same normal for its normal-offset sample.
     let n_lit = normalize(in.world_normal);
-    let world_shadow = shadow_hook::realtime_shadow(
+    let shadow_terms = shadow_hook::realtime_shadow_terms(
         in.world_position,
         n_lit,
         view_z,
         cam_dist,
         wow_light._wmo_fog[1].z,
         sun_shadow_strength,
+        moon_shadow_strength,
     );
+    let world_shadow = shadow_terms.x;
     // MONKEY (outdoor torch shadows: terrain): the exterior point term, CAST-SHADOWED at night.
     //
     // `in.primary` is the Gouraud (per-vertex, per-vertex-CLAMPED) diffuse, and it stays the only
@@ -734,6 +743,19 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         primary = mix(in.primary, primary_night, ext_night_w);
     }
 
+    // MONKEY (moon shadows): attenuate the SKY (ambient AND directional) BEFORE adding points
+    // and saturating. Subtracting from primary loses over-gamut torch energy: sky .2 + point 1
+    // must remain 1 under a .35 moon shadow, not .93. Keep the entire off arm above untouched;
+    // neither a zero weight nor a fully lit fragment earns a different Gouraud/clamp path.
+    if (shadow_terms.y < 1.0) {
+        var points = in.point_lit;
+        if (ext_night_w > 0.0) {
+            points = mix(points,
+                point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit), ext_night_w);
+        }
+        primary = clamp(in.base_lit * shadow_terms.y + points, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
     // STEP 4: MCSH baked shadow. On the reference path (pixelShaders+specular) terrain is ONE pass
     // through `terrainp_s.bls`, which carries the MCSH bit in the blend texture's alpha (1.0 lit / 0.0
     // shadowed) and uses it TWO ways (Q15) — NOT the Q11 separate ambient-tint overlay (that's the
@@ -756,6 +778,14 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // world shadow fades at night the baked MCSH fades back IN. By day (strength 1) MCSH is fully
     // replaced; at night (strength 0) the authored bake returns; dusk crossfades. Character-only
     // (lane flag off) never suppresses MCSH.
+    // MONKEY (moon shadows): this stays on the SUN weight alone — deliberately. The symmetric
+    // reading ("a moon shadow replaces 35 % of the bake too") lightens MCSH everywhere, including
+    // the ground BEYOND the cascade where the realtime lane resolves nothing and there would be no
+    // replacement for what was removed. The two also compose rather than double-count: the moon
+    // arm scales the light SUM (`primary`, above) and MCSH multiplies the result, and the moon arm
+    // is ≤ 0.35 of a term the bake is already a flat −30 % of. The visible consequence is that a
+    // tree at night wears its baked noon-sun shadow AND a faint moon-direction one — which is worth
+    // eyes on a capture before it is called wrong.
     let world_shadow_lane = wow_light.sh_c16.w > 0.5;
     let mcsh_suppress = select(0.0, sun_shadow_strength, world_shadow_lane);
     let shadow_lit_eff = mix(shadow_lit, 1.0, mcsh_suppress);

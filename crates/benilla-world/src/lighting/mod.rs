@@ -41,6 +41,13 @@ pub use global_light::{
     ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
     WorldShadowActive,
 };
+// MONKEY (moon shadows): the night directional-shadow strength dial (`moonShadowStrength`), the
+// one resource the settings registry writes for this feature (`0` = the pre-feature night render),
+// plus the two halves of the hand-over law the SHADOW RIG has to agree with the light packer
+// about — which body the one directional light is aimed at, and how much it may cast.
+pub use global_light::{
+    moon_shadow_weight, sun_shadow_strength, MoonShadowStrength, ShadowBody, ShadowHandover,
+};
 // MONKEY (merge 2026-09-17): upstream's world-light component, adopted as THE world light.
 pub use global_light::WorldPointLight;
 // MONKEY (spellLightGain): the spell lane's marker + its live gain — the two-word world-side
@@ -202,6 +209,23 @@ impl WowLighting {
     /// sun (with an elevation clamp) rather than the near-fixed lighting `sun_dir`.
     pub fn celestial_dir(&self) -> Vec3 {
         self.celestial_dir
+    }
+
+    /// MONKEY (moon shadows): the visible **white moon** direction (camera→moon, Bevy space) — the
+    /// body the one shadow rig re-aims at after dark.
+    ///
+    /// This is the renderer's REAL moon, not a stand-in for the sun: [`daynight::moon_direction`]
+    /// is its own `DayNight` track pair off `WoW.exe`'s sky-bodies builder (elevation table
+    /// `0xce8d24`, φ 35°↔100° — overhead at midnight, parked 10° under the horizon 04:00→22:00).
+    /// Its AZIMUTH, however, is the constant 45° the celestial sun also uses (table `0xce8d0c`), so
+    /// a moon shadow falls along the same compass line a midday sun shadow does, only from a lower
+    /// and slower-moving elevation. That is the reference's own geometry, not an approximation
+    /// here.
+    ///
+    /// Exposed beside [`Self::celestial_dir`] and for the same reason: the shadow rig lives in
+    /// `benilla-app` and must aim at the same body the light packer is weighting.
+    pub fn moon_dir(&self) -> Vec3 {
+        self.moon_dir_white
     }
 
     /// Per-kind **water swatch endpoints**: `(shallow_rgb, deep_rgb, shallow_alpha, deep_alpha)`. These

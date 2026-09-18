@@ -80,7 +80,7 @@ struct WowLight {
     _light_sun: vec4<f32>,     // 2
     _light_spec: vec4<f32>,    // 3
     fog_color: vec4<f32>,      // 4 rgb = Light.dbc row 7 (gamma 0..1); w = enable (>0.5 ⇒ blend)
-    fog_params: vec4<f32>,     // 5 x/y = the SCENE fog start/end yd (unread here — the hull has its own pair); z unused; w = farclip wall (0 ⇒ off)
+    fog_params: vec4<f32>,     // 5 x/y = the SCENE fog start/end yd (unread here — the hull has its own pair); z = the signed directional-shadow weight (MONKEY moon shadows: +sun / -moon; unread here); w = farclip wall (0 ⇒ off)
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> w: WowLight;
 

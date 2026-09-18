@@ -26,6 +26,7 @@
 //! corruption seen during the first experiment. Only the private-layer proxy casts.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::ecs::entity::EntityHashSet;
 use bevy::camera::visibility::{NoFrustumCulling, RenderLayers};
 use bevy::light::{
     CascadeShadowConfigBuilder, DirectionalLight, DirectionalLightShadowMap, NotShadowReceiver,
@@ -45,7 +46,13 @@ use benilla_assets::materials::WowModelMaterial;
 use benilla_formats::ModelBlend;
 use benilla_world::billboard::BillboardCard;
 use benilla_world::interact::PickMesh;
-use benilla_world::lighting::{ShadowDistance, ShadowFilterGaussian, WowLighting};
+// MONKEY (moon shadows): `sun_shadow_strength` is the rig's half of the hand-over law — WHICH body
+// this one directional light is aimed at. Imported rather than mirrored so the aim and the packed
+// weight can never disagree about which map the receivers are reading.
+use benilla_world::lighting::{
+    moon_shadow_weight, sun_shadow_strength, MoonShadowStrength, ShadowBody, ShadowHandover,
+    ShadowDistance, ShadowFilterGaussian, WowLighting,
+};
 use benilla_world::model_render::{ModelKind, ModelPart, ShadowOccluder};
 use benilla_world::rig_palette::{RigPalettes, RigPart, RigSkin};
 use benilla_world::view::WorldCamera;
@@ -227,6 +234,13 @@ fn sun_snap_due(held: Option<Vec3>, live: Vec3) -> bool {
 /// celestial TO-sun direction, elevation clamped to [`MIN_SHADOW_SUN_ELEVATION`,
 /// `MAX_SHADOW_SUN_ELEVATION`]. Azimuth is preserved so shadows sweep with the real sun; only the
 /// height is tamed so a set/zenith sun can't invert or degenerate the basis.
+///
+/// MONKEY (moon shadows): the MOON is aimed through this same function, unchanged. The clamp is
+/// exactly what a moonrise needs — the white moon climbs from −10° through 0° to +55°, and an
+/// unclamped basis at 1° of elevation stretches the cascade's footprint toward the horizon until
+/// every shadow in it is a smear. The moon also has no separate azimuth problem to solve: its
+/// bearing is the SAME constant 45° the celestial sun uses (`daynight::moon_direction`), so a moon
+/// shadow falls along a midday sun shadow's compass line, only longer.
 fn shadow_sun_travel(to_sun: Vec3) -> Vec3 {
     let s = to_sun.normalize_or_zero();
     if s == Vec3::ZERO {
@@ -259,8 +273,8 @@ struct ShadowCameraLayer {
     had_layers: bool,
 }
 
-/// The two ordered phases of the shadow feature within `Last`: the rig runs FIRST (spawns/aims the
-/// sun, publishes [`ShadowFrame`]), then every lane runs in [`ShadowSet::Lanes`] — reading the frame
+/// MONKEY (moon shadows): the rig runs in PostUpdate BEFORE Propagate (spawns/aims the
+/// sun, publishes [`ShadowFrame`]), then lanes run in Last in [`ShadowSet::Lanes`] — reading the frame
 /// to build its casters and ORing its demand back in for the rig to read next frame.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ShadowSet {
@@ -280,6 +294,8 @@ pub(crate) struct ShadowDemand(pub bool);
 #[derive(Resource, Default)]
 pub(crate) struct ShadowFrame {
     pub active: bool,
+    /// MONKEY (moon shadows): keep cached geometry, but spend no rebuild work on an off night.
+    pub suspended: bool,
     pub light_position: Vec3,
     pub sun_direction: Vec3,
     /// Reach for short casters (creatures/gameobjects — at most a body tall).
@@ -347,12 +363,15 @@ impl Plugin for ShadowCorePlugin {
             .init_resource::<ShadowDemand>()
             .init_resource::<ShadowFrame>()
             // The rig runs before the lanes every frame; the lanes read the frame it publishes.
-            .configure_sets(Last, (ShadowSet::Rig, ShadowSet::Lanes).chain())
+            // MONKEY (moon shadows): after ALL Update work (lighting resolve + strength bridge),
+            // before this frame's transform propagation and light-buffer packing. Last was too
+            // late: a time jump had already packed the new body's weight over the old basis.
+            .configure_sets(PostUpdate, ShadowSet::Rig.before(bevy::transform::TransformSystems::Propagate))
             // MONKEY (sun shadow perf): the quality dials land BEFORE the rig each frame, and
             // unconditionally — a `shadowMapSize` write must take even while the lanes are off, so
             // turning shadows back on doesn't render one frame at the previous size.
             .add_systems(
-                Last,
+                PostUpdate,
                 (apply_shadow_quality, manage_rig)
                     .chain()
                     .in_set(ShadowSet::Rig),
@@ -433,19 +452,24 @@ fn manage_rig(
     state: Res<State<ClientState>>,
     video: Res<VideoConfig>,
     lighting: Res<WowLighting>,
+    time: Res<Time>,
+    mut handover: ResMut<ShadowHandover>,
     mut demand: ResMut<ShadowDemand>,
     mut frame: ResMut<ShadowFrame>,
     mut rig: ResMut<ShadowRigState>,
     // MONKEY (distance slider): bridge the app-side `shadowDistance` to benilla-world so
     // `global_light` can pack it for the receivers' edge fade (which must fade at THIS distance).
     mut shadow_distance_out: ResMut<ShadowDistance>,
+    // MONKEY (moon shadows): read-only here — the settings registry owns the write. `0` keeps the
+    // rig aimed at the celestial sun all night, i.e. the pre-feature behaviour exactly.
+    moon_strength: Res<MoonShadowStrength>,
     mut commands: Commands,
     mut materials: ResMut<Assets<ShadowCasterMaterial>>,
     mut cameras: Query<
         (Entity, Option<&mut RenderLayers>, Option<&ShadowCameraLayer>),
         With<WorldCamera>,
     >,
-    mut suns: Query<&mut Transform, With<ShadowSun>>,
+    mut suns: Query<(&mut Transform, &mut DirectionalLight), With<ShadowSun>>,
     cameras_for_position: Query<&GlobalTransform, With<WorldCamera>>,
 ) {
     let in_world = *state.get() == ClientState::InWorld;
@@ -459,6 +483,13 @@ fn manage_rig(
     // (they run after us, in ShadowSet::Lanes). One-frame lag on rig spawn — imperceptible.
     let wanted = demand.0 && in_world;
     demand.0 = false;
+    // MONKEY (moon shadows): publish zero immediately on a body change. Only the actual write
+    // below acknowledges the basis; fresh spawns may need a deferred-command frame to get here.
+    let sun_w = sun_shadow_strength(lighting.celestial_dir().y);
+    handover.request(sun_w,
+        moon_shadow_weight(lighting.celestial_dir().y, lighting.moon_dir().y),
+        moon_strength.0, wanted, time.delta_secs());
+    frame.suspended = sun_w <= 0.0 && moon_strength.0 <= 0.0;
 
     if !wanted {
         if let Some(entity) = rig.sun.take() {
@@ -485,6 +516,17 @@ fn manage_rig(
         return;
     }
 
+    // MONKEY (moon shadows): an externally removed light is not an acknowledged live rig.
+    // Deferred first spawns have no written basis yet, so they are allowed their creation frame.
+    if rig.sun_written.is_some() && rig.sun.is_some_and(|sun| !suns.contains(sun)) {
+        rig.sun = None;
+        rig.sun_written = None;
+        *handover = ShadowHandover::default();
+        handover.request(sun_w,
+            moon_shadow_weight(lighting.celestial_dir().y, lighting.moon_dir().y),
+            moon_strength.0, wanted, 0.0);
+    }
+
     if rig.material.is_none() {
         rig.material = Some(materials.add(ShadowCasterMaterial {}));
     }
@@ -495,7 +537,7 @@ fn manage_rig(
                     // The light exists to populate a shadow map; WoW's shader lighting stays
                     // authoritative, so it must not add a second diffuse term.
                     illuminance: 0.0,
-                    shadows_enabled: true,
+                    shadows_enabled: !frame.suspended,
                     shadow_depth_bias: 0.02,
                     shadow_normal_bias: 0.8,
                     ..default()
@@ -558,8 +600,15 @@ fn manage_rig(
         .map(GlobalTransform::translation)
         .unwrap_or(Vec3::ZERO);
 
-    // MONKEY (moving sun): aim at the VISIBLE celestial sun (rises/sets), clamped in elevation.
-    let sun_direction = shadow_sun_travel(lighting.celestial_dir());
+    // MONKEY (moon shadows): request/acknowledge rather than assuming the clock is continuous.
+    // The published weight stays zero across the write and its propagation frame, including a
+    // noon-to-midnight jump, login and a strength-zero-to-enabled transition at midnight.
+    let aim_at_moon = handover.wanted == Some(ShadowBody::Moon);
+    let sun_direction = shadow_sun_travel(if aim_at_moon {
+        lighting.moon_dir()
+    } else {
+        lighting.celestial_dir()
+    });
     // MONKEY (sun shadow perf): `shadowCasterReach` scales BOTH reaches by the same factor, after
     // the reach law rather than inside it — the law's terms (resolve range, rebuild margin, the
     // sun-elevation extension) each mean something, and a dial that rewrote one of them would
@@ -572,15 +621,21 @@ fn manage_rig(
 
     if let Some(sun) = rig.sun {
         // Only the rotation matters; QUANTISED to hold the cascade texel snap (see SUN_SNAP_RADIANS).
-        if sun_snap_due(rig.sun_written, sun_direction) {
-            if let Ok(mut current) = suns.get_mut(sun) {
+        if let Ok((mut current, mut light)) = suns.get_mut(sun) {
+            if light.shadows_enabled == frame.suspended {
+                light.shadows_enabled = !frame.suspended;
+            }
+            if handover.aimed != handover.wanted || sun_snap_due(rig.sun_written, sun_direction) {
                 *current = Transform::IDENTITY.looking_to(sun_direction, Vec3::Y);
                 rig.sun_written = Some(sun_direction);
+                if let Some(body) = handover.wanted {
+                    handover.aim_written(body);
+                }
             }
         }
     }
 
-    frame.active = true;
+    frame.active = rig.sun.is_some_and(|sun| suns.contains(sun));
     frame.light_position = light_position;
     frame.sun_direction = sun_direction;
     frame.entity_reach = entity_reach;
@@ -676,6 +731,7 @@ pub(crate) fn empty_cutout_mesh() -> Mesh {
 pub(crate) fn collect_entity_geometry(
     parts: &Query<
         (
+            Entity,
             &PickMesh,
             &ModelPart,
             Option<&GlobalTransform>,
@@ -694,9 +750,10 @@ pub(crate) fn collect_entity_geometry(
     doodad_reach: f32,
     positions: &mut Vec<[f32; 3]>,
     indices: &mut Vec<u32>,
+    mut built_parts: Option<&mut EntityHashSet>,
 ) -> (u32, u32) {
     let (mut admitted, mut rejected) = (0u32, 0u32);
-    for (pick, part, global, rig_part, occluder, _material) in parts.iter() {
+    for (entity, pick, part, global, rig_part, occluder, _material) in parts.iter() {
         if !casts_realtime_shadow(part.kind, part.blend, want_creatures, want_environment) {
             continue;
         }
@@ -734,7 +791,15 @@ pub(crate) fn collect_entity_geometry(
         }
         let added = positions.len() as u32 - base;
         if added != 0 {
+            let before = indices.len();
             append_triangles(&pick.0.indices, added, base, indices);
+            // MONKEY (moon shadows): readiness is a successful triangle append, not admission
+            // or a material handle. Missing palettes / pending mesh data must keep the oval.
+            if indices.len() > before {
+                if let Some(built) = built_parts.as_deref_mut() {
+                    built.insert(entity);
+                }
+            }
         }
     }
     (admitted, rejected)
@@ -848,6 +913,52 @@ mod tests {
             "travel points away from the sun's horizontal bearing"
         );
         assert_eq!(shadow_sun_travel(Vec3::ZERO), Vec3::NEG_Z);
+    }
+
+    /// MONKEY (moon shadows): the RIG's half of the hand-over — WHICH body the one directional
+    /// light is aimed at, and that the swap lands where nothing is being cast.
+    ///
+    /// `manage_rig`'s predicate is `moonShadowStrength > 0 && sun_shadow_strength(sun.y) <= 0`.
+    /// What has to hold for that to be a swap and not a POP is that on the frame it flips, BOTH
+    /// weights are zero — the sun's because the predicate says so, the moon's because
+    /// `moon_shadow_weight` has its own elevation ramp and the moon is still under the horizon
+    /// there. (The weights' own continuity over the whole game day is
+    /// `benilla_world`'s `the_two_shadow_weights_never_overlap_and_neither_jumps`; this is the
+    /// aiming side of the same contract, and the reason the two are not one test is that the aim
+    /// lives in this crate and the weights in that one.)
+    ///
+    /// The third assertion is the one a reviewer should look at hardest: a moon at or under the
+    /// horizon must still produce a DOWNWARD, elevation-clamped basis. Unclamped, a moonrise aim
+    /// either inverts (a below-horizon body's travel points up, so every shadow falls the wrong
+    /// way) or stretches the cascade's footprint toward the horizon until the map resolves nothing.
+    #[test]
+    fn the_rig_hands_over_to_the_moon_only_where_neither_body_casts() {
+        use benilla_world::lighting::{moon_shadow_weight, sun_shadow_strength};
+
+        // Dusk, the frame the aim flips: the sun has just reached the horizon.
+        let sun_down = -0.02_f32;
+        assert_eq!(sun_shadow_strength(sun_down), 0.0, "the sun casts nothing at the horizon");
+        // …and the moon is still under it (the shipped tables put moonrise ~1h45m later).
+        let moon_under = -0.17_f32;
+        assert_eq!(
+            moon_shadow_weight(sun_down, moon_under),
+            0.0,
+            "the moon must not start casting the instant the sun stops — the swap has to happen \
+             where BOTH weights are zero or the map's contents change under a live weight"
+        );
+        // While the sun is still up the moon is refused outright, whatever its elevation.
+        assert!(sun_shadow_strength(0.5) > 0.0);
+        assert_eq!(moon_shadow_weight(0.5, 0.9), 0.0, "one body casts at a time");
+        // A high midnight moon does cast, and at full weight (the strength dial scales it later).
+        assert_eq!(moon_shadow_weight(sun_down, 0.82), 1.0);
+        // The aim itself: a below-horizon moon still travels DOWN, pinned at the floor elevation —
+        // the same treatment `shadow_sun_travel` gives a set sun.
+        let t = shadow_sun_travel(Vec3::new(0.7, moon_under, 0.7).normalize());
+        assert!(t.y < 0.0, "a moonrise basis still points down");
+        assert!(
+            ((-t.y).asin() - MIN_SHADOW_SUN_ELEVATION).abs() < 1e-3,
+            "a low moon is pinned to the floor elevation, so its shadows cannot smear to the horizon"
+        );
     }
 
     #[test]

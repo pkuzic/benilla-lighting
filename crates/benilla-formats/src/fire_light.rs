@@ -829,7 +829,7 @@ impl SpellLightKind {
 /// After the vetoes the luminous keys run. Note `FIRE` catches `FIREWORK`, `FIRECRACKER`,
 /// `SOULFIRE`, `HELLFIRE`, `RAINOFFIRE`, `FIREBALL`, `FIREBOLT` and `FIREBLAST` in one entry,
 /// which is why the list is this short: the artists named the corpus by school already.
-const SPELL_NAME_RULES: [(&str, SpellLightKind); 32] = [
+const SPELL_NAME_RULES: [(&str, SpellLightKind); 33] = [
     // --- the dark schools, and the name collisions they must win ---
     ("LIGHTNING", SpellLightKind::None),
     ("STARFIRE", SpellLightKind::None),
@@ -863,6 +863,19 @@ const SPELL_NAME_RULES: [(&str, SpellLightKind); 32] = [
     ("HOLY", SpellLightKind::Holy),
     ("DIVINE", SpellLightKind::Holy),
     ("SMITE", SpellLightKind::Holy),
+    // MONKEY (area spell light): the hunter's Flare. `Holy` names the LIGHT FAMILY, not the spell's
+    // school (Flare is school 0, Physical) — a magnesium signal flare burns white-hot, and Holy is
+    // this enum's warm-white. Without the rule its own ramp decides, and `spell_color`'s
+    // most-saturated key on `Flare_State_Base` is the `(1.00, 0.37, 0.08)` ember the particle COOLS
+    // to, not the white core it is born at, so the one spell in 1.12 that exists to be a light
+    // would light the ground campfire-orange.
+    //
+    // The key is anchored to a PATH SEPARATOR (`\FLARE_`) rather than the bare word, because the
+    // bare word over-reaches in this corpus: `SPELLS\Infernal_Flare_Rec` (a warlock summon) and
+    // `SPELLS\Missile_Flare` (a generic projectile streak) both contain `FLARE` and neither is a
+    // signal flare. Only `SPELLS\Flare_Cast_Base` / `SPELLS\Flare_State_Base` — the cast arc and
+    // the burning ground object — start a path component with it.
+    ("\\FLARE_", SpellLightKind::Holy),
     ("FEL", SpellLightKind::Fel),
 ];
 
@@ -1110,6 +1123,129 @@ pub fn synthesize_spell_light<'a>(
         bucket,
         onset: emit_onset(def),
     })
+}
+
+// ---------------------------------------------------------------------------------------------
+// MONKEY (area spell light): the PERSISTENT GROUND EFFECT arm of the spell route.
+//
+// A ground cast's visual is not the unit-kit lane at all: the server creates a TYPEID-6
+// DynamicObject and the client instances the `SpellVisual` row's own area model on it for the
+// object's whole life (`benilla_app::entities::dest_fx`). That lane is exactly the one the spell
+// light had no shape for — it spawned a `Burst`, i.e. an impact flash, on something that stands on
+// the ground for eight seconds, and then a shard flash 5× a second on top of it.
+//
+// The three questions this section answers for that lane, and why each one needed a rule of its
+// own rather than reusing [`synthesize_spell_light`]'s answer:
+//
+// 1. **Does it light?** Half the area models author NO particle emitter whatsoever — they are flat
+//    animated ground DECALS (`Spells\Flamestrike_Impact_Base` and `spells\noname_area`, Explosive
+//    Trap's patch, are pure geometry). The emitter route returns `None` for them, so the burning
+//    ground of a Flamestrike could never light anything. [`area_light_kind`] is the fallback
+//    ladder for exactly that case.
+// 2. **What colour?** See [`area_color`] — a POOL is read for seconds where a flash is read for a
+//    frame, and the holy ramps in this corpus are ember art.
+// 3. **How far?** The wire `DYNAMICOBJECT_RADIUS` is the effect's real footprint (the shard
+//    emitter spreads its particles over exactly it), so an area light sizes its pool from the
+//    spell's own AoE rather than from its particles ([`area_reach`]).
+// ---------------------------------------------------------------------------------------------
+
+/// `Spell.dbc` field 1 `School` = **0, Physical** — a spell that has no magic school at all.
+///
+/// Called out because it is the one value that must NOT be read as "this school does not glow":
+/// a hunter's Flare, a Volley of arrows and every trap are school 0, and the three want opposite
+/// answers. School 0 therefore means "the column says nothing" ([`area_light_kind`]).
+pub const SPELL_SCHOOL_PHYSICAL: u32 = 0;
+
+/// The luminous family of a `Spell.dbc` **School** index (field 1 — an index, not a mask):
+/// `1 Holy`, `2 Fire`, and the rest (Nature 3, Frost 4, Shadow 5, Arcane 6) dark.
+///
+/// This is the owner's rule read off the data instead of guessed off a filename, and it is why the
+/// area lane needs almost no new name keys: Blizzard IS frost, Hurricane IS nature, Consecration IS
+/// holy and Explosive Trap IS fire, stated by the same table the damage comes from. It is also
+/// LOCALE-PROOF where matching the spell's NAME would not be — `Spell.dbc`'s name column is
+/// translated, its school column is not.
+///
+/// No `Fel` arm: 1.12 has no fel school (a warlock's spells are Fire or Shadow), so green fire is
+/// only ever named by a model path ([`SPELL_NAME_RULES`]'s `FEL`).
+pub fn spell_school_kind(school: u32) -> SpellLightKind {
+    match school {
+        1 => SpellLightKind::Holy,
+        2 => SpellLightKind::Fire,
+        _ => SpellLightKind::None,
+    }
+}
+
+/// The luminous family of a persistent AREA effect — `model_path` is the area model the
+/// DynamicObject instances, `spell_school` its spell's `Spell.dbc` school index, and `hue_kind` the
+/// verdict [`synthesize_spell_light`] already reached on that model (`None` when it reached none,
+/// i.e. no emitter or a vetoed one).
+///
+/// Three sources, most-authoritative first, and the order is the design:
+///
+/// 1. **The model's own path.** An artist who called the file `Flamestrike` or `FrostTrap` has
+///    stated the answer, and stated it about the very object that will be on the ground. This arm
+///    carries the VETOES too, so `Blizzard_Impact_Base` is dark here and can never be re-lit below.
+/// 2. **The spell's school**, whenever it is a real one. This is what lets a model with a
+///    meaningless name light correctly: Explosive Trap's patch is `spells\noname_area.m2`, which
+///    names nothing and emits nothing, and only the Fire school says it burns.
+/// 3. **The model's hue**, last, because it is the only guess in the list — and by the time we
+///    reach it both the artist and the DBC have declined to answer.
+pub fn area_light_kind(
+    model_path: &str,
+    spell_school: u32,
+    hue_kind: Option<SpellLightKind>,
+) -> SpellLightKind {
+    if let Some(named) = spell_name_kind(model_path) {
+        return named;
+    }
+    if spell_school != SPELL_SCHOOL_PHYSICAL {
+        return spell_school_kind(spell_school);
+    }
+    hue_kind.unwrap_or(SpellLightKind::None)
+}
+
+/// An area light's colour: the model's own ramp ([`spell_color`], passed in as `ramp`) — **except
+/// for the HOLY family, which always takes [`DEFAULT_HOLY`]**.
+///
+/// The exception is the area lane's alone, and it exists because a POOL is read differently from a
+/// FLASH. Both holy ground effects in 1.12 author warm DUST: Consecration's strongest key is
+/// `(1.00, 0.72, 0.17)` and Flare's is `(1.00, 0.37, 0.08)`. Taken literally, a paladin's
+/// consecrated ground and a hunter's flare both put an orange pool on the terrain — which is
+/// indistinguishable from Flamestrike's, for seconds at a time, right next to it. An impact keeps
+/// its ramp (its whole life is a frame or two and the hue is the effect's signature); a light that
+/// stands still long enough to be compared has to be the colour its school reads as.
+pub fn area_color(kind: SpellLightKind, ramp: Option<[f32; 3]>) -> [f32; 3] {
+    match kind {
+        SpellLightKind::Holy => DEFAULT_HOLY,
+        _ => ramp.unwrap_or_else(|| kind.default_color()),
+    }
+}
+
+/// How high above the DynamicObject's own point an area light hangs (yd).
+///
+/// A dynobj sits ON the ground and its model is a flat decal, so a light at the object's exact
+/// position is a light INSIDE the terrain: the faithful falloff `1/(0.7d + 0.03d²)` blows up at
+/// `d → 0`, and every ground vertex within a step of the centre would clip to white while the ring
+/// two yards out got nothing. Lifting it to roughly waist height makes the pool read as a pool.
+pub const AREA_LIGHT_LIFT: f32 = 1.5;
+
+/// The intensity an area light takes when its model authors **no usable emitter at all** — the
+/// decal-only population (Flamestrike, Explosive Trap). `2.0` is the shared ladder's *brazier*
+/// rung ([`spell_intensity`]), which is where an 8-yard patch of burning ground belongs: a torch
+/// (1.5) is a hand-held flame and the 3.0 bonfire rung is reserved for a forge, per the spell
+/// route's own "a spell must not out-blaze a forge".
+pub const AREA_FALLBACK_INTENSITY: f32 = 2.0;
+
+/// An area light's interior reach (yd) from the wire `DYNAMICOBJECT_RADIUS`.
+///
+/// `× 1.6` because the light has to spill PAST the effect: a pool that stopped exactly at the AoE
+/// edge would draw a hard disc of lit terrain with a dark rim, where a real fire lights the ground
+/// around it more faintly than the ground under it. The floor stops a 1-yard dynobj from producing
+/// a light too small to notice, and the ceiling is the top rung of the shared reach ladder
+/// (`room_claim::m2_light_reach`) — an area effect may reach as far as a bonfire and no further,
+/// so a single spell can never out-light a building's own fixtures.
+pub fn area_reach(radius: f32) -> f32 {
+    (radius * 1.6).clamp(8.0, 24.0)
 }
 
 #[cfg(test)]
@@ -1849,5 +1985,144 @@ mod tests {
         assert_eq!(spell_intensity(0.08, 300.0), (1.5, "torch"));
         assert_eq!(spell_intensity(0.5, 200.0), (2.0, "brazier"));
         assert_eq!(spell_intensity(1.1, 500.0), (2.0, "brazier"));
+    }
+
+    // -- MONKEY (area spell light) ---------------------------------------------------------
+
+    /// Vanilla `Spell.dbc` school indices, so the area tests below read as the spells they are.
+    const PHYSICAL: u32 = 0;
+    const HOLY: u32 = 1;
+    const FIRE: u32 = 2;
+    const NATURE: u32 = 3;
+    const FROST: u32 = 4;
+
+    /// GOLDEN — the whole named worklist, on the REAL `SpellVisual` field-12 area models each spell
+    /// actually instances on its DynamicObject (dumped with `benilla-extract spellvis <id>`; the
+    /// `area` line). The third argument is what [`synthesize_spell_light`] independently reached on
+    /// that model, `None` for the decal-only half that authors no emitter at all — which is the
+    /// case the whole ladder exists for, and is Flamestrike's.
+    #[test]
+    fn the_ground_effects_that_light_and_the_ones_that_stay_dark() {
+        use SpellLightKind::{Fire as F, Holy as H, None as Dark};
+
+        // --- lights ---
+        // Flamestrike (2120): a flat animated burn decal — ZERO particle emitters, so the emitter
+        // route has nothing to say and the model's own name is the only source that does.
+        assert_eq!(
+            area_light_kind("Spells\\Flamestrike_Impact_Base.m2", FIRE, None),
+            F
+        );
+        // Rain of Fire (5740): five emitters, `FIRE` in the path — named and measured agree.
+        assert_eq!(
+            area_light_kind("Spells\\RainOfFire_Impact_Base.m2", FIRE, Some(F)),
+            F
+        );
+        // Consecration (26573): its one emitter ramps to `(1.00, 0.72, 0.17)`, which `spell_hue_kind`
+        // reads as FIRE. The school column is what corrects it — and the colour rule below is what
+        // stops the paladin's ground burning orange.
+        assert_eq!(
+            area_light_kind("spells\\consecration_impact_base.m2", HOLY, Some(F)),
+            H
+        );
+        // Explosive Trap (13812): the patch is `noname_area` — no emitters, and a filename that
+        // names nothing. ONLY the school says it burns.
+        assert_eq!(area_light_kind("spells\\noname_area.m2", FIRE, None), F);
+        // Flare (1543): school 0 Physical, so the school arm must abstain; the `\FLARE_` key is
+        // what makes the one spell that IS a light a light.
+        assert_eq!(
+            area_light_kind("spells\\flare_state_base.m2", PHYSICAL, Some(F)),
+            H
+        );
+
+        // --- dark, and each for its own reason ---
+        // Blizzard (10): `BLIZZ` vetoes in the path, and the school agrees. Its shards are this
+        // same model, so the whole storm stays dark.
+        assert_eq!(
+            area_light_kind("Spells\\Blizzard_Impact_Base.m2", FROST, None),
+            Dark
+        );
+        // Hurricane (16914): `LIGHTNING` in `LightningStorm_Cloud_State`.
+        assert_eq!(
+            area_light_kind("Spells\\LightningStorm_Cloud_State.m2", NATURE, None),
+            Dark
+        );
+        // Volley (1510): `ARCANE` in `arcaneshot_area` — and school 0, so the path veto is the
+        // ONLY thing holding it. That is the ordering being pinned.
+        assert_eq!(
+            area_light_kind("spells\\arcaneshot_area.m2", PHYSICAL, Some(F)),
+            Dark
+        );
+        // Frost Trap (13810), and Freezing Trap, which has no area object at all.
+        assert_eq!(
+            area_light_kind("spells\\frosttrap_aura.m2", FROST, None),
+            Dark
+        );
+        // A school veto beats a warm ramp: a frost model with one red spark stays dark even where
+        // its path says nothing.
+        assert_eq!(area_light_kind("spells\\noname_area.m2", FROST, Some(F)), Dark);
+        // …and with nothing to go on at all, dark is the answer (the reference's own behaviour).
+        assert_eq!(area_light_kind("spells\\noname_area.m2", PHYSICAL, None), Dark);
+    }
+
+    /// The `\FLARE_` key is anchored to a path separator so it takes the hunter's Flare and NOT the
+    /// two unrelated models that merely contain the word — the reason it is not the bare `FLARE`.
+    #[test]
+    fn the_flare_key_is_anchored_to_a_path_component() {
+        assert_eq!(
+            spell_name_kind("SPELLS\\Flare_State_Base.m2"),
+            Some(SpellLightKind::Holy)
+        );
+        assert_eq!(
+            spell_name_kind("SPELLS\\Flare_Cast_Base.m2"),
+            Some(SpellLightKind::Holy)
+        );
+        // A warlock summon and a generic projectile streak — neither is a signal flare, and both
+        // keep whatever their own art says.
+        assert_eq!(spell_name_kind("SPELLS\\Infernal_Flare_Rec.m2"), None);
+        assert_eq!(spell_name_kind("SPELLS\\Missile_Flare.m2"), None);
+        // `ArcaneConsecration_Impact_Base_Q` is the other collision in this corpus, and the veto
+        // block's position is what resolves it — `ARCANE` is read before any luminous key.
+        assert_eq!(
+            spell_name_kind("Spells\\ArcaneConsecration_Impact_Base_Q.m2"),
+            Some(SpellLightKind::None)
+        );
+    }
+
+    /// The colour rule: a fire pool keeps the artist's ramp, a holy pool never does.
+    #[test]
+    fn a_holy_pool_is_white_gold_whatever_its_dust_ramp_says() {
+        let ember = Some([1.0, 0.718, 0.173]);
+        assert_eq!(area_color(SpellLightKind::Fire, ember), [1.0, 0.718, 0.173]);
+        assert_eq!(area_color(SpellLightKind::Holy, ember), DEFAULT_HOLY);
+        // No ramp at all (the decal-only models) falls back to the family's own hue.
+        assert_eq!(area_color(SpellLightKind::Fire, None), DEFAULT_WARM);
+        assert_eq!(area_color(SpellLightKind::Fel, None), DEFAULT_FEL);
+        assert_eq!(area_color(SpellLightKind::Holy, None), DEFAULT_HOLY);
+    }
+
+    /// The reach ladder from the wire radius, and both clamps.
+    #[test]
+    fn area_reach_scales_the_wire_radius_between_its_clamps() {
+        // Flamestrike / Rain of Fire ship an 8 yd radius: the pool spills ~5 yd past the AoE.
+        assert!((area_reach(8.0) - 12.8).abs() < 1e-4);
+        assert!((area_reach(10.0) - 16.0).abs() < 1e-4);
+        // A tiny (or absent — the wire field is optional) radius still makes a visible pool…
+        assert_eq!(area_reach(0.0), 8.0);
+        assert_eq!(area_reach(2.0), 8.0);
+        // …and nothing reaches past the shared ladder's top rung.
+        assert_eq!(area_reach(20.0), 24.0);
+        assert_eq!(area_reach(500.0), 24.0);
+    }
+
+    /// The school column, read as the index it is. Only 1/2 light; 0 is "says nothing" and is
+    /// handled by [`area_light_kind`], not here.
+    #[test]
+    fn only_holy_and_fire_schools_glow() {
+        assert_eq!(spell_school_kind(0), SpellLightKind::None);
+        assert_eq!(spell_school_kind(1), SpellLightKind::Holy);
+        assert_eq!(spell_school_kind(2), SpellLightKind::Fire);
+        for dark in [3, 4, 5, 6, 99] {
+            assert_eq!(spell_school_kind(dark), SpellLightKind::None);
+        }
     }
 }

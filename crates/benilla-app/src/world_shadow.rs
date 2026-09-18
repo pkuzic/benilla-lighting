@@ -138,6 +138,7 @@ fn update_world_shadows(
     mut world_active: ResMut<WorldShadowActive>,
     parts: Query<
         (
+            Entity,
             &PickMesh,
             &ModelPart,
             Option<&GlobalTransform>,
@@ -161,6 +162,12 @@ fn update_world_shadows(
 
     if !world_on {
         teardown(&mut lane, &mut commands, &mut meshes, &mut cutout_materials);
+        return;
+    }
+    // MONKEY (moon shadows): no receiver can use the off-night map. Preserve cached geometry,
+    // but suspend BOTH entity and retained-world rebuilds until a body can cast again.
+    if frame.suspended {
+        lane.env_rate.reset();
         return;
     }
     let Some(material) = frame.material.clone() else {
@@ -200,6 +207,7 @@ fn update_world_shadows(
                 frame.tall_reach,
                 &mut positions,
                 &mut indices,
+                None,
             );
             let tris = (indices.len() / 3) as u32;
             restore_mesh_buffers(mesh, positions, indices);

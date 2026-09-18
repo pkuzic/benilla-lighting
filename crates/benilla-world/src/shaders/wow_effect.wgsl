@@ -31,7 +31,10 @@ struct WowLight {
     light_sun: vec4<f32>,
     light_spec: vec4<f32>,
     fog_color: vec4<f32>,  // rgb row-7 fog (gamma); w = enable (>0.5)
-    fog_params: vec4<f32>, // x=start y=end z=linear-lighting A/B flag w=farclip wall
+    // MONKEY (moon shadows): `.z` is the SIGNED directional-shadow weight (+sun / -moon, see
+    // `global_light::pack_shadow_lane`) - unread here, but the old "linear-lighting A/B flag"
+    // note was stale twice over and a lane this shader mirrors should not misname it.
+    fog_params: vec4<f32>, // x=start y=end z=signed shadow weight w=farclip wall
     sh_c10_r: vec4<f32>,
     sh_c10_g: vec4<f32>,
     sh_c10_b: vec4<f32>,

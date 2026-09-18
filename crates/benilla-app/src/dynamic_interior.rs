@@ -16,7 +16,13 @@
 //!
 //! MONKEY (spellLightGain): and `spellLightGain` → [`benilla_world::lighting::SpellLightGain`],
 //! the third of the same shape.
-use benilla_world::lighting::{DynamicInteriors, FireLightGain, SpellLightGain};
+//!
+//! MONKEY (moon shadows): and `moonShadowStrength` →
+//! [`benilla_world::lighting::MoonShadowStrength`], the fourth. Same shape, same guard, same
+//! liveness requirement — and `0` is that lane's faithful null the way `fireLightGain 0` is the
+//! synthesised-fire lane's kill switch. It is what the Advanced Graphics page's Moon Shadows row
+//! and the Off/Low presets reach.
+use benilla_world::lighting::{DynamicInteriors, FireLightGain, MoonShadowStrength, SpellLightGain};
 use bevy::prelude::*;
 
 use crate::video::VideoConfig;
@@ -46,12 +52,18 @@ fn bridge(
     // an interior knob at all: a fireball down a street takes it exactly as one down a corridor
     // does, and `FireLightGain` beside it already stands as the precedent for that.
     mut spell: ResMut<SpellLightGain>,
+    // MONKEY (moon shadows): the night lane's shadow darkness, on the same bridge and for the same
+    // reasons as the two gains above it — one live `f32`, one benilla-world resource, one guard.
+    mut moon: ResMut<MoonShadowStrength>,
 ) {
     if fire.0 != video.fire_light_gain {
         fire.0 = video.fire_light_gain;
     }
     if spell.0 != video.spell_light_gain {
         spell.0 = video.spell_light_gain;
+    }
+    if moon.0 != video.moon_shadow_strength {
+        moon.0 = video.moon_shadow_strength;
     }
     let want = DynamicInteriors {
         enabled: video.interior_light,

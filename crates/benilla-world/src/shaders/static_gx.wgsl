@@ -1459,18 +1459,25 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // fade, via `benilla::shadow_hook`) — now with the same fades as terrain + models. INTERIOR
     // batches (`WORD_INTERIOR`) take the point-light (torch) shadow instead (#2): no sun reaches a
     // sealed room, but a promoted torch does. Both are no-ops when their light source is absent.
+    // MONKEY (moon shadows): the NIGHT arm rides the SAME fetch and the SAME `WORD_INTERIOR` gate —
+    // 1.0 (inert) on every interior batch, all day, and with the feature off. Interiors stay
+    // untouched at both ends of the clock: a sealed room has no sky, so it has no moon either.
     var world_shadow = 1.0;
+    var world_moon = 1.0;
     if ((in.word & WORD_INTERIOR) == 0u) {
         let view_z = (view.view_from_world * in.world_position).z;
         let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-        world_shadow = shadow_hook::realtime_shadow(
+        let terms = shadow_hook::realtime_shadow_terms(
             in.world_position,
             n_lit,
             view_z,
             cam_dist,
             wow_light.wmo_fog_params.z,
-            wow_light.fog_params.z,
+            shadow_hook::sun_shadow_w(wow_light.fog_params.z),
+            shadow_hook::moon_shadow_w(wow_light.fog_params.z),
         );
+        world_shadow = terms.x;
+        world_moon = terms.y;
     } else {
         world_shadow = shadow_hook::torch_shadow(in.world_position, n_lit);
     }
@@ -1480,7 +1487,7 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // `world_shadow < 0.999` arm keeps `worldShadows 0` (no shadow-mapped light) and a fully
     // sunlit fragment byte-identical: `ambient + (lit − ambient) × 1.0` is not guaranteed to
     // round back to `lit`.
-    let lit_nl_shadowed = select(
+    var lit_nl_shadowed = select(
         lit_nl,
         clamp(
             wow_light.light_ambient.rgb + (lit_nl - wow_light.light_ambient.rgb) * shadow_term,
@@ -1489,6 +1496,14 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         ),
         world_shadow < 0.999,
     );
+    // MONKEY (moon shadows): shadow the unclamped exterior SKY, ambient AND directional.
+    // Points join later, before the final saturation, so a hot torch stays hot beneath a canopy.
+    // world_moon is exactly one indoors and when off; leave those arithmetic paths untouched.
+    if (world_moon < 1.0) {
+        lit_nl_shadowed = (wow_light.light_ambient.rgb + wow_light.light_diffuse.rgb * ndotl)
+            * world_moon;
+    }
+
     // The order-2 SH basis products over the fragment normal — shared by the exterior
     // doodad lobe and the interior-prop probe lane (wow_model.wgsl computes them once too).
     let quad = vec4<f32>(n_lit.x * n_lit.y, n_lit.y * n_lit.z, n_lit.z * n_lit.z, n_lit.x * n_lit.z);
@@ -1992,7 +2007,7 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
             wow_light.sh_c10_b.w,
         );
         let lit_doodad_plain = clamp(sun_lobe, vec3<f32>(0.0), vec3<f32>(1.0));
-        let lit_doodad = select(
+        var lit_doodad = select(
             lit_doodad_plain,
             clamp(
                 sun_ambient + (sun_lobe - sun_ambient) * shadow_term,
@@ -2001,6 +2016,11 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
             ),
             world_shadow < 0.999,
         );
+        // MONKEY (moon shadows): retained ADT doodads and exterior MODD props select this SH
+        // branch, not lit_nl_shadowed. Shadow the whole sky lobe before points/clamp here too.
+        if (world_moon < 1.0) {
+            lit_doodad = sun_lobe * world_moon;
+        }
         // Sun disabled (light_sun.w) falls back to the FFP matte, like the entity path.
         let lit = select(lit_nl_shadowed, lit_doodad, wow_light.light_sun.w > 0.5);
         // FFP combine: the light sum saturates FIRST, the texture (× the baked constant

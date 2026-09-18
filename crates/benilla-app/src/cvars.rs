@@ -908,6 +908,24 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
     // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
     same("gxVSync", "1").latched(),
+    // MONKEY (advanced graphics): the one row on the Advanced Graphics page that is not a knob —
+    // it is a NAME for a combination of the rows under it ([`LIGHTING_PRESETS`]). Writing a preset
+    // name writes that preset's members; writing anything else is corrected on the next frame by
+    // [`lighting_quality`], which re-DERIVES the name from the members those rows actually hold.
+    // So the stored value is never stale: it is either a preset every member agrees with, or
+    // `Custom`.
+    //
+    // A STRING row, not an int, so `config.toml` and `/console set lightingQuality Medium` both
+    // read as what they mean — and so the ladder can gain a rung without renumbering a player's
+    // saved value. `Row::numeric` is false for it (the default does not parse as a number), which
+    // is what lets the registry accept a non-numeric write at all; `realmList` is the precedent.
+    ours(
+        "lightingQuality",
+        "High",
+        "benilla's own: the preset ladder over the dynamic light + shadow rows — Off / Low / \
+         Medium / High, or Custom when the members match none of them; the reference has no \
+         realtime light or shadow system to preset",
+    ),
     // Benilla's opt-in realtime shadow-map path, split into two INDEPENDENT lanes over one shared
     // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
     // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
@@ -967,6 +985,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "shadowCasterReach",
         "1",
         "benilla's own: multiplier on the shadow caster-collection reach, 0.25..2 (1 = unchanged)",
+    ),
+    // MONKEY (moon shadows): how dark a MOON-shadowed fragment is allowed to get at night — the
+    // dial over the night lane's own shadow term (`benilla_world::lighting::MoonShadowStrength`,
+    // bridged by `dynamic_interior` beside the spell gain). `0` is the FAITHFUL null: every
+    // consumer guards on it, so a night at 0 renders as the build before the feature did — which
+    // is also what the Off and Low presets ask for.
+    ours(
+        "moonShadowStrength",
+        "0.35",
+        "benilla's own: how dark a moon-shadowed fragment gets at night, 0..1 (0 = no moon \
+         shadow, the reference's own night)",
     ),
     // MONKEY (dynamic interiors): WMO interiors + their props light from the room's LIVE fixtures
     // instead of the MOCV bake / the baked prop probe (`static_gx.wgsl` `interior_room_light`;
@@ -1087,8 +1116,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `build_light_data`, so `SetCVar` moves the whole world on the very next frame — which is how
     // "20 % / 30 % darker" gets judged at all, and `1` on either is the restore.
     //
-    // Neither touches the fires: a point light keeps its brightness under both dials, because the
-    // ask is for a darker night AROUND the flame, not a dimmer flame.
+    // Night gain leaves fire lights alone; interior gain also scales interior fixtures,
+    // including their candlelight. Outdoor fires retain their brightness under both dials.
     ours(
         "nightGain",
         "0.45",
@@ -1647,12 +1676,22 @@ impl Cvars {
     /// the minimap zoom, the camera views, the remembered character, the loading screen's tip
     /// cursor. Mirrored into the VM, persisted, and observed like any other write.
     pub(crate) fn set(&mut self, name: &str, value: &str) -> SetOutcome {
-        self.write(name, value, false)
+        let outcome = self.write(name, value, false);
+        if name.eq_ignore_ascii_case("lightingQuality") {
+            apply_lighting_preset(self, value);
+        }
+        outcome
     }
 
     /// A write the VM's mirror already made — drained from its change queue.
     pub(crate) fn set_from_vm(&mut self, name: &str, value: &str) -> SetOutcome {
-        self.write(name, value, true)
+        let outcome = self.write(name, value, true);
+        // Apply at the write's position in the queue: a later member edit must win,
+        // including a re-selection of the currently displayed preset.
+        if name.eq_ignore_ascii_case("lightingQuality") {
+            apply_lighting_preset(self, value);
+        }
+        outcome
     }
 
     /// **The table follows a value the engine already applied** — a mirror, not a write: the
@@ -1917,6 +1956,165 @@ impl Plugin for CvarPlugin {
     }
 }
 
+// ─── MONKEY (advanced graphics): the lighting preset ladder ──────────────────────────────────
+
+/// **The one place the presets are written down** — the Advanced Graphics page's `lightingQuality`
+/// ladder, as (name, members) pairs in the order [`derive_lighting_quality`] tries them.
+///
+/// A preset is a NAME FOR A SET OF ROWS, not a knob: applying one writes each member through the
+/// ordinary registry path ([`Cvars::set`]), so every observer, clamp, bridge and save that a
+/// hand-typed `/console set` would run, runs. That is why this table lives beside the registry
+/// rather than in the options window's Lua: the page is one of four ways to reach it (the others
+/// being `/console`, the lighting debug panel, and a hand-edited `config.toml`), and a table
+/// carried by the window would be a table three of them cannot see.
+///
+/// **A preset names only the members it decides.** `Off` says nothing about `shadowMapSize` — with
+/// both shadow lanes off there is no map to size — and Low says nothing about the torch counts,
+/// which its `interiorShadows 0` has already made inert. Derivation matches on exactly the members
+/// a preset lists, so a row nobody's preset mentions never pushes the ladder to `Custom`.
+///
+/// Order matters twice: the ladder reads Off → High for a human, and the first preset whose whole
+/// member list matches wins. The four are mutually exclusive on `characterShadows` /
+/// `worldShadows` / `exteriorShadows`, so no value can answer to two of them — a property
+/// `every_preset_derives_back_to_its_own_name` holds rather than a reader has to check.
+pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
+    // Everything this whole system invented, off — the client as it rendered before any of it
+    // existed. Not "cheap": OFF, so a machine that cannot afford the lanes can say so in one
+    // click, and so a bug report can be split from a taste report in one click too.
+    (
+        "Off",
+        &[
+            ("characterShadows", "0"),
+            ("worldShadows", "0"),
+            ("interiorLight", "0"),
+            ("interiorShadows", "0"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "0"),
+            ("fireLightGain", "0"),
+            ("nightGain", "1.0"),
+            ("interiorGain", "1.0"),
+            ("moonShadowStrength", "0"),
+            ("fireFlicker", "0"),
+        ],
+    ),
+    // Character silhouettes and lit rooms, and nothing that costs a second shadow pass: no world
+    // lane, no torch maps indoors or out, no moon term, and the smallest sun map on the ladder.
+    (
+        "Low",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "0"),
+            ("shadowMapSize", "1024"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "0"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+    // Both sun lanes, indoor torch shadows at half the residency, and the moon term — but no
+    // OUTDOOR torch shadows, which are the one lane whose cost is paid in the open world where the
+    // sun lanes are already paying.
+    (
+        "Medium",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "1"),
+            ("shadowMapSize", "2048"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "1"),
+            ("interiorShadowCasters", "6"),
+            ("interiorShadowDynamic", "2"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0.35"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+    // **High IS the shipped default**, member for member — which is a property, not a coincidence:
+    // `the_high_preset_is_the_registered_defaults` welds the two, so a fresh `benilla-config`
+    // reads "High" on this row rather than "Custom".
+    (
+        "High",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "1"),
+            ("shadowMapSize", "2048"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "1"),
+            ("interiorShadowCasters", "12"),
+            ("interiorShadowDynamic", "4"),
+            ("exteriorShadows", "1"),
+            ("spellLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0.35"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+];
+
+/// What the ladder shows when the members match no preset. Not a preset: selecting it writes
+/// nothing, and the next derivation puts back whatever the members really say.
+pub(crate) const LIGHTING_CUSTOM: &str = "Custom";
+
+/// Two registry values are the SAME setting when they are the same number — `"0"`, `"0.00"` and
+/// `"0.0"` all mean a lane that is off, and a preset whose member reads `"1"` must not be called
+/// `Custom` because a slider wrote `"1.00"`. Falls back to a case-insensitive string compare for
+/// the rows that hold words.
+fn same_value(a: &str, b: &str) -> bool {
+    match (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() < 1e-4,
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+/// **The name the members currently spell** — the first preset every one of whose members matches
+/// the live registry, or [`LIGHTING_CUSTOM`]. This is the only thing `lightingQuality` is ever
+/// allowed to say, which is what keeps the row from going stale behind a `/console` write.
+pub(crate) fn derive_lighting_quality(cvars: &Cvars) -> &'static str {
+    for (name, members) in LIGHTING_PRESETS {
+        let matched = members
+            .iter()
+            .all(|(k, v)| cvars.get(k).is_some_and(|live| same_value(live, v)));
+        if matched {
+            return name;
+        }
+    }
+    LIGHTING_CUSTOM
+}
+
+/// Write one preset's members. Ordinary registry writes: observers, clamps and the save all run.
+/// Unknown names (including `Custom`) write nothing and say so by answering `false`.
+pub(crate) fn apply_lighting_preset(cvars: &mut Cvars, name: &str) -> bool {
+    let Some((_, members)) = LIGHTING_PRESETS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    else {
+        return false;
+    };
+    for (k, v) in *members {
+        cvars.set(k, v);
+    }
+    true
+}
+
+/// Derive after all ordered writes, before the mirror/observer flush. File loading bypasses
+/// `set`, so saved members remain authoritative even when the saved preset name disagrees.
+fn lighting_quality(cvars: &mut Cvars) {
+    let derived = derive_lighting_quality(cvars);
+    // A derived label is a mirror, never another request to apply a preset.
+    cvars.mirror("lightingQuality", derived);
+}
+
 /// **What the environment took for this session, and what it set it to** — read off the knobs
 /// the env levers already seeded (`RenderScale::default()` reads `$WOW_RENDER_SCALE`, and so
 /// on), so the registry answers `GetCVar` with the value the client is actually running at.
@@ -2119,6 +2317,7 @@ pub(crate) fn sync_cvars(
         }
     }
     let Some(mut script) = script else {
+        lighting_quality(&mut cvars);
         // Nothing to mirror into; a later VM is seeded from the table, which carries it all.
         if cvars.has_outbox() {
             cvars.take_outbox();
@@ -2146,6 +2345,7 @@ pub(crate) fn sync_cvars(
             cvars.set_from_vm(&name, &value);
         }
     }
+    lighting_quality(&mut cvars);
     if seeded.claim(&script) {
         // The file's unclaimed entries go in FIRST (decision 1291): an addon's `RegisterCVar`
         // later starts its key at the saved value. Then the table itself, at its live values.
@@ -2208,8 +2408,12 @@ pub(crate) fn sync_cvars(
         });
     }
     if cvars.has_outbox() {
-        for (name, value) in cvars.take_outbox() {
-            script.set_cvar_host(&name, &value);
+        for (name, _) in cvars.take_outbox() {
+            // A preset may have queued this before a newer VM member edit. Publish
+            // the final registry value, never that older queued snapshot.
+            if let Some(value) = cvars.get(&name) {
+                script.set_cvar_host(&name, value);
+            }
         }
     }
     if cvars.has_events() {
@@ -2249,6 +2453,7 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
         for (name, value) in changes {
             cvars.set_from_vm(&name, &value);
         }
+        lighting_quality(&mut cvars);
         if cvars.has_outbox() {
             cvars.take_outbox(); // the VM this was for is going away
         }
@@ -2660,7 +2865,7 @@ mod tests {
         // a row, forgot its weld" fail HERE: the length check below is the gate.
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let lighting: [(&str, f32); 29] = [
+        let lighting: [(&str, f32); 30] = [
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
             ("characterShadows", flag(shadows.character_shadows)),
@@ -2671,6 +2876,8 @@ mod tests {
             ("characterShadowRate", shadows.character_shadow_rate as f32),
             ("worldShadowRate", shadows.world_shadow_rate as f32),
             ("shadowCasterReach", shadows.shadow_caster_reach),
+            // MONKEY (moon shadows): the night lane's own shadow darkness.
+            ("moonShadowStrength", shadows.moon_shadow_strength),
             // MONKEY (dynamic interiors): the room lane's switch and its light law.
             ("interiorLight", flag(shadows.interior_light)),
             ("interiorAmbient", shadows.interior_ambient),
@@ -2710,9 +2917,9 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 29 rows, 29 welds.
+        // row the client does not have; the length is the other half — 30 rows, 30 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
-        assert_eq!(welded.len(), 29, "the lighting lane welds 29 distinct rows");
+        assert_eq!(welded.len(), 30, "the lighting lane welds 30 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2727,6 +2934,10 @@ mod tests {
         // candle-lit surfaces moving under +10 % — only true at this number.
         assert_eq!(d["interiorBakeFloor"], 0.12);
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
+        // The 31st lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
+        // only one with no `VideoConfig` knob to weld to, because it is a NAME for the rows above
+        // rather than a knob of its own. Its own weld is `the_high_preset_is_the_registered_
+        // defaults` — a fresh config must read "High", not "Custom".
         // ── end MONKEY (lighting) ─────────────────────────────────────────────────────────────
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
@@ -2734,6 +2945,205 @@ mod tests {
         // goldens is denominated in a 1:1 backdrop, so a registered value other than 1 would
         // silently re-render every one of them through a resample.
         assert_eq!(d["renderScale"], 1.0);
+    }
+
+    // ── MONKEY (advanced graphics): the preset ladder ─────────────────────────────────────────
+
+    /// A registry holding nothing but the registered defaults — the state a fresh
+    /// `benilla-config` boots into, which is what every claim below is measured against.
+    fn fresh_registry() -> Cvars {
+        Cvars::default()
+    }
+
+    /// **The round trip, for every rung**: apply a preset, derive, and get that preset's own name
+    /// back. This is the property the whole ladder rests on — without it the dropdown would show
+    /// `Custom` the instant after the player picked something, which is the exact failure the
+    /// "derived, never stored stale" rule exists to prevent.
+    #[test]
+    fn every_preset_derives_back_to_its_own_name() {
+        for (from, _) in LIGHTING_PRESETS {
+            for (name, _) in LIGHTING_PRESETS {
+                let mut cvars = fresh_registry();
+                apply_lighting_preset(&mut cvars, from);
+                cvars.set("shadowDistance", "120");
+                cvars.set("interiorShadowSoft", "2.5");
+                assert!(apply_lighting_preset(&mut cvars, name), "{name}: applied");
+                assert_eq!(derive_lighting_quality(&cvars), *name, "{from} -> {name}");
+                assert_eq!(cvars.get("shadowDistance"), Some("120"));
+                assert_eq!(cvars.get("interiorShadowSoft"), Some("2.5"));
+                for member in ["fireLightGain", "nightGain", "interiorGain"] {
+                    let expected = if *name == "Off" {
+                        if member == "fireLightGain" { "0" } else { "1.0" }
+                    } else {
+                        cvars.default_of(member).unwrap()
+                    };
+                    assert!(same_value(cvars.get(member).unwrap(), expected), "{name}/{member}");
+                }
+            }
+        }
+    }
+
+    /// **High is the shipped default, member for member.** A fresh config must read "High" on this
+    /// row rather than "Custom" — otherwise the very first thing a player sees on the page is a
+    /// word that says their settings are a hand-made combination when they have touched nothing.
+    #[test]
+    fn the_high_preset_is_the_registered_defaults() {
+        let cvars = fresh_registry();
+        assert_eq!(derive_lighting_quality(&cvars), "High");
+        assert_eq!(
+            cvars.get("lightingQuality"),
+            Some("High"),
+            "the registered default agrees with what a fresh registry derives"
+        );
+        // …and the table is not merely CONSISTENT with the defaults, it IS them: a member whose
+        // registered default moved without its preset entry moving would still derive "High"
+        // above (both sides move together), so the weld is checked against the row's own default.
+        let (_, members) = LIGHTING_PRESETS
+            .iter()
+            .find(|(n, _)| *n == "High")
+            .expect("the High rung");
+        for (k, v) in *members {
+            assert!(
+                same_value(cvars.default_of(k).expect("a registered member"), v),
+                "{k}: the High preset says {v}, the registry's default says {:?}",
+                cvars.default_of(k)
+            );
+        }
+    }
+
+    /// **One member off the rung is `Custom`** — for every rung, and for every member of it, which
+    /// is the half that keeps the derivation from being a lucky match on a favourite row.
+    #[test]
+    fn one_changed_member_derives_custom() {
+        for (name, members) in LIGHTING_PRESETS {
+            for (k, v) in *members {
+                let mut cvars = fresh_registry();
+                apply_lighting_preset(&mut cvars, name);
+                // Somewhere else on the row's own scale: the flags flip, the numbers move by one.
+                let moved = match v.trim().parse::<f32>() {
+                    Ok(x) if x == 0.0 => "1".to_string(),
+                    Ok(x) if x == 1.0 => "0".to_string(),
+                    Ok(x) => (x + 1.0).to_string(),
+                    Err(_) => format!("{v}x"),
+                };
+                assert_eq!(cvars.set(k, &moved), SetOutcome::Changed, "{name}/{k}");
+                assert_eq!(
+                    derive_lighting_quality(&cvars),
+                    LIGHTING_CUSTOM,
+                    "{name}: {k} moved to {moved} and the ladder still says {name}"
+                );
+            }
+        }
+    }
+
+    /// A value that says the same NUMBER is the same setting: the options window's sliders write
+    /// `"1"`, a hand-edited config may say `"1.0"`, and `%.2f` formatting elsewhere says `"1.00"`.
+    /// A ladder that compared strings would call every one of those `Custom`.
+    #[test]
+    fn the_ladder_compares_numbers_not_spellings() {
+        let mut cvars = fresh_registry();
+        apply_lighting_preset(&mut cvars, "High");
+        for spelling in ["1.0", "1.00", "1"] {
+            cvars.set("spellLightGain", spelling);
+            assert_eq!(derive_lighting_quality(&cvars), "High", "{spelling}");
+        }
+        cvars.set("moonShadowStrength", "0.350");
+        assert_eq!(derive_lighting_quality(&cvars), "High");
+    }
+
+    /// `Custom` is not a rung: picking it writes nothing, so the members — and therefore the name
+    /// the next derivation lands on — are exactly where they were.
+    #[test]
+    fn picking_custom_writes_nothing() {
+        let mut cvars = fresh_registry();
+        apply_lighting_preset(&mut cvars, "Medium");
+        assert!(!apply_lighting_preset(&mut cvars, LIGHTING_CUSTOM));
+        assert!(!apply_lighting_preset(&mut cvars, "Ultra"));
+        assert_eq!(derive_lighting_quality(&cvars), "Medium");
+    }
+
+    /// Every member every rung names is a REGISTERED row — a typo'd member would otherwise make
+    /// its whole preset underivable (a `cvars.get` that answers `None` never matches), and the
+    /// only symptom would be a dropdown stuck on `Custom`.
+    #[test]
+    fn every_preset_member_is_registered_and_inside_its_observers_clamp() {
+        let mut app = cvar_app();
+        for (name, members) in LIGHTING_PRESETS {
+            for (k, value) in *members {
+                assert!(
+                    REGISTERED.iter().any(|r| r.name == *k),
+                    "{name}: member {k} is not registered"
+                );
+                // Drive the real setter: a clamp, integer conversion or map-size snap
+                // must leave every preset value unchanged.
+                apply(&mut app, k, "-1");
+                apply(&mut app, k, value);
+                let video = res::<VideoConfig>(&app);
+                let applied = match *k {
+                    "characterShadows" => video.character_shadows as u32 as f32,
+                    "worldShadows" => video.world_shadows as u32 as f32,
+                    "interiorLight" => video.interior_light as u32 as f32,
+                    "interiorShadows" => video.interior_shadows as u32 as f32,
+                    "exteriorShadows" => video.exterior_shadows as u32 as f32,
+                    "shadowMapSize" => video.shadow_map_size as f32,
+                    "interiorShadowCasters" => video.interior_shadow_casters as f32,
+                    "interiorShadowDynamic" => video.interior_shadow_dynamic as f32,
+                    "spellLightGain" => video.spell_light_gain,
+                    "fireLightGain" => video.fire_light_gain,
+                    "moonShadowStrength" => video.moon_shadow_strength,
+                    "fireFlicker" => video.fire_flicker,
+                    "nightGain" => video.night_gain,
+                    "interiorGain" => video.interior_gain,
+                    _ => panic!("add the observer readback for {k}"),
+                };
+                assert_eq!(applied, value.parse::<f32>().unwrap(), "{name}/{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn preset_then_member_edit_survives_sync_observers_and_later_flushes() {
+        for seeded in [false, true] {
+            for flush_preset_first in [false, true] {
+                let mut app = cvar_app();
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .register_cvars(registered_pairs());
+                // Run the production Update schedule without Startup's on-disk config load.
+                if seeded {
+                    app.world_mut().run_schedule(Update);
+                }
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .run("SetCVar('lightingQuality', 'Low')").unwrap();
+                if flush_preset_first {
+                    app.world_mut().run_schedule(Update);
+                    assert_eq!(res::<VideoConfig>(&app).shadow_map_size, 1024);
+                }
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .run("SetCVar('shadowMapSize', '4096')").unwrap();
+                for _ in 0..3 {
+                    app.world_mut().run_schedule(Update);
+                    let cvars = res::<Cvars>(&app);
+                    assert_eq!(cvars.get("shadowMapSize"), Some("4096"));
+                    assert_eq!(cvars.get("lightingQuality"), Some(LIGHTING_CUSTOM));
+                    assert_eq!(res::<VideoConfig>(&app).shadow_map_size, 4096);
+                    let script = app.world().non_send_resource::<UiScript>();
+                    assert_eq!(script.cvar("shadowMapSize").as_deref(), Some("4096"));
+                    assert_eq!(script.cvar("lightingQuality").as_deref(), Some(LIGHTING_CUSTOM));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fire_and_spell_gains_above_two_reach_the_video_observer() {
+        let mut app = cvar_app();
+        for value in ["3.25", "4"] {
+            apply(&mut app, "fireLightGain", value);
+            apply(&mut app, "spellLightGain", value);
+            let expected = value.parse::<f32>().unwrap();
+            assert_eq!(res::<VideoConfig>(&app).fire_light_gain, expected);
+            assert_eq!(res::<VideoConfig>(&app).spell_light_gain, expected);
+        }
     }
 
     /// **Every arm, through the registry and its observers.** The old central `apply_to_knobs`

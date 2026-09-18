@@ -7,6 +7,7 @@
 //! exists — remove either lane and the other is untouched.
 
 use bevy::pbr::MeshMaterial3d;
+use bevy::ecs::entity::EntityHashSet;
 use bevy::prelude::*;
 
 use benilla_assets::materials::WowModelMaterial;
@@ -26,9 +27,16 @@ pub(crate) struct CharacterShadowPlugin;
 impl Plugin for CharacterShadowPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CharacterLane>()
+            .init_resource::<CharacterShadowReady>()
             .add_systems(Last, collect_character_shadows.in_set(ShadowSet::Lanes));
     }
 }
+
+/// MONKEY (moon shadows): roots/ancestors with triangles in the LAST completed caster build.
+/// Blobs consume this in PostUpdate, before this frame's Last rebuild: a newly uploaded proxy
+/// gets a render frame before its oval yields. Cadence skips retain the same geometry/verdict.
+#[derive(Resource, Default)]
+pub(crate) struct CharacterShadowReady(pub EntityHashSet);
 
 /// The character lane's retained per-frame caster.
 #[derive(Resource, Default)]
@@ -49,10 +57,13 @@ fn collect_character_shadows(
     mut demand: ResMut<ShadowDemand>,
     frame: Res<ShadowFrame>,
     mut lane: ResMut<CharacterLane>,
+    mut ready: ResMut<CharacterShadowReady>,
+    parents: Query<&ChildOf>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     parts: Query<
         (
+            Entity,
             &PickMesh,
             &ModelPart,
             Option<&GlobalTransform>,
@@ -71,6 +82,7 @@ fn collect_character_shadows(
 
     // Rig down or lane off → drop our caster so it stops casting.
     if !(frame.active && on) {
+        ready.0.clear();
         if let Some(entity) = lane.caster.take() {
             commands.entity(entity).despawn();
         }
@@ -78,6 +90,12 @@ fn collect_character_shadows(
             meshes.remove(handle.id());
         }
         // The mesh this gate was pacing is gone — re-arm so a re-enable builds on its first frame.
+        lane.rate.reset();
+        return;
+    }
+    // MONKEY (moon shadows): keep the cache but suspend CPU skin/re-upload on feature-off nights.
+    if frame.suspended {
+        ready.0.clear();
         lane.rate.reset();
         return;
     }
@@ -114,6 +132,7 @@ fn collect_character_shadows(
     if let Some(handle) = lane.mesh.clone() {
         if let Some(mesh) = meshes.get_mut(&handle) {
             let (mut positions, mut indices) = take_mesh_buffers(mesh);
+            let mut built_parts = EntityHashSet::default();
             let (admitted, rejected) = collect_entity_geometry(
                 &parts,
                 &rigs,
@@ -125,7 +144,14 @@ fn collect_character_shadows(
                 frame.tall_reach,
                 &mut positions,
                 &mut indices,
+                Some(&mut built_parts),
             );
+            ready.0.clear();
+            for part in built_parts {
+                ready.0.insert(part);
+                // The unit root owns its blob; mounts and equipment can be nested below it.
+                ready.0.extend(parents.iter_ancestors(part));
+            }
             let tris = (indices.len() / 3) as u32;
             restore_mesh_buffers(mesh, positions, indices);
             if shadow_trace() {
