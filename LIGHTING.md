@@ -2,7 +2,7 @@
 
 A dynamic light and shadow system for [benilla](https://github.com/samwhosung/benilla), the Rust +
 Bevy reimplementation of the 1.12.1 client. This branch is upstream benilla (merged at
-`66388278`) plus the lighting work, and nothing else. It needs no data changes: everything is
+`edec5b22`) plus the lighting work, and nothing else. It needs no data changes: everything is
 derived from what a 1.12 install already carries (WMO `MOLT` lights, `MOCV` vertex colour, portals,
 M2 particle emitters, `Light.dbc`).
 
@@ -21,11 +21,12 @@ behind each constant.
 | Torch shadows | cube-map shadows from point lights onto buildings, models and terrain, with a contact-hardening penumbra and a shadow floor | `interiorShadows`, `exteriorShadows`, `torchShadowStrength`, `interiorShadowSoft` |
 | Daylight and doorways | calibrated fixtures at doors, windows and open boundaries carry daylight into a room, and doorways between rooms bleed light | `interiorDaylight`, env `WOW_DAYLIGHT`, `WOW_BLEED` |
 | Spell and firework lights | fire, holy and fel effects light their surroundings for their lifetime; frost, nature, arcane and shadow do not | `spellLightGain`, env `WOW_SPELL_LIGHT=0` |
+| Moon shadows | at night the same shadow rig re-aims at the moon and casts a faint shadow; dims only the night sky term, never point lights | `moonShadowStrength` |
+| Ground-effect spells | Flamestrike, Rain of Fire, Consecration, Flare and fire traps light the ground for their duration; frost and nature areas stay dark | `spellLightGain` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
-The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
-Bright presets. The Video options page gains Real Character Shadows, World Shadows and Shadow
-Distance.
+Players reach all of it from **Options -> Advanced Graphics** (a Lighting Quality preset Off / Low / Medium / High plus the individual rows; Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
+Bright presets.
 
 ## Where the code lives
 
