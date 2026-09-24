@@ -13,6 +13,7 @@ use bevy::prelude::*;
 use benilla_assets::LockRecover;
 use benilla_ui::script::UiScript;
 
+use super::manifest::silenced_ui_load;
 use super::{
     load_font_registry, load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock,
     UiKeyboardCapture,
@@ -45,8 +46,7 @@ pub(crate) fn setup_script(world: &mut World) {
 /// with `_G`, and the native `CSimpleFont` registry with the frame-script owner (`0x7839c0`, torn
 /// down at `0x490c97`). Because [`end_ui_session`] routes every login through here, every session's
 /// VM gets the registry and every `inherits="GameFontNormal"` in FrameXML resolves. A design that
-/// dropped the VM and skipped index 0 on the in-game load would fail exactly there — verified in
-/// wow-re's §5 for this change (2277).
+/// dropped the VM and skipped index 0 on the in-game load would fail exactly there (2277).
 fn install_boot_vm(world: &mut World) {
     let mut script = match UiScript::new() {
         Ok(s) => s,
@@ -72,7 +72,7 @@ fn install_boot_vm(world: &mut World) {
 /// it where the process already is, and [`UiClock`] is re-anchored to match in the same breath.
 ///
 /// The reference's `GetTime` (`0x515ea0`) reads `KERNEL32!GetTickCount` and scales by 0.001 (the
-/// thunk `0x42c010` → `0x42b790`, wow-re's `core` boundary row): an OS clock, with no relationship
+/// thunk `0x42c010` → `0x42b790`): an OS clock, with no relationship
 /// to the Lua VM, that cannot restart. Ours is a Lua global the VM owns, and since 1290/1291 the VM
 /// is destroyed and rebuilt at every logout/login and every `ReloadUI` — so without this seed the
 /// clock went back to zero on each of those, and every host value already converted onto it
@@ -276,8 +276,7 @@ fn unpark_boot_vm(world: &mut World) {
 /// 2226). It said `UI_Init 0x48fbf0` fires the world-enter cascade from inside itself, so a UI-less
 /// client never sees a unit event; that is 1348's reading and the bytes refute it, because the
 /// cascade call at `0x490168` is gated on an active-player GUID that is still 0/0 on a fresh login
-/// (see [`finish_ui_init`]). The conclusion survives, on four independent structural grounds, all
-/// re-verified in wow-5875-re:
+/// (see [`finish_ui_init`]). The conclusion survives, on four independent structural grounds:
 ///
 /// - World entry is a **category-5** callee (`0x420d63`), dispatched after the same iteration's
 ///   **category-6** inbound drain (`0x420d55`) has already returned.
@@ -457,6 +456,14 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
     let identity = world
         .get_resource::<crate::char_select::Roster>()
         .and_then(crate::ui_macro::identity);
+    // …and the realm's whole character list, which is the enable store's node set: the reference
+    // populates one `ADDONSTATELIST` node per character at char-list time, and an addon this
+    // character has never had an opinion about is resolved from what the others said
+    // (decision 2311).
+    let roster: Vec<String> = world
+        .get_resource::<crate::char_select::Roster>()
+        .map(|r| r.chars.iter().map(|c| c.name.clone()).collect())
+        .unwrap_or_default();
     // **The Lua index space, before a single addon file runs** (decision 2175). The reference has
     // the array in hand well before `UI_Init 0x48fbf0` reaches the addon walk — `SMSG_ADDON_INFO`
     // lands during the handshake — so an addon reading `GetNumAddOns()` at file scope sees a
@@ -576,47 +583,58 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
     // through its whole load edge and only converged a frame later off whatever poll the caller
     // had written to survive it.
     seat_raster_seam_for_load(world, &mut script);
-    let _ = load_ingame_ui(&mut script, identity.as_ref(), version_check);
-    // The Minimap widget was born a moment ago with `MinimapState::default()`; seed its two live
-    // zoom indices from the persisted CVars now, before anything reads them — the reference's own
-    // minimap reset path copying each CVar object's int into its live index (decision 1131). Once
-    // only: from here the widget's index is the live truth and `Minimap:SetZoom` writes the CVar
-    // back. Startup always precedes this state edge (1038), so the knob is already loaded.
-    let zoom = world.resource::<crate::minimap::MinimapZoom>();
-    script.set_minimap_zoom(zoom.outdoor, zoom.inside);
-    // The saved-variables chunk runs HERE — after the XML assigned its file-scope defaults, before
-    // any consumer reads them — then `VARIABLES_LOADED`. That is the reference's own load order
-    // (`AddOn_Load 0x51f240` steps 2 → 4 → 6, decision 1128); reversing it means the defaults
-    // always win and nothing can ever be remembered.
-    //
-    // **And the chat cache restores inside it, between `VARIABLES_LOADED` and `PLAYER_LOGIN`** —
-    // the reference's own slot for the reader's `UPDATE_CHAT_WINDOWS` + `UPDATE_CHAT_COLOR` burst
-    // (`0x4900d6`, after `0x4900b2` and before `0x490959`; decisions 2119 and 2125). It is the
-    // sole firer of `UPDATE_CHAT_WINDOWS`, which is the only thing that registers a chat frame for
-    // any `CHAT_MSG_*` (ref `ChatFrame.lua` l.1261-1273) — as an `Update` system it landed after
-    // the session's first chat had already been routed, and the login MOTD went to a window
-    // registered for nothing.
-    // The plate pair is read out of the world FIRST: the second closure borrows `world` for the
-    // chat-cache restore, and a `Copy` of two bools costs nothing next to fighting that borrow.
-    // Absent in a bare test world, where "both off" is also the resource's own default.
+    // The minimap zoom pair and the plate pair are read out of the world FIRST: the bracket's body
+    // borrows `world` for the chat-cache restore, and two `Copy` pairs cost nothing next to
+    // fighting that borrow. The plates are absent in a bare test world, where "both off" is also
+    // the resource's own default.
+    let zoom = {
+        let z = world.resource::<crate::minimap::MinimapZoom>();
+        (z.outdoor, z.inside)
+    };
     let plates = world
         .get_resource::<crate::vplates::VPlateMode>()
         .copied()
         .unwrap_or_default();
-    finish_ui_load_with(
-        &mut script,
-        // `NAMEPLATES_ON` / `FRIENDNAMEPLATES_ON` (2132). This seat, and not the `Update` feed
-        // beside it, is what fixes the bug: `UIParent_OnEvent`'s first `UpdateNameplates()` runs
-        // inside the `VARIABLES_LOADED` fired at the end of this very call.
-        |script| crate::vplates::push_plate_globals(script, plates),
-        |script| {
-            crate::ui_chat::restore_chat_looks(world, script);
-        },
-    );
+    // **The whole load edge is silent** — the TOC walk, every addon, the saved variables and
+    // `PLAYER_LOGIN`, the span `0x48fbf0` brackets itself across (`0x48fbfa` → `0x49016d`). Both
+    // login and `ReloadUI` come through here; see [`silenced_ui_load`].
+    silenced_ui_load(&mut script, |script| {
+        let _ = load_ingame_ui(script, identity.as_ref(), &roster, version_check);
+        // The Minimap widget was born a moment ago with `MinimapState::default()`; seed its two
+        // live zoom indices from the persisted CVars now, before anything reads them — the
+        // reference's own minimap reset path copying each CVar object's int into its live index
+        // (decision 1131). Once only: from here the widget's index is the live truth and
+        // `Minimap:SetZoom` writes the CVar back. Startup always precedes this state edge (1038),
+        // so the knob is already loaded.
+        script.set_minimap_zoom(zoom.0, zoom.1);
+        // The saved-variables chunk runs HERE — after the XML assigned its file-scope defaults,
+        // before any consumer reads them — then `VARIABLES_LOADED`. That is the reference's own
+        // load order (`AddOn_Load 0x51f240` steps 2 → 4 → 6, decision 1128); reversing it means the
+        // defaults always win and nothing can ever be remembered.
+        //
+        // **And the chat cache restores inside it, between `VARIABLES_LOADED` and `PLAYER_LOGIN`**
+        // — the reference's own slot for the reader's `UPDATE_CHAT_WINDOWS` + `UPDATE_CHAT_COLOR`
+        // burst (`0x4900d6`, after `0x4900b2` and before `0x490959`; decisions 2119 and 2125). It
+        // is the sole firer of `UPDATE_CHAT_WINDOWS`, which is the only thing that registers a chat
+        // frame for any `CHAT_MSG_*` (ref `ChatFrame.lua` l.1261-1273) — as an `Update` system it
+        // landed after the session's first chat had already been routed, and the login MOTD went to
+        // a window registered for nothing.
+        finish_ui_load_with(
+            script,
+            // `NAMEPLATES_ON` / `FRIENDNAMEPLATES_ON` (2132). This seat, and not the `Update`
+            // feed beside it, is what fixes the bug: `UIParent_OnEvent`'s first
+            // `UpdateNameplates()` runs inside the `VARIABLES_LOADED` fired at the end of this
+            // very call.
+            |script| crate::vplates::push_plate_globals(script, plates),
+            |script| {
+                crate::ui_chat::restore_chat_looks(world, script);
+            },
+        );
+    });
     // **Say it out loud when an addon didn't load** (decision 1495). Every failure the walk found
     // is retained now, but a log nobody knows to open does not fix silence — and silence is the
-    // actual defect B293 reports: *"there are a lot of addons that still doesn't work"*, with
-    // nothing on screen to say which or why. Counted off the retained log rather than the walk's
+    // actual defect: addons that do not load, with nothing on screen to say which or why. Counted
+    // off the retained log rather than the walk's
     // `failures` vec so the number matches what `/errors` will show: the log deduplicates, and one
     // broken addon that fails four files should not read as four broken addons. The VM is fresh
     // per world entry, so every `Load` row here is this load's.
@@ -755,8 +773,7 @@ pub(crate) fn seat_from_roster(
         // lua_pushnil`. `UnitLevel 0x517fc0` likewise carries no `"player"` compare at all and
         // reaches its total-miss arm `0x51813e push 0; push 0` — the **number 0**, not nil. The
         // two misses are deliberately asymmetric and a client that modelled "no data" uniformly
-        // would be wrong on one of them (wow-re `ui/scratch/unit-verbs-before-player-object.md`
-        // §2-§3; it also corrected that repo's own `main`, which had published the opposite).
+        // would be wrong on one of them.
         //
         // This seat is no longer what makes the player *answerable* — the record above is — so it
         // no longer has to claim a unit exists in order to deliver a name. What it still carries
@@ -846,20 +863,17 @@ pub(crate) fn arm_leaving_world_on_self_create(
     }
 }
 
-/// **The UI shutdown, in the reference's own order** — `0x490bd0`, whose ordered tail wow-5875-re
-/// carves as (`system/ui/ui.md`):
+/// **The UI shutdown, in the reference's own order** — `0x490bd0`, whose ordered tail is:
 ///
 /// > `PLAYER_LEAVING_WORLD` (273) → **`PLAYER_LOGOUT`** (271, `0x490c2a`) → `layout-cache.txt` →
 /// > **the flat saved file** (`0x490c7e`) → **the per-addon files** (`0x490c83`) → `AddOns.txt`
 /// > (`0x490c88`) → destroy the frame-script owner (`0x490c97`) → nil all 216 C bindings out of
 /// > `_G` (`0x490cba` → `0x490ce0`)
 ///
-/// **The last step is not "destroy the Lua state"** — which is what three of wow-re's own notes
-/// said, until this client's teardown made the question load-bearing and a §5 cross-check settled
-/// it (`system/ui/scratch/lua-state-lifecycle.md`; 2277). `0x490c97` is the frame-script owner's
+/// **The last step is not "destroy the Lua state"** (2277). `0x490c97` is the frame-script owner's
 /// scalar-deleting destructor — the widget tree and the native virtual-font registry — and the Lua
 /// state outlives it. The state is closed and re-opened at `0x703b80`, which reaches `InitLua` by a
-/// **tail-`jmp`** (`0x703b8e`) rather than a call, which is exactly why a call-census missed it.
+/// **tail-`jmp`** (`0x703b8e`) rather than a call, which is exactly why a call-census misses it.
 /// Its three callers are `UI_Init 0x48fbf0` (at its *head*), `ShutdownGame 0x491180`, and the glue
 /// builder `0x46a7b0` — so a logout/login cycle runs through four distinct states, and the glue
 /// screen gets its own.
@@ -953,7 +967,7 @@ pub(crate) fn end_ui_session(world: &mut World) {
     // that lands in an engine-side store that survives), before the VM is replaced. The next
     // VM's registration seeds from what this writes ([`crate::cvars`]'s saved base).
     crate::cvars::fold_dying_vm_cvars(world);
-    // The chat cache, on the same terms and for the same reason (decision NNNN): it composes the
+    // The chat cache, on the same terms and for the same reason (decision 2184): it composes the
     // player's file out of the DYING VM, and `/reload` never crosses the `OnExit(InWorld)` edge
     // its flush used to hang on — so a window moved in the last second before a reload was
     // written nowhere and re-read stale from disk.
@@ -1070,9 +1084,7 @@ pub(crate) fn shutdown_on_exit(
 /// The UI-init sequence's ordered tail, once every file — ours and every addon's — has loaded:
 /// the saved-variables chunk and `VARIABLES_LOADED`, then `PLAYER_LOGIN`.
 ///
-/// **The order is the reference's**, byte-verified in wow-5875-re (`system/ui/ui.md`, and the
-/// cascade in `system/ui/scratch/mail-pending-countdown.md`). Inside `UI_Init 0x48fbf0`, in
-/// straight-line address order:
+/// **The order is the reference's**. Inside `UI_Init 0x48fbf0`, in straight-line address order:
 ///
 /// | | |
 /// |---|---|
@@ -1086,7 +1098,7 @@ pub(crate) fn shutdown_on_exit(
 /// and a window that waits on `PLAYER_LOGIN` expects both — so it is worth being able to assert.
 ///
 /// **The third row does not run on a fresh login, and this doc used to say it did** (corrected
-/// 2226; the claim came from 1348 and was re-checked in wow-5875-re against the bytes). The call
+/// 2226; the claim came from 1348 and was re-checked against the bytes). The call
 /// at `0x490168` is gated three instructions earlier:
 ///
 /// ```text
@@ -1106,8 +1118,8 @@ pub(crate) fn shutdown_on_exit(
 /// resolved.** Our `finish_ui_init` fires the cascade inside the load, which matches the reload
 /// case and not the fresh-login one; whether to split those is its own change with its own
 /// measurements, and 2226 (which was about the VM's identity, not the cascade's timing) is not it.
-/// wow-re's own `DEFERRED:` entry — which of `0x4908c0`'s two data-dependent entries fires first on
-/// a real login — is still open, so the target shape is not yet known.
+/// Which of `0x4908c0`'s two data-dependent entries fires first on a real login is still open, so
+/// the target shape is not yet known.
 ///
 /// **`PLAYER_LOGIN` is the conditional one; `PLAYER_ENTERING_WORLD` is not.** The cascade fires
 /// the former only when `[0xb4e260]` is set, and only the FrameXML-loader path sets it, clearing
@@ -1130,8 +1142,7 @@ pub(crate) fn finish_ui_load(script: &mut UiScript) {
 /// The reference's login is `FrameXML → addons + ADDON_LOADED (0x4900a3) → VARIABLES_LOADED
 /// (0x4900b2) → the chat-cache reader's burst (0x4900d6, firing synchronously through the
 /// register-or-fire-now trampoline 0x498a20) → PLAYER_LOGIN (0x490959) → PLAYER_ENTERING_WORLD
-/// (0x49096a)` — byte-derived in wow-re `system/ui/scratch/login-chat-colour-pipeline.md`, §5
-/// cross-checked. 2119 put the restore ahead of `VARIABLES_LOADED`, which is one step too early:
+/// (0x49096a)`. 2119 put the restore ahead of `VARIABLES_LOADED`, which is one step too early:
 /// an addon reading its chat colours out of a `VARIABLES_LOADED` handler would see the file's
 /// values where the reference shows it the boot ones.
 ///
@@ -1402,7 +1413,7 @@ mod tests {
         // …and the pair every `Instant`→`GetTime` conversion runs through moved with it: a
         // 10-minute cooldown armed 30 s before the rebuild still derives its real start.
         let clock = world.resource::<UiClock>();
-        let armed = crate::cooldowns::CooldownInfo {
+        let armed = crate::spell::cooldowns::CooldownInfo {
             start: startup + Duration::from_secs(60),
             remaining_ms: 570_000,
             duration_ms: 600_000,

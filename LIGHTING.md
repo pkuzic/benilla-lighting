@@ -2,7 +2,7 @@
 
 A dynamic light and shadow system for [benilla](https://github.com/samwhosung/benilla), the Rust +
 Bevy reimplementation of the 1.12.1 client. This branch is upstream benilla (merged at
-`edec5b22`) plus the lighting work, and nothing else. It needs no data changes: everything is
+`fd386e75`) plus the lighting work, the enhanced water module and volumetric fog, and nothing else. It needs no data changes: everything is
 derived from what a 1.12 install already carries (WMO `MOLT` lights, `MOCV` vertex colour, portals,
 M2 particle emitters, `Light.dbc`).
 
