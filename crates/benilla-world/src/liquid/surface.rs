@@ -512,6 +512,7 @@ pub(super) fn setup_liquid(
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
     water_depth: Res<benilla_assets::WaterDepthImage>,
+    water_colour: Res<benilla_assets::WaterColourImage>,
     water_quality: Res<benilla_assets::WaterQuality>,
 ) {
     let (Some(_config), Some(mut world_assets)) = (config, world_assets) else {
@@ -525,6 +526,7 @@ pub(super) fn setup_liquid(
         std::env::var("WOW_CAPTURE_WATER_T").ok().and_then(|v| v.parse::<f32>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0)
     } else { 0.0 };
+    let deterministic = crate::dev_state::deterministic_run();
     let mut assets = LiquidAssets::default();
     for &(kind, dir, stem, count) in FRAME_SETS {
         let Some((frames, frame_count)) =
@@ -608,33 +610,40 @@ pub(super) fn setup_liquid(
                         WATER_SHININESS,
                     ),
                     // Which of the reference's three liquid renderers `liquid.wgsl` runs.
-                    // `w` is unused (it was the river-flow dial; the owner had the effect removed).
-                    path: Vec4::new(
-                        path.shader_id(), water_quality.0 as f32,
-                        if kind.is_fullbright() { 0.0 }
-                        else if path != LiquidPath::Adt { 0.12 }
-                        else if kind == LiquidKind::Ocean { 1.0 }
-                        else { 0.18 },
-                        0.0,
-                    ),
-                    // x = fixed Enhanced capture time (live frame index uses the shader
+                    path: Vec4::new(path.shader_id(), 0.0, 0.0, 0.0),
+                    // x = reserved (frame 0; the shader derives the live index from its own
                     // clock); y = frame count; z = the SCROLL FLAG (1 = this lane takes the
                     // stage-0 v-scroll — [`scrolls`]' nibble-6/7 WMO lane); w = the clock
                     // enable (0 on a deterministic run bakes the 0600 capture freeze — frame 0,
                     // scroll 0 — with no tick left to skip).
                     anim: Vec4::new(
-                        capture_time,
+                        0.0,
                         frame_count as f32,
                         if scroll { 1.0 } else { 0.0 },
-                        if crate::dev_state::deterministic_run() {
-                            0.0
-                        } else {
-                            1.0
-                        },
+                        if deterministic { 0.0 } else { 1.0 },
                     ),
-                    sky_zenith: Vec4::ZERO,
-                    sky_horizon: Vec4::ZERO,
-                    celestial: Vec3::Y.extend(0.0),
+                    // MONKEY (enhanced water): the module's uniform; the sky rows and the
+                    // quality follow at runtime (`liquid/scene_depth.rs`).
+                    water: benilla_assets::WaterUniform {
+                        mode: Vec4::new(
+                            water_quality.0 as f32,
+                            if kind.is_fullbright() { 0.0 }
+                            else if path != LiquidPath::Adt { 0.12 }
+                            else if kind == LiquidKind::Ocean { 1.0 }
+                            else { 0.18 },
+                            capture_time,
+                            if deterministic { 0.0 } else { 1.0 },
+                        ),
+                        lane: Vec4::new(
+                            path.shader_id(),
+                            if kind == LiquidKind::Ocean { 1.0 } else { 0.0 },
+                            if kind.is_fullbright() { 1.0 } else { 0.0 },
+                            if path.interior_fog() { 1.0 } else { 0.0 },
+                        ),
+                        ..default()
+                    },
+                    water_light: world_assets.shared_light.clone(),
+                    scene_colour: water_colour.0.clone(),
                     light_buf: world_assets.shared_light.clone(),
                 },
             });

@@ -50,6 +50,8 @@ pub fn register_shaders(app: &mut App) {
     // (loaded eagerly so `#import benilla::shadow_hook` resolves in terrain/model/static_gx). This is
     // the ONE place the realtime directional-shadow term lives; the receivers just call into it.
     load_shader_library!(app, "shaders/shadow_hook.wgsl");
+    // MONKEY (enhanced water): the optional water module, `benilla::enhanced_water` (WATER.md).
+    load_shader_library!(app, "shaders/enhanced_water.wgsl");
 }
 
 /// The WDL far-band shader's source, for the law tests that live beside the renderer rather than
@@ -565,16 +567,28 @@ pub type LiquidMaterial = ExtendedMaterial<StandardMaterial, LiquidExt>;
 /// match the field order.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
 pub struct LiquidExt {
-    /// Opaque world depth resolved after both retained and Bevy geometry. No sampler needed.
+    /// MONKEY (enhanced water): the water module's own bindings (103-106, `enhanced_water.wgsl`).
+    /// The opaque world depth, resolved after the main opaque pass (`liquid/scene_depth.rs`).
     #[texture(103, sample_type = "float", filterable = false, visibility(fragment))]
     pub scene_depth: Handle<Image>,
+    /// The module's uniform: quality, wave energy, clock, lane, sky rows, celestial body.
+    #[uniform(104)]
+    pub water: crate::WaterUniform,
+    /// The shared light buffer again (the same `Buffer` as `light_buf`), for the module's own
+    /// view of it: read-only storage may be bound twice in one group.
+    #[storage(105, read_only, buffer, visibility(fragment))]
+    pub water_light: Buffer,
+    /// The opaque scene colour, copied beside the depth (`liquid/scene_depth.rs`): what the
+    /// refraction looks through. Loaded, never sampled, so no sampler.
+    #[texture(106, sample_type = "float", filterable = false, visibility(fragment))]
+    pub scene_colour: Handle<Image>,
     /// The kind's animated frames (`lake_a`/`fast_a`/`ocean_h`), stacked as `2d_array` layers
     /// (`Rgba8Unorm`, repeat-sampled). RGB near-black; alpha = the ripple/wave → transparency.
     #[texture(100, dimension = "2d_array", visibility(fragment))]
     #[sampler(101, visibility(fragment))]
     pub frames: Handle<Image>,
     /// The per-material constants that pick which *lanes* of the shared light this surface reads.
-    /// Kind is fixed at creation; quality and the Enhanced sky rows can update at runtime.
+    /// None of them is a light value; all four are fixed at material creation.
     ///
     /// - `x` = **fullbright** (>0.5 ⇒ magma/slime): the animated texture IS the opaque body — skip
     ///   the depth swatch and the N·L term. Not "skip the fog"; see `liquid.wgsl` and decision 0691.
@@ -594,25 +608,14 @@ pub struct LiquidExt {
     ///   MCLQ (`ocean0_s.bls`), `1` = WMO exterior (`MapObjExtWater0.bls`), `2` = WMO interior
     ///   (fixed-function, unlit). The reference has three liquid renderers with genuinely different
     ///   combines, stage counts and opacity sources; this is which one `liquid.wgsl` runs.
-    /// - `y` = water quality (0 Classic, 1 Enhanced, 2 High).
-    /// - `z` = wave energy: ocean 1.0, ADT river/lake 0.18, WMO pools 0.12.
-    /// - `w` = unused (was the river-flow dial; the effect was removed at the owner request).
+    /// - `y`/`z`/`w` reserved.
     #[uniform(102)]
     pub path: Vec4,
-    /// `x` = fixed Enhanced capture time, `y` = frame count, `z` = scroll flag, `w` = clock enable —
+    /// `x` = reserved (frame 0), `y` = frame count, `z` = scroll flag, `w` = clock enable —
     /// the shader derives frame index and scroll from `globals.time` (liquid.wgsl `anim_time`);
     /// nothing mutates this uniform after build.
     #[uniform(102)]
     pub anim: Vec4,
-    /// Enhanced reflection endpoints, linear RGB from the dome's resolved LightIntBand 2/6.
-    #[uniform(102)]
-    pub sky_zenith: Vec4,
-    #[uniform(102)]
-    pub sky_horizon: Vec4,
-    /// xyz: toward the visible sun by day, white moon by night (not the fixed FFP light).
-    /// w: 0 sun, 1 moon; moon reflection is independent of darkness/shadow strength.
-    #[uniform(102)]
-    pub celestial: Vec4,
     /// **The shared global light** (`lighting::global_light`): the one storage buffer terrain and the
     /// models already read, now liquid's source too. `liquid.wgsl` reads rows 0-5 (light + scene fog +
     /// farclip), 13-16 (the two water swatches) and 18/19 (the interior fog block). Read in BOTH

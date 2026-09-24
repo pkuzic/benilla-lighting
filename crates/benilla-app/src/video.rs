@@ -220,6 +220,8 @@ pub(crate) struct VideoConfig {
     /// Water tier: 0 Classic, 1 Enhanced (default), 2 High with opt-in mirror reflections.
     /// Published to the water renderer by `dynamic_interior::bridge`.
     pub(crate) water_quality: u8,
+    // MONKEY (volumetric fog): live camera raymarch tier: 0 Off, 1 Low, 2 High.
+    pub(crate) volumetric_fog: u8,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -463,6 +465,8 @@ impl Default for VideoConfig {
             fire_light_gain: 1.0,
             spell_light_gain: 1.0,
             water_quality: 1,
+            // MONKEY (volumetric fog): default to the inexpensive atmosphere.
+            volumetric_fog: 1,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -524,7 +528,7 @@ pub(crate) fn on_cvar(
         // Display mode (1627) — the reference's own polarity: `1` is WINDOWED (the row is
         // "Windowed Mode"). `apply_window_mode` pushes it to the window when this moves.
         "gxwindow" => cfg.display = display_from_flag(v),
-        // ── MONKEY (lighting): the dynamic light + shadow system's 32 rows ────────────────────
+        // ── MONKEY (lighting): the dynamic light + shadow system's 33 rows ────────────────────
         // They live in THIS observer, and not in one of their own beside `shadow_core` /
         // `dynamic_interior`, because of the law the arm above states: *each arm writes only its
         // own resource*. Every one of these knobs IS a field of [`VideoConfig`] — the lanes read
@@ -540,8 +544,10 @@ pub(crate) fn on_cvar(
         //
         // Clamps are each row's own, stated beside it, exactly as for the reference rows above;
         // the `ours(...)` entries in `cvars::REGISTERED` carry the matching defaults, and
-        // `cvars::tests::registered_defaults_mirror_the_code_truths` welds all 32 pairs.
+        // MONKEY (volumetric fog): the atmospheric tier brings the defaults weld to 33 pairs.
         "waterquality" => cfg.water_quality = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (volumetric fog): constrain UI/console writes to supported tiers.
+        "volumetricfog" => cfg.volumetric_fog = v.clamp(0.0, 2.0) as u8,
         "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),

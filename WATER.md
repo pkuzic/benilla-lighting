@@ -18,7 +18,7 @@ player picks it, and every part of it can be switched off.
 The WarcraftXL water module is the design reference for this one, and its author has given
 permission to reuse its code here on the condition that the author and the original project are
 named. This section is that attribution; it must travel with the module (this file, and the
-`liquid.wgsl` header) wherever the module is copied or shared.
+`enhanced_water.wgsl` header) wherever the module is copied or shared.
 
 Rule for contributors: a file that ports code or a technique from WarcraftXL says so in its header
 (`Portions derived from WarcraftXL wxl-experimental-water by iThorgrim, used with permission`) and
@@ -28,9 +28,9 @@ the technique is listed in the table below. Do not remove either.
 |---|---|---|
 | Visual-only wave riding for swimmers (authoritative position never moves) | shipped (`water_fx/bob.rs`) | same principle as `world/Ride.cpp`, implemented independently |
 | Shore surf limited by the TERRAIN column, so objects in the water never foam | shipped (authored depth gate, `on_bed`) | principle from `sea/Shore.hpp` |
-| Per-channel extinction + scene-copy refraction | planned | `shaders/Surface.ps.hlsl`, `render/Refraction.cpp` |
-| Caustics, two layers multiplied | planned | `shaders/Surface.ps.hlsl`, `render/Noise.cpp` |
-| One-probe screen-space reflection | planned (`High`) | `shaders/Surface.ps.hlsl` |
+| Per-channel extinction + scene-copy refraction | shipped (`enhanced_water.wgsl` DEPTH LOOK; bent samples landing on anything in front of the water are refused via the scene depth) | ported from `shaders/Surface.ps.hlsl`, `render/Refraction.cpp` |
+| Caustics, two layers at incommensurate scales/rates | shipped (floor web; built from animated cell edges, not value noise) | ported from `shaders/Surface.ps.hlsl`, `render/Noise.cpp` |
+| Screen-space reflection of the scenery | shipped on `High` (a bisected march against the scene depth, not WXL's single probe) | principle from `shaders/Surface.ps.hlsl` |
 | Gerstner trains + breaker index, crest-fold foam | planned | `sea/Spectrum.*`, `sea/Shore.hpp`, `shaders/Wave.hlsli` |
 | Specular lobe widened by the normal's screen derivative, distance glints | shipped / planned | `shaders/Surface.ps.hlsl` |
 
@@ -38,10 +38,10 @@ the technique is listed in the table below. Do not remove either.
 
 | Lane | What you see | Main switch |
 |---|---|---|
-| Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (currently = Enhanced) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
+| Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (= Enhanced + scenery reflections) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
 | Procedural waves | multi-band analytic waves with exact normals; the long swell moves ocean vertices | tier |
 | Ocean / inland profiles | the sea and lakes/rivers have their own colour, energy and reflectivity | tier |
-| Depth look | soft shoreline, depth-driven colour and opacity from the real scene depth | tier |
+| Depth look | light fades per channel over the real path through the water; the bed is seen through it, bent by the waves; sunlit shallows carry a caustic web | tier |
 | Reflection and glints | Fresnel sky reflection from the zone's sky rows, sun path, moon path, point-light glints | tier |
 | Beach surf | a travelling wave front, a lace of foam that dissolves behind it, a swash sheet on the sand | tier |
 | Swimmers | wake foam, treading rings and a visual-only bob with the swell | tier |
@@ -52,11 +52,17 @@ request. If it ever returns it should read the authored MCLQ flow records, not d
 
 ## Where the code lives
 
-- **Shader**: `crates/benilla-assets/src/shaders/liquid.wgsl` — `enhanced_water()` and its helpers;
-  the `fragment` entry point branches into it and otherwise runs the untouched reference path.
-- **Assets** (`crates/benilla-assets/src`): `water_depth.rs` (the scene-depth binding),
-  `materials.rs` (`LiquidExt`: quality, wave energy, sky rows, celestial), `lib.rs` (`WaterQuality`).
-- **World** (`crates/benilla-world/src`): `liquid/scene_depth.rs` (resolves the opaque depth after
+- **Shader**: `crates/benilla-assets/src/shaders/enhanced_water.wgsl` - the whole module on the GPU
+  side, an importable library (`benilla::enhanced_water`) with its own bindings: 103 scene depth,
+  104 `WaterParams` (`benilla_assets::WaterUniform`), 105 the shared light buffer (a second
+  read-only view of upstream's binding 90), 106 the scene colour (for refraction and reflection). Upstream's `liquid.wgsl` carries three hooks only: the
+  `#import`, `water_swell` in its vertex stage, and the `water_active()` branch at the top of its
+  fragment stage, which returns the module's result as-is (the module fogs its own surface terms
+  only: the scene it refracts and reflects is already fogged). Keep it that way: new
+  water code goes in the module, not in `liquid.wgsl`.
+- **Assets** (`crates/benilla-assets/src`): `water_depth.rs` (`WaterUniform`, the scene-depth image),
+  `materials.rs` (`LiquidExt` fields 103-106, shader registration), `lib.rs` (`WaterQuality`).
+- **World** (`crates/benilla-world/src`): `liquid/scene_depth.rs` (copies the opaque depth AND colour after
   the main opaque pass), `liquid/waves.rs` (the CPU mirror of the vertex swell), `liquid/surface.rs`
   (per-kind material parameters), `water_fx/bob.rs` (swimmer bob), `lighting/lava_light.rs`.
 - **App** (`crates/benilla-app/src`): the setting in `cvars.rs` / `video.rs`, the options rows in

@@ -1063,6 +1063,16 @@ pub(super) fn seed_ui_fixture(
                 warn!("capture: ui-options-graphics seed failed: {e}");
             }
         }
+        // MONKEY (volumetric fog): exercise the rendered Advanced Graphics dropdown and layout.
+        UiFixture::OptionsAdvancedGraphics => {
+            let Some(script) = script else { return; };
+            script.register_cvars(crate::cvars::registered_pairs());
+            if let Err(e) = script.run(
+                "ShowUIPanel(BenillaOptionsFrame); BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()",
+            ) {
+                warn!("capture: ui-options-advanced seed failed: {e}");
+            }
+        }
         UiFixture::OptionsChat => {
             let Some(script) = script else {
                 return;

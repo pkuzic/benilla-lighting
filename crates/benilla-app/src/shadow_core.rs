@@ -266,7 +266,8 @@ fn shadow_sun_travel(to_sun: Vec3) -> Vec3 {
 pub(crate) struct ShadowCaster;
 
 #[derive(Component)]
-struct ShadowSun;
+// MONKEY (volumetric fog): identify the celestial map without touching other lights.
+pub(crate) struct ShadowSun;
 
 #[derive(Component)]
 struct ShadowCameraLayer {

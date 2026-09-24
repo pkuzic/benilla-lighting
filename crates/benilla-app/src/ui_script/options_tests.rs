@@ -1973,6 +1973,60 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
 /// The name every row on the new page is derived from.
 const ADVGFX: &str = "BenillaOptionsFrameContainerBodyAdvancedGraphics";
 
+// MONKEY (volumetric fog): exercise translations and numeric writes through the real UI.
+#[test]
+fn volumetric_fog_dropdown_is_localised_and_live() {
+    // MONKEY (volumetric fog): validate the authored table and row even on a
+    // data-free checkout; the complete window additionally needs stock FrameXML.
+    let xml = include_str!("../../assets/ui/OptionsFrame.xml");
+    let strings = &xml[xml.find("BENILLA_ADVGFX_STRINGS = {").unwrap()
+        ..xml.find("OPTIONS_PAGE_ROWS = {").unwrap()];
+    let row = xml.split("<Frame name=\"$parentRowVolumetricFog\"").nth(1).unwrap();
+    let on_load = row.split("<OnLoad>").nth(1).unwrap().split("</OnLoad>").next().unwrap();
+    for (locale, title, labels) in [
+        ("enUS", "Volumetric Fog", ["Off", "Low", "High"]),
+        ("ruRU", "Объёмный туман", ["Выкл", "Низкое", "Высокое"]),
+    ] {
+        let mut s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
+        s.run(strings).unwrap();
+        s.run(r#"
+            self = {}
+            function OptionsRow_OnLoad(row, cvar, title, tip)
+                row.cvar, row.title, row.tip = cvar, title, tip
+            end
+            function OptionsDropdownRow_Setup(row, choices) row.choices = choices end
+        "#).unwrap();
+        s.run(on_load).unwrap();
+        assert_eq!(s.eval::<String>("return self.title").unwrap(), title);
+        assert!(s.eval::<bool>("return getglobal(self.tip) == BENILLA_ADVGFX.tips.VOLUMETRIC_FOG and string.len(getglobal(self.tip)) > 80").unwrap());
+        for (tier, label) in labels.iter().enumerate() {
+            assert_eq!(s.eval::<String>(&format!("return self.choices[{}].text", tier + 1)).unwrap(), *label);
+            let _ = s.take_cvar_changes();
+            s.run(&format!("SetCVar(self.cvar, self.choices[{}].value)", tier + 1)).unwrap();
+            assert_eq!(s.take_cvar_changes(), vec![("volumetricFog".to_string(), tier.to_string())]);
+        }
+        if benilla_formats::wow_data().is_none() {
+            continue;
+        }
+        // MONKEY (volumetric fog): with an install, also exercise the real widget kit.
+        let s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
+        let mut s = harness_on(s);
+        s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[3]").unwrap(), "RowVolumetricFog");
+        assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowVolumetricFogLabel:GetText()")).unwrap(), title);
+        assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowVolumetricFogDropdownText:GetText()")).unwrap(), labels[1]);
+        let _ = s.take_cvar_changes();
+        for (tier, label) in labels.iter().enumerate() {
+            s.run(&format!("OptionsRow_Set({ADVGFX}RowVolumetricFog, '{tier}') OptionsDropdown_ShowValue({ADVGFX}RowVolumetricFog)")).unwrap();
+            assert_eq!(s.take_cvar_changes(), vec![("volumetricFog".to_string(), tier.to_string())]);
+            assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowVolumetricFogDropdownText:GetText()")).unwrap(), *label);
+        }
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+    }
+}
+
 #[test]
 fn water_quality_writes_numeric_tiers_with_localised_labels() {
     for (locale, labels, lava_label) in [
@@ -1983,9 +2037,10 @@ fn water_quality_writes_numeric_tiers_with_localised_labels() {
         s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
-        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 17);
+        // MONKEY (volumetric fog): account for the atmosphere row after water.
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 18);
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
-        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[15]").unwrap(), "RowLavaGlow");
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[16]").unwrap(), "RowLavaGlow");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowLavaGlowLabel:GetText()")).unwrap(), lava_label);
         assert!(s.eval::<bool>("return BENILLA_TOOLTIP_WATER_QUALITY == BENILLA_ADVGFX.tips.WATER_QUALITY and BENILLA_TOOLTIP_LAVA_GLOW == BENILLA_ADVGFX.tips.LAVA_GLOW").unwrap());
@@ -2900,6 +2955,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         // that silently resolves to nothing — is untouched: the pairing below is exact, so a
         // `BENILLA_` key on the wrong row still fails.
         const BENILLA_OWNED: &[(&str, &str)] = &[
+            // MONKEY (volumetric fog): the row owns a translated tooltip too.
+            ("BENILLA_TOOLTIP_VOLUMETRIC_FOG", "AdvancedGraphicsRowVolumetricFog"),
             ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
             ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),
@@ -3165,7 +3222,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // teeth bite hardest, since it is the first one to seat a dropdown, a checkbox and a slider
     // whose descriptions are all benilla's.
     // Water Quality and Lava Glow add two more: 93 -> 95.
-    assert_eq!(raised, 95, "every row but Auto Loot raises a description");
+    // MONKEY (volumetric fog): the atmosphere dropdown adds one more described row.
+    assert_eq!(raised, 96, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

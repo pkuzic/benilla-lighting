@@ -1,7 +1,7 @@
 //! MONKEY (swim waves) — **the CPU mirror of the ocean's vertex swell**.
 //!
 //! Enhanced water displaces the ocean mesh in the VERTEX stage
-//! (`benilla-assets/src/shaders/liquid.wgsl`, the `@vertex fn vertex` swell arm at lines 279-283),
+//! (`benilla-assets/src/shaders/enhanced_water.wgsl`, `water_swell`, called from `liquid.wgsl`'s vertex stage),
 //! so the surface a swimmer floats on is not the flat MCLQ heightfield the CPU queries
 //! ([`super::query::WaterChunkInfo::surface_z_at`]) — it is that heightfield plus an analytic
 //! long-swell band the CPU never sees. A body positioned off the queried height therefore rides
@@ -16,7 +16,7 @@
 //!
 //! **What it deliberately does not mirror.** The shader's fragment stage sums all EIGHT
 //! components for its normal; the vertex stage takes `long_only` — components 0 and 1 only
-//! (`liquid.wgsl:393`), because the rest are finer than the liquid lattice can resolve and exist
+//! (`enhanced_water.wgsl`), because the rest are finer than the liquid lattice can resolve and exist
 //! to shade, not to move geometry. A bob driven off the fragment band would chase ripples the mesh
 //! under it never made. So: two components, the mesh's own.
 //!
@@ -25,7 +25,7 @@
 
 use bevy::math::Vec2;
 
-/// The long-swell component table — `liquid.wgsl:365-375`'s `WATER_WAVES[0..2]`, verbatim:
+/// The long-swell component table — `enhanced_water.wgsl`'s `WATER_WAVES[0..2]`, verbatim:
 /// `(direction_radians, wavelength_yd, amplitude_yd, phase_offset)`. Direction is radians from
 /// world +X toward +Z; the two sum to at most 0.34 yd before energy and shore attenuation.
 ///
@@ -36,17 +36,17 @@ pub const LONG_SWELL: [[f32; 4]; 2] = [
     [0.80, 12.8, 0.140, 1.7],
 ];
 
-/// Gravity in yd/s², `liquid.wgsl:398` — deep-water dispersion, `c = sqrt(g/k)`.
+/// Gravity in yd/s², `enhanced_water.wgsl` — deep-water dispersion, `c = sqrt(g/k)`.
 const GRAVITY_YD: f32 = 10.72;
 
-/// `6.2831853` exactly as the shader spells it (`liquid.wgsl:397`). Identical to `f32::TAU` once
+/// `6.2831853` exactly as the shader spells it (`enhanced_water.wgsl`). Identical to `f32::TAU` once
 /// rounded, spelled as the literal so the mirror reads against the line it copies.
 const TWO_PI: f32 = 6.2831853;
 
-/// The ADT **ocean**'s wave energy — `liquid/surface.rs:609-616` packs `path.z = 1.0` for
+/// The ADT **ocean**'s wave energy — `liquid/surface.rs` packs `water.mode.y = 1.0` for
 /// `LiquidPath::Adt` + [`benilla_formats::LiquidKind::Ocean`] (river/lake 0.18, WMO pools 0.12,
 /// fullbright 0.0). The vertex swell arm only ever runs on that one combination
-/// (`liquid.wgsl:280`), so this is the only energy a bob can ever be driven at — the parameter
+/// (`enhanced_water.wgsl`), so this is the only energy a bob can ever be driven at — the parameter
 /// stays open because the function is the shader's, not the bob's.
 pub const OCEAN_WAVE_ENERGY: f32 = 1.0;
 
@@ -58,11 +58,11 @@ pub struct Swell {
     /// Vertical displacement in yards, the shader's `result.x` — added to the mesh's world Y.
     pub height: f32,
     /// `(∂height/∂x, ∂height/∂z)` in BEVY world axes, the shader's `result.yz`. The shader builds
-    /// its normal from exactly this as `normalize(vec3(-grad.x, 1, -grad.y))` (`liquid.wgsl:457`).
+    /// its normal from exactly this as `normalize(vec3(-grad.x, 1, -grad.y))` (`enhanced_water.wgsl`).
     pub grad: Vec2,
 }
 
-/// `liquid.wgsl:377-380`'s `swell_shore_fade`: the authored ocean depth `V` (byte/255, ≈148 yd at
+/// `enhanced_water.wgsl`'s `swell_shore_fade`: the authored ocean depth `V` (byte/255, ≈148 yd at
 /// 1.0) faded in over ~0.15..3.7 yd, so the swell dies at a beach and the waterline stays pinned.
 ///
 /// Kept here for completeness of the mirror. **The CPU has no per-position `V`** — the depth bytes
@@ -74,12 +74,12 @@ pub fn swell_shore_fade(depth_v: f32) -> f32 {
 }
 
 /// The vertex stage's swell at one world point. A faithful transcription of `water_waves(p, t, 0,
-/// 0, shore, true)` (`liquid.wgsl:382-408`) under the vertex arm's own arguments:
+/// 0, shore, true)` (`enhanced_water.wgsl`) under the vertex arm's own arguments:
 ///
-/// * `distance = 0` and `footprint = 0` — the vertex call passes both (`liquid.wgsl:281`), so the
+/// * `distance = 0` and `footprint = 0` — the vertex call passes both (`enhanced_water.wgsl`), so the
 ///   Nyquist fade is `1 - smoothstep(0.10, 0.45, 0) = 1` and the 35-yd ripple cull never applies.
 /// * `inland = false` — the arm requires the ocean swatch on the ADT renderer, which is exactly
-///   the negation of the shader's `inland` (`liquid.wgsl:386`), so there is no drift term and no
+///   the negation of the shader's `inland` (`enhanced_water.wgsl`), so there is no drift term and no
 ///   `i < 3` skip.
 /// * `long_only = true` — components 0 and 1, which are also the two the shore fade multiplies.
 ///
@@ -110,8 +110,8 @@ pub fn swell_height(world_xz: Vec2, time: f32, wave_energy: f32, shallow_fade: f
 
 /// **The clock the material runs on**, so CPU and GPU agree on which crest is where.
 ///
-/// The shader reads `anim_time()` (`liquid.wgsl:217-220`): `w.anim.w * globals.time`, or the
-/// frozen capture pin `w.anim.x` when the clock enable is 0 on a non-fullbright Enhanced
+/// The shader reads `water_time()` (`enhanced_water.wgsl`): `globals.time`, or the
+/// frozen capture pin `water.mode.z` when the clock enable `water.mode.w` is 0 on an Enhanced
 /// material. Both halves of that are reproduced here:
 ///
 /// * `globals.time` is **`Time::elapsed_secs_wrapped`**, not `elapsed_secs` — bevy_render's
@@ -120,7 +120,7 @@ pub fn swell_height(world_xz: Vec2, time: f32, wave_energy: f32, shallow_fade: f
 ///   clock would put the CPU an entire wrap out of phase with the mesh it is riding, silently,
 ///   after an hour of play — the kind of drift that only reproduces in a long session.
 /// * the capture pin is `WOW_CAPTURE_WATER_T` under `WOW_CAPTURE`, read the same way
-///   `liquid/surface.rs:521-525` reads it into `anim.x`; `anim.w` is 0 on precisely the same
+///   `liquid/surface.rs` reads it into `water.mode.z`; `water.mode.w` is 0 on precisely the same
 ///   condition ([`crate::dev_state::deterministic_run`]), so the two branches line up one to one.
 pub fn water_anim_time(elapsed_secs_wrapped: f32) -> f32 {
     if crate::dev_state::deterministic_run() {
@@ -155,7 +155,7 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// **The mirror pin.** The table against the literal numbers in `liquid.wgsl:365-375`, and the
+    /// **The mirror pin.** The table against the literal numbers in `enhanced_water.wgsl`, and the
     /// two derived scalars against the lines that spell them. This test exists so that a change on
     /// EITHER side is a build failure rather than a swimmer floating half a yard off the sea: the
     /// shader is another agent's file, and nothing but this assertion couples the two.
@@ -164,11 +164,11 @@ mod tests {
         assert_eq!(
             LONG_SWELL,
             [[0.35, 18.0, 0.200, 0.0], [0.80, 12.8, 0.140, 1.7]],
-            "liquid.wgsl WATER_WAVES[0..2]"
+            "enhanced_water.wgsl WATER_WAVES[0..2]"
         );
-        assert_eq!(GRAVITY_YD, 10.72, "liquid.wgsl:398 gravity");
-        assert_eq!(TWO_PI, 6.2831853, "liquid.wgsl:397 k = 6.2831853/wavelength");
-        assert_eq!(OCEAN_WAVE_ENERGY, 1.0, "surface.rs path.z for ADT ocean");
+        assert_eq!(GRAVITY_YD, 10.72, "enhanced_water.wgsl gravity");
+        assert_eq!(TWO_PI, 6.2831853, "enhanced_water.wgsl k = 6.2831853/wavelength");
+        assert_eq!(OCEAN_WAVE_ENERGY, 1.0, "surface.rs water.mode.y for ADT ocean");
         // The band's ceiling, stated in the shader's own comment ("at most 0.34 yd").
         let peak: f32 = LONG_SWELL.iter().map(|w| w[2]).sum();
         assert!((peak - 0.34).abs() < 1e-6, "amplitude sum {peak}");

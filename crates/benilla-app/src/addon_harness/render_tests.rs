@@ -22,6 +22,28 @@ use std::path::{Path, PathBuf};
 
 use super::{survey, Drew};
 
+// MONKEY (volumetric fog): the mandatory Windows test run cannot compile an
+// unconditional unix import. Keep Unix links; copy these small fixtures elsewhere
+// so the same oracle runs without administrator symlink privileges on Windows.
+pub(super) fn link_fixture(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    { std::os::unix::fs::symlink(source, destination) }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let target = destination.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                link_fixture(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One throwaway AddOns root, cleaned up on drop even if a test panics.
 struct Fixtures(PathBuf);
 
@@ -196,7 +218,8 @@ fn the_directors_two_verified_addons_come_out_on_opposite_sides() {
     // `addon_harness` example's job, not a unit test's.
     let fx = Fixtures::new("oracle");
     for name in ["!OmniCC", "Bagnon", "Bagnon_Core", "Bagnon_Forever"] {
-        std::os::unix::fs::symlink(corpus.join(name), fx.root().join(name)).unwrap();
+        // MONKEY (volumetric fog): use the portable corpus fixture for Windows verification.
+        link_fixture(&corpus.join(name), &fx.root().join(name)).unwrap();
     }
     let reports = survey(fx.root());
     let row = |name: &str| {

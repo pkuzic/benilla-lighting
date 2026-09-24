@@ -107,7 +107,7 @@ struct SwimBob {
 fn ride(state: &BobState) -> (f32, Quat) {
     let g = state.grad;
     // Clamp the SLOPE, not the resulting quaternion: the wave normal is `(-∂x, 1, -∂z)`
-    // (`liquid.wgsl:457`), so a gradient of length `tan(θ)` is a lean of exactly θ.
+    // (`enhanced_water.wgsl`), so a gradient of length `tan(θ)` is a lean of exactly θ.
     let len = g.length();
     let g = if len > MAX_TILT_TAN && len > 0.0 {
         g * (MAX_TILT_TAN / len)

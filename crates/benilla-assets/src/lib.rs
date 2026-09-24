@@ -24,7 +24,7 @@ pub mod column_grid;
 pub mod coords;
 pub mod materials;
 mod water_depth;
-pub use water_depth::{WaterDepthImage, WaterQuality};
+pub use water_depth::{WaterColourImage, WaterDepthImage, WaterQuality, WaterUniform};
 pub mod minimap_grid;
 mod spatial_cache;
 pub mod trace;

@@ -180,6 +180,8 @@ pub(super) enum UiFixture {
     /// read the CVar registration defaults (hermetic capture = no config file), so the pixels
     /// move only with the window, the atlas seam, or a registered default.
     OptionsGraphics,
+    // MONKEY (volumetric fog): photograph the new quality row on its actual page.
+    OptionsAdvancedGraphics,
     /// The Options window ON THE CHAT PAGE (decision 1589 — B246's "no chat section in options").
     /// The page 1.12 calls `CHAT_LABEL`: four checkbox rows over three stores at once (a saved
     /// variable, three CVars), which is what makes it worth a baseline of its own — the row art is
@@ -474,6 +476,32 @@ pub(super) const SUBJECT_INDOOR: [f32; 3] = [-9469.4, 31.9, 57.9];
 /// fixtures, the house-compass and street scenes. Capturable by name (`WOW_CAPTURE=<name>`) for
 /// debugging and look passes, but NOT part of the blessed baseline sweep.
 pub(super) const ON_DEMAND: &[Scenario] = &[
+    // MONKEY (volumetric fog): UI proof uses the same live page selection as a player.
+    Scenario {
+        name: "ui-options-advanced", map: Some(MAP_AZEROTH),
+        eye: GROUND_EYE, look: GROUND_LOOK, minute: 720,
+        ui: Some(UiFixture::OptionsAdvancedGraphics),
+    },
+    // MONKEY (volumetric fog): reproducible dawn trees, moonlit lamps and the inn's common room.
+    Scenario {
+        name: "volfog-dawn", map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0], look: [-9410.0, 120.0, 67.0], minute: 390, ui: None,
+    },
+    Scenario {
+        name: "volfog-night", map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0], look: [-9450.0, 20.0, 61.0], minute: 0, ui: None,
+    },
+    // MONKEY (volumetric fog): celestial_sun_direction(420) has WoW azimuth
+    // 45 degrees and elevation 12.20778 degrees: dz = hypot(70,70)*tan(elevation).
+    // The Goldshire lake bank has sunlit air behind the gaps between the trees.
+    Scenario {
+        name: "volfog-sun", map: Some(MAP_AZEROTH),
+        eye: WATER_EYE, look: [-9457.0, -240.6, 92.21753], minute: 420, ui: None,
+    },
+    Scenario {
+        name: "volfog-inn", map: Some(MAP_AZEROTH),
+        eye: INN_EYE, look: INN_LOOK, minute: 390, ui: None,
+    },
     // WOW_CAPTURE_WATER_T=<seconds>: fixed Enhanced water phase (read once, default 0).
     // Compare 0 and 1.5; Classic and non-water animation stay frozen.
     // Above Lakeshire's broken docks, looking across Lake Everstill and its rocky shores.
@@ -555,6 +583,16 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         eye: [-9606.0, 1257.0, 9.0],
         look: [-9588.0, 1256.0, 0.0],
         minute: 480,
+        ui: None,
+    },
+    // Longshore shallows at noon, looking down through 2-4 yd of sea: refraction and the caustic
+    // web on the sand (the morning scenes are too low-sun to focus).
+    Scenario {
+        name: "water-caustics",
+        map: Some(MAP_AZEROTH),
+        eye: [-9612.0, 1262.0, 7.0],
+        look: [-9598.0, 1262.0, -3.5],
+        minute: 720,
         ui: None,
     },
     // Canal water, wall, hull and dock-post contacts in one near view.

@@ -835,6 +835,9 @@
             enUS = {
                 page = "Advanced Graphics",
                 lightingQuality = "Lighting Quality",
+                -- MONKEY (volumetric fog): localised atmospheric quality row.
+                volumetricFog = "Volumetric Fog",
+                fogOff = "Off",
                 waterQuality = "Water Quality",
                 waterClassic = "Classic",
                 waterEnhanced = "Enhanced",
@@ -863,14 +866,17 @@
                 tips = {
                     LIGHTING_QUALITY =
                         "Sets character, world, indoor torch and outdoor torch shadows; dynamic "
-                        .. "interior lighting; moon shadows; water quality; lava glow; fire and spell brightness; fire flicker; "
+                        .. "interior lighting; moon shadows; volumetric fog; water quality; lava glow; fire and spell brightness; fire flicker; "
                         .. "and night and interior darkness. Low, Medium and High also set shadow "
                         .. "resolution; Medium and High also set resident and moving torch shadow counts.\n\n"
-                        .. "Off restores the original client's look: Classic water, no lava glow or synthesised fire lights, "
+                        .. "Off restores the original client's look: Classic water, no volumetric fog, lava glow or synthesised fire lights, "
                         .. "night gain 1.0 and interior gain 1.0. All other settings, including "
                         .. "Shadow Distance and Torch Shadow Softness, stay as you set them. "
                         .. "Low, Medium and High use Enhanced water; mirror reflections stay opt-in. "
                         .. "Changing a preset member shows Custom when no preset matches.",
+                    -- MONKEY (volumetric fog): explain cost and the shadow-map dependency.
+                    VOLUMETRIC_FOG =
+                        "Off disables volumetric fog. Low adds nearby haze and sun or moon shafts with fewer steps; High uses more steps for smoother shafts. Mist is heavier at dawn and in bad weather, and subtle indoors. Shafts require shadows; with shadows off only haze remains.",
                     WATER_QUALITY =
                         "Classic is the original client's water. Enhanced adds soft shorelines, "
                         .. "animated foam around shores and objects, moving wave highlights, sky reflection "
@@ -953,6 +959,9 @@
             ruRU = {
                 page = "Расширенная графика",
                 lightingQuality = "Качество освещения",
+                -- MONKEY (volumetric fog): Russian atmospheric quality row.
+                volumetricFog = "Объёмный туман",
+                fogOff = "Выкл",
                 waterQuality = "Качество воды",
                 waterClassic = "Классическое",
                 waterEnhanced = "Улучшенное",
@@ -981,16 +990,19 @@
                 tips = {
                     LIGHTING_QUALITY =
                         "Задаёт тени персонажей, мира и огней внутри и снаружи помещений; "
-                        .. "динамическое освещение помещений; лунные тени; качество воды; свечение лавы; яркость огня и заклинаний; "
+                        .. "динамическое освещение помещений; лунные тени; объёмный туман; качество воды; свечение лавы; яркость огня и заклинаний; "
                         .. "мерцание огня; темноту ночи и помещений. «Низкое», «Среднее» и «Высокое» "
                         .. "также задают разрешение теней; «Среднее» и «Высокое» — число карт теней "
                         .. "от огней и число огней с тенями движущихся объектов.\n\n"
-                        .. "«Выкл.» возвращает вид оригинального клиента: классическая вода, без свечения лавы и созданных из пламени "
+                        .. "«Выкл.» возвращает вид оригинального клиента: классическая вода, без объёмного тумана, свечения лавы и созданных из пламени "
                         .. "источников света, с коэффициентами яркости ночи и помещений 1.0. "
                         .. "Все остальные настройки, включая дальность теней и мягкость теней от огня, "
                         .. "сохраняют ваши значения. «Низкое», «Среднее» и «Высокое» используют улучшенную воду; "
                         .. "зеркальные отражения включаются отдельно. Изменение настройки набора показывает «Своё», "
                         .. "если ни один набор больше не совпадает.",
+                    -- MONKEY (volumetric fog): localised effect and cost explanation.
+                    VOLUMETRIC_FOG =
+                        "Выкл отключает объёмный туман. Низкое добавляет дымку вблизи и лучи солнца или луны с меньшим числом шагов; Высокое использует больше шагов для более плавных лучей. Туман гуще на рассвете и в непогоду, а в помещениях слабее. Для лучей нужны тени; без теней остаётся только дымка.",
                     WATER_QUALITY =
                         "«Классическое» — вода оригинального клиента. «Улучшенное» добавляет плавные переходы у берегов, "
                         .. "анимированную пену у берегов и вокруг объектов, подвижные блики на волнах, отражение неба "
@@ -1136,7 +1148,8 @@
             -- the rig they share, and the Graphics page had become the place where a player found
             -- three of eighteen shadow settings and no hint that the other fifteen existed.
             AdvancedGraphics = {
-                "RowLightingQuality", "RowWaterQuality",
+                -- MONKEY (volumetric fog): include in refresh, defaults and search.
+                "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
@@ -3624,10 +3637,26 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- MONKEY (volumetric fog): live numeric tiers use the existing localised dropdown. -->
+                                        <Frame name="$parentRowVolumetricFog" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowWaterQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowWaterQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "volumetricFog", BENILLA_ADVGFX.volumetricFog,
+                                                    "BENILLA_TOOLTIP_VOLUMETRIC_FOG")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.fogOff, value = "0" },
+                                                    { text = BENILLA_ADVGFX.qLow, value = "1" },
+                                                    { text = BENILLA_ADVGFX.qHigh, value = "2" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",

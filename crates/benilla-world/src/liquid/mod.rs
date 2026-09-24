@@ -181,6 +181,7 @@ impl Plugin for LiquidPlugin {
         app.add_plugins(MaterialPlugin::<LiquidMaterial>::default())
             .init_resource::<benilla_assets::WaterQuality>()
             .init_resource::<benilla_assets::WaterDepthImage>()
+            .init_resource::<benilla_assets::WaterColourImage>()
             .init_resource::<Underwater>()
             .init_resource::<SubmergedEye>()
             .init_resource::<WaterIndex>()

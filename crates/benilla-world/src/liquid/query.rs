@@ -486,10 +486,10 @@ impl WaterChunkInfo {
     /// MONKEY (swim waves) — **does this surface's MESH heave?** i.e. is its rendered height the
     /// grid height plus [`super::waves`]'s long swell, rather than the grid height flat.
     ///
-    /// The shader's vertex-displacement arm (`liquid.wgsl:280`) runs on exactly one combination:
-    /// not fullbright (`kind.x < 0.5`), the ocean swatch (`kind.y > 0.5`), and the ADT MCLQ
-    /// renderer (`path.x < 0.5`) — the three static halves of that gate, which is what this
-    /// answers. The fourth, `path.y > 0.5` (Enhanced or High), is a **resource**
+    /// The shader's vertex-displacement arm (`enhanced_water.wgsl` (`water_swell`)) runs on exactly one combination:
+    /// not fullbright (`water.lane.z < 0.5`), the ocean swatch (`water.lane.y > 0.5`), and the ADT MCLQ
+    /// renderer (`water.lane.x < 0.5`) — the three static halves of that gate, which is what this
+    /// answers. The fourth, `water.mode.x > 0.5` (Enhanced or High), is a **resource**
     /// ([`benilla_assets::WaterQuality`]) and not a property of a surface, so it stays the
     /// caller's to apply; folding a global setting into a per-chunk predicate is how the two
     /// would eventually disagree about the same frame.

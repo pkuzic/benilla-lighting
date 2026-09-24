@@ -95,26 +95,24 @@
     view_transformations::position_world_to_clip,
     mesh_view_bindings::{view, globals},
 }
+// MONKEY (enhanced water): the optional water module - see enhanced_water.wgsl and WATER.md.
+#import benilla::enhanced_water::{water_active, water_swell, enhanced_water, WaterFragment}
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var frames: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var frames_samp: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(103) var scene_depth: texture_2d<f32>;
 
 struct LiquidParams {
     // x = fullbright (magma/slime); y = ocean swatch; z = interior fog; w = sun-sheen shininess.
     kind: vec4<f32>,
     // x = WHICH RENDERER (see `LiquidPath`): 0 = ADT MCLQ, 1 = WMO exterior, 2 = WMO interior.
-    // y = quality: 0 Classic, 1 Enhanced, 2 High (stage 1 shares Enhanced); z = wave energy (0..1); w reserved.
+    // y/z/w reserved.
     path: vec4<f32>,
-    // x = fixed Enhanced capture time; y = frame count; z = the SCROLL FLAG (1 only on the nibble-6/7
+    // x = reserved (frame 0); y = frame count; z = the SCROLL FLAG (1 only on the nibble-6/7
     // WMO magma/slime lane — the reference's animated stage-0 texture matrix; see
     // `liquid/surface.rs`'s `scrolls`, and `apply_scroll` below); w = the clock enable (0 on a
     // deterministic run — the whole animation freezes at frame 0 / scroll 0, the 0600 capture
     // pin, baked at material build).
     anim: vec4<f32>,
-    sky_zenith: vec4<f32>, // linear RGB, LightIntBand 2
-    sky_horizon: vec4<f32>, // linear RGB, LightIntBand 6
-    celestial: vec4<f32>, // xyz toward visible body; w = 0 sun, 1 white moon
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> w: LiquidParams;
 
@@ -136,8 +134,6 @@ struct WowLight {
     _grade: vec4<f32>,             // 17
     wmo_fog_color: vec4<f32>,      // 18 rgb = INTERIOR fog (block 2); w = enable
     wmo_fog_params: vec4<f32>,     // 19 x = start yd; y = end yd
-    point_count: vec4<f32>,        // 20 live count + point-light controls
-    points: array<vec4<f32>, 512>, // 21+ position/range, colour/lane pairs
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 
@@ -215,7 +211,6 @@ fn sun_sheen(world_normal: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
 // fallout (uniform re-uploads, bind-group rebuilds, whole-population `AssetChanged` arming)
 // measured 0.28 cpu_ms/frame at the SW pin (2026-08-18 bracket).
 fn anim_time() -> f32 {
-    if w.kind.x < 0.5 && w.path.y > 0.5 && w.anim.w == 0.0 { return w.anim.x; }
     return w.anim.w * globals.time;
 }
 
@@ -276,13 +271,8 @@ fn vertex(in: Vertex) -> LiquidVsOut {
     let world_from_local = mesh_functions::get_world_from_local(in.instance_index);
     out.world_position =
         mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(in.position, 1.0));
-    // Only mesh-resolvable long swell moves ocean vertices. Authored shallow depth pins beaches.
-    if w.kind.x < 0.5 && w.kind.y > 0.5 && w.path.x < 0.5 && w.path.y > 0.5 {
-        // The swell band is the owner-approved one:
-        // the explicit zero keeps this call byte-identical to what it has always been.
-        out.world_position.y += water_waves(out.world_position.xz, anim_time(), 0.0, 0.0,
-            swell_shore_fade(in.uv_b.x), true).x;
-    }
+    // MONKEY (enhanced water): the ocean's long swell; 0 on Classic and on every other surface.
+    out.world_position.y += water_swell(out.world_position.xz, in.uv_b.x);
     out.clip_position = position_world_to_clip(out.world_position.xyz);
     out.world_normal = mesh_functions::mesh_normal_local_to_world(in.normal, in.instance_index);
     out.uv = in.uv;
@@ -361,444 +351,6 @@ fn swatch_at(shallow: vec4<f32>, deep: vec4<f32>, v: f32, ocean: bool) -> vec4<f
     );
 }
 
-// Enhanced is entirely analytic: height and its exact x/z derivatives, in yards.
-// Direction is radians from world +X toward +Z; phase speed follows deep-water dispersion.
-// Two mesh-resolvable long waves sum to at most 0.34 yd before energy/shore attenuation.
-const WATER_WAVES: array<vec4<f32>, 8> = array<vec4<f32>, 8>(
-    // direction, wavelength, amplitude, phase offset
-    vec4<f32>(0.35, 18.0, 0.200, 0.0),
-    vec4<f32>(0.80, 12.8, 0.140, 1.7),
-    vec4<f32>(-0.18, 9.5, 0.090, 3.1),
-    vec4<f32>(0.52, 4.8, 0.055, 0.8),
-    vec4<f32>(1.10, 3.3, 0.033, 2.4),
-    vec4<f32>(-0.45, 2.6, 0.018, 4.6),
-    vec4<f32>(0.15, 1.3, 0.006, 1.2),
-    vec4<f32>(0.95, 0.85, 0.003, 3.8),
-);
-
-// ── SHORE BREAK (item 1) + FOAM LEVELS: the tuned constants, all in one place ──
-//
-// The shore break is a SEPARATE band from `WATER_WAVES` and touches neither the long swell that
-// moves ocean vertices nor the inland colour profile. It exists only in the shoaling zone —
-// roughly 0.35 to 3.5 yd of water over the bed — and it is normals + foam, never displacement.
-//
-// **Its phase coordinate is the vertical depth itself**, not a world ruler. That is the whole
-// trick: an iso-depth line IS the shoreline's own contour, so crests run exactly parallel to the
-// beach on a curved coast, a headland and a cove alike, with no per-chunk seam and no phase jump
-// when the depth gradient rotates. The world direction only ever enters through the NORMAL, where
-// it arrives as the analytic derivative `d(phase)/d(depth) · grad(depth)` — so the picture and the
-// lighting agree by construction. Where the bed is flat enough that the gradient is unusable the
-// direction falls back to the wind (`SHORE_WIND_DIR`, the primary swell's bearing), which is also
-// the only place the fallback can show, because a flat bed has no shoaling band to draw.
-//
-// `shore_g(d) = (d + A·(1 − e^(−d/B))) / L` is a smooth, strictly increasing crest count. Its
-// derivative `(1 + (A/B)·e^(−d/B)) / L` is the local wavenumber in DEPTH space, so with A/B = 1.3
-// the crest spacing runs 0.5 yd of depth at the waterline out to ~1.07 yd offshore: the wave
-// shortens by better than 2× as it shoals, which is the shoaling law's visible half. Because the
-// coordinate is depth, that spacing turns into a WORLD wavelength through the bed slope — so a
-// gentle beach gets long rollers and a steep one short ones, and the number of visible lines
-// approaching the sand stays about four either way.
-const SHORE_LAMBDA_D: f32 = 1.15;      // yards of depth per crest, offshore
-const SHORE_COMPRESS: f32 = 1.56;      // A — shoaling compression (A/B = 1.3 ⇒ 2.3× at the edge)
-const SHORE_COMPRESS_D: f32 = 1.2;     // B — yards of depth the compression decays over
-const SHORE_PERIOD: f32 = 3.6;         // seconds between arrivals; the swash runs at 2×  this
-const SHORE_TILT: f32 = 0.09;          // peak crest steepness (tan of the tilt), slope-independent
-const SHORE_WARP_A: f32 = 0.22;        // yards of depth — coarse crest wander (never ruler-straight)
-const SHORE_WARP_B: f32 = 0.10;        // yards of depth — finer segmentation of the same crests
-const SHORE_WIND_DIR: f32 = 0.35;      // = WATER_WAVES[0].x, the primary swell bearing
-
-// Foam alphas. The owner rejected BOTH a thick icing sheet and straight stripes before this, so
-// every one of these is gated behind a noise breakup and a depth window; the numbers are the
-// ceiling a fully-lit, fully-broken crest can reach, not what a typical pixel gets.
-const FOAM_WET_EDGE: f32 = 0.35;       // the faint wet line where water meets anything solid
-const FOAM_SWASH: f32 = 0.62;          // the sheet running up the sand and fading
-const FOAM_CREST: f32 = 0.88;          // the white front of the last wave or two, and its lace
-const FOAM_MAX: f32 = 0.90;            // hard ceiling on the sum
-
-fn swell_shore_fade(depth: f32) -> f32 {
-    // Ocean V = byte/255, about 148 yd at 1.0: fade in over ~0.15..3.7 yd.
-    return smoothstep(0.001, 0.025, depth);
-}
-
-fn water_waves(p: vec2<f32>, t: f32, distance: f32, footprint: f32,
-    shore: f32, long_only: bool) -> vec3<f32> {
-    let energy = clamp(w.path.z, 0.0, 1.0);
-    let tempo = mix(0.4, 1.0, sqrt(energy));
-    let inland = w.kind.y < 0.5 || w.path.x > 0.5;
-    // Inland ADT water drifts gently (a constant vector: a rigid translation, never a shear).
-    // WMO pools have no drift at all.
-    var ripple_p = p;
-    if inland && w.path.x < 0.5 {
-        ripple_p -= t * vec2<f32>(0.06, 0.025);
-    }
-    var result = vec3<f32>(0.0);
-    for (var i = 0u; i < 8u; i += 1u) {
-        if long_only && i >= 2u { break; }
-        if inland && i < 3u { continue; }
-        let wave = WATER_WAVES[i];
-        let direction = vec2<f32>(cos(wave.x), sin(wave.x));
-        let k = 6.2831853 / wave.y;
-        let speed = sqrt(10.72 / k); // gravity in yd/s^2; phase speed in yd/s
-        let phase = k * (dot(direction, ripple_p) - speed * tempo * t) + wave.w;
-        // Suppress unresolved waves before Nyquist, and remove fine ripples beyond 35 yd.
-        var fade = 1.0 - smoothstep(0.10, 0.45, footprint / wave.y);
-        if i >= 6u { fade *= 1.0 - smoothstep(10.0, 35.0, distance); }
-        if i < 2u { fade *= shore; }
-        let amplitude = wave.z * energy * fade;
-        result += vec3<f32>(amplitude * sin(phase), amplitude * k * cos(phase) * direction);
-    }
-    return result;
-}
-
-fn foam_hash(p_in: vec2<f32>) -> f32 {
-    // MONKEY (foam noise): world coordinates here are ~1e4 yd and are scaled further before they
-    // arrive, so `p * 0.1031` sat near 2e3 where an f32 keeps only ~13 fraction bits - the hash
-    // degenerated into a visible regular tile grid inside the foam (capture it11-water-beach-top).
-    // Wrap the LATTICE CELL to a 512 period first: exact for integers, invisible at 512 cells, and it
-    // gives the hash its full precision back.
-    let p = p_in - 512.0 * floor(p_in / 512.0);
-    let q = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
-    let r = q + dot(q, q.yzx + 33.33);
-    return fract((r.x + r.y) * r.z);
-}
-
-fn foam_value_noise(p: vec2<f32>) -> f32 {
-    let cell = floor(p);
-    let f = fract(p);
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    return mix(mix(foam_hash(cell), foam_hash(cell + vec2<f32>(1.0, 0.0)), u.x),
-        mix(foam_hash(cell + vec2<f32>(0.0, 1.0)),
-            foam_hash(cell + vec2<f32>(1.0, 1.0)), u.x), u.y);
-}
-
-// MONKEY (foam noise): thresholded VALUE noise shows its lattice - the foam and crest masks came out
-// as boxy slabs with stair-stepped edges aligned to the world axes (capture it9/it10-water-beach-top).
-// Two samples on differently ROTATED and scaled lattices, averaged, have no shared axis, so the
-// thresholded shapes turn into irregular blobs. Same range (0..1), same call sites, twice the taps.
-fn foam_noise(p: vec2<f32>) -> f32 {
-    let a = vec2<f32>(0.7986 * p.x - 0.6018 * p.y, 0.6018 * p.x + 0.7986 * p.y);
-    let q = p * 1.37 + vec2<f32>(17.3, -9.1);
-    let b = vec2<f32>(0.3584 * q.x + 0.9336 * q.y, -0.9336 * q.x + 0.3584 * q.y);
-    // Averaging narrows the distribution; re-expand it so the existing thresholds keep their cut.
-    return clamp((0.5 * (foam_value_noise(a) + foam_value_noise(b)) - 0.5) * 1.4 + 0.5, 0.0, 1.0);
-}
-// Reverse-Z perspective: valid for both finite and infinite far planes. For z_view = -distance,
-// depth = -P22 + P32 / distance. Do not use a forward-Z near/far approximation.
-fn water_view_distance(depth: f32) -> f32 {
-    return view.clip_from_view[3][2] / max(depth + view.clip_from_view[2][2], 1e-7);
-}
-
-// == ENHANCED WATER (the optional water module; see WATER.md at the repo root) ==================
-// Design reference and credit: the WarcraftXL project's `wxl-experimental-water` module for the
-// 1.12 client, author iThorgrim - https://github.com/WarcraftXL. Its author permits reuse of that
-// code here provided the author and the original project are named; this notice is that
-// attribution and must stay with the module. A block that ports WarcraftXL code says so where it
-// stands and is listed in WATER.md.
-fn enhanced_water(in: LiquidVsOut, shallow: vec4<f32>, deep: vec4<f32>) -> vec4<f32> {
-    let pixel = clamp(vec2<i32>(in.clip_position.xy), vec2<i32>(0),
-        vec2<i32>(textureDimensions(scene_depth)) - vec2<i32>(1));
-    let own_depth = textureLoad(scene_depth, pixel, 0).r;
-    // MONKEY (bed clutter): grass blades and reeds standing in a stream are in the opaque depth, so
-    // every blade read as "something solid at the surface" - each one grew a white contact-foam
-    // outline and a paler, less-absorbed tint than the bed around it (owner screenshot, Stonefield
-    // Farm). Anything THIN is not a shore: take the FARTHEST of nine taps (reverse-Z: the smallest)
-    // over a ~0.7 % of the view height ring, so a blade a few pixels wide resolves to the bed behind
-    // it, while a bank, a rock or a hull - wider than the ring - is untouched bar a few pixels.
-    let ring = max(i32(view.viewport.w * 0.0065), 2);
-    let top = vec2<i32>(textureDimensions(scene_depth)) - vec2<i32>(1);
-    var far_depth = own_depth;
-    var offs = array<vec2<i32>, 8>(
-        vec2<i32>(1, 1), vec2<i32>(1, 0), vec2<i32>(-1, 1), vec2<i32>(0, 1),
-        vec2<i32>(-1, -1), vec2<i32>(-1, 0), vec2<i32>(1, -1), vec2<i32>(0, -1));
-    for (var k = 0; k < 8; k += 1) {
-        let reach = select(ring, 2 * ring, (k & 1) == 1);
-        let tap = textureLoad(scene_depth,
-            clamp(pixel + offs[k] * reach, vec2<i32>(0), top), 0).r;
-        // Reverse-Z: farther is SMALLER; 0 is the sky, which is not a bed.
-        if tap < far_depth && tap > 0.0 { far_depth = tap; }
-    }
-    // The open sea keeps its own pixel: its shore train's phase IS this depth, and sand has no reeds.
-    let sea = w.kind.y > 0.5 && w.path.x < 0.5;
-    let bed_depth = select(far_depth, own_depth, sea);
-    let to_view = normalize(view.world_position.xyz - in.world_position.xyz);
-    let eye_pos = (view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).xyz;
-    // Convert the two eye-Z distances to a distance ALONG the pixel's view ray.
-    let ray_cos = max(abs(normalize(eye_pos).z), 0.001);
-    let thickness = min(max(water_view_distance(bed_depth)
-        - water_view_distance(in.clip_position.z), 0.0) / ray_cos, 1000.0);
-    // Reconstruct the opaque scene point, then measure height below the surface.
-    // Ray thickness is only the contact measure: opacity must not follow eye-Z.
-    let ndc_xy = ((in.clip_position.xy - view.viewport.xy) / view.viewport.zw)
-        * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
-    let scene_h = view.world_from_clip * vec4<f32>(ndc_xy, bed_depth, 1.0);
-    var vertical_depth = 1000.0;
-    if bed_depth > 0.0 && abs(scene_h.w) > 1e-7 {
-        vertical_depth = clamp(in.world_position.y - scene_h.y / scene_h.w, 0.0, 1000.0);
-    }
-    let t = anim_time(); // WOW_CAPTURE_WATER_T pins the frozen water phase.
-    let p = in.world_position.xz;
-    let energy = clamp(w.path.z, 0.0, 1.0);
-    let ocean_mesh = w.kind.y > 0.5 && w.path.x < 0.5;
-
-    // ── EVERY screen derivative in this shader is taken HERE ────────────────────────────────
-    // Top level of the function, before any branch, loop or early return: WGSL's uniformity rule
-    // makes a derivative inside non-uniform control flow invalid, and this function is long enough
-    // that the only safe discipline is to have exactly one place they can live. Nothing below may
-    // reintroduce a `dpdx`/`dpdy` inside a conditional.
-    let ddx_p = dpdx(p);
-    let ddy_p = dpdy(p);
-    let ddx_depth = dpdx(vertical_depth);
-    let ddy_depth = dpdy(vertical_depth);
-    let footprint = max(length(ddx_p), length(ddy_p));
-
-    // The BED's slope in world yards, recovered by inverting the pixel→world Jacobian: solve
-    // `g·(dp/dx) = dd/dx` and `g·(dp/dy) = dd/dy` for the world-space gradient of the vertical
-    // depth field. `offshore` is the unit direction of INCREASING depth, so `−offshore` points at
-    // the beach and the shore train travels that way.
-    let jac_det = ddx_p.x * ddy_p.y - ddx_p.y * ddy_p.x;
-    var depth_grad = vec2<f32>(0.0, 0.0);
-    if abs(jac_det) > 1e-12 {
-        depth_grad = vec2<f32>(
-            (ddx_depth * ddy_p.y - ddy_depth * ddx_p.y) / jac_det,
-            (ddy_depth * ddx_p.x - ddx_depth * ddy_p.x) / jac_det,
-        );
-    }
-    let bed_slope = length(depth_grad);
-    // Flat bed, or the depth field broke across a silhouette (the ratio blows up there): fall back
-    // to the wind. A flat bed has no shoaling band to draw, so the fallback is mostly a guard.
-    var offshore = vec2<f32>(cos(SHORE_WIND_DIR), sin(SHORE_WIND_DIR));
-    if bed_slope > 0.02 && bed_slope < 12.0 {
-        offshore = depth_grad / bed_slope;
-    }
-
-    // ── The shore break: shoaling trains riding the bathymetry (see the constants block) ────
-    // Domain-warped in DEPTH units, so the crests wander and segment along the beach instead of
-    // running as ruler-straight bands.
-    let shore_warp =
-        SHORE_WARP_A * (2.0 * foam_noise(p * 0.075 + t * vec2<f32>(0.010, -0.007)) - 1.0)
-        + SHORE_WARP_B * (2.0 * foam_noise(p * 0.21 - t * vec2<f32>(0.006, 0.009)) - 1.0);
-    let dq = max(vertical_depth + shore_warp, 0.0);
-    let shore_g = (dq + SHORE_COMPRESS * (1.0 - exp(-dq / SHORE_COMPRESS_D))) / SHORE_LAMBDA_D;
-    // `+ t/period` with a crest-count that RISES with depth ⇒ a crest of fixed phase slides to
-    // shallower water as time runs: the train travels shoreward.
-    let shore_phase = 6.2831853 * (shore_g + t / SHORE_PERIOD);
-    let shore_phase2 = 6.2831853 * (1.9 * shore_g + t / (SHORE_PERIOD * 0.62)) + 2.1;
-    // Steepness rises as it shoals (3.5 → 0.75 yd), collapses into the break below ~0.35 yd, and
-    // is gone past the band's offshore edge.
-    let shoal = smoothstep(3.5, 0.75, vertical_depth);
-    let shore_collapse = smoothstep(0.12, 0.38, vertical_depth);
-    let shore_offshore_fade = 1.0 - smoothstep(2.4, 3.6, vertical_depth);
-    // MONKEY (surf on wrecks): the shore train reads the SCENE depth, and a sunken boat, a pier
-    // foot or a rock shelf is shallow scene depth in the middle of deep water - so the whole surf
-    // (crests, lace, swash) was painted over the hull of a wreck off Longshore. A shore is where
-    // the SEA BED is shallow. The mesh carries the authored bed depth (`in.depth`, byte/255 of about
-    // 148 yd): where the bed lies well below what the pixel sees, the pixel is an OBJECT, and an
-    // object gets the thin wet-edge line only. The byte is a FLOOR (1.72 per yd), so on a real beach the
-    // authored bed is never deeper than the scene by more than interpolation error: allow 0.5 yd.
-    let bed_yd = clamp(in.depth, 0.0, 1.0) * 148.0;
-    let on_bed = 1.0 - smoothstep(0.5, 1.0, bed_yd - vertical_depth);
-    let shore_gain = select(0.0, shoal * shore_collapse * shore_offshore_fade * on_bed, ocean_mesh)
-        * energy;
-    // Steepness is set DIRECTLY — the tangent of the crest tilt — rather than through an amplitude
-    // and a wavenumber, so a gentle beach and a steep one roll with the same visible strength
-    // instead of one washing out and the other exploding.
-    let shore_grad = SHORE_TILT * shore_gain
-        * (cos(shore_phase) + 0.45 * cos(shore_phase2)) * offshore;
-
-    let shore = select(1.0, swell_shore_fade(in.depth), ocean_mesh);
-    let wave = water_waves(p, t, length(eye_pos), footprint, shore, false);
-    // One surface gradient: the procedural bands and the shore break.
-    let surf_grad = wave.yz + shore_grad;
-    var n = normalize(vec3<f32>(-surf_grad.x, 1.0, -surf_grad.y));
-    if dot(n, to_view) < 0.0 { n = -n; }
-
-    // Far water settles into a calm sky sheet.
-    n = normalize(mix(n, vec3<f32>(0.0, sign(n.y), 0.0),
-        0.6 * smoothstep(60.0, 120.0, length(eye_pos))));
-    // Clean translucent teal at the edge; zone tint remains in the deeper body.
-    let teal_shallow = mix(vec3<f32>(0.12, 0.42, 0.39), shallow.rgb, 0.18);
-    // MONKEY (water body): the zone deep row alone renders the open sea and lake middles a muddy
-    // grey-brown (Westfall ocean, Loch Modan) - it was authored to sit UNDER the reference ripple
-    // sheet, not to be a lit body colour. Pull it 70 % toward the zone zenith sky (deep water takes
-    // its colour from the sky it scatters) and keep it blue-dominant, so the body reads as water by
-    // day, follows dusk and night through the same sky row, and still differs zone to zone.
-    let zenith_gamma = pow(max(w.sky_zenith.rgb, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-    let deep_sky = mix(deep.rgb, zenith_gamma * 1.1, 0.7);
-    let deep_body = vec3<f32>(min(deep_sky.r, deep_sky.g * 0.85), deep_sky.g,
-        max(deep_sky.b, deep_sky.g * 1.12));
-    var body = mix(teal_shallow, deep_body, smoothstep(0.0, 3.5, vertical_depth));
-    if !ocean_mesh {
-        let clear_row = mix(shallow.rgb, vec3<f32>(0.20, 0.40, 0.36), 0.35);
-        let clear_tint = vec3<f32>(min(clear_row.r, clear_row.g * 0.72), clear_row.g,
-            clamp(clear_row.b, clear_row.g * 0.82, clear_row.g * 1.15));
-        let inland_row = mix(deep.rgb, zenith_gamma * 1.1, 0.25);
-        let inland_deep = vec3<f32>(min(inland_row.r, inland_row.g * 0.72), inland_row.g,
-            clamp(inland_row.b, inland_row.g * 0.82, inland_row.g * 1.15));
-        body = mix(clear_tint, inland_deep, smoothstep(0.0, 5.0, vertical_depth));
-    }
-    let to_light = -normalize(wow_light.light_sun.xyz);
-    // MONKEY (water body): water is lit by the light it SCATTERS, not only by N.L on its skin, so
-    // the lit body keeps a high floor (ambient x 1.35, N.L floor 0.5). With the old 0.25 floor a
-    // noon lake rendered near-black navy where the owner reference is a bright teal-blue; night
-    // still darkens because both rows do.
-    let lighting = clamp(wow_light.light_ambient.rgb * 1.35 + wow_light.light_diffuse.rgb
-        * max(dot(n, to_light), 0.5), vec3<f32>(0.0), vec3<f32>(1.0));
-    var rgb = body * lighting;
-    // MONKEY (shore waves): the shore train is shown mainly as a CONTINUOUS crest brightening, not as
-    // a normal tilt. Its direction comes from the screen-space gradient of the bed depth, and the
-    // terrain is flat triangles, so that direction jumps at every triangle edge: at SHORE_TILT 0.30
-    // the highlights broke into blocky rectangular shards with staircase edges (capture
-    // it9-water-beach-top). The PHASE is a function of the depth itself and is continuous, so a term
-    // driven by the phase alone cannot facet. The tilt stays at 0.09 for a little specular life.
-    let shore_crest = pow(max(sin(shore_phase), 0.0), 2.0)
-        + 0.45 * pow(max(sin(shore_phase2), 0.0), 2.0);
-    rgb += shore_gain * shore_crest * 0.13 * lighting * vec3<f32>(0.72, 0.95, 0.90);
-    if !ocean_mesh {
-        // Keep the zone's green-blue absorption under warm dusk illumination.
-        rgb = body * dot(lighting, vec3<f32>(0.2126, 0.7152, 0.0722));
-    }
-    let celestial_dir = normalize(w.celestial.xyz);
-    let crest = smoothstep(0.35, 0.95, 0.5 + 0.5 * wave.x / max(0.545 * energy, 0.001));
-    let transmission = crest * pow(max(dot(to_view, -celestial_dir), 0.0), 3.0) * energy
-        * smoothstep(-0.02, 0.12, celestial_dir.y);
-    rgb += vec3<f32>(0.06, 0.30, 0.19) * transmission * lighting;
-    let reflection_n = normalize(mix(vec3<f32>(0.0, sign(n.y), 0.0), n, 0.45));
-    let reflected = reflect(-to_view, reflection_n);
-    let sky_linear = mix(w.sky_horizon.rgb, w.sky_zenith.rgb, clamp(reflected.y * 1.4, 0.0, 1.0));
-    // Linear reflection interpolation, then conversion to the world's gamma blend/fog lane.
-    let sky = select(12.92 * sky_linear,
-        1.055 * pow(max(sky_linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055,
-        sky_linear > vec3<f32>(0.0031308));
-    var reflectivity = mix(0.06, 0.88, pow(1.0 - max(dot(n, to_view), 0.0), 4.0));
-    if !ocean_mesh { reflectivity = min(reflectivity, 0.55); }
-    rgb = mix(rgb, sky, reflectivity);
-    // Smooth crest glints; widen and conserve lobe energy as the footprint grows.
-    let half_v = normalize(celestial_dir + to_view);
-    let ndoth = max(dot(n, half_v), 0.0);
-    let normal_variance = dot(dpdx(n), dpdx(n)) + dot(dpdy(n), dpdy(n));
-    let spread = 1.0 + 400.0 * normal_variance + 2.0 * smoothstep(30.0, 160.0, length(eye_pos));
-    if w.path.x < 1.5 {
-        if w.celestial.w > 0.5 {
-            // Own peak intensity, never nightGain or the signed moon-shadow weight.
-            // sin(8 degrees): the reflection is exactly zero below the horizon.
-            rgb += vec3<f32>(0.80, 0.88, 1.0) * 0.45
-                * (pow(ndoth, 400.0 / spread) / sqrt(spread)
-                    + 0.25 * pow(ndoth, 60.0 / sqrt(spread)) / sqrt(spread))
-                * smoothstep(0.0, 0.1391731, celestial_dir.y);
-        } else {
-            rgb += wow_light.light_diffuse.rgb
-                * (pow(ndoth, 400.0 / spread) / sqrt(spread)
-                    + 0.25 * pow(ndoth, 60.0 / sqrt(spread)) / sqrt(spread))
-                * smoothstep(-0.02, 0.08, celestial_dir.y);
-        }
-    }
-
-    // Rank candidates by actual fragment distance, not table order. Only four lights are shaded.
-    var nearest = array<u32, 4>(256u, 256u, 256u, 256u);
-    var distances = array<f32, 4>(900.0, 900.0, 900.0, 900.0);
-    for (var i = 0u; i < min(u32(wow_light.point_count.x), 256u); i += 1u) {
-        let colour = wow_light.points[2u * i + 1u];
-        if colour.w >= 0.5 && w.path.x < 1.5 { continue; }
-        let delta = wow_light.points[2u * i].xyz - in.world_position.xyz;
-        let d2 = dot(delta, delta);
-        if d2 >= distances[3] { continue; }
-        var slot = 3u;
-        loop {
-            if slot == 0u { break; }
-            if d2 >= distances[slot - 1u] { break; }
-            distances[slot] = distances[slot - 1u];
-            nearest[slot] = nearest[slot - 1u];
-            slot -= 1u;
-        }
-        distances[slot] = d2;
-        nearest[slot] = i;
-    }
-    for (var j = 0u; j < 4u; j += 1u) {
-        if nearest[j] == 256u { continue; }
-        let pos = wow_light.points[nearest[j] * 2u];
-        let colour = wow_light.points[nearest[j] * 2u + 1u];
-        let delta = pos.xyz - in.world_position.xyz;
-        let distance = sqrt(max(distances[j], 0.0001));
-        let light_dir = delta / distance;
-        let reach = min(select(pos.w, 2.0 * colour.w, colour.w >= 0.5), 30.0);
-        let attenuation = pow(1.0 - smoothstep(0.0, max(reach, 0.01), distance), 2.0);
-        rgb += colour.rgb * pow(max(dot(n, normalize(light_dir + to_view)), 0.0), 64.0)
-            * max(dot(n, light_dir), 0.0) * attenuation * 0.7;
-    }
-
-    // Patchy, low-frequency coverage, never a texture-derived white outline.
-    let noise = 0.7 * foam_noise(p * 0.6 + t * vec2<f32>(0.025, -0.018))
-        + 0.3 * foam_noise(p * 1.7 - t * vec2<f32>(0.014, 0.021));
-    let breakup = smoothstep(0.40, 0.72, noise);
-    // The cached derivatives from the top of the function — same expression as before, one tap.
-    let depth_gradient = length(vec2<f32>(ddx_depth, ddy_depth))
-        / max(length(vec2<f32>(length(ddx_p), length(ddy_p))), 0.001);
-    let wall_suppression = mix(1.0, 0.3, smoothstep(0.8, 3.0, depth_gradient));
-    let contact = smoothstep(0.0, 0.025, thickness)
-        * (1.0 - smoothstep(0.055, 0.15, thickness));
-    let contact_alpha = FOAM_WET_EDGE * contact * wall_suppression * breakup;
-    // MONKEY (beach foam, third pass). The owner called the previous surf ugly: it was the crest
-    // line chopped into DASHES by a breakup noise, plus swash "crescents" stamped from an 8 yd patch
-    // grid - rows of white blobs. Surf is not dashes. A breaking wave is (1) a thin, nearly
-    // continuous bright FRONT, (2) a LACE of foam left behind it that thins out and dissolves, and
-    // (3) a sheet that runs up the sand after each arrival and fizzles. All three are driven by the
-    // shore train's own phase, so the foam sits on the wave the normals show.
-    //
-    // `surf_u` is the fraction of a wave spacing BEHIND the front (the phase rises with depth, so
-    // behind = seaward): 0 at the front, which sits just ahead of the crest the normals draw.
-    let surf_u = fract(shore_g + t / SHORE_PERIOD - 0.20);
-    // Web-like lace: ridged noise (bright along the zero set of two noise fields), two octaves.
-    let lace_a = 1.0 - abs(2.0 * foam_noise(p * 1.25 + t * vec2<f32>(0.030, -0.020)) - 1.0);
-    let lace_b = 1.0 - abs(2.0 * foam_noise(p * 3.30 - t * vec2<f32>(0.020, 0.035)) - 1.0);
-    let lace = 0.62 * lace_a + 0.38 * lace_b;
-    // The lace dissolves with age: the threshold climbs from "most of it" to "only the ridges".
-    let dissolve = mix(0.42, 0.93, smoothstep(0.02, 0.60, surf_u));
-    let lace_mask = smoothstep(dissolve, dissolve + 0.16, lace);
-    // The front itself: crisp on its shoreward side, solid for a few percent of a spacing.
-    let front = smoothstep(0.0, 0.018, surf_u) * (1.0 - smoothstep(0.035, 0.11, surf_u));
-    let trail = smoothstep(0.0, 0.03, surf_u) * (1.0 - smoothstep(0.25, 0.70, surf_u));
-    // Strength wanders along the beach, but never to nothing - no gaps, no dashes.
-    let along = mix(0.55, 1.0, foam_noise(p * 0.055 + t * vec2<f32>(0.008, 0.005)));
-    let break_zone = smoothstep(0.10, 0.30, vertical_depth)
-        * (1.0 - smoothstep(1.3, 2.6, vertical_depth)) * on_bed;
-    let crest_alpha = select(0.0,
-        FOAM_CREST * break_zone * along * max(front, 0.85 * trail * lace_mask), ocean_mesh)
-        * wall_suppression * energy;
-
-    // The swash: what is left of each wave runs up the last hand of water and fizzles. Its clock
-    // is the front's arrival at the break (0.22 yd of water): 0 when it lands, 1 as the next does.
-    let land_g = (0.22 + SHORE_COMPRESS * (1.0 - exp(-0.22 / SHORE_COMPRESS_D))) / SHORE_LAMBDA_D;
-    let swash_age = fract(land_g + t / SHORE_PERIOD - 0.20 + 0.10 * (along - 0.75));
-    let swash_life = smoothstep(0.0, 0.06, swash_age) * (1.0 - smoothstep(0.30, 0.95, swash_age));
-    let swash_band = (1.0 - smoothstep(0.10, 0.34, vertical_depth + 0.5 * shore_warp)) * on_bed;
-    let swash_thin = mix(0.30, 0.90, smoothstep(0.05, 0.85, swash_age));
-    let swash_lace = smoothstep(swash_thin, swash_thin + 0.18, lace);
-    // The very lip of the water keeps a thin bright line while the sheet is alive.
-    let lip = 1.0 - smoothstep(0.015, 0.07, vertical_depth);
-    let arcs_alpha = select(0.0,
-        FOAM_SWASH * swash_life * swash_band * max(swash_lace, 0.8 * lip), ocean_mesh)
-        * wall_suppression * energy;
-
-    let foam = min(FOAM_MAX, contact_alpha + arcs_alpha + crest_alpha);
-    let illumination = wow_light.light_ambient.rgb + wow_light.light_diffuse.rgb;
-    let foam_luma = clamp(dot(illumination, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.22, 1.0);
-    // Matte foam composites on top of reflection with its own coverage.
-    let soft_edge = smoothstep(0.0, 0.18, vertical_depth);
-    var body_alpha = soft_edge * mix(0.55, 0.97, smoothstep(0.0, 1.6, vertical_depth));
-    if !ocean_mesh {
-        body_alpha = soft_edge * mix(0.30, 0.86, smoothstep(0.0, 4.5, vertical_depth));
-    }
-    let foam_alpha = smoothstep(0.0, 0.045, vertical_depth) * foam;
-    let alpha = foam_alpha + body_alpha * (1.0 - foam_alpha);
-    // Foam is white UNDER the light it stands in: half the way to the light's own colour, so a
-    // dusk surf is warm and a moonlit one blue-grey, not a neutral paste.
-    let foam_tint = mix(vec3<f32>(foam_luma),
-        clamp(illumination, vec3<f32>(0.22), vec3<f32>(1.0)), 0.5);
-    rgb = (foam_tint * foam_alpha + rgb * body_alpha * (1.0 - foam_alpha))
-        / max(alpha, 0.0001);
-    return vec4<f32>(apply_fog(rgb, in.world_position.xyz, in.room_fog), alpha);
-}
-
 @fragment
 fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
     // HARD FAR-CLIP WALL (same as terrain/models, see terrain.wgsl): discard water beyond the
@@ -811,15 +363,19 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Enhanced never samples the classic ripple sheet. The 1x1 image retains the safe fallback.
-    if w.kind.x < 0.5 && w.path.y > 0.5 && textureDimensions(scene_depth).x > 1u {
+    // MONKEY (enhanced water): the optional module takes the whole surface; Classic falls through.
+    if water_active() {
         var shallow_enhanced = wow_light.water_river[0];
         var deep_enhanced = wow_light.water_river[1];
         if w.kind.y > 0.5 && w.path.x < 0.5 {
             shallow_enhanced = wow_light.water_ocean[0];
             deep_enhanced = wow_light.water_ocean[1];
         }
-        return enhanced_water(in, shallow_enhanced, deep_enhanced);
+        // Returned as-is: the module fogs its own surface terms (the scene it shows through is
+        // already fogged).
+        return enhanced_water(
+            WaterFragment(in.clip_position, in.world_position, in.depth, in.room_fog),
+            shallow_enhanced, deep_enhanced);
     }
 
     // Animated frame. For water/ocean this is the DETAIL ripple (RGB ≈ near-black, ALPHA = ripple);

@@ -1,6 +1,9 @@
 //! Main-pass depth for water. The shared image fits ExtendedMaterial's existing bind group;
 //! only the world camera writes it (portrait/preview views never overwrite it). This belongs
 //! in world/liquid because visibility and the WorldCamera marker are world responsibilities.
+//!
+//! MONKEY (enhanced water: refraction): the same node also copies the opaque COLOUR, the frame
+//! as it stood before any water drew, into `WaterColourImage` for the module to look through.
 use bevy::prelude::*;
 use bevy::camera::visibility::VisibleEntities;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -14,8 +17,8 @@ use bevy::render::render_graph::*;
 use bevy::render::render_resource::*;
 use bevy::render::renderer::{RenderContext, RenderDevice};
 use bevy::render::texture::GpuImage;
-use bevy::render::view::ViewDepthTexture;
-use benilla_assets::{WaterDepthImage, WaterQuality, materials::LiquidMaterial};
+use bevy::render::view::{ViewDepthTexture, ViewTarget};
+use benilla_assets::{WaterColourImage, WaterDepthImage, WaterQuality, materials::LiquidMaterial};
 
 #[derive(Component, Clone, ExtractComponent)]
 struct WaterView;
@@ -23,6 +26,7 @@ struct WaterView;
 #[derive(Resource, Clone, ExtractResource)]
 struct DepthSource {
     image: Handle<Image>,
+    colour: Handle<Image>,
     active: bool,
 }
 
@@ -34,13 +38,15 @@ struct WaterOverride(Option<u8>);
 
 impl Plugin for WaterDepthPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<WaterQuality>().init_resource::<WaterDepthImage>();
+        app.init_resource::<WaterQuality>().init_resource::<WaterDepthImage>()
+            .init_resource::<WaterColourImage>();
         let value = std::env::var("WOW_WATER").ok()
             .and_then(|v| v.parse::<u8>().ok()).filter(|v| *v <= 2);
         if let Some(value) = value { app.insert_resource(WaterQuality(value)); }
         let image = app.world().resource::<WaterDepthImage>().0.clone();
+        let colour = app.world().resource::<WaterColourImage>().0.clone();
         app.insert_resource(WaterOverride(value))
-            .insert_resource(DepthSource { image, active: false })
+            .insert_resource(DepthSource { image, colour, active: false })
             .add_plugins((ExtractComponentPlugin::<WaterView>::default(),
                 ExtractResourcePlugin::<DepthSource>::default()))
             // Camera sizes and the per-view visible list are final by Last, before extraction.
@@ -84,17 +90,20 @@ fn update_water_depth(
         light.celestial_dir.extend(0.0)
     } else { light.moon_dir_white.extend(1.0) };
     // Evaluated after lighting resolves each frame; mutate only on actual changes.
-    let changed: Vec<_> = materials.iter().filter(|(_, m)| m.extension.kind.x < 0.5
-        && (m.extension.path.y != quality.0.min(2) as f32
-            || (quality.0 > 0 && (m.extension.sky_zenith != zenith
-                || m.extension.sky_horizon != horizon || m.extension.celestial != celestial))))
-        .map(|(id, _)| id).collect();
+    let tier = quality.0.min(2) as f32;
+    let changed: Vec<_> = materials.iter().filter(|(_, m)| {
+        let water = &m.extension.water;
+        water.lane.z < 0.5
+            && (water.mode.x != tier
+                || (quality.0 > 0 && (water.sky_zenith != zenith
+                    || water.sky_horizon != horizon || water.celestial != celestial)))
+    }).map(|(id, _)| id).collect();
     for id in changed {
-        let ext = &mut materials.get_mut(id).unwrap().extension;
-        ext.path.y = quality.0.min(2) as f32;
-        ext.sky_zenith = zenith;
-        ext.sky_horizon = horizon;
-        ext.celestial = celestial;
+        let water = &mut materials.get_mut(id).unwrap().extension.water;
+        water.mode.x = tier;
+        water.sky_zenith = zenith;
+        water.sky_horizon = horizon;
+        water.celestial = celestial;
     }
     source.active = false;
     for (entity, camera, mut camera3d, visible) in &mut cameras {
@@ -106,12 +115,18 @@ fn update_water_depth(
         if quality.0 == 0 || !camera.is_active { continue; }
         source.active = visible.get(std::any::TypeId::of::<Mesh3d>()).iter().any(|entity| {
             liquids.get(*entity).ok().and_then(|m| materials.get(&m.0))
-                .is_some_and(|m| m.extension.kind.x < 0.5)
+                .is_some_and(|m| m.extension.water.lane.z < 0.5)
         });
         if let Some(size) = camera.physical_target_size() {
             if size.x > 0 && size.y > 0 {
-                if images.get(&source.image).is_some_and(|image| image.size() != size) {
-                    images.get_mut(&source.image).unwrap().resize(size.to_extents());
+                let stale = |handle: &Handle<Image>| images.get(handle)
+                    .is_some_and(|image| image.size() != size);
+                if stale(&source.image) || stale(&source.colour) {
+                    for handle in [source.image.clone(), source.colour.clone()] {
+                        if let Some(image) = images.get_mut(&handle) {
+                            if image.size() != size { image.resize(size.to_extents()); }
+                        }
+                    }
                     // A resize replaces the GPU view behind this stable handle. Rebuild all
                     // material bindings, including opaque liquids sharing the fallback binding.
                     let ids: Vec<_> = materials.ids().collect();
@@ -126,6 +141,8 @@ fn update_water_depth(
 struct DepthPipelines {
     layouts: [BindGroupLayoutDescriptor; 2],
     pipelines: [CachedRenderPipelineId; 2],
+    colour_layout: BindGroupLayoutDescriptor,
+    colour_pipeline: CachedRenderPipelineId,
 }
 
 #[derive(Resource)]
@@ -150,7 +167,24 @@ fn init_pipeline(mut commands: Commands, shader: Res<DepthShader>, cache: Res<Pi
                 blend: None, write_mask: ColorWrites::ALL })],
         }), ..default()
     }));
-    commands.insert_resource(DepthPipelines { layouts, pipelines });
+    let colour_layout = BindGroupLayoutDescriptor::new(
+        "water colour source", &[BindGroupLayoutEntry {
+            binding: 0, visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Texture { sample_type: TextureSampleType::Float { filterable: false },
+                view_dimension: TextureViewDimension::D2, multisampled: false }, count: None,
+        }],
+    );
+    let colour_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("water colour copy".into()), layout: vec![colour_layout.clone()],
+        vertex: VertexState { shader: shader.clone(), entry_point: Some("vertex".into()), ..default() },
+        fragment: Some(FragmentState {
+            shader: shader.clone(), entry_point: Some("colour".into()),
+            shader_defs: vec!["COLOUR".into()],
+            targets: vec![Some(ColorTargetState { format: TextureFormat::Rgba16Float,
+                blend: None, write_mask: ColorWrites::ALL })],
+        }), ..default()
+    });
+    commands.insert_resource(DepthPipelines { layouts, pipelines, colour_layout, colour_pipeline });
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -159,9 +193,9 @@ struct WaterDepthLabel;
 struct DepthNode;
 
 impl ViewNode for DepthNode {
-    type ViewQuery = (&'static WaterView, &'static ViewDepthTexture);
+    type ViewQuery = (&'static WaterView, &'static ViewDepthTexture, &'static ViewTarget);
     fn run<'w>(&self, _: &mut RenderGraphContext, context: &mut RenderContext<'w>,
-        (_, depth): QueryItem<'w, '_, Self::ViewQuery>, world: &'w World) -> Result<(), NodeRunError> {
+        (_, depth, target): QueryItem<'w, '_, Self::ViewQuery>, world: &'w World) -> Result<(), NodeRunError> {
         let source = world.resource::<DepthSource>();
         if !source.active { return Ok(()); }
         let images = world.resource::<RenderAssets<GpuImage>>();
@@ -171,6 +205,14 @@ impl ViewNode for DepthNode {
         let cache = world.resource::<PipelineCache>();
         let index = usize::from(depth.texture.sample_count() > 1);
         let Some(pipeline) = cache.get_render_pipeline(pipelines.pipelines[index]) else { return Ok(()) };
+        // Both copies or neither: a depth copy without its colour would show the module a real bed
+        // through a black frame (shallows flash black while the colour pipeline compiles). With
+        // neither, the cleared depth reads as sky, the water is opaque, and nothing shows.
+        let Some(colour_pipeline) = cache.get_render_pipeline(pipelines.colour_pipeline) else {
+            return Ok(());
+        };
+        let Some(colour) = images.get(&source.colour) else { return Ok(()) };
+        if colour.texture.size() != depth.texture.size() { return Ok(()); }
         let device = world.resource::<RenderDevice>();
         let bind = device.create_bind_group("water depth source",
             &cache.get_bind_group_layout(&pipelines.layouts[index]),
@@ -185,13 +227,32 @@ impl ViewNode for DepthNode {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+
+        // The opaque colour, for the refraction. `main_texture_view` is the single-sample texture
+        // the opaque pass resolved into, so no MSAA variant is needed here.
+        let bind = device.create_bind_group("water colour source",
+            &cache.get_bind_group_layout(&pipelines.colour_layout),
+            &BindGroupEntries::single(target.main_texture_view()));
+        let mut pass = context.command_encoder().begin_render_pass(&RenderPassDescriptor {
+            label: Some("water opaque colour copy"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &colour.texture_view, resolve_target: None, depth_slice: None,
+                ops: Operations { load: LoadOp::Clear(Default::default()), store: StoreOp::Store },
+            })], ..default()
+        });
+        pass.set_pipeline(colour_pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
         Ok(())
     }
 }
 
 // Sample zero is intentional: averaging reverse-Z samples invents surfaces at silhouettes.
 const RESOLVE_SHADER: &str = r#"
-#ifdef MULTISAMPLED
+#ifdef COLOUR
+@group(0) @binding(0) var source: texture_2d<f32>;
+#else ifdef MULTISAMPLED
 @group(0) @binding(0) var depth: texture_depth_multisampled_2d;
 #else
 @group(0) @binding(0) var depth: texture_depth_2d;
@@ -201,9 +262,15 @@ const RESOLVE_SHADER: &str = r#"
     let y = f32(i & 2u);
     return vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
 }
+#ifdef COLOUR
+@fragment fn colour(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(source, vec2<i32>(p.xy), 0);
+}
+#else
 @fragment fn fragment(@builtin(position) p: vec4<f32>) -> @location(0) f32 {
     return textureLoad(depth, vec2<i32>(p.xy), 0);
 }
+#endif
 "#;
 
 #[cfg(test)]

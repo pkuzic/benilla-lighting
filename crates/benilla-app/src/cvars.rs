@@ -926,6 +926,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
          Medium / High, or Custom when the members match none of them; the reference has no \
          realtime light or shadow system to preset",
     ),
+    // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
+    ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
     ours(
         "waterQuality",
         "1",
@@ -2001,6 +2003,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("exteriorShadows", "0"),
             ("spellLightGain", "0"),
             ("waterQuality", "0"),
+            // MONKEY (volumetric fog): Off preset restores the original atmosphere.
+            ("volumetricFog", "0"),
             ("lavaLightGain", "0"),
             ("fireLightGain", "0"),
             ("nightGain", "1.0"),
@@ -2022,6 +2026,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("exteriorShadows", "0"),
             ("spellLightGain", "1"),
             ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2046,6 +2052,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("exteriorShadows", "0"),
             ("spellLightGain", "1"),
             ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2071,6 +2079,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("spellLightGain", "1"),
             // Mirror reflections stay opt-in until their cost is measured.
             ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2884,8 +2894,11 @@ mod tests {
         // a row, forgot its weld" fail HERE: the length check below is the gate.
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let lighting: [(&str, f32); 32] = [
+        // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
+        let lighting: [(&str, f32); 33] = [
             ("waterQuality", shadows.water_quality as f32),
+            // MONKEY (volumetric fog): weld registry and renderer defaults.
+            ("volumetricFog", shadows.volumetric_fog as f32),
             ("lavaLightGain", shadows.lava_light_gain),
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
@@ -2938,9 +2951,10 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 32 rows, 32 welds.
+        // row the client does not have; the length is the other half — 33 rows, 33 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
-        assert_eq!(welded.len(), 32, "the lighting lane welds 32 distinct rows");
+        // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
+        assert_eq!(welded.len(), 33, "the lighting lane welds 33 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2994,9 +3008,10 @@ mod tests {
                 assert_eq!(derive_lighting_quality(&cvars), *name, "{from} -> {name}");
                 assert_eq!(cvars.get("shadowDistance"), Some("120"));
                 assert_eq!(cvars.get("interiorShadowSoft"), Some("2.5"));
-                for member in ["fireLightGain", "waterQuality", "lavaLightGain", "nightGain", "interiorGain"] {
+                // MONKEY (volumetric fog): Off must remove atmosphere as well as enhanced water.
+                for member in ["fireLightGain", "waterQuality", "volumetricFog", "lavaLightGain", "nightGain", "interiorGain"] {
                     let expected = if *name == "Off" {
-                        if matches!(member, "fireLightGain" | "waterQuality" | "lavaLightGain") { "0" } else { "1.0" }
+                        if matches!(member, "fireLightGain" | "waterQuality" | "volumetricFog" | "lavaLightGain") { "0" } else { "1.0" }
                     } else {
                         cvars.default_of(member).unwrap()
                     };
@@ -3113,6 +3128,8 @@ mod tests {
                     "interiorShadowDynamic" => video.interior_shadow_dynamic as f32,
                     "spellLightGain" => video.spell_light_gain,
                     "waterQuality" => video.water_quality as f32,
+                    // MONKEY (volumetric fog): verify presets reach the renderer.
+                    "volumetricFog" => video.volumetric_fog as f32,
                     "lavaLightGain" => video.lava_light_gain,
                     "fireLightGain" => video.fire_light_gain,
                     "moonShadowStrength" => video.moon_shadow_strength,

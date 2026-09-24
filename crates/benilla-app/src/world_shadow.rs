@@ -106,7 +106,8 @@ struct CutoutCaster {
 
 /// The world lane's retained casters.
 #[derive(Resource, Default)]
-struct WorldLane {
+// MONKEY (volumetric fog): allow the fog plugin to invalidate a stale streamed caster cache.
+pub(crate) struct WorldLane {
     /// The cached static caster — the retained `static_gx` world (trees + buildings), rebuilt on drift.
     static_caster: Option<Entity>,
     static_mesh: Option<Handle<Mesh>>,
@@ -120,6 +121,14 @@ struct WorldLane {
     /// MONKEY (sun shadow perf): the `worldShadowRate` cadence gate on the ENVIRONMENT caster only.
     /// The static solid + cutout casters keep their own, much coarser cadence (16 yd camera drift).
     env_rate: RebuildRate,
+}
+
+// MONKEY (volumetric fog): retain ownership of the cache here; the fog plugin decides
+// when streamed geometry needs a fresh map, without changing the legacy Off path.
+impl WorldLane {
+    pub(crate) fn invalidate_static(&mut self) {
+        self.static_rebuilt_at = None;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
