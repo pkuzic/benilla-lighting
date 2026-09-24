@@ -57,6 +57,7 @@
 //! avatar + streamed units, the record pool, and one additive effect-stream draw per
 //! (chunk, category) with live records (fog OFF — the reference's verified foam render state).
 
+mod bob;
 mod params;
 
 use bevy::asset::RenderAssetUsages;
@@ -78,6 +79,7 @@ use crate::world_unit::{ViewerUnit, WorldUnit};
 use benilla_assets::{AssetSet, WorldAssets};
 
 use params::{foam_params, foam_uv, rand01, record_alpha, record_size, WadeState};
+use params::{foam_gain, swim_ramp, tread_params, FoamLook, TREAD_INTERVAL};
 use params::{wake_cooldown, RING_INTERVAL};
 
 /// The two foam stencils (render categories: 0 = ring, 1 = wake). Loaded RAW — the alpha carries
@@ -149,6 +151,11 @@ struct UnitFoam {
     ready: f32,
     /// Step-in latch: currently deeper than the one-shot threshold.
     wading: bool,
+    /// MONKEY (swim waves) — the treading ring's OWN deadline, deliberately not the shared cell
+    /// above. The reference's one cooldown is a faithful detail (a ring delays a wake and vice
+    /// versa); a record the reference does not have must not reach into it, or the Enhanced ring
+    /// would start eating the wakes the same pass exists to make more visible.
+    tread_ready: f32,
     rng: u32,
     /// Fed this frame (drives retiring state for despawned units).
     active: bool,
@@ -161,6 +168,7 @@ impl UnitFoam {
             last_yaw: None,
             ready: 0.0,
             wading: false,
+            tread_ready: 0.0,
             rng: seed | 1,
             active: false,
         }
@@ -316,6 +324,49 @@ fn build_patch(
     }
 }
 
+/// Build one record's static patch and hand it to the pool — the tail every emission shares.
+///
+/// Extracted whole (MONKEY (swim waves)) when the treading ring became a second emitter on the
+/// same frame: two copies of the candidate walk is two places for the patch clip to drift apart,
+/// and the clip is what keeps foam off dry sand.
+fn emit_record(
+    alloc: &mut dyn FnMut(FoamRecord),
+    index: &WaterIndex,
+    water: &Query<(Entity, &WaterChunkInfo, &FoamPatch)>,
+    center: [f32; 2],
+    p: &params::FoamParams,
+    heading: f32,
+    now: f32,
+) {
+    let final_size = p.size0 + p.growth * p.lifetime;
+    // Candidates for the patch box only — resolved here, on the EMISSION path (past the depth
+    // gate and the cooldown), never on the every-frame classify above. `over_box` unions the
+    // 1–4 cells a final-size box touches, so the set `build_patch` filters with `overlaps` is
+    // the same one the full walk offered it.
+    let candidates: Vec<_> = index
+        .over_box(
+            [center[0] - final_size, center[1] - final_size],
+            [center[0] + final_size, center[1] + final_size],
+        )
+        .into_iter()
+        .filter_map(|e| water.get(e).ok())
+        .collect();
+    if let Some((verts, chunk)) = build_patch(center, final_size, &candidates) {
+        alloc(FoamRecord {
+            center,
+            heading,
+            size0: p.size0,
+            growth: p.growth,
+            lifetime: p.lifetime,
+            peak: p.peak,
+            born: now,
+            ring: p.ring,
+            verts,
+            chunk,
+        });
+    }
+}
+
 /// Classify + gate + emit for one unit this frame (the driver `0x5fa760`, once per unit per
 /// frame; emission paced by the unit's shared cooldown cell).
 fn drive_unit(
@@ -329,6 +380,9 @@ fn drive_unit(
     water: &Query<(Entity, &WaterChunkInfo, &FoamPatch)>,
     index: &WaterIndex,
     now: f32,
+    // MONKEY (swim waves) — `WaterQuality >= 1`. The ONE gate on the readability pass; at `false`
+    // every line it touches below is the reference's.
+    enhanced: bool,
 ) {
     let gate = (GATE_DEPTH_FRAC * h).max(1.0);
     foam_state.active = true;
@@ -356,44 +410,47 @@ fn drive_unit(
     let oneshot = wading_now != foam_state.wading;
     foam_state.wading = wading_now;
 
+    // MONKEY (swim waves) — how this record should READ (Enhanced only; `FoamLook::CLASSIC`
+    // reproduces the reference exactly). The swim half is the depth law evaluated here rather
+    // than a movement flag, because a streamed murloc's flags never reach this crate.
+    // Spelled as the constant on the Classic arm rather than as `enhanced: false`: Classic IS the
+    // reference look, and stating it that way is what makes "byte-identical" a thing the type
+    // says instead of a thing a comment claims. It also keeps the depth law off the Classic
+    // frame's hot path entirely — nothing reads it there.
+    let look = if enhanced {
+        FoamLook {
+            enhanced: true,
+            swimming: swim_ramp(depth, h) > 0.5,
+        }
+    } else {
+        FoamLook::CLASSIC
+    };
+
+    // The treading ring, BEFORE the shared cooldown's early return and on its own cell: a body
+    // hanging in deep water is the state the reference's driver renders almost invisible, and it
+    // is exactly the state the owner's murloc will be in. Classic touches nothing here — not the
+    // timer, not the RNG stream.
+    if look.enhanced && look.swimming && !matches!(state, WadeState::Translating { .. }) {
+        if now >= foam_state.tread_ready {
+            foam_state.tread_ready = now + TREAD_INTERVAL;
+            if let Some(p) = tread_params(look, scale, &mut foam_state.rng) {
+                let heading = rand01(&mut foam_state.rng) * std::f32::consts::TAU;
+                emit_record(alloc, index, water, [wow[0], wow[1]], &p, heading, now);
+            }
+        }
+    }
+
     if !oneshot && now < foam_state.ready {
         return;
     }
-    let Some(p) = foam_params(state, oneshot, scale, gate, depth, &mut foam_state.rng) else {
+    let Some(p) = foam_params(state, oneshot, scale, gate, depth, look, &mut foam_state.rng) else {
         return;
     };
     let heading = match (p.ring, state) {
         (false, WadeState::Translating { heading, .. }) => heading,
         _ => rand01(&mut foam_state.rng) * std::f32::consts::TAU,
     };
-    let final_size = p.size0 + p.growth * p.lifetime;
-    let center = [wow[0], wow[1]];
-    // Candidates for the patch box only — resolved here, on the EMISSION path (past the depth
-    // gate and the cooldown), never on the every-frame classify above. `over_box` unions the
-    // 1–4 cells a final-size box touches, so the set `build_patch` filters with `overlaps` is
-    // the same one the full walk offered it.
-    let candidates: Vec<_> = index
-        .over_box(
-            [center[0] - final_size, center[1] - final_size],
-            [center[0] + final_size, center[1] + final_size],
-        )
-        .into_iter()
-        .filter_map(|e| water.get(e).ok())
-        .collect();
-    if let Some((verts, chunk)) = build_patch(center, final_size, &candidates) {
-        alloc(FoamRecord {
-            center,
-            heading,
-            size0: p.size0,
-            growth: p.growth,
-            lifetime: p.lifetime,
-            peak: p.peak,
-            born: now,
-            ring: p.ring,
-            verts,
-            chunk,
-        });
-    }
+    emit_record(alloc, index, water, [wow[0], wow[1]], &p, heading, now);
     // The shared cooldown cell: the one-shot resets it; a ring pulses on the 400+U[0,50) ms law;
     // a wake re-arms on the distance law (one decal per ~0.625 yd of travel).
     let mut uni = |a: f32, b: f32| a + (b - a) * rand01(&mut foam_state.rng);
@@ -414,6 +471,7 @@ fn drive_unit(
 /// selection bits) and for every streamed unit (the velocity/yaw proxy), emitting pool records.
 fn emit_water_foam(
     time: Res<Time>,
+    quality: Res<benilla_assets::WaterQuality>,
     materials: Option<Res<FoamAssets>>,
     mut foam: ResMut<WaterFoam>,
     viewer: Res<crate::view::Viewer>,
@@ -427,6 +485,8 @@ fn emit_water_foam(
     }
     let now = time.elapsed_secs();
     let dt = time.delta_secs().max(1.0e-4);
+    // MONKEY (swim waves): Enhanced water gets a readable wake; Classic keeps the reference's.
+    let enhanced = quality.0 >= 1;
 
     for uf in foam.units.values_mut() {
         uf.active = false;
@@ -467,7 +527,9 @@ fn emit_water_foam(
             let mut alloc = |rec: FoamRecord| {
                 pool[alloc_slot(self_cursor, 0, SELF_SLOTS)] = Some(rec);
             };
-            drive_unit(uf, &mut alloc, body, state, scale, h, &water, &index, now);
+            drive_unit(
+                uf, &mut alloc, body, state, scale, h, &water, &index, now, enhanced,
+            );
         }
 
         // Streamed units (the avatar's own wire ghost is excluded via `Without<SelfPlayer>`).
@@ -519,7 +581,7 @@ fn emit_water_foam(
                 pool[alloc_slot(other_cursor, SELF_SLOTS, POOL_SIZE - SELF_SLOTS)] = Some(rec);
             };
             drive_unit(
-                uf, &mut alloc, pos, state, unit.scale, h, &water, &index, now,
+                uf, &mut alloc, pos, state, unit.scale, h, &water, &index, now, enhanced,
             );
         }
     }
@@ -535,6 +597,7 @@ fn emit_water_foam(
 /// tie-break bias; a chunk that streamed out lets its records age out silently.
 fn push_water_foam(
     time: Res<Time>,
+    quality: Res<benilla_assets::WaterQuality>,
     assets: Option<Res<FoamAssets>>,
     cam: Query<Entity, With<WorldCamera>>,
     mut foam: ResMut<WaterFoam>,
@@ -544,6 +607,11 @@ fn push_water_foam(
     let Some(assets) = assets else { return };
     let Ok(cam) = cam.single() else { return };
     let now = time.elapsed_secs();
+    // MONKEY (swim waves) — the Enhanced readability gain, on the VERTEX COLOUR (see
+    // [`params::foam_gain`] for why it cannot be on the alpha). `1.0` in Classic, so that path's
+    // vertex stream is `[1, 1, 1, alpha]` exactly as it has always been.
+    let enhanced = quality.0 >= 1;
+    let gain = foam_gain(enhanced);
 
     for slot in &mut foam.pool {
         if slot.as_ref().is_some_and(|r| now - r.born >= r.lifetime) {
@@ -573,7 +641,7 @@ fn push_water_foam(
                 quads.verts.push(EffectVertex {
                     pos: v.to_array(),
                     uv: foam_uv(rec.center, rec.heading, size, [wow[0], wow[1]]),
-                    color: [1.0, 1.0, 1.0, alpha],
+                    color: [gain, gain, gain, alpha],
                 });
                 centroid += *v;
                 n += 1;
@@ -596,8 +664,20 @@ fn push_water_foam(
                 // `0x68fcd7`; the long-standing `0x68fcc1` citation was the blend setup — 1808).
                 fog: EffectFog::Off,
                 // The reference's foam render is its own additive path (`0x68fae0`), not the
-                // M2 batch state producer — no GL_LIGHTING on it.
-                lighting: crate::particles::buffer::EffectLighting::None,
+                // M2 batch state producer — no GL_LIGHTING on it. Classic keeps that verbatim.
+                //
+                // MONKEY (swim waves): Enhanced takes the SCENE term instead, and it is the gain
+                // above that makes it necessary. At the authored colour the foam is dark enough
+                // that an unlit draw is invisible at night anyway; at 3.5× it would be a bright
+                // white wake under a midnight sky — the environment-sheet failure mode this lane
+                // was built for (`EffectLighting::Scene`'s own doc: the Zul'Gurub waterfall foam
+                // as a full-white cutout against shaded terrain). So the two changes ship as one:
+                // brighter, and tinted by the world that lights everything around it.
+                lighting: if enhanced {
+                    crate::particles::buffer::EffectLighting::Scene
+                } else {
+                    crate::particles::buffer::EffectLighting::None
+                },
                 anchor: centroid / n as f32,
                 bias: FOAM_BIAS,
                 // A few ULPs of constant and **no slope term** (`Rung::FOAM_RASTER*`, whose docs
@@ -645,6 +725,10 @@ impl Plugin for WaterFxPlugin {
             )
             // The stream push: PostUpdate after the frame's clear (emission ran in Update).
             .add_systems(PostUpdate, push_water_foam.after(begin_effect_frame));
+        // MONKEY (swim waves) — the bodies' half: bobbing on the ocean's vertex swell. It shares
+        // this module's water lookup shape and its depth law but nothing else (it emits no
+        // records and draws nothing), so it registers itself rather than being threaded in here.
+        bob::register(app);
     }
 }
 
@@ -659,7 +743,12 @@ mod tests {
     #[test]
     fn the_emitter_finds_its_water_through_the_index() {
         let mut app = App::new();
-        app.init_resource::<Time>()
+        app
+            // CLASSIC deliberately: this fence pins the REFERENCE emitter's record count, and
+            // MONKEY (swim waves)'s Enhanced pass adds a second record (the treading ring) for
+            // exactly the body this fixture spawns. The Enhanced count has its own test below.
+            .insert_resource(benilla_assets::WaterQuality(0))
+            .init_resource::<Time>()
             .init_resource::<WaterIndex>()
             .init_resource::<WaterFoam>()
             .init_resource::<crate::view::Viewer>()
@@ -719,6 +808,69 @@ mod tests {
             live[0] >= SELF_SLOTS,
             "a streamed unit allocates from the other partition"
         );
+    }
+
+    /// MONKEY (swim waves) — **Enhanced adds the treading ring, and Classic does not.** Same
+    /// world, same body, same seed: the only difference is [`benilla_assets::WaterQuality`], and
+    /// the swimmer that emits one reference record at 0 emits that record plus a ring at 1.
+    ///
+    /// The ring has to come out of a live emitter and not just [`params::tread_params`], because
+    /// what it actually has to clear is the shared-cooldown early return the reference's driver
+    /// takes on almost every frame — the whole reason it carries its own cadence cell.
+    #[test]
+    fn enhanced_adds_a_treading_ring_for_a_swimmer() {
+        let live = |quality: u8| {
+            let mut app = App::new();
+            app.insert_resource(benilla_assets::WaterQuality(quality))
+                .init_resource::<Time>()
+                .init_resource::<WaterIndex>()
+                .init_resource::<WaterFoam>()
+                .init_resource::<crate::view::Viewer>()
+                .insert_resource(FoamAssets {
+                    ring: Handle::default(),
+                    wake: Handle::default(),
+                })
+                .add_systems(
+                    Update,
+                    (crate::liquid::maintain_water_index, emit_water_foam).chain(),
+                );
+            let mut positions = Vec::new();
+            for j in 0..3 {
+                for i in 0..3 {
+                    positions.push([i as f32 * 5.0, j as f32 * 5.0, 5.0]);
+                }
+            }
+            app.world_mut().spawn((
+                WaterChunkInfo::new(
+                    crate::liquid::LiquidSource::AdtChunk,
+                    benilla_formats::LiquidKind::Ocean,
+                    [3, 3],
+                    positions,
+                    vec![true; 4],
+                ),
+                FoamPatch,
+            ));
+            // Feet 1.6 yd under a 2.0-yd body: past the 0.78·h band top, so it is SWIMMING, and
+            // standing still, so it is treading. Inside the 2·h = 4 yd emission gate either way.
+            app.world_mut().spawn((
+                Transform::from_translation(wow_to_bevy([2.0, 2.0, 3.4])),
+                WorldUnit {
+                    wades: true,
+                    scale: 1.0,
+                    height: 2.0,
+                    bound: None,
+                },
+            ));
+            app.update();
+            app.world()
+                .resource::<WaterFoam>()
+                .pool
+                .iter()
+                .filter(|r| r.is_some())
+                .count()
+        };
+        assert_eq!(live(0), 1, "Classic: the reference's step-in ring, alone");
+        assert_eq!(live(1), 2, "Enhanced: + the treading ring");
     }
 
     /// Pool partitioning: the self cursor wraps within [0, 32), others within [32, 128) —

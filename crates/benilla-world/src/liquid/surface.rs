@@ -258,10 +258,11 @@ pub(crate) fn spawn_liquids<'a>(
         // transform is a no-op round-trip).
         let info = wet_footprint(lq, &Transform::IDENTITY, LiquidSource::AdtChunk);
         let foam = !lq.kind.is_fullbright(); // white surf is a water thing
+        let mesh_handle = meshes.add(liquid_bevy_mesh(lq, None));
         entities.push(
             commands
                 .spawn((
-                    Mesh3d(meshes.add(liquid_bevy_mesh(lq, None))),
+                    Mesh3d(mesh_handle.clone()),
                     MeshMaterial3d(material),
                     Transform::IDENTITY,
                     LiquidSurface,
@@ -352,7 +353,8 @@ fn liquid_bevy_mesh(lq: &LiquidMesh, body_color: Option<[f32; 3]>) -> Mesh {
     // world by the entity transform) + the sun.
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 1.0, 0.0]; n]);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, lq.uvs.clone());
-    // UV1.x carries the per-vertex swatch depth (0..1) for the shader's opacity ramp.
+    // UV1.x carries the per-vertex swatch depth (0..1) for the shader's opacity ramp; UV1.y is
+    // unused.
     let uv1: Vec<[f32; 2]> = lq.depths.iter().map(|&d| [d, 0.0]).collect();
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, uv1);
     // An INTERIOR WMO pool's body colour is its own `MOMT.diffColor`, and it rides the vertex colour
@@ -509,6 +511,8 @@ pub(super) fn setup_liquid(
     world_assets: Option<ResMut<WorldAssets>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<LiquidMaterial>>,
+    water_depth: Res<benilla_assets::WaterDepthImage>,
+    water_quality: Res<benilla_assets::WaterQuality>,
 ) {
     let (Some(_config), Some(mut world_assets)) = (config, world_assets) else {
         return; // no client data → no terrain, so no water either
@@ -516,6 +520,11 @@ pub(super) fn setup_liquid(
     // No light seed and no per-frame push: light, fog and both water swatches come off the shared
     // global-light buffer (`lighting::global_light`), which `build_light_data` has already packed by
     // the time anything draws — the same path terrain and the models take.
+    // Read once at setup; only frozen water captures consume this override.
+    let capture_time = if std::env::var_os("WOW_CAPTURE").is_some() {
+        std::env::var("WOW_CAPTURE_WATER_T").ok().and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0)
+    } else { 0.0 };
     let mut assets = LiquidAssets::default();
     for &(kind, dir, stem, count) in FRAME_SETS {
         let Some((frames, frame_count)) =
@@ -586,6 +595,7 @@ pub(super) fn setup_liquid(
                     ..default()
                 },
                 extension: LiquidExt {
+                    scene_depth: water_depth.0.clone(),
                     frames: frames.clone(),
                     // x = fullbright (magma/slime: the animated texture is the opaque body, skipping
                     // the swatch and N·L — but NOT the fog, which every liquid kind takes); y = read
@@ -598,14 +608,22 @@ pub(super) fn setup_liquid(
                         WATER_SHININESS,
                     ),
                     // Which of the reference's three liquid renderers `liquid.wgsl` runs.
-                    path: Vec4::new(path.shader_id(), 0.0, 0.0, 0.0),
-                    // x = reserved (frame 0; the shader derives the live index from its own
+                    // `w` is unused (it was the river-flow dial; the owner had the effect removed).
+                    path: Vec4::new(
+                        path.shader_id(), water_quality.0 as f32,
+                        if kind.is_fullbright() { 0.0 }
+                        else if path != LiquidPath::Adt { 0.12 }
+                        else if kind == LiquidKind::Ocean { 1.0 }
+                        else { 0.18 },
+                        0.0,
+                    ),
+                    // x = fixed Enhanced capture time (live frame index uses the shader
                     // clock); y = frame count; z = the SCROLL FLAG (1 = this lane takes the
                     // stage-0 v-scroll — [`scrolls`]' nibble-6/7 WMO lane); w = the clock
                     // enable (0 on a deterministic run bakes the 0600 capture freeze — frame 0,
                     // scroll 0 — with no tick left to skip).
                     anim: Vec4::new(
-                        0.0,
+                        capture_time,
                         frame_count as f32,
                         if scroll { 1.0 } else { 0.0 },
                         if crate::dev_state::deterministic_run() {
@@ -614,6 +632,9 @@ pub(super) fn setup_liquid(
                             1.0
                         },
                     ),
+                    sky_zenith: Vec4::ZERO,
+                    sky_horizon: Vec4::ZERO,
+                    celestial: Vec3::Y.extend(0.0),
                     light_buf: world_assets.shared_light.clone(),
                 },
             });

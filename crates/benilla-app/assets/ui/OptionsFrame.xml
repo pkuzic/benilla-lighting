@@ -835,6 +835,11 @@
             enUS = {
                 page = "Advanced Graphics",
                 lightingQuality = "Lighting Quality",
+                waterQuality = "Water Quality",
+                waterClassic = "Classic",
+                waterEnhanced = "Enhanced",
+                waterHigh = "High",
+                lavaGlow = "Lava Glow",
                 qOff = "Off",
                 qLow = "Low",
                 qMedium = "Medium",
@@ -858,13 +863,20 @@
                 tips = {
                     LIGHTING_QUALITY =
                         "Sets character, world, indoor torch and outdoor torch shadows; dynamic "
-                        .. "interior lighting; moon shadows; fire and spell brightness; fire flicker; "
+                        .. "interior lighting; moon shadows; water quality; lava glow; fire and spell brightness; fire flicker; "
                         .. "and night and interior darkness. Low, Medium and High also set shadow "
                         .. "resolution; Medium and High also set resident and moving torch shadow counts.\n\n"
-                        .. "Off restores the original client's look: no synthesised fire lights, "
+                        .. "Off restores the original client's look: Classic water, no lava glow or synthesised fire lights, "
                         .. "night gain 1.0 and interior gain 1.0. All other settings, including "
                         .. "Shadow Distance and Torch Shadow Softness, stay as you set them. "
+                        .. "Low, Medium and High use Enhanced water; mirror reflections stay opt-in. "
                         .. "Changing a preset member shows Custom when no preset matches.",
+                    WATER_QUALITY =
+                        "Classic is the original client's water. Enhanced adds soft shorelines, "
+                        .. "animated foam around shores and objects, moving wave highlights, sky reflection "
+                        .. "and light glints. High also adds mirror reflections and costs the most.",
+                    LAVA_GLOW =
+                        "How strongly lava lights its surroundings. 0 turns the glow off.",
                     CHARACTER_SHADOWS =
                         "Renders real dynamic silhouettes for players, NPCs, creatures, and mounts, replacing "
                         .. "the legacy oval blob. Matches Wrath's character-only shadow tier. This uses "
@@ -941,6 +953,11 @@
             ruRU = {
                 page = "Расширенная графика",
                 lightingQuality = "Качество освещения",
+                waterQuality = "Качество воды",
+                waterClassic = "Классическое",
+                waterEnhanced = "Улучшенное",
+                waterHigh = "Высокое",
+                lavaGlow = "Свечение лавы",
                 qOff = "Выкл.",
                 qLow = "Низкое",
                 qMedium = "Среднее",
@@ -964,15 +981,22 @@
                 tips = {
                     LIGHTING_QUALITY =
                         "Задаёт тени персонажей, мира и огней внутри и снаружи помещений; "
-                        .. "динамическое освещение помещений; лунные тени; яркость огня и заклинаний; "
+                        .. "динамическое освещение помещений; лунные тени; качество воды; свечение лавы; яркость огня и заклинаний; "
                         .. "мерцание огня; темноту ночи и помещений. «Низкое», «Среднее» и «Высокое» "
                         .. "также задают разрешение теней; «Среднее» и «Высокое» — число карт теней "
                         .. "от огней и число огней с тенями движущихся объектов.\n\n"
-                        .. "«Выкл.» возвращает вид оригинального клиента: без созданных из пламени "
+                        .. "«Выкл.» возвращает вид оригинального клиента: классическая вода, без свечения лавы и созданных из пламени "
                         .. "источников света, с коэффициентами яркости ночи и помещений 1.0. "
                         .. "Все остальные настройки, включая дальность теней и мягкость теней от огня, "
-                        .. "сохраняют ваши значения. Изменение настройки набора показывает «Своё», "
+                        .. "сохраняют ваши значения. «Низкое», «Среднее» и «Высокое» используют улучшенную воду; "
+                        .. "зеркальные отражения включаются отдельно. Изменение настройки набора показывает «Своё», "
                         .. "если ни один набор больше не совпадает.",
+                    WATER_QUALITY =
+                        "«Классическое» — вода оригинального клиента. «Улучшенное» добавляет плавные переходы у берегов, "
+                        .. "анимированную пену у берегов и вокруг объектов, подвижные блики на волнах, отражение неба "
+                        .. "и блики от источников света. «Высокое» также добавляет зеркальные отражения и требует больше всего ресурсов.",
+                    LAVA_GLOW =
+                        "Насколько сильно лава освещает всё вокруг. При 0 свечение отключено.",
                     CHARACTER_SHADOWS =
                         "Рисует настоящие динамические силуэты игроков, НИП, существ и ездовых "
                         .. "животных вместо старого овального пятна. Соответствует уровню теней "
@@ -1112,11 +1136,11 @@
             -- the rig they share, and the Graphics page had become the place where a player found
             -- three of eighteen shadow settings and no hint that the other fifteen existed.
             AdvancedGraphics = {
-                "RowLightingQuality",
+                "RowLightingQuality", "RowWaterQuality",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
-                "RowFireLight", "RowFireFlicker", "RowSpellLights",
+                "RowFireLight", "RowFireFlicker", "RowSpellLights", "RowLavaGlow",
                 "RowNightDarkness", "RowInteriorDarkness",
             },
             -- Player Guild Names (2180) rides as a CHILD of Player Names, which is the
@@ -3584,10 +3608,26 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <Frame name="$parentRowWaterQuality" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowLightingQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowLightingQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "waterQuality",
+                                                    BENILLA_ADVGFX.waterQuality,
+                                                    "BENILLA_TOOLTIP_WATER_QUALITY")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.waterClassic, value = "0" },
+                                                    { text = BENILLA_ADVGFX.waterEnhanced, value = "1" },
+                                                    { text = BENILLA_ADVGFX.waterHigh, value = "2" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowWaterQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowWaterQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",
@@ -3760,10 +3800,22 @@
                                                 OptionsSliderRow_Setup(self, 0, 4, 0.05)
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowNightDarkness" inherits="OptionsSliderRowTemplate">
+                                        <Frame name="$parentRowLavaGlow" inherits="OptionsSliderRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowSpellLights" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowSpellLights" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "lavaLightGain",
+                                                    BENILLA_ADVGFX.lavaGlow,
+                                                    "BENILLA_TOOLTIP_LAVA_GLOW")
+                                                OptionsSliderRow_Setup(self, 0, 4, 0.05)
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowNightDarkness" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowLavaGlow" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowLavaGlow" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- 0.2..1.5, the CVar's own clamp verbatim: the

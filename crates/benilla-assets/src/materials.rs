@@ -565,13 +565,16 @@ pub type LiquidMaterial = ExtendedMaterial<StandardMaterial, LiquidExt>;
 /// match the field order.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
 pub struct LiquidExt {
+    /// Opaque world depth resolved after both retained and Bevy geometry. No sampler needed.
+    #[texture(103, sample_type = "float", filterable = false, visibility(fragment))]
+    pub scene_depth: Handle<Image>,
     /// The kind's animated frames (`lake_a`/`fast_a`/`ocean_h`), stacked as `2d_array` layers
     /// (`Rgba8Unorm`, repeat-sampled). RGB near-black; alpha = the ripple/wave → transparency.
     #[texture(100, dimension = "2d_array", visibility(fragment))]
     #[sampler(101, visibility(fragment))]
     pub frames: Handle<Image>,
     /// The per-material constants that pick which *lanes* of the shared light this surface reads.
-    /// None of them is a light value; all four are fixed at material creation.
+    /// Kind is fixed at creation; quality and the Enhanced sky rows can update at runtime.
     ///
     /// - `x` = **fullbright** (>0.5 ⇒ magma/slime): the animated texture IS the opaque body — skip
     ///   the depth swatch and the N·L term. Not "skip the fog"; see `liquid.wgsl` and decision 0691.
@@ -591,14 +594,25 @@ pub struct LiquidExt {
     ///   MCLQ (`ocean0_s.bls`), `1` = WMO exterior (`MapObjExtWater0.bls`), `2` = WMO interior
     ///   (fixed-function, unlit). The reference has three liquid renderers with genuinely different
     ///   combines, stage counts and opacity sources; this is which one `liquid.wgsl` runs.
-    /// - `y`/`z`/`w` reserved.
+    /// - `y` = water quality (0 Classic, 1 Enhanced, 2 High).
+    /// - `z` = wave energy: ocean 1.0, ADT river/lake 0.18, WMO pools 0.12.
+    /// - `w` = unused (was the river-flow dial; the effect was removed at the owner request).
     #[uniform(102)]
     pub path: Vec4,
-    /// `x` = reserved (frame 0), `y` = frame count, `z` = scroll flag, `w` = clock enable —
+    /// `x` = fixed Enhanced capture time, `y` = frame count, `z` = scroll flag, `w` = clock enable —
     /// the shader derives frame index and scroll from `globals.time` (liquid.wgsl `anim_time`);
     /// nothing mutates this uniform after build.
     #[uniform(102)]
     pub anim: Vec4,
+    /// Enhanced reflection endpoints, linear RGB from the dome's resolved LightIntBand 2/6.
+    #[uniform(102)]
+    pub sky_zenith: Vec4,
+    #[uniform(102)]
+    pub sky_horizon: Vec4,
+    /// xyz: toward the visible sun by day, white moon by night (not the fixed FFP light).
+    /// w: 0 sun, 1 moon; moon reflection is independent of darkness/shadow strength.
+    #[uniform(102)]
+    pub celestial: Vec4,
     /// **The shared global light** (`lighting::global_light`): the one storage buffer terrain and the
     /// models already read, now liquid's source too. `liquid.wgsl` reads rows 0-5 (light + scene fog +
     /// farclip), 13-16 (the two water swatches) and 18/19 (the interior fog block). Read in BOTH

@@ -483,6 +483,23 @@ impl WaterChunkInfo {
         }
     }
 
+    /// MONKEY (swim waves) — **does this surface's MESH heave?** i.e. is its rendered height the
+    /// grid height plus [`super::waves`]'s long swell, rather than the grid height flat.
+    ///
+    /// The shader's vertex-displacement arm (`liquid.wgsl:280`) runs on exactly one combination:
+    /// not fullbright (`kind.x < 0.5`), the ocean swatch (`kind.y > 0.5`), and the ADT MCLQ
+    /// renderer (`path.x < 0.5`) — the three static halves of that gate, which is what this
+    /// answers. The fourth, `path.y > 0.5` (Enhanced or High), is a **resource**
+    /// ([`benilla_assets::WaterQuality`]) and not a property of a surface, so it stays the
+    /// caller's to apply; folding a global setting into a per-chunk predicate is how the two
+    /// would eventually disagree about the same frame.
+    ///
+    /// A body is only lifted by water that is actually lifting: a river, a WMO pool and lava all
+    /// render flat, and bobbing on them would be a body floating over its own reflection.
+    pub(crate) fn has_vertex_swell(&self) -> bool {
+        matches!(self.source, LiquidSource::AdtChunk) && self.kind == LiquidKind::Ocean
+    }
+
     /// Is this WoW-space XY inside the chunk's wet footprint?
     pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y

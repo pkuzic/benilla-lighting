@@ -474,6 +474,116 @@ pub(super) const SUBJECT_INDOOR: [f32; 3] = [-9469.4, 31.9, 57.9];
 /// fixtures, the house-compass and street scenes. Capturable by name (`WOW_CAPTURE=<name>`) for
 /// debugging and look passes, but NOT part of the blessed baseline sweep.
 pub(super) const ON_DEMAND: &[Scenario] = &[
+    // WOW_CAPTURE_WATER_T=<seconds>: fixed Enhanced water phase (read once, default 0).
+    // Compare 0 and 1.5; Classic and non-water animation stay frozen.
+    // Above Lakeshire's broken docks, looking across Lake Everstill and its rocky shores.
+    Scenario {
+        name: "water-lake",
+        map: Some(MAP_AZEROTH),
+        eye: [-9350.0, -2340.0, 82.0],
+        look: [-9367.0, -2436.0, 57.1],
+        minute: 720,
+        ui: None,
+    },
+    // Westfall western coast: sand in the foreground, open sea to the west.
+    Scenario {
+        name: "water-ocean",
+        map: Some(MAP_AZEROTH),
+        eye: [-10500.0, 2112.0, 6.0],
+        look: [-10420.0, 2192.0, 0.0],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "water-ocean-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-10500.0, 2112.0, 6.0],
+        look: [-10420.0, 2192.0, 0.0],
+        minute: 1110,
+        ui: None,
+    },
+    // Owner's Westfall shore, facing 0.86 rad with the white moon above the sea.
+    Scenario {
+        name: "water-ocean-moon",
+        map: Some(MAP_AZEROTH),
+        eye: [-9754.7, 1714.9, 3.0],
+        look: [-9689.45, 1790.68, 7.0],
+        minute: 170,
+        ui: None,
+    },
+    // Elevated oblique beach view: compare phases 0, 2 and 4 seconds for swash run-up.
+    Scenario {
+        name: "water-beach-top",
+        map: Some(MAP_AZEROTH),
+        eye: [-9754.7, 1714.9, 30.7],
+        look: [-9739.8, 1700.0, 0.6],
+        minute: 400,
+        ui: None,
+    },
+    // Elwynn river from flight height; both banks and the river bed at dusk.
+    Scenario {
+        name: "water-river-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-9500.0, -390.0, 97.7],
+        look: [-9500.0, -433.26, 61.4],
+        minute: 1140,
+        ui: None,
+    },
+    // The same river from well above: several chunks and a bend in one frame (flow continuity).
+    Scenario {
+        name: "water-river-high",
+        map: Some(MAP_AZEROTH),
+        eye: [-9440.0, -380.0, 150.0],
+        look: [-9500.0, -433.26, 57.6],
+        minute: 1080,
+        ui: None,
+    },
+    // Standing in the shallows at the bank: bed clutter seen through a foot of water.
+    Scenario {
+        name: "water-river-bank",
+        map: Some(MAP_AZEROTH),
+        eye: [-9500.0, -418.0, 60.2],
+        look: [-9500.0, -428.0, 57.2],
+        minute: 720,
+        ui: None,
+    },
+    // The sunken rowing boat off Longshore: an OBJECT in shallow scene depth over a deeper bed -
+    // the surf must not be painted on its hull (owner screenshot).
+    Scenario {
+        name: "water-wreck",
+        map: Some(MAP_AZEROTH),
+        eye: [-9606.0, 1257.0, 9.0],
+        look: [-9588.0, 1256.0, 0.0],
+        minute: 480,
+        ui: None,
+    },
+    // Canal water, wall, hull and dock-post contacts in one near view.
+    Scenario {
+        name: "stormwind-canal-near",
+        map: Some(MAP_AZEROTH),
+        eye: [-8850.0, 760.0, 102.0],
+        look: [-8779.29, 830.71, 78.91],
+        minute: 720,
+        ui: None,
+    },
+    // Sunset companion to the near canal contact probe, matching the rejected water reference.
+    Scenario {
+        name: "water-canal-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-8850.0, 760.0, 102.0],
+        look: [-8779.29, 830.71, 78.91],
+        minute: 1110,
+        ui: None,
+    },
+    // Enhanced-water contact probe: lower, closer view across the Elwynn river bank.
+    Scenario {
+        name: "water-shore",
+        map: Some(MAP_AZEROTH),
+        eye: [-9520.0, -321.0, 65.5],
+        look: [-9501.0, -350.0, 61.4],
+        minute: 720,
+        ui: None,
+    },
     // ---- The Deeprun Tram's undersea tube (map 369) ----
     // The one shipped map with NO `Light.dbc` row at all — not even the falloff-0 global that maps
     // 0/1 carry — so its whole atmosphere has to come from the building's own MFOG (record 2:
@@ -1200,7 +1310,58 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: Some(UiFixture::NameWater),
     },
+    // ---- Searing Gorge, the MAGMA-LIGHT reproducers (report: "lava not really glowing") ----
+    // `lava-searing` is the owner's own spot and clock, server-less: their `.go xyz` pin lifted to
+    // eye height, looking down their reported facing of 1.53 rad, at MIDNIGHT — the only time of
+    // day at which a warm fixture over lava is separable from the sun. `-noon` is the control (the
+    // same frame with the sky on: if the rock reads in one and not the other, the defect is the
+    // fixture's and not the terrain's). `-river` stands ON the bank of a lava channel, because the
+    // owner's pin may simply be out of reach of any magma — 16 yd is a brazier, not a floodlight.
+    Scenario {
+        name: "lava-searing",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_SEARING_EYE,
+        look: LAVA_SEARING_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "lava-searing-noon",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_SEARING_EYE,
+        look: LAVA_SEARING_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "lava-searing-river",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_RIVER_EYE,
+        look: LAVA_RIVER_LOOK,
+        minute: 0,
+        ui: None,
+    },
 ];
+
+/// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing
+/// 1.53 rad, Searing Gorge, map 0. The eye takes the standard [`VISTA_EYE_HEIGHT`]-ish lift off
+/// the pin (a `.go` lands at the feet) and the look runs 60 yd down the reported facing,
+/// `(cos 1.53, sin 1.53) = (0.041, 0.999)`, pitched a little down so the GROUND — the surface the
+/// report says is only faintly tinted — fills the lower frame rather than the sky.
+pub(super) const LAVA_SEARING_EYE: [f32; 3] = [-7048.8, -1000.6, 244.0];
+pub(super) const LAVA_SEARING_LOOK: [f32; 3] = [-7046.3, -940.7, 236.0];
+
+/// An OPEN lava river in Searing Gorge, found from the run's own magma census (see
+/// `_fx/lava_findings.md`) — the shot that answers "does magma light the rock beside it", with the
+/// magma unambiguously inside a fixture's reach and the receivers on the EXTERIOR lane.
+///
+/// Picking this spot was the round's methodological lesson. The obvious choice — the nearest magma
+/// to the owner's pin — is a channel under a cave roof, where every visible surface is
+/// interior-class WMO. A "does the lava light the rock" instrument planted there measures the
+/// interior lane and says nothing about the open world, and it cost one wrong conclusion before
+/// the pixels caught it. This vantage is open sky over open terrain.
+pub(super) const LAVA_RIVER_EYE: [f32; 3] = [-7469.25, -848.17, 269.83];
+pub(super) const LAVA_RIVER_LOOK: [f32; 3] = [-7505.6, -861.4, 259.5];
 
 /// The `name-close` instrument's subject: the `name-water` wolf's overhead NAME, orbited at an
 /// arbitrary distance. **World text is the only consumer that draws the glyph sheet at anything

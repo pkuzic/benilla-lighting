@@ -60,6 +60,9 @@ const INTERIOR: &[Knob] = &[
 ];
 
 const GROUPS: &[(&str, &[Knob])] = &[
+    ("Water", &[
+        knob!("waterQuality", water_quality, Choice(&[0, 1, 2]), "0 Classic, 1 Enhanced, 2 High; High adds mirror reflections and costs the most."),
+    ]),
     ("Interior light", INTERIOR),
     ("Fire", &[
         knob!("fireLightGain", fire_light_gain, Slider(0.0..=4.0), "Brightness of lights synthesized from flame emitters."),
@@ -67,6 +70,7 @@ const GROUPS: &[(&str, &[Knob])] = &[
         // sources this group tunes — it is just the one whose brightness is a combat setting rather
         // than a scenery one, which is exactly why it needs its own dial and not the one above it.
         knob!("spellLightGain", spell_light_gain, Slider(0.0..=4.0), "Brightness of spell, missile and impact lights."),
+        knob!("lavaLightGain", lava_light_gain, Slider(0.0..=4.0), "How strongly lava lights its surroundings; 0 turns the glow off."),
         knob!("fireFlicker", fire_flicker, Slider(0.0..=2.0), "0 steady, 1 default, 2 pronounced."),
     ]),
     ("Torch shadows", &[

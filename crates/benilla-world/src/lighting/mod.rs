@@ -15,6 +15,8 @@ mod daylight; // MONKEY (daylight fixtures): the sun as an interior-lane light i
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
 mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
+mod lava_light; // MONKEY (lava light): magma surface fixtures and their independent gain
+pub use lava_light::{LavaLight, LavaLightGain};
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
 mod resolve; // the per-frame time-of-day sample into WowLighting + the WMO interior-fog crossfade
 mod sh; // the model SH light-probe coefficient math
@@ -427,6 +429,7 @@ impl Plugin for LightingPlugin {
         global_light::register(app);
         // MONKEY (daylight fixtures): the per-frame re-aim, ordered before the packer's own set.
         daylight::register(app);
+        lava_light::register(app);
     }
 }
 
@@ -507,6 +510,10 @@ mod ordering_tests {
             (
                 "lighting/global_light.rs",
                 "build_light_data: PostUpdate, .after(update_time_lighting)",
+            ),
+            (
+                "liquid/scene_depth.rs",
+                "MONKEY (water): update_water_depth feeds the sky rows to the water material in `Last`, after the PostUpdate resolve",
             ),
             (
                 "sun/follow.rs",

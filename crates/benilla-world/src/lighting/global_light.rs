@@ -1352,7 +1352,7 @@ fn build_light_data(
             Option<&FlameFlicker>,
             // MONKEY (darkness gains): the daylight-fixture marker — an interior-lane entry that
             // is the SUN standing in a doorway, not a candle, so `interiorGain` must skip it.
-            Has<super::DaylightFixture>,
+            Option<&super::DaylightFixture>,
             // MONKEY (spellLightGain): the spell-effect marker ([`SpellFxLight`]). Last in the
             // tuple so every positional destructuring below keeps its index — and read for one
             // thing only: WHICH live gain owns this row.
@@ -1594,6 +1594,8 @@ fn build_light_data(
                 // `nightGain` claim it instead — that one dims the night, and a daylight fixture is
                 // already scaled to nothing by its own day envelope (`daylight_target`'s `sun_w`,
                 // the same curve) by the time the night dim is at full strength.
+                // MONKEY (lava light): lava borrows the caster exclusion, not the sun's gain exemption.
+                let daylight = daylight.is_some_and(|f| f.how != super::DaylightHow::Lava);
                 let rgb = if interior && !daylight {
                     rgb.map(|c| c * dynamic_interiors.interior_gain)
                 } else {

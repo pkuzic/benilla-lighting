@@ -926,6 +926,16 @@ pub(crate) const REGISTERED: &[Registered] = &[
          Medium / High, or Custom when the members match none of them; the reference has no \
          realtime light or shadow system to preset",
     ),
+    ours(
+        "waterQuality",
+        "1",
+        "benilla's own: water quality, 0 Classic / 1 Enhanced / 2 High; mirror reflections are opt-in",
+    ),
+    ours(
+        "lavaLightGain",
+        "1",
+        "benilla's own: brightness of lava lighting its surroundings, 0..4 (0 = no glow)",
+    ),
     // Benilla's opt-in realtime shadow-map path, split into two INDEPENDENT lanes over one shared
     // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
     // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
@@ -1990,6 +2000,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorShadows", "0"),
             ("exteriorShadows", "0"),
             ("spellLightGain", "0"),
+            ("waterQuality", "0"),
+            ("lavaLightGain", "0"),
             ("fireLightGain", "0"),
             ("nightGain", "1.0"),
             ("interiorGain", "1.0"),
@@ -2009,6 +2021,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorShadows", "0"),
             ("exteriorShadows", "0"),
             ("spellLightGain", "1"),
+            ("waterQuality", "1"),
+            ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
             ("interiorGain", "0.5"),
@@ -2031,6 +2045,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorShadowDynamic", "2"),
             ("exteriorShadows", "0"),
             ("spellLightGain", "1"),
+            ("waterQuality", "1"),
+            ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
             ("interiorGain", "0.5"),
@@ -2053,6 +2069,9 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorShadowDynamic", "4"),
             ("exteriorShadows", "1"),
             ("spellLightGain", "1"),
+            // Mirror reflections stay opt-in until their cost is measured.
+            ("waterQuality", "1"),
+            ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
             ("interiorGain", "0.5"),
@@ -2856,7 +2875,7 @@ mod tests {
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
         // ── MONKEY (lighting): the weld for the dynamic light + shadow system's whole row set ──
         //
-        // **All 29, as one census, with the count asserted.** Every one of them lands on
+        // **All 32, as one census, with the count asserted.** Every one of them lands on
         // `VideoConfig` and is read from there per frame (`shadow_core::update_shadows`,
         // `dynamic_interior::bridge`, `torch_shadow`), so a registered default that drifts from
         // the struct's literal is a setting that reads one way in `config.toml` and renders
@@ -2865,7 +2884,9 @@ mod tests {
         // a row, forgot its weld" fail HERE: the length check below is the gate.
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let lighting: [(&str, f32); 30] = [
+        let lighting: [(&str, f32); 32] = [
+            ("waterQuality", shadows.water_quality as f32),
+            ("lavaLightGain", shadows.lava_light_gain),
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
             ("characterShadows", flag(shadows.character_shadows)),
@@ -2917,9 +2938,9 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 30 rows, 30 welds.
+        // row the client does not have; the length is the other half — 32 rows, 32 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
-        assert_eq!(welded.len(), 30, "the lighting lane welds 30 distinct rows");
+        assert_eq!(welded.len(), 32, "the lighting lane welds 32 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2934,7 +2955,9 @@ mod tests {
         // candle-lit surfaces moving under +10 % — only true at this number.
         assert_eq!(d["interiorBakeFloor"], 0.12);
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
-        // The 31st lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
+        assert_eq!(d["waterQuality"], 1.0, "mirror reflections stay opt-in");
+        assert_eq!(d["lavaLightGain"], 1.0);
+        // The 33rd lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
         // only one with no `VideoConfig` knob to weld to, because it is a NAME for the rows above
         // rather than a knob of its own. Its own weld is `the_high_preset_is_the_registered_
         // defaults` — a fresh config must read "High", not "Custom".
@@ -2971,9 +2994,9 @@ mod tests {
                 assert_eq!(derive_lighting_quality(&cvars), *name, "{from} -> {name}");
                 assert_eq!(cvars.get("shadowDistance"), Some("120"));
                 assert_eq!(cvars.get("interiorShadowSoft"), Some("2.5"));
-                for member in ["fireLightGain", "nightGain", "interiorGain"] {
+                for member in ["fireLightGain", "waterQuality", "lavaLightGain", "nightGain", "interiorGain"] {
                     let expected = if *name == "Off" {
-                        if member == "fireLightGain" { "0" } else { "1.0" }
+                        if matches!(member, "fireLightGain" | "waterQuality" | "lavaLightGain") { "0" } else { "1.0" }
                     } else {
                         cvars.default_of(member).unwrap()
                     };
@@ -3089,6 +3112,8 @@ mod tests {
                     "interiorShadowCasters" => video.interior_shadow_casters as f32,
                     "interiorShadowDynamic" => video.interior_shadow_dynamic as f32,
                     "spellLightGain" => video.spell_light_gain,
+                    "waterQuality" => video.water_quality as f32,
+                    "lavaLightGain" => video.lava_light_gain,
                     "fireLightGain" => video.fire_light_gain,
                     "moonShadowStrength" => video.moon_shadow_strength,
                     "fireFlicker" => video.fire_flicker,
@@ -3135,15 +3160,33 @@ mod tests {
     }
 
     #[test]
-    fn fire_and_spell_gains_above_two_reach_the_video_observer() {
+    fn fire_spell_and_lava_gains_above_two_reach_the_video_observer() {
         let mut app = cvar_app();
         for value in ["3.25", "4"] {
             apply(&mut app, "fireLightGain", value);
             apply(&mut app, "spellLightGain", value);
+            apply(&mut app, "lavaLightGain", value);
             let expected = value.parse::<f32>().unwrap();
             assert_eq!(res::<VideoConfig>(&app).fire_light_gain, expected);
             assert_eq!(res::<VideoConfig>(&app).spell_light_gain, expected);
+            assert_eq!(res::<VideoConfig>(&app).lava_light_gain, expected);
         }
+    }
+
+    #[test]
+    fn water_and_lava_observers_clamp_and_water_high_is_opt_in() {
+        let mut app = cvar_app();
+        for (value, water, lava) in [("-1", 0, 0.0), ("1.75", 1, 1.75), ("2", 2, 2.0), ("9", 2, 4.0)] {
+            apply(&mut app, "waterQuality", value);
+            apply(&mut app, "lavaLightGain", value);
+            assert_eq!(res::<VideoConfig>(&app).water_quality, water);
+            assert_eq!(res::<VideoConfig>(&app).lava_light_gain, lava);
+        }
+        let mut cvars = fresh_registry();
+        cvars.set("waterQuality", "2");
+        assert_eq!(derive_lighting_quality(&cvars), LIGHTING_CUSTOM);
+        apply_lighting_preset(&mut cvars, "High");
+        assert_eq!(cvars.get("waterQuality"), Some("1"));
     }
 
     /// **Every arm, through the registry and its observers.** The old central `apply_to_knobs`

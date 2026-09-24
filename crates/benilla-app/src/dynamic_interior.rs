@@ -22,7 +22,10 @@
 //! liveness requirement — and `0` is that lane's faithful null the way `fireLightGain 0` is the
 //! synthesised-fire lane's kill switch. It is what the Advanced Graphics page's Moon Shadows row
 //! and the Off/Low presets reach.
-use benilla_world::lighting::{DynamicInteriors, FireLightGain, MoonShadowStrength, SpellLightGain};
+//!
+//! Water quality and lava glow use the same guarded bridge into their renderer resources.
+use benilla_assets::WaterQuality;
+use benilla_world::lighting::{DynamicInteriors, FireLightGain, LavaLightGain, MoonShadowStrength, SpellLightGain};
 use bevy::prelude::*;
 
 use crate::video::VideoConfig;
@@ -55,7 +58,15 @@ fn bridge(
     // MONKEY (moon shadows): the night lane's shadow darkness, on the same bridge and for the same
     // reasons as the two gains above it — one live `f32`, one benilla-world resource, one guard.
     mut moon: ResMut<MoonShadowStrength>,
+    mut water: ResMut<WaterQuality>,
+    mut lava: ResMut<LavaLightGain>,
 ) {
+    if water.0 != video.water_quality {
+        water.0 = video.water_quality;
+    }
+    if lava.0 != video.lava_light_gain {
+        lava.0 = video.lava_light_gain;
+    }
     if fire.0 != video.fire_light_gain {
         fire.0 = video.fire_light_gain;
     }
@@ -102,5 +113,40 @@ fn bridge(
     };
     if *out != want {
         *out = want;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn water_and_lava_bridge_publishes_changes_without_dirtying_idle_frames() {
+        let mut app = App::new();
+        app.init_resource::<VideoConfig>()
+            .init_resource::<DynamicInteriors>()
+            .init_resource::<FireLightGain>()
+            .init_resource::<SpellLightGain>()
+            .init_resource::<MoonShadowStrength>()
+            .init_resource::<WaterQuality>()
+            .init_resource::<LavaLightGain>()
+            .add_plugins(DynamicInteriorPlugin);
+        assert_eq!(app.world().resource::<WaterQuality>().0, VideoConfig::default().water_quality);
+        assert_eq!(app.world().resource::<LavaLightGain>().0, VideoConfig::default().lava_light_gain);
+        app.update();
+        for (water, lava) in [(0, 0.0), (2, 3.25), (1, 1.0)] {
+            {
+                let mut video = app.world_mut().resource_mut::<VideoConfig>();
+                video.water_quality = water;
+                video.lava_light_gain = lava;
+            }
+            app.world_mut().run_schedule(Update);
+            assert_eq!(app.world().resource::<WaterQuality>().0, water);
+            assert_eq!(app.world().resource::<LavaLightGain>().0, lava);
+            app.world_mut().clear_trackers();
+            app.world_mut().run_schedule(Update);
+            assert!(!app.world().resource_ref::<WaterQuality>().is_changed());
+            assert!(!app.world().resource_ref::<LavaLightGain>().is_changed());
+        }
     }
 }

@@ -101,11 +101,14 @@ use benilla_assets::materials::LiquidMaterial;
 use benilla_assets::AssetSet;
 
 mod drift;
+mod scene_depth;
+pub use scene_depth::WaterDepthPlugin;
 mod query;
 #[cfg(test)]
 mod real_data;
 mod spatial;
 mod surface; // the against-real-client-files tests — they span both halves
+pub mod waves;
 
 // The submodules are private, so this list IS the subsystem's face: everything the rest of the
 // client may name. Most of this list is now reached through `crate::world_point::WorldPoint`
@@ -176,6 +179,8 @@ pub(crate) struct LiquidPlugin;
 impl Plugin for LiquidPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<LiquidMaterial>::default())
+            .init_resource::<benilla_assets::WaterQuality>()
+            .init_resource::<benilla_assets::WaterDepthImage>()
             .init_resource::<Underwater>()
             .init_resource::<SubmergedEye>()
             .init_resource::<WaterIndex>()

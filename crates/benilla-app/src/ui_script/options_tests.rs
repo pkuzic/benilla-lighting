@@ -1974,23 +1974,50 @@ fn defaults_resets_the_graphics_page_to_registered_defaults() {
 const ADVGFX: &str = "BenillaOptionsFrameContainerBodyAdvancedGraphics";
 
 #[test]
-fn advanced_graphics_fire_and_spell_sliders_read_and_write_the_full_range() {
+fn water_quality_writes_numeric_tiers_with_localised_labels() {
+    for (locale, labels, lava_label) in [
+        ("enUS", ["Classic", "Enhanced", "High"], "Lava Glow"),
+        ("ruRU", ["Классическое", "Улучшенное", "Высокое"], "Свечение лавы"),
+    ] {
+        let s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
+        let mut s = harness_on(s);
+        s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 17);
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[15]").unwrap(), "RowLavaGlow");
+        assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
+        assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowLavaGlowLabel:GetText()")).unwrap(), lava_label);
+        assert!(s.eval::<bool>("return BENILLA_TOOLTIP_WATER_QUALITY == BENILLA_ADVGFX.tips.WATER_QUALITY and BENILLA_TOOLTIP_LAVA_GLOW == BENILLA_ADVGFX.tips.LAVA_GLOW").unwrap());
+        let _ = s.take_cvar_changes();
+        for (tier, label) in labels.iter().enumerate() {
+            s.run(&format!("OptionsRow_Set({ADVGFX}RowWaterQuality, '{tier}') OptionsDropdown_ShowValue({ADVGFX}RowWaterQuality)")).unwrap();
+            assert_eq!(s.take_cvar_changes(), vec![("waterQuality".to_string(), tier.to_string())]);
+            assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), *label);
+        }
+        assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
+    }
+}
+
+#[test]
+fn advanced_graphics_fire_spell_and_lava_sliders_read_and_write_the_full_range() {
     let mut s = audio_harness();
     s.set_cvar_host("fireLightGain", "3.25");
     s.set_cvar_host("spellLightGain", "3.25");
+    s.set_cvar_host("lavaLightGain", "3.25");
     let mut s = harness_on(s);
     s.run("ShowUIPanel(BenillaOptionsFrame) \
            BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()")
         .unwrap();
     let _ = s.take_cvar_changes();
-    for (row, cvar) in [("RowFireLight", "fireLightGain"), ("RowSpellLights", "spellLightGain")] {
+    for (row, cvar) in [("RowFireLight", "fireLightGain"), ("RowSpellLights", "spellLightGain"), ("RowLavaGlow", "lavaLightGain")] {
         assert_eq!(s.eval::<f32>(&format!(
             "return {ADVGFX}{row}ControlSlider:GetValue()"
         )).unwrap(), 3.25);
         assert_eq!(s.eval::<String>(&format!(
             "return {ADVGFX}{row}ControlValue:GetText()"
         )).unwrap(), "325%");
-        for value in ["4", "2.75"] {
+        for value in ["4", "2.75", "0", "0.05"] {
             s.run(&format!("{ADVGFX}{row}ControlSlider:SetValue({value})")).unwrap();
             assert!(s.take_cvar_changes().contains(&(cvar.to_string(), value.to_string())));
             assert_eq!(s.cvar(cvar).as_deref(), Some(value));
@@ -2083,6 +2110,7 @@ fn the_advanced_graphics_page_reads_the_lighting_cvars_on_select() {
         ("RowMoonShadows", "35%"),
         ("RowFireFlicker", "100%"),
         ("RowSpellLights", "100%"),
+        ("RowLavaGlow", "100%"),
     ] {
         assert_eq!(
             s.eval::<String>(&format!("return {ADVGFX}{row}ControlValue:GetText()"))
@@ -2257,6 +2285,8 @@ fn the_page_repaints_when_a_host_write_moves_a_row_under_it() {
     // Lua write behind it.
     s.set_cvar_host("exteriorShadows", "0");
     s.set_cvar_host("moonShadowStrength", "0");
+    s.set_cvar_host("waterQuality", "2");
+    s.set_cvar_host("lavaLightGain", "0.5");
     // Under the poll interval: nothing has happened yet.
     s.tick(0.1);
     assert!(s
@@ -2272,6 +2302,8 @@ fn the_page_repaints_when_a_host_write_moves_a_row_under_it() {
             .unwrap(),
         "0%"
     );
+    assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), "High");
+    assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowLavaGlowControlValue:GetText()")).unwrap(), "50%");
     // The refresh writes NOTHING back — it is a read of the table, not a round trip.
     assert!(
         s.take_cvar_changes().is_empty(),
@@ -2868,6 +2900,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         // that silently resolves to nothing — is untouched: the pairing below is exact, so a
         // `BENILLA_` key on the wrong row still fails.
         const BENILLA_OWNED: &[(&str, &str)] = &[
+            ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
+            ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),
             ("BENILLA_TOOLTIP_DISPLAY_MODE", "GraphicsRowDisplayMode"),
             (
@@ -3000,7 +3034,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // Torch Shadow Softness, Fire Light Brightness, Fire Flicker, Spell Lights, Night Darkness
     // and Interior Darkness. The three rows that MOVED onto it are already in the 81: a row
     // changing pages does not change this count, only its entry in BENILLA_OWNED. 81 -> 93.
-    assert_eq!(checked, 93, "every tipped row carries a live key");
+    // Water Quality and Lava Glow add two more: 93 -> 95.
+    assert_eq!(checked, 95, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -3129,7 +3164,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // already counted, on their old page). 81 -> 93 — and the page is where this test's own
     // teeth bite hardest, since it is the first one to seat a dropdown, a checkbox and a slider
     // whose descriptions are all benilla's.
-    assert_eq!(raised, 93, "every row but Auto Loot raises a description");
+    // Water Quality and Lava Glow add two more: 93 -> 95.
+    assert_eq!(raised, 95, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a

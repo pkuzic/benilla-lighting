@@ -120,6 +120,7 @@ impl PluginGroup for GamePlugins {
             // ask for one. The engine's seven register themselves inside `WorldPlugins`, which
             // `run()` adds ahead of this group.
             .add(crate::shaders::plugin)
+            .add(benilla_world::liquid::WaterDepthPlugin)
             .add(BowstringPlugin)
             .add(crate::weapon_trail::WeaponTrailPlugin)
             .add(FishingLinePlugin)
