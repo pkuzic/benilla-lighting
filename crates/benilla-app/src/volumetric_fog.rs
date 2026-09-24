@@ -1,0 +1,548 @@
+//! MONKEY (volumetric fog): gamma-space distance haze and shadow-map light shafts.
+//! Runs after world transparencies and before the world's gamma decode. Bevy's physical
+//! fog loses energy in shade; this artistic lane preserves luminance while converging
+//! toward the zone fog chromaticity. All shader code lives here with its pipeline.
+use crate::{
+    shadow_core::{ShadowSet, ShadowSun},
+    video::VideoConfig,
+    world_shadow::WorldLane,
+};
+use benilla_world::{
+    lighting::{WorldTime, WowLighting},
+    static_gx::StaticGx,
+    view::WorldCamera,
+    weather::WeatherState,
+    wmo_portal::CameraInteriorClaim,
+};
+use bevy::{
+    core_pipeline::{
+        core_3d::graph::{Core3d, Node3d},
+        FullscreenShader,
+    },
+    ecs::query::QueryItem,
+    light::VolumetricLight,
+    pbr::{
+        GpuLights, LightMeta, ViewLightsUniformOffset, ViewShadowBindings, MAX_CASCADES_PER_LIGHT,
+        MAX_DIRECTIONAL_LIGHTS,
+    },
+    prelude::*,
+    render::{
+        diagnostic::RecordDiagnostics,
+        extract_component::{ExtractComponent, ExtractComponentPlugin},
+        render_graph::{
+            NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
+        },
+        render_resource::{binding_types::*, *},
+        renderer::{RenderContext, RenderDevice, RenderQueue},
+        view::{Msaa, ViewDepthTexture, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
+        Render, RenderApp, RenderStartup, RenderSystems,
+    },
+    shader::ShaderDefVal,
+};
+
+pub(crate) struct VolumetricFogPlugin;
+#[derive(Resource)]
+struct FogOverride(Option<u8>, f32);
+
+#[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
+struct FogView {
+    // Gamma byte-space colour and extinction per yard.
+    color_density: Vec4,
+    // Sun colour and strength, independent of PBR lux/exposure.
+    sun_strength: Vec4,
+    // Actual celestial direction and raymarch step count.
+    direction_steps: Vec4,
+}
+
+impl Plugin for VolumetricFogPlugin {
+    fn build(&self, app: &mut App) {
+        let value = std::env::var("WOW_VOLFOG")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 2);
+        // Dev capture instrument: isolate shafts without changing surface shadows or haze.
+        let shaft_gain = if cfg!(feature = "dev") && std::env::var_os("WOW_CAPTURE").is_some() {
+            std::env::var("WOW_VOLFOG_SHAFT_GAIN")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite())
+                .unwrap_or(2.0)
+                .clamp(0.0, 8.0)
+        } else {
+            2.0
+        };
+        app.insert_resource(FogOverride(value, shaft_gain))
+            .add_plugins(ExtractComponentPlugin::<FogView>::default())
+            .add_systems(Last, refresh_streamed_shadows.before(ShadowSet::Lanes))
+            .add_systems(Last, update_fog.after(ShadowSet::Lanes));
+        // Keep headless policy tests independent of the renderer.
+        if !app.is_plugin_added::<AssetPlugin>() {
+            return;
+        }
+        let shader = app
+            .world_mut()
+            .resource_mut::<Assets<Shader>>()
+            .add(Shader::from_wgsl(FOG_SHADER, "volumetric_fog.rs"));
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+        render_app
+            .insert_resource(FogShader(shader))
+            .init_resource::<SpecializedRenderPipelines<FogPipeline>>()
+            .add_systems(RenderStartup, init_pipeline)
+            .add_systems(Render, prepare_pipelines.in_set(RenderSystems::Prepare))
+            .add_render_graph_node::<ViewNodeRunner<FogNode>>(Core3d, FogLabel)
+            .add_render_graph_edges(
+                Core3d,
+                (
+                    Node3d::EndMainPass,
+                    FogLabel,
+                    Node3d::StartMainPassPostProcessing,
+                ),
+            );
+    }
+}
+
+// The legacy caster cache otherwise misses streamed trees at a stationary camera.
+// Off must leave even this old cache behaviour untouched for the exact baseline.
+fn refresh_streamed_shadows(
+    video: Res<VideoConfig>,
+    override_value: Res<FogOverride>,
+    gx: Option<Res<StaticGx>>,
+    mut lane: ResMut<WorldLane>,
+    mut seen: Local<Option<u64>>,
+) {
+    if override_value.0.unwrap_or(video.volumetric_fog) == 0 || !video.world_shadows {
+        *seen = None;
+        return;
+    }
+    let Some(gx) = gx else { return };
+    let generation = gx.torch_residency_generation();
+    if *seen != Some(generation) {
+        lane.invalidate_static();
+        *seen = Some(generation);
+    }
+}
+
+fn density(minute: f32, weather: f32, indoors: bool) -> f32 {
+    let dawn = (1.0 - ((minute - 390.0) / 90.0).abs()).clamp(0.0, 1.0);
+    let dawn = dawn * dawn * (3.0 - 2.0 * dawn);
+    0.004 * (1.0 + dawn * 1.5 + weather.clamp(0.0, 1.0) * 2.0) * if indoors { 0.18 } else { 1.0 }
+}
+
+fn update_fog(
+    mut commands: Commands,
+    video: Res<VideoConfig>,
+    override_value: Res<FogOverride>,
+    lighting: Res<WowLighting>,
+    clock: Res<WorldTime>,
+    weather: Res<WeatherState>,
+    interior: Res<CameraInteriorClaim>,
+    mut cameras: Query<(Entity, &Camera, &mut Camera3d), With<WorldCamera>>,
+    suns: Query<(Entity, &DirectionalLight), With<ShadowSun>>,
+) {
+    let tier = override_value.0.unwrap_or(video.volumetric_fog).min(2);
+    let enabled = tier != 0 && cameras.iter().any(|(_, c, _)| c.is_active);
+    for (entity, sun) in &suns {
+        // Only a tag for selecting this light in our shader. No Bevy VolumetricFog
+        // camera/volume is created, and the rig's lux and surface lighting stay intact.
+        if enabled && sun.shadows_enabled {
+            commands.entity(entity).insert(VolumetricLight);
+        } else {
+            commands.entity(entity).remove::<VolumetricLight>();
+        }
+    }
+    for (entity, camera, mut camera3d) in &mut cameras {
+        if !enabled || !camera.is_active {
+            commands.entity(entity).remove::<FogView>();
+            continue;
+        }
+        camera3d.depth_texture_usages.0 |= TextureUsages::TEXTURE_BINDING.bits();
+        let sun = lighting.celestial_dir();
+        let daylight = ((sun.y + 0.02) / 0.15).clamp(0.0, 1.0);
+        let fog = Vec3::from_array(lighting.fog_color);
+        commands.entity(entity).insert(FogView {
+            color_density: fog.extend(
+                density(
+                    clock.minute_f,
+                    weather.sky_density.max(weather.effect_density),
+                    interior.0.is_some(),
+                ) * if tier == 2 { 1.6 } else { 1.0 },
+            ),
+            sun_strength: Vec3::from_array(lighting.diffuse)
+                .lerp(Vec3::ONE, 0.5)
+                .extend(override_value.1 * daylight),
+            direction_steps: sun.extend(if tier == 1 { 24.0 } else { 64.0 }),
+        });
+    }
+}
+
+#[derive(Resource)]
+struct FogShader(Handle<Shader>);
+#[derive(Resource)]
+struct FogPipeline {
+    layouts: [BindGroupLayoutDescriptor; 2],
+    shader: Handle<Shader>,
+    fullscreen: FullscreenShader,
+    comparison: Sampler,
+}
+#[derive(Component)]
+struct ViewFogPipeline(CachedRenderPipelineId);
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+struct FogLabel;
+
+fn init_pipeline(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    shader: Res<FogShader>,
+    fullscreen: Res<FullscreenShader>,
+) {
+    let layouts = [false, true].map(|multisampled| {
+        BindGroupLayoutDescriptor::new(
+            "gamma_fog_layout",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(TextureSampleType::Float { filterable: false }),
+                    if multisampled {
+                        texture_depth_2d_multisampled()
+                    } else {
+                        texture_depth_2d()
+                    },
+                    uniform_buffer::<ViewUniform>(true),
+                    uniform_buffer::<GpuLights>(true),
+                    texture_2d_array(TextureSampleType::Depth),
+                    sampler(SamplerBindingType::Comparison),
+                    uniform_buffer::<FogView>(false),
+                ),
+            ),
+        )
+    });
+    commands.insert_resource(FogPipeline {
+        layouts,
+        shader: shader.0.clone(),
+        fullscreen: fullscreen.clone(),
+        comparison: device.create_sampler(&SamplerDescriptor {
+            compare: Some(CompareFunction::GreaterEqual),
+            min_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Linear,
+            ..default()
+        }),
+    });
+}
+impl SpecializedRenderPipeline for FogPipeline {
+    type Key = (TextureFormat, bool);
+    fn specialize(&self, (format, multisampled): Self::Key) -> RenderPipelineDescriptor {
+        let mut defs = vec![
+            ShaderDefVal::UInt(
+                "MAX_DIRECTIONAL_LIGHTS".into(),
+                MAX_DIRECTIONAL_LIGHTS as u32,
+            ),
+            ShaderDefVal::UInt(
+                "MAX_CASCADES_PER_LIGHT".into(),
+                MAX_CASCADES_PER_LIGHT as u32,
+            ),
+            ShaderDefVal::UInt("AVAILABLE_STORAGE_BUFFER_BINDINGS".into(), 0),
+        ];
+        if multisampled {
+            defs.push("MULTISAMPLED".into());
+        }
+        RenderPipelineDescriptor {
+            label: Some("gamma_volumetric_fog".into()),
+            layout: vec![self.layouts[multisampled as usize].clone()],
+            vertex: self.fullscreen.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs: defs,
+                entry_point: Some("fragment".into()),
+                targets: vec![Some(ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            ..default()
+        }
+    }
+}
+fn prepare_pipelines(
+    mut commands: Commands,
+    cache: Res<PipelineCache>,
+    pipeline: Res<FogPipeline>,
+    mut specialized: ResMut<SpecializedRenderPipelines<FogPipeline>>,
+    views: Query<(Entity, &ViewTarget, &Msaa), With<FogView>>,
+) {
+    for (entity, target, msaa) in &views {
+        let id = specialized.specialize(
+            &cache,
+            &pipeline,
+            (target.main_texture_format(), msaa.samples() > 1),
+        );
+        commands.entity(entity).insert(ViewFogPipeline(id));
+    }
+}
+#[derive(Default)]
+struct FogNode;
+impl ViewNode for FogNode {
+    type ViewQuery = (
+        &'static ViewTarget,
+        &'static ViewDepthTexture,
+        &'static ViewUniformOffset,
+        &'static ViewLightsUniformOffset,
+        &'static ViewShadowBindings,
+        &'static FogView,
+        &'static ViewFogPipeline,
+    );
+    fn run<'w>(
+        &self,
+        _graph: &mut RenderGraphContext,
+        context: &mut RenderContext<'w>,
+        (target, depth, view_offset, light_offset, shadows, fog, id): QueryItem<
+            'w,
+            '_,
+            Self::ViewQuery,
+        >,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        let cache = world.resource::<PipelineCache>();
+        let Some(pipeline) = cache.get_render_pipeline(id.0) else {
+            return Ok(());
+        };
+        if !depth
+            .texture
+            .usage()
+            .contains(TextureUsages::TEXTURE_BINDING)
+        {
+            return Ok(());
+        }
+        let (Some(view), Some(lights)) = (
+            world.resource::<ViewUniforms>().uniforms.binding(),
+            world.resource::<LightMeta>().view_gpu_lights.binding(),
+        ) else {
+            return Ok(());
+        };
+        let settings = world.resource::<FogPipeline>();
+        let device = context.render_device();
+        let mut uniform = UniformBuffer::from(*fog);
+        uniform.write_buffer(device, world.resource::<RenderQueue>());
+        let out = target.post_process_write();
+        let bind = device.create_bind_group(
+            "gamma_fog",
+            &cache.get_bind_group_layout(
+                &settings.layouts[(depth.texture.sample_count() > 1) as usize],
+            ),
+            &BindGroupEntries::sequential((
+                out.source,
+                depth.view(),
+                view,
+                lights,
+                &shadows.directional_light_depth_texture_view,
+                &settings.comparison,
+                uniform.binding().unwrap(),
+            )),
+        );
+        let diagnostics = context.diagnostic_recorder();
+        let mut pass = context
+            .command_encoder()
+            .begin_render_pass(&RenderPassDescriptor {
+                label: Some("gamma_volumetric_fog"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: out.destination,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Load,
+                        store: StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        let span = diagnostics.pass_span(&mut pass, "gamma_volumetric_fog");
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bind, &[view_offset.offset, light_offset.offset]);
+        pass.draw(0..3, 0..1);
+        span.end(&mut pass);
+        Ok(())
+    }
+}
+
+const FOG_SHADER: &str = r#"
+#import bevy_render::view::View
+#import bevy_pbr::mesh_view_types::Lights
+@group(0) @binding(0) var scene: texture_2d<f32>;
+#ifdef MULTISAMPLED
+@group(0) @binding(1) var depth: texture_depth_multisampled_2d;
+#else
+@group(0) @binding(1) var depth: texture_depth_2d;
+#endif
+@group(0) @binding(2) var<uniform> view: View;
+@group(0) @binding(3) var<uniform> lights: Lights;
+@group(0) @binding(4) var shadows: texture_depth_2d_array;
+@group(0) @binding(5) var shadow_sampler: sampler_comparison;
+struct Fog { color_density: vec4<f32>, sun_strength: vec4<f32>, direction_steps: vec4<f32> }
+@group(0) @binding(6) var<uniform> fog: Fog;
+
+// Integral of smoothstep(10, 30, distance): zero in the first ten yards,
+// continuous density and derivative at both ends, bounded at 150 yd.
+fn fog_path(distance: f32) -> f32 {
+    let d = clamp(distance, 10.0, 150.0);
+    let u = clamp((d - 10.0) / 20.0, 0.0, 1.0);
+    return 20.0 * (u*u*u - 0.5*u*u*u*u) + max(d - 30.0, 0.0);
+}
+fn visibility(light_index: u32, p: vec3<f32>) -> f32 {
+    // Borrow uniform records instead of copying all cascade matrices per sample.
+    let light = &lights.directional_lights[light_index];
+    let view_distance = -(view.view_from_world * vec4(p, 1.0)).z;
+    for (var cascade = 0u; cascade < (*light).num_cascades; cascade += 1u) {
+        let shadow_cascade = &(*light).cascades[cascade];
+        if (view_distance > (*shadow_cascade).far_bound) { continue; }
+        let q = (*shadow_cascade).clip_from_world * vec4(p + (*light).direction_to_light * (*light).shadow_depth_bias, 1.0);
+        let ndc = q.xyz / q.w;
+        let uv = ndc.xy * vec2(0.5, -0.5) + 0.5;
+        if (any(uv < vec2(0.0)) || any(uv > vec2(1.0)) || ndc.z < 0.0 || ndc.z > 1.0) { continue; }
+        return textureSampleCompareLevel(shadows, shadow_sampler, uv,
+            i32((*light).depth_texture_base_index + cascade), ndc.z);
+    }
+    // Unknown outside caster coverage is not evidence of direct sunlight.
+    return 0.0;
+}
+@fragment
+fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
+    let xy = vec2<i32>(pixel.xy);
+    let source = textureLoad(scene, xy, 0);
+    let z = textureLoad(depth, xy, 0);
+    let uv = (pixel.xy - view.viewport.xy) / view.viewport.zw;
+    let q = view.world_from_clip * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), max(z, 0.000001), 1.0);
+    let delta = q.xyz / q.w - view.world_position;
+    let distance = min(length(delta), 150.0);
+    if (distance <= 10.0) { return source; }
+    let ray = normalize(delta);
+    let optical_depth = fog.color_density.w * fog_path(distance);
+    let opacity = 1.0 - exp(-optical_depth);
+    let luma = vec3(0.2126, 0.7152, 0.0722);
+    var haze = mix(source.rgb, fog.color_density.rgb, opacity);
+    // A darker zone colour may change hue, never the pixel's luminance. Add
+    // neutral headroom proportionally so saturated channels cannot clip dark.
+    let missing = max(0.0, dot(source.rgb - haze, luma));
+    let headroom = max(vec3(0.0), vec3(1.0) - haze);
+    haze += headroom * clamp(missing / max(dot(headroom, luma), 0.00001), 0.0, 1.0);
+    if (fog.sun_strength.w > 0.0) {
+        let g = 0.65;
+        let cosine = dot(ray, fog.direction_steps.xyz);
+        let denom = 1.0 + g*g - 2.0*g*cosine;
+        let phase = 0.07957747 * (1.0-g*g) / (denom * sqrt(denom));
+        let count = u32(fog.direction_steps.w);
+        let step_size = (distance - 10.0) / f32(count);
+        var scatter = 0.0;
+        for (var light_index = 0u; light_index < lights.n_directional_lights; light_index += 1u) {
+            if ((lights.directional_lights[light_index].flags & 3u) != 3u) { continue; }
+            for (var step = 0u; step < count; step += 1u) {
+                // Fixed midpoint samples: no temporal noise in this gamma lane.
+                let t = 10.0 + (f32(step) + 0.5) * step_size;
+                let density = fog.color_density.w * smoothstep(10.0, 30.0, t);
+                scatter += visibility(light_index, view.world_position + ray*t)
+                    * exp(-fog.color_density.w * fog_path(t)) * density * step_size;
+            }
+        }
+        let shafts = fog.sun_strength.rgb * fog.sun_strength.w * phase * scatter;
+        haze += max(vec3(0.0), vec3(1.0) - haze) * (vec3(1.0) - exp(-shafts));
+    }
+    return vec4(haze, source.a);
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shadow_cache_refresh_is_gated_and_quiet_when_unchanged() {
+        let mut app = App::new();
+        app.init_resource::<VideoConfig>()
+            .init_resource::<StaticGx>()
+            .init_resource::<WorldLane>()
+            .insert_resource(FogOverride(Some(0), 2.0))
+            .add_systems(Update, refresh_streamed_shadows);
+        app.world_mut().clear_trackers();
+        app.world_mut().run_schedule(Update);
+        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
+        app.world_mut().resource_mut::<FogOverride>().0 = Some(1);
+        app.world_mut().run_schedule(Update);
+        assert!(app.world().resource_ref::<WorldLane>().is_changed());
+        app.world_mut().clear_trackers();
+        app.world_mut().run_schedule(Update);
+        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
+    }
+    #[test]
+    fn dawn_weather_and_rooms_control_density() {
+        let noon = density(720.0, 0.0, false);
+        assert!(density(390.0, 0.0, false) > noon * 2.0);
+        assert_eq!(density(300.0, 0.0, false), noon);
+        assert_eq!(density(480.0, 0.0, false), noon);
+        assert!(density(720.0, 1.0, false) > noon * 2.0);
+        assert!(density(390.0, 1.0, true) < noon);
+    }
+    #[test]
+    fn live_tiers_shadow_loss_inactive_camera_and_off() {
+        let mut app = App::new();
+        app.init_resource::<VideoConfig>()
+            .init_resource::<WowLighting>()
+            .init_resource::<WorldTime>()
+            .init_resource::<WeatherState>()
+            .init_resource::<CameraInteriorClaim>()
+            .insert_resource(FogOverride(None, 2.0))
+            .add_systems(Update, update_fog);
+        let camera = app
+            .world_mut()
+            .spawn((WorldCamera, Camera::default(), Camera3d::default()))
+            .id();
+        let preview = app
+            .world_mut()
+            .spawn((Camera::default(), Camera3d::default()))
+            .id();
+        let sun = app
+            .world_mut()
+            .spawn((
+                ShadowSun,
+                DirectionalLight {
+                    illuminance: 123.0,
+                    shadows_enabled: true,
+                    ..default()
+                },
+            ))
+            .id();
+        app.update();
+        let low = *app.world().get::<FogView>(camera).unwrap();
+        assert_eq!(low.direction_steps.w, 24.0);
+        assert!(app.world().get::<FogView>(preview).is_none());
+        assert!(app.world().get::<VolumetricLight>(sun).is_some());
+        app.world_mut().resource_mut::<VideoConfig>().volumetric_fog = 2;
+        app.world_mut()
+            .get_mut::<DirectionalLight>(sun)
+            .unwrap()
+            .shadows_enabled = false;
+        app.update();
+        let high = *app.world().get::<FogView>(camera).unwrap();
+        assert_eq!(high.direction_steps.w, 64.0);
+        assert_eq!(high.color_density.w, low.color_density.w * 1.6);
+        assert!(app.world().get::<VolumetricLight>(sun).is_none());
+        assert_eq!(
+            app.world()
+                .get::<DirectionalLight>(sun)
+                .unwrap()
+                .illuminance,
+            123.0
+        );
+        app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = false;
+        app.update();
+        assert!(app.world().get::<FogView>(camera).is_none());
+        app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = true;
+        app.world_mut().resource_mut::<FogOverride>().0 = Some(0);
+        app.update();
+        assert!(app.world().get::<FogView>(camera).is_none());
+        app.world_mut().resource_mut::<FogOverride>().0 = None;
+        app.update();
+        assert!(app.world().get::<FogView>(camera).is_some());
+    }
+}

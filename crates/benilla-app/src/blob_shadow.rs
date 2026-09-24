@@ -2,8 +2,7 @@
 //! creature), the reference's per-frame shadow pass rebuilt on the shared surface-decal projector
 //! ([`benilla_world::decal`]), drawn on the shared effect stream (0733).
 //!
-//! **The byte-verified mechanism** (wow-re `unit-blob-shadow.md`, a §5 cross-check; the "cloud
-//! shadow" label on `0x6d7920` was corrected — it IS the unit shadow draw):
+//! **The mechanism** (`0x6d7920` IS the unit shadow draw):
 //! - **Draw path**: a per-frame pass over registered model nodes (`0x683dd0`, list `[0xc7cb10]`)
 //!   → gate `0x6d78f0` (model streamed, master toggle) → `0x6d7920` → the **same decal chain the
 //!   selection ring uses** (`0x6d7330 → 0x6d6fa0 → 0x6d7480`), collector flags `0x2f0122` = the
@@ -11,15 +10,12 @@
 //!   [`GroundDecalSurface`] set yet — the shadow lands on terrain + WMO faces only).
 //! - **Frame slot**: PHASE 1, among the opaque drains — `0x6812c5 call 0x683dd0`, fifth of the
 //!   row `0x6812b1`–`0x6812ca` inside `0x681070`, which the driver `0x483460` calls at
-//!   `0x48361d` (wow-re `water-frame-straddle.md` §1 + `unit-blob-shadow.md` Q1). `0x683dd0` is
-//!   the **M2 node drain**, and the same loop body ticks each node's object first
-//!   (`0x48160c call [obj vt+0x38]` → the selection ring) and draws its shadow second
-//!   (`0x683ec3`) — so per unit the additive ring goes down and this modulate darkens it, never
-//!   the other way round (wow-re `decal-frame-slot.md`). That second step is **not** a gate:
-//!   both exits of the tick `0x481540` return 1, so `0x683ea5`'s `je` is dead — an earlier
-//!   reading of it as "the callback suppresses a hidden object's shadow" was wrong at the bytes
-//!   and is corrected in wow-re (2026-09-06). What the tick DOES do is write the alpha this draw
-//!   is about to read, 30 bytes later — which is the whole of §"Appearance" below. So the shadow
+//!   `0x48361d`. `0x683dd0` is the **M2 node drain**, and the same loop body ticks each node's
+//!   object first (`0x48160c call [obj vt+0x38]` → the selection ring) and draws its shadow second
+//!   (`0x683ec3`) — so per unit the additive ring goes down and this modulate darkens it, never the
+//!   other way round. That second step is **not** a gate: both exits of the tick `0x481540` return
+//!   1, so `0x683ea5`'s `je` is dead. What the tick DOES do is write the alpha this draw is about
+//!   to read, 30 bytes later — which is the whole of §"Appearance" below. So the shadow
 //!   lands after terrain and WMO and **before** everything else: the footprint decals
 //!   (`0x483654`), the M2 opaque pass (`0x4836a6`), the water surfaces (phase 3, drawn *between*
 //!   the two M2 transparent passes) and both of those passes. Every transparent in the world
@@ -29,17 +25,17 @@
 //! - **Texture**: `Textures\ShadowBlob.blp` — a 32×32 grayscale radial blob (flat gray-160 core,
 //!   linear rim to white) under a binary alpha disc. The reference multitextures a procedural 64×8
 //!   trapezoid ramp on a second stage (`0x6d81a0`/`0x6d82d0`, blend-mode-selected); its combine
-//!   wiring is an open RE item (apitrace) — here the ramp is the vertex-alpha vertical fade below.
+//!   wiring is open (an apitrace question) — here the ramp is the vertex-alpha vertical fade below.
 //! - **Box law** (`0x711a20` + the `0x6d7920` corner build): a sequence CAaBox, clamped INTO ±5
 //!   per axis (a cap, never a floor), scaled by the world matrix, yaw-rotated with the unit's
 //!   facing then **axis-aligned-bounded**. Vertical about the model origin: `+1.0·(zExt/2)` up,
 //!   `−(5/3)·(zExt/2)` down. A degenerate horizontal box is the reference's no-op exit (no
 //!   shadow). **No** `OBJECT_FIELD_SCALE_X` re-read (the transform scale already carries it), no
 //!   ring-style `sqrt` compression, no floor. **WHICH sequence — settled at bytes + pixels**
-//!   (decision 0316; wow-re `27406d9b`, Q3-ORACLE): the draw re-reads
+//!   (decision 0316): the draw re-reads
 //!   `playableAnimationLookup[0]` every frame — **slot 0 = Stand for characters, from the file
 //!   image, so the value never changes** (not the playing sequence: the director's gait-stable
-//!   observation falsified that first reading, and the trace oracle confirmed — 1,682 measured
+//!   observation falsified that first reading, and reference captures confirmed — 1,682 measured
 //!   draws, six bit-stable box sizes, HumanMale 0.9134 × 1.0805 yd permanently, Walk/Run extents
 //!   never appear). Full extents, no missing half/scale factor — the standing size IS the law.
 //! - **Appearance**: multiplicative darken — `GL_DST_COLOR/GL_ZERO` with the fade riding the
@@ -51,7 +47,7 @@
 //!   touched at exactly three `mov ecx,ebx; call` sites (box `0x711a20`, matrix `0x710600`,
 //!   alpha `0x710ca0`), which makes that list the complete field census.
 //!
-//!   **What rides in, at the bytes** (wow-re, 2026-09-06): the 2 s appear ramp and the despawn
+//!   **What rides in, at the bytes** (2026-09-06): the 2 s appear ramp and the despawn
 //!   ramp (`obj+0xf4`, `0x613b1e`'s `0x7d0`), the self first-person fade, **and the CharProc-14
 //!   aura transition** — stealth's `0.3`, ghost/invisibility's `0.5`. The aura is not a second
 //!   channel: `0x60d180` drives the SAME `StartAlphaFade` (`0x614f80`) the appear fade uses, and
@@ -70,7 +66,7 @@
 //! - **Gating**: the reference's `shadowLOD` cvar {0,1} is the master toggle (default on) — we are
 //!   always-on; `shadowBias` (default 0.1) is its depth-bias knob — [`SHADOW_DEPTH_BIAS`] plays
 //!   that role here. No dead/mount/kind test exists on the draw path, and **which** objects
-//!   register is now settled (wow-re, 2026-09-06 — the old `HANDOFF(-> object-layer)` is closed):
+//!   register is now settled (2026-09-06):
 //!   `[node+0x90]` bit `0x400` is `NOT(arg bit1)` (`0x670e94`), and `0x613e10` takes that arg off
 //!   `OBJECT_FIELD_TYPE` — `0xb` GAMEOBJECT, `2` DYNAMICOBJECT, `0` otherwise. **GameObjects and
 //!   DynamicObjects never cast a blob shadow; units, players and corpses always do.** Which is
@@ -99,13 +95,16 @@ use bevy::prelude::*;
 use crate::creature_anim::AnimData;
 use crate::net::{Embodied, NetEntity};
 use benilla_world::decal::{DecalFrame, WorldDecal};
-use benilla_world::lighting::WowLighting;
+// MONKEY (moon shadows): the oval now yields to a NIGHT cast as well as a day one, so it needs the
+// same two numbers the packer weights that cast with.
+use benilla_world::lighting::ShadowHandover;
+use crate::character_shadow::CharacterShadowReady;
+use crate::shadow_core::{ShadowFrame, ShadowSet};
 use benilla_world::particles::buffer::{begin_effect_frame, EffectVertex};
-use benilla_world::schedule::WorldStage;
 use benilla_world::view::WorldCamera;
 use benilla_world::wmo_portal::UnitWmoRoom;
 
-/// The reference's shadow disc (`Textures\ShadowBlob.blp`, wow-re unit-blob-shadow RE): grayscale
+/// The reference's shadow disc (`Textures\ShadowBlob.blp`, created by `0x6d8070`): grayscale
 /// radial blob (gray-160 core → white rim) under a binary alpha disc, multiplied onto the ground.
 const SHADOW_TEXTURE: &str = "mpq://textures/shadowblob.blp";
 /// The byte clamp on the animation box: each corner component is clamped INTO ±5 yd pre-scale
@@ -158,14 +157,16 @@ impl Plugin for BlobShadowPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_shadow_assets)
             .add_systems(
-                Update,
+                PostUpdate,
                 (sync_shadows, update_shadows)
                     .chain()
-                    // After net motion + input: the decal follows this frame's unit transforms.
-                    .after(WorldStage::Input),
+                    // MONKEY (moon shadows): after ALL Update work (resolve + strength bridge)
+                    // and this frame's rig verdict. Push only after the blob has consumed it.
+                    .after(ShadowSet::Rig)
+                    .after(bevy::transform::TransformSystems::Propagate)
+                    .before(push_shadows),
             )
-            // The stream push: after the frame's stream clear (the caches were rebuilt in
-            // `Update`, so this is a pure copy).
+            // The stream push: after both the frame's stream clear and the blob cache rebuild.
             .add_systems(PostUpdate, push_shadows.after(begin_effect_frame));
     }
 }
@@ -178,8 +179,8 @@ fn setup_shadow_assets(mut commands: Commands, asset_server: Res<AssetServer>) {
 
 /// Keep one shadow record per eligible unit: spawn for new Player/Unit entities whose model has
 /// built (an animated model — [`ModelAnimations`] arrives with it), despawn orphans (owner
-/// destroyed / streamed out). The registration *policy* is the open RE item; this is the v1 set
-/// (see module docs).
+/// destroyed / streamed out). The registration *policy* is still open; this is the v1 set (see
+/// module docs).
 #[allow(clippy::type_complexity)] // the filtered spawn-gate query, commented inline
 fn sync_shadows(
     mut commands: Commands,
@@ -241,10 +242,12 @@ fn update_shadows(
     shadow_assets: Option<Res<ShadowAssets>>,
     images: Res<Assets<Image>>,
     decals: WorldDecal,
-    // MONKEY (night blob): the live celestial sun, for the realtime lane's day strength — the SAME
-    // `celestial_dir` height `global_light` packs the shader's night fade from, so the oval's
-    // crossfade and the realtime shadow's fade are two halves of one number.
-    lighting: Res<WowLighting>,
+    // MONKEY (moon shadows): SAME acknowledged weight as the packed receivers, plus actual
+    // per-unit caster readiness. The cvar alone cannot promise a silhouette exists.
+    handover: Res<ShadowHandover>,
+    // Missing core/character plugins are a valid no-silhouette state: keep the oval there too.
+    shadow_frame: Option<Res<ShadowFrame>>,
+    ready: Option<Res<CharacterShadowReady>>,
     // …and the camera, for the realtime lane's EDGE fade (its cascade ends at `shadowDistance`).
     cam_pos: Query<&GlobalTransform, With<WorldCamera>>,
     // The unit's render alpha, asked of the unit — see the alpha block below.
@@ -270,7 +273,7 @@ fn update_shadows(
     // mount's rendered scale while a mount model is attached (the mount IS the footprint on the
     // ground; the rider's box would undersize it). The mount-vs-body source of the client's own
     // shadow box is untraced — this is the named approximation of decision 0441's P2, carried
-    // until a wow-re shadow-consumer trace pins it.
+    // until that source is known.
     mount_anims: Query<(&NetEntity, &ModelAnimations), With<crate::entities::mount::MountBody>>,
     mut shadows: Query<(&BlobShadow, &mut ShadowKey, &mut ShadowVerts)>,
     // Once-a-second census at debug level (`RUST_LOG=benilla_app::blob_shadow=debug` — the lib
@@ -279,24 +282,9 @@ fn update_shadows(
     // report, answerable from a log instead of a debugger.
     mut census_at: Local<f32>,
 ) {
-    // `characterShadows 1`: the realtime shadow-map path owns OUTDOOR unit shadows — the per-unit
-    // gate in the loop below fades the oval out for outdoor units so they don't wear both, while
-    // INDOOR units keep it at full strength (the realtime sun shadow is gated out of interiors, so
-    // an indoor unit would otherwise have no ground shadow at all). (This keys on the CHARACTER
-    // lane, not the world lane: the oval is a character's shadow, so `worldShadows` alone must
-    // leave it be.) With the cvar off — the shipped default — that gate is a single false branch
-    // and this is the reference path.
-    //
-    // MONKEY (night blob): it is a FADE, not the hard hide it used to be. The realtime lane's own
-    // strength is `night · (1 − edge_fade)` (`shadow_hook.wgsl::realtime_shadow`), and `night` is
-    // `sun_shadow_strength(celestial sun height)` — exactly ZERO once the sun is under the horizon.
-    // So with the old hide, an outdoor unit between dusk and dawn had NO shadow of any kind: no
-    // realtime cast (faded to nothing) and no oval (hidden by the cvar). The reference client draws
-    // the oval all night, which is what the complement below restores. The oval is NOT replaced by
-    // a moon-lit realtime cast: benilla's rig aims only at the celestial SUN (`shadow_sun_travel`),
-    // the moon direction is `pub(super)` inside `benilla-world`'s day/night module and never
-    // reaches a shadow lane, and the packed `night` scalar would zero a moon cast anyway.
-    let sun_strength = sun_shadow_strength(lighting.celestial_dir().y);
+    // MONKEY (moon shadows): a time jump or pending aim must restore the oval in the SAME
+    // frame that the receiver goes fully lit. Do not independently reconstruct the clock weight.
+    let lane_strength = handover.weight.abs();
     // No camera yet → treat every unit as beyond the cascade, i.e. keep its oval. Failing toward
     // "has a shadow" is the safe direction for a lane whose bug is a missing shadow.
     let camera_pos = cam_pos.iter().next().map(GlobalTransform::translation);
@@ -331,9 +319,12 @@ fn update_shadows(
         // nothing left to draw, so that stays the early-out the hard hide used to be.
         let indoors = room.is_some_and(|r| r.room().is_some());
         let mut lane_w = 1.0;
-        if video.character_shadows && !indoors {
+        if video.character_shadows && !indoors
+            && shadow_frame.as_ref().is_some_and(|frame| frame.active && !frame.suspended)
+            && ready.as_ref().is_some_and(|ready| ready.0.contains(&shadow.owner))
+        {
             let cam_dist = camera_pos.map_or(f32::INFINITY, |c| unit.translation.distance(c));
-            lane_w = blob_weight(sun_strength, cam_dist, video.shadow_distance);
+            lane_w = blob_weight(lane_strength, cam_dist, video.shadow_distance);
             if lane_w <= 1.0 / 255.0 {
                 hide(&mut key, &mut verts);
                 continue;
@@ -356,7 +347,7 @@ fn update_shadows(
             Some((mnet, manims)) => (manims, mnet.scale),
             None => (anims, 1.0),
         };
-        // The byte+pixel law (0316, wow-re 27406d9b): the box is playableAnimationLookup[0]'s
+        // The byte+pixel law (0316): the box is playableAnimationLookup[0]'s
         // sequence — Stand, permanently (the reference re-reads it per frame from the file image;
         // the value can't change). resolve(0) walks the same baked table, so Stand-less models
         // land on their substitute exactly like the binary's row-0 fast path.
@@ -526,8 +517,9 @@ fn update_shadows(
                 .map(|v| format!("({:.3},{:.3})", v.uv[0], v.uv[1]))
                 .collect();
             debug!("self shadow uvs: {}", uvs.join(" "));
-            // And the box/rect numbers: the oracle says HumanFemale's footprint is 0.77x0.74 yd
-            // nearly centred; a bigger or offset rect indicts the box math, not the projector.
+            // And the box/rect numbers: measured on the reference client, HumanFemale's
+            // footprint is 0.77x0.74 yd nearly centred; a bigger or offset rect indicts the box
+            // math, not the projector.
             debug!(
                 "self shadow box: bmin {:?} bmax {:?} rect x [{:.3}, {:.3}] z [{:.3}, {:.3}] \
                  (extent {:.3}x{:.3}, centre offset ({:.3}, {:.3}))",
@@ -636,6 +628,7 @@ fn key_changed(a: &ShadowKey, b: &ShadowKey) -> bool {
 /// `benilla_world::lighting::global_light` (private there; that copy is what gets packed into the
 /// shader's `night` scalar). The pair is pinned by `oval_is_the_complement_of_the_realtime_lane`
 /// below — if the curve is ever tuned, tune both or the handover gains a seam.
+#[cfg(test)]
 fn sun_shadow_strength(sun_height: f32) -> f32 {
     let t = (sun_height / 0.208).clamp(0.0, 1.0); // 0.208 ≈ sin(12°)
     t * t * (3.0 - 2.0 * t)
@@ -712,6 +705,45 @@ mod tests {
             prev = w;
         }
         assert!((prev - 1.0).abs() < 1e-6);
+    }
+
+    /// MONKEY (moon shadows): the oval yields to the NIGHT cast by exactly what that cast lands.
+    ///
+    /// The bug this forbids is the one the feature creates if the blob is left alone: a unit at
+    /// midnight now HAS a real silhouette shadow, and an unfaded oval under it is a second,
+    /// differently-shaped shadow in the same place. The complement law already handles that — what
+    /// has to hold is that the moon's weight enters it the same way the sun's does, and that
+    /// `moonShadowStrength 0` puts the full oval back, bit for bit.
+    ///
+    /// The sum is exact rather than approximate because the two weights are mutually exclusive
+    /// (`benilla_world::lighting::moon_shadow_weight`, swept over the whole game day by its own
+    /// test), so `sun + moon` IS the realtime lane's total strength at every instant.
+    #[test]
+    fn the_oval_yields_to_a_moon_cast_by_exactly_its_strength() {
+        // Midnight, close in: the sun casts nothing, the moon casts at the shipped 0.35.
+        let night_sun = sun_shadow_strength(-0.3);
+        assert_eq!(night_sun, 0.0);
+        let full = blob_weight(night_sun, 10.0, 70.0);
+        assert_eq!(full, 1.0, "with the feature off the whole oval is still there");
+        let under_moon = blob_weight(night_sun + 0.35, 10.0, 70.0);
+        assert!(
+            (under_moon - 0.65).abs() < 1e-6,
+            "a 0.35 moon cast leaves 0.65 of the oval, not {under_moon}"
+        );
+        // …and the two together are the constant the day arm is: whatever the realtime lane lands,
+        // the oval lands the rest.
+        assert!((under_moon + 0.35 - 1.0).abs() < 1e-6);
+        // Past the cascade edge the moon cast resolves nothing, so the full oval returns even
+        // though the moon is up — the same edge behaviour the sun arm has.
+        assert_eq!(blob_weight(night_sun + 0.35, 80.0, 70.0), 1.0);
+        // The moonrise ramp reaches the oval monotonically: no pop as the weight lifts off zero.
+        let mut prev = 1.0;
+        for step in 0..=20 {
+            let w = blob_weight(night_sun + 0.35 * step as f32 / 20.0, 10.0, 70.0);
+            assert!(w <= prev + 1e-6, "the oval brightened as the moon rose, at step {step}");
+            prev = w;
+        }
+        assert!((prev - 0.65).abs() < 1e-6);
     }
 
     /// The box law: clamp INTO ±5 pre-scale (a cap, not a floor), then scale.

@@ -22,6 +22,40 @@
 // it fades in rather than popping at the resolve boundary.
 const SHADOW_EDGE_BAND: f32 = 14.0;
 
+// MONKEY (moon shadows): the `fog_params.z` lane decodes. ONE SIGNED float carries BOTH directional
+// weights — `+w` the sun's, `-w` the moon's — because `global_light::moon_shadow_weight` guarantees
+// they are never both non-zero (the rig holds ONE body's depth map at a time; the receiver loop
+// below ASSIGNS, last light wins). The CPU half is `global_light::pack_shadow_lane`; KEEP THE TWO
+// ENDS IN SYNC.
+//
+// Every OTHER reader of this lane was already sign-safe, which is what made the sign free: the
+// three `ext_night_w` decodes are `clamp(1 - z, 0, 1)`, and a negative `z` gives them the same 1.0
+// the 0.0 they used to read gave them, so the exterior torch lane is bit-identical after dark.
+fn sun_shadow_w(lane: f32) -> f32 {
+    return max(lane, 0.0);
+}
+
+fn moon_shadow_w(lane: f32) -> f32 {
+    return max(-lane, 0.0);
+}
+
+// MONKEY (moon shadows): ONE map fetch, the piece both weights share. Split out of
+// `realtime_shadow` so `realtime_shadow_terms` can weight the SAME sample twice instead of
+// sampling twice — the fetch is a 9-tap Gaussian PCF and the whole feature's cost budget is "no new
+// passes, no new textures, and nothing a second time".
+fn shadow_fetch(sample_pos: vec4<f32>, normal: vec3<f32>, view_z: f32) -> f32 {
+    var shadow = 1.0;
+    if (lights.n_directional_lights > 0u) {
+        for (var light_id = 0u; light_id < lights.n_directional_lights; light_id = light_id + 1u) {
+            if ((lights.directional_lights[light_id].flags & 1u) != 0u) {
+                shadow = shadows::fetch_directional_shadow(light_id, sample_pos, normal, view_z);
+                break;
+            }
+        }
+    }
+    return shadow;
+}
+
 // The realtime directional-shadow factor at `sample_pos`: 1.0 = lit, 0.0 = fully shadowed.
 //
 // - `sample_pos`   world-space point to sample the shadow map at — a per-fragment position, or a
@@ -43,17 +77,47 @@ fn realtime_shadow(
     shadow_range: f32,
     night: f32,
 ) -> f32 {
-    var shadow = 1.0;
-    if (lights.n_directional_lights > 0u) {
-        for (var light_id = 0u; light_id < lights.n_directional_lights; light_id = light_id + 1u) {
-            if ((lights.directional_lights[light_id].flags & 1u) != 0u) {
-                shadow = shadows::fetch_directional_shadow(light_id, sample_pos, normal, view_z);
-                break;
-            }
-        }
-    }
+    let shadow = shadow_fetch(sample_pos, normal, view_z);
     let edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, cam_dist);
     return 1.0 - (1.0 - shadow) * night * (1.0 - edge_fade);
+}
+
+// MONKEY (moon shadows): BOTH directional weights over ONE fetch — `.x` the SUN arm (exactly what
+// `realtime_shadow` above returns, character for character), `.y` the MOON arm.
+//
+// The three receivers call this instead of `realtime_shadow` because they apply the two arms to
+// DIFFERENT terms, and must do so from the same sample:
+//   · the SUN arm keeps its existing home in each receiver (terrain's `character_shadow_term`, the
+//     model's and static_gx's `ambient + (lit − ambient) × shadow_term`), untouched;
+//   · the MOON arm scales the exterior NIGHT law — see each receiver's own note for which term and
+//     why point lights, torches and spell lights are outside it.
+//
+// Both arms are written as the ONE original expression rather than factored through a shared
+// `occ = (1 − shadow)·(1 − edge_fade)`: float multiply is not associative, and `.x` must be the
+// same BITS as before this function existed. At `moon == 0.0` — every daylight frame, every frame
+// with `moonShadowStrength 0`, and the ≈20:30-22:17 window with the sun down and the moon not yet
+// up — `.y` is exactly `1.0` whatever the map holds, and every receiver's moon branch is guarded on
+// exactly that, so it is not entered and the render is the pre-feature one.
+fn realtime_shadow_terms(
+    sample_pos: vec4<f32>,
+    normal: vec3<f32>,
+    view_z: f32,
+    cam_dist: f32,
+    shadow_range: f32,
+    night: f32,
+    moon: f32,
+) -> vec2<f32> {
+    // MONKEY (moon shadows): neither body casts during hand-over or feature-off night. Skip
+    // the map entirely, including PCF; the old night cost must not grow with an inert moon.
+    if (night <= 0.0 && moon <= 0.0) {
+        return vec2<f32>(1.0);
+    }
+    let shadow = shadow_fetch(sample_pos, normal, view_z);
+    let edge_fade = smoothstep(shadow_range - SHADOW_EDGE_BAND, shadow_range, cam_dist);
+    return vec2<f32>(
+        1.0 - (1.0 - shadow) * night * (1.0 - edge_fade),
+        1.0 - (1.0 - shadow) * moon * (1.0 - edge_fade),
+    );
 }
 
 // MONKEY (torch shadows Phase 1): the point/cluster-based torch shadow is DEAD. benilla's world

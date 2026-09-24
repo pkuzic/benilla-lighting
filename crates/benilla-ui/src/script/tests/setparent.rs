@@ -1,13 +1,10 @@
-//! The runtime `SetParent` law — strata/level re-assignment, the hide→show round-trip, and the
-//! binding's error surface, per wow-re `ui/scratch/setparent-runtime-strata-level.md` (decision
-//! 1323). Every test drives the production Lua binding; the arena split
-//! (`reparent_begin`/`reparent_finish`) is exercised through it.
+//! Runtime `SetParent` (`0x7a1550`): strata and level re-assignment, the hide and show round-trip,
+//! and the binding's errors.
 
 use super::common::script;
 
-/// `strata := parent.strata`, `level := parent.level + 1` (`0x76ab5a`/`0x76ab65`) — and the
-/// subtree is NOT re-based (`propagate = 0`): an existing child keeps its absolute level, landing
-/// below its own parent, exactly as shipped.
+/// `strata := parent.strata`, `level := parent.level + 1` (`0x76ab5a`/`0x76ab65`); the subtree's
+/// levels are not re-based (`propagate = 0`), so a child can land below its own parent.
 #[test]
 fn reparent_relevels_the_moved_frame_only() {
     let s = script();
@@ -44,8 +41,7 @@ fn reparent_relevels_the_moved_frame_only() {
     );
 }
 
-/// `SetParent(nil)` is a RESET — strata MEDIUM, level 0 (`0x76aba3`/`0x76abac`) — never "keep
-/// current".
+/// `SetParent(nil)` resets to strata MEDIUM, level 0 (`0x76aba3`/`0x76abac`).
 #[test]
 fn reparent_to_nil_resets_strata_and_level() {
     let s = script();
@@ -66,11 +62,8 @@ fn reparent_to_nil_resets_strata_and_level() {
     assert_eq!(s.eval::<i64>("return F:GetFrameLevel()").unwrap(), 0);
 }
 
-/// A reparent of an effectively-visible frame is a hide→show round-trip: `OnHide` fires (under the
-/// OLD parent), then `OnShow` refires down the subtree — and an `OnShow` doing
-/// `SetFrameLevel(GetParent():GetFrameLevel()+1)` lands the child back above its parent. That
-/// hand-repair is AtlasLoot's own idiom and the reason its browse panel works on the reference —
-/// the round-trip is what makes it run.
+/// A visible frame's reparent fires `OnHide` under the old parent, then `OnShow` down the subtree,
+/// where AtlasLoot's `SetFrameLevel(GetParent():GetFrameLevel()+1)` lifts a child back up.
 #[test]
 fn a_visible_reparent_refires_onhide_then_onshow() {
     let s = script();
@@ -115,10 +108,8 @@ fn a_visible_reparent_refires_onhide_then_onshow() {
     );
 }
 
-/// A reparent of a hidden frame fires neither event, and does not recompute effective visibility:
-/// the `+0xd4` cascade only runs inside the show half (`0x76abfd` gates on the captured `ebx`), so
-/// a shown-but-invisible frame moved under a visible parent STAYS effectively invisible until
-/// something shows it. Shipped behaviour, byte-verified — not an oversight.
+/// The `+0xd4` visibility cascade runs only in the show half (`0x76abfd` gates on the captured
+/// `ebx`), so a hidden frame moved under a visible parent stays invisible until shown.
 #[test]
 fn a_hidden_reparent_fires_nothing_and_leaves_visibility_stale() {
     let s = script();
@@ -145,9 +136,7 @@ fn a_hidden_reparent_fires_nothing_and_leaves_visibility_stale() {
             .unwrap(),
         "shown bit intact, effective visibility stale-false under the visible new parent"
     );
-    // An explicit Show is what recomputes it — but Show() no-ops while the bit is already set, so
-    // a real transition needs the toggle. The Hide half fires no OnHide (the frame was already
-    // effectively invisible — transition-gated); only the Show half's false→true fires.
+    // Show() no-ops while the shown bit is set, so it takes a toggle; only its Show half fires.
     s.run("STF:Hide(); STF:Show()").unwrap();
     assert!(s.eval::<bool>("return STF:IsVisible()").unwrap());
     assert_eq!(
@@ -157,9 +146,8 @@ fn a_hidden_reparent_fires_nothing_and_leaves_visibility_stale() {
     );
 }
 
-/// The binding's error surface: a cycle RAISES (`0x87cb14` — including `newParent == self`), an
-/// unresolvable name raises `Couldn't find region named`, and an ABSENT argument is the same raise
-/// — not the nil path. The same-parent call is a total no-op that fires nothing.
+/// A cycle, self included, raises (`0x87cb14`); an absent argument takes the bad-name raise, not
+/// the nil path.
 #[test]
 fn the_binding_raises_on_cycle_bad_name_and_absent_argument() {
     let s = script();
@@ -185,7 +173,7 @@ fn the_binding_raises_on_cycle_bad_name_and_absent_argument() {
     let absent = s.run("A:SetParent()").unwrap_err().to_string();
     assert!(absent.contains("Couldn't find region named"), "{absent}");
 
-    // Same parent: the total no-op — no events, no level rewrite.
+    // B's parent is already A: the same-parent call is a total no-op, firing nothing.
     s.run(
         r#"
         B:SetFrameLevel(9)
@@ -201,5 +189,56 @@ fn the_binding_raises_on_cycle_bad_name_and_absent_argument() {
         s.eval::<i64>("return B:GetFrameLevel()").unwrap(),
         9,
         "0x76ab20 skips everything — the level is not re-derived"
+    );
+}
+
+/// Under `WOW_LAYOUT_VERIFY`, on for this crate's tests, every incremental pass is checked against
+/// a full one, so the test only needs a reparent that changes the child's scale.
+#[test]
+fn a_reparent_under_a_scale_change_moves_the_childs_rect() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        one = CreateFrame("Frame", "ScaleOne")
+        one:SetPoint("BOTTOMLEFT", 0, 0); one:SetWidth(800); one:SetHeight(600)
+        two = CreateFrame("Frame", "ScaleTwo")
+        two:SetPoint("BOTTOMLEFT", 0, 0); two:SetWidth(800); two:SetHeight(600)
+        two:SetScale(2)
+        kid = CreateFrame("Frame", "ScaleKid", one)
+        kid:SetPoint("BOTTOMLEFT", one, "BOTTOMLEFT", 10, 20); kid:SetWidth(100); kid:SetHeight(50)
+    "#,
+    )
+    .unwrap();
+    s.resolve();
+    let at_one: (f32, f32, f32) = s
+        .eval("return ScaleKid:GetLeft(), ScaleKid:GetBottom(), ScaleKid:GetWidth()")
+        .unwrap();
+
+    // Own-space reads (`GetLeft`, `GetWidth`) stay put while the screen rect doubles.
+    s.run("kid:SetParent(two)").unwrap();
+    s.resolve();
+    let at_two: (f32, f32, f32) = s
+        .eval("return ScaleKid:GetLeft(), ScaleKid:GetBottom(), ScaleKid:GetWidth()")
+        .unwrap();
+
+    assert_eq!(at_one, (10.0, 20.0, 100.0), "seated in the unscaled parent");
+    assert_eq!(
+        at_two,
+        (10.0, 20.0, 100.0),
+        "own-space coordinates are scale-relative, so these do not move"
+    );
+    // The extraction is in screen units.
+    let widths: Vec<f32> = s
+        .extract()
+        .iter()
+        .filter_map(|q| match q.target {
+            crate::order::ZTarget::Frame(_) => q.rect.map(|r| r.right - r.left),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        widths.iter().any(|w| (w - 200.0).abs() < 1e-3),
+        "the reparented child should be 100 x scale 2 = 200 screen units wide; got {widths:?}"
     );
 }

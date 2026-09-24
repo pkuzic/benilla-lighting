@@ -1,29 +1,13 @@
-// Phase 6 terrain splat shader — extends Bevy's StandardMaterial with a CUSTOM vertex + fragment stage.
+// Terrain splat shader: a custom vertex and fragment stage on Bevy's StandardMaterial. Blends up to
+// four tiled layers by a per-chunk alpha map, lit as the reference's fixed-function terrain:
+//   diffuse  = clamp(ambient (row 1) + diffuse (row 0)·max(N·L, 0) + Σ point·att·N·L), evaluated
+//     and clamped per vertex (GL T&L), Gouraud-interpolated, modulated 1× into the texture;
+//   specular = clamp(row 9 · max(N·H, 0)^20) per vertex (local viewer), times the sheen mask (the
+//     `_s` texture's per-texel alpha, blended like the colour), added after the modulate.
+// Evaluated per pixel, or unmasked, the near-white row 9 would wash lit ground to cream.
 //
-// Blends up to 4 tiled layer textures by a per-chunk alpha map, then lights the result with WoW's
-// faithful terrain lighting (fixed-function GL_LIGHTING, reproduced):
-//   • DIFFUSE — `clamp(ambient_row1 + diffuse_row0·max(N·L,0) + Σ point·att·N·L)`, modulated into
-//     the texture (MOD 1×). Evaluated AND CLAMPED per VERTEX (the GL T&L locus), then
-//     Gouraud-interpolated — the clamp position matters once an over-gamut point light is in the
-//     sum (see the `primary` varying note).
-//   • SPECULAR (the bare-ground "sheen") — `clamp(row9 · pow(max(N·H,0),20)) · sheen_mask`, added
-//     AFTER the texture modulate (separate-specular, LOCAL_VIEWER). The Blinn term is computed
-//     PER-VERTEX (clamped per vertex, Gouraud-interpolated); the `sheen_mask` is the `_s` texture's
-//     per-texel ALPHA, blended like the colour (so the sheen rides only shiny texels — stone, not
-//     grass). See docs/knowledge/lighting.md
-//     ⚠️ Two things bound it, BOTH needed (each was a separate blow-out): (a) per-vertex undersampling
-//     of the sharp lobe (sampled only at the ~4 yd MCVT vertices, clamped, linearly smeared) vs a
-//     per-PIXEL eval that saturates; (b) the `_s` alpha sheen-mask (ref mean ≈ 0.1) vs applying it at
-//     a uniform 1.0 — row 9 ≈ near-white, so unmasked it washes the whole lit face to cream.
-//
-// Because Bevy's `VertexOutput` has no slot for the interpolated specular, we do our own (minimal)
-// vertex transform and a custom IO struct, and drop `main_pass_post_lighting_processing` (fog returns
-// IN-SHADER at Step 5, per docs/plans/lighting-rebuild.md — not Bevy's DistanceFog).
-//
-// One material serves a whole ADT tile (see terrain.rs): layer textures live in a `texture_2d_array`
-// (binding 100), per-chunk alpha maps in another (104). Each merged-mesh vertex carries its chunk's 4
-// layer indices in `color` (vertex COLOR) and its alpha-layer index in `uv_b.x` (UV1) — constant across
-// the chunk, so interpolation lands back on the integer index.
+// Bevy's `VertexOutput` has no slot for the interpolated specular, so the vertex transform and IO
+// struct are our own and `main_pass_post_lighting_processing` is dropped; fog is in-shader.
 
 #import bevy_pbr::{
     mesh_functions,
@@ -52,18 +36,15 @@ struct TerrainParams {
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> t: TerrainParams;
 
-// The shared global light (lighting::global_light): ONE storage buffer every material reads, updated
-// once/frame in place — replaces the per-material light/fog uniforms `apply_wow_lighting` re-pushed
-// each frame. Rows 0-5 (of the 18-row LightStd430) are the light + fog terrain needs, plus the grade
-// row at the end (rows 6-16 — model SH + water swatches — are skipped as a pad). Read in BOTH stages
-// (the per-vertex sheen needs light_sun/spec in the vertex stage).
+// The shared global light (`lighting::global_light`), updated in place once a frame; this mirrors
+// its row layout, which must match.
 struct WowLight {
     light_ambient: vec4<f32>, // rgb = row 1 ambient; w = Mod2x scale (×1).
     light_diffuse: vec4<f32>, // rgb = row 0 sun diffuse; w = clamp-light flag (>0.5 ⇒ saturate).
-    light_sun: vec4<f32>,     // xyz = world-space sun TRAVEL direction (to-light = −xyz); w unused.
+    light_sun: vec4<f32>,     // xyz = world-space sun travel direction (to-light = −xyz); w unused.
     light_spec: vec4<f32>,    // rgb = row 9 specular color; w = shininess (20). rgb == 0 disables.
     fog_color: vec4<f32>,     // rgb = row 7 fog (raw, gamma 0..1); w = enable (>0.5 ⇒ blend).
-    fog_params: vec4<f32>,    // x = fog_start yd; y = fog_end yd; z unused; w = farclip wall.
+    fog_params: vec4<f32>,    // x = fog_start yd; y = fog_end yd; z = signed +sun / -moon shadow weight; w = farclip wall.
     _sh: array<vec4<f32>, 6>, // rows 6-11: the model SH coeffs (live in wow_model.wgsl, 0354) — unread by terrain.
     sh_c16: vec4<f32>,        // row 12: xyz the models' c16 quad band; .w a FREE lane (the 0273 point gain is retired).
     _water: array<vec4<f32>, 4>, // rows 13-16: the liquid swatches — unread by terrain.
@@ -249,14 +230,9 @@ struct TerrainVsOut {
     @location(3) uv_b: vec2<f32>,
     @location(4) color: vec4<f32>,
     @location(5) specular: vec3<f32>,
-    // The full Gouraud diffuse — `clamp01(ambient + sun·max(N·L,0) + Σ point·att·N·L)`, evaluated
-    // AND CLAMPED per VERTEX: the GL T&L locus. The clamp position is load-bearing for a hot
-    // carried light (the raw committed torch is (1.4, 0.87, 0.40)): GL clamps the summed vertex
-    // colour BEFORE interpolation, so an over-gamut torch saturates one vertex and Gouraud falls
-    // linearly away from it. Interpolating the raw sum and clamping per pixel — what we did
-    // before — keeps pixels pinned at white far from the hot vertex: a wide flat plateau with a
-    // hard knee, the director's "hard square". Sun N·L moving per-pixel → per-vertex is the
-    // faithful direction (Step 3's own note: indistinguishable on the smooth term).
+    // The Gouraud diffuse, summed and clamped per vertex as GL T&L does: an over-gamut light (a
+    // carried torch is (1.4, 0.87, 0.40)) saturates one vertex and falls off linearly from it,
+    // where clamping per pixel would pin a wide plateau at white.
     @location(6) primary: vec3<f32>,
     // The receiver normal is carried so the real cascaded shadow lookup can apply a slope-aware
     // bias. This is forward-pass data only; the terrain shadow caster is a stock Bevy proxy.
@@ -281,13 +257,14 @@ struct TerrainVsOut {
     // reads `primary` and is therefore bit-identical. Unclamped is safe to interpolate: it is
     // linear in `N.L` and the clamp that used to bound it is re-applied per fragment.
     @location(9) base_lit: vec3<f32>,
+    // MONKEY (moon shadows): preserve the point sum BEFORE saturation; primary cannot recover it.
+    @location(10) point_lit: vec3<f32>,
 }
 
-// Terrain's point-light **candidacy half-width** (yd): the reference's guaranteed covered box is
-// `w + 10` where `w` is the chunk's bounding-sphere radius — `sqrt(2·16.666666² + (zExtent/2)²)`,
-// i.e. 23.570166 on flat ground (`0x68df70` hard-codes that same constant at `68dfac`). Relief
-// widens a chunk's own `w`; we use the flat value, so on steep ground we gather very slightly
-// narrower than the reference — the lights that differ are ≥33 yd out, where `att ≈ 0.02`.
+// Terrain's point-light candidacy half-width (yd): `w + 10`, `w` being the chunk's bounding-sphere
+// radius `sqrt(2·16.666666² + (zExtent/2)²)`, 23.570166 on flat ground (constant at `0x68dfac`).
+// This takes the flat `w` everywhere, so steep chunks gather slightly narrower than the reference;
+// the lights that differ are 33 yd out or more, where att ≈ 0.02.
 const TERRAIN_REACH: f32 = 33.570166;
 
 // The dynamic point-light term at a world-space point (decisions 0016/0273/0278, selection 0285) —
@@ -546,23 +523,13 @@ fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3
     return sum;
 }
 
-// The MCNK chunk cell center under a world point — terrain's light-selection anchor (the terrain
-// draw unit; the grid is fixed world-wide, chunk = 533.3333/16 yd, half-extent 32 tiles). WoW x/y
-// are Bevy −z/−x and the grid is symmetric, so snapping Bevy x/z directly lands on the same cells.
-//
-// **The XY snap is VERIFIED** (wow-re `terrain-dynamic-light-gather.md`: `CMapChunk+0x5c..0x64` is
-// the chunk's world AABB centre, written by the MCVT world-vert builder `0x6b0e50` at
-// `6b106c`/`6b10ec`, and the 33.33-yd chunk really is the draw unit — gather → commit → draw pair
-// 1:1 per record at `68478a`/`68479c`/`6847bb`/`6847c4`).
-//
-// **The height is KNOWN-WRONG and deliberately not fixed here.** The reference's anchor Z is the
-// chunk's own mid-height `(minH + maxH)/2` over its 145 verts — one constant per chunk. We keep the
-// vertex's own y, which means the anchor VARIES within a chunk, so on relief two vertices of the
-// same chunk can select different light sets and seam mid-chunk — the reference cannot do that.
-// Fixing it needs a per-chunk constant plumbed to the vertex stage (a custom mesh attribute + a
-// `specialize` on the terrain material, which has none today), so it is scoped as its own change;
-// on flat ground the two anchors coincide and nothing differs. Mirrored in wow_model.wgsl (clutter
-// snaps to the same cells).
+// The MCNK chunk cell centre under a world point: the reference's light anchor, the chunk's world
+// AABB centre `CMapChunk+0x5c..0x64` (written by `0x6b0e50`). The grid is fixed world-wide (chunk
+// 533.33333/16 yd, half-extent 32 tiles) and symmetric, and WoW x/y are Bevy −z/−x, so snapping
+// Bevy x/z lands on the same cells; wow_model.wgsl mirrors it for clutter.
+// The anchor height is the vertex's own y, not the chunk's mid-height `(minH + maxH)/2`, so on
+// relief one chunk's vertices can select different lights: the per-chunk constant is not plumbed
+// to the vertex stage. On flat ground the two agree.
 fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
     let cell = 533.33333 / 16.0;
     let half = 32.0 * 533.33333;
@@ -589,9 +556,8 @@ fn vertex(in: Vertex) -> TerrainVsOut {
     out.uv_b = in.uv_b;
     out.color = in.color;
 
-    // STEP 3b: terrain SUN SPECULAR, computed PER-VERTEX (Q14). Material spec = white, shininess =
-    // wow_light.light_spec.w (20), spec color = row 9 (wow_light.light_spec.rgb); H = halfway(to-light, to-eye) with
-    // the LOCAL viewer (per-vertex eye dir). Clamp HERE, per vertex — rasterizer Gouraud-interpolates.
+    // Sun specular per vertex: white material, row-9 colour, shininess `light_spec.w` (20), local
+    // viewer; clamped here, then Gouraud-interpolated.
     let n = normalize(world_normal);
     let l = -normalize(wow_light.light_sun.xyz); // to-light (the sun travels along +light_sun)
     let v = normalize(view.world_position.xyz - out.world_position.xyz); // to-eye (local viewer)
@@ -611,6 +577,7 @@ fn vertex(in: Vertex) -> TerrainVsOut {
     let sel = point_light_pick(mcnk_cell_anchor(out.world_position.xyz), MCNK_CELL_HALF);
     out.ext_sel = sel;
     let points = point_light_eval(sel, out.world_position.xyz, n);
+    out.point_lit = points;
     let sun_lighting = wow_light.light_diffuse.rgb * ndotl;
     // The sun/ambient half on its own slot, UNCLAMPED (see `base_lit`) - the night lane's only way
     // back to a `primary` that does not already have the unshadowed point term baked into it.
@@ -625,11 +592,8 @@ fn vertex(in: Vertex) -> TerrainVsOut {
 
 @fragment
 fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
-    // HARD FAR-CLIP WALL (faithful `farclip`): the reference clips the detailed world at its projection
-    // far plane (~777 yd). Geometry beyond is GPU-clipped per-pixel, so a tall object reveals
-    // closest-part-first as you approach and the sky/WDL shows behind it. We reproduce that with a
-    // per-fragment discard on PLANAR eye-Z (same coordinate as the fog) beyond `fog_params.w` = farclip
-    // (0 ⇒ disabled). WDL/sky use other shaders, so they still render to the horizon behind the wall.
+    // The far-clip wall: the reference clips the detailed world per pixel at its far plane
+    // (`farclip`, about 777 yd). Discard beyond `fog_params.w` (0 disables) on planar eye-Z.
     if (wow_light.fog_params.w > 0.0) {
         let clip_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
         if (clip_z > wow_light.fog_params.w) {
@@ -637,27 +601,21 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         }
     }
 
-    // Per-chunk array indices, baked into the merged mesh: COLOR = 4 layer indices, UV1.x = alpha.
+    // Per-chunk array indices baked per vertex, COLOR the 4 layers and UV1.x the alpha; constant
+    // across a chunk, so they interpolate back to the integer.
     let li = vec4<i32>(round(in.color));
     let ai = i32(round(in.uv_b.x));
 
     let tiled = in.uv * t.params.x;
-    // Full RGBA: `.rgb` = diffuse, `.a` = the `_s` texture's per-texel SHEEN MASK (see assets.rs /
-    // terrain.rs — the base `.blp` has no alpha, so we load the `_s` variant; matte where no mask).
-    // `view.mip_bias` (decision 1639): a render scale below 1 doubles every derivative and so
-    // picks a coarser mip, and that blur is then stretched back up by the resolve. The bias undoes
-    // exactly that shift and is 0.0 at native and above, so this is an identity at scale 1.
-    // Only the LAYER array takes it: `alpha_array`/`shadow_array` are one 64x64 grid per chunk,
-    // built with a single mip level (terrain.rs `array_image`), so no bias could move them.
+    // `.a` is the `_s` texture's sheen mask, 0 without an `_s`. `view.mip_bias` undoes the coarser
+    // mip a render scale below 1 picks; the alpha and shadow arrays have one mip, so only the
+    // layers take it.
     let s0 = textureSampleBias(layer_array, splat_samp, tiled, li.x, view.mip_bias);
     let s1 = textureSampleBias(layer_array, splat_samp, tiled, li.y, view.mip_bias);
     let s2 = textureSampleBias(layer_array, splat_samp, tiled, li.z, view.mip_bias);
     let s3 = textureSampleBias(layer_array, splat_samp, tiled, li.w, view.mip_bias);
-    // Alpha + shadow maps are one 64² grid per chunk in 0..1 (NOT tiled), yet they share the layer
-    // textures' Repeat sampler. The old "repeat == clamp here" assumption is FALSE under LINEAR
-    // filtering: at a chunk edge (uv→0/1) the bilinear footprint WRAPS to the chunk map's opposite
-    // edge, blending unrelated weights → a thin seam at every chunk border (the creases; introduced
-    // when 228d336 switched Nearest→Linear). Inset by half a texel so the footprint clamps instead.
+    // The alpha and shadow maps (one untiled 64² grid per chunk) share the layers' repeat sampler,
+    // so a linear footprint at a chunk edge would wrap to the far edge; a half-texel inset clamps.
     let auv = clamp(in.uv, vec2<f32>(0.5 / 64.0), vec2<f32>(1.0 - 0.5 / 64.0));
     let a = textureSample(alpha_array, splat_samp, auv, ai);
 
@@ -666,10 +624,8 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     color = mix(color, s2.rgb, a.g);
     color = mix(color, s3.rgb, a.b);
 
-    // Sheen mask: blend the layers' `_s` alpha with the SAME splat weights as the colour, so the sun
-    // specular rides only the shiny texels (stone/pebbles), not matte grass/dirt. This per-pixel mask
-    // is what bounds the highlight — the real client's mask averages ≈ 0.1 (Q14); applying the sheen at
-    // a uniform 1.0 is what blew out the floor. (FP: `secondary · texture[0].w`.)
+    // The sheen mask, blended with the colour's splat weights (the fragment program's
+    // `secondary · texture[0].w`).
     var specmask = s0.a;
     specmask = mix(specmask, s1.a, a.r);
     specmask = mix(specmask, s2.a, a.g);
@@ -693,18 +649,24 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // MCSH fade-back.
     let view_z = (view.view_from_world * in.world_position).z;
     let cam_dist = distance(in.world_position.xyz, view.world_position.xyz);
-    let sun_shadow_strength = wow_light.fog_params.z;
+    // MONKEY (moon shadows): the lane is SIGNED now — `+` the sun's weight, `-` the moon's (see
+    // `shadow_hook::sun_shadow_w`). `max(z, 0)` is the identity on every value this lane ever held
+    // before the feature, so the name, the MCSH gate and the torch-lane decode below are unchanged.
+    let sun_shadow_strength = shadow_hook::sun_shadow_w(wow_light.fog_params.z);
+    let moon_shadow_strength = shadow_hook::moon_shadow_w(wow_light.fog_params.z);
     // Hoisted out of the `realtime_shadow` call (same expression, same bits) because the torch lane
     // below needs the same normal for its normal-offset sample.
     let n_lit = normalize(in.world_normal);
-    let world_shadow = shadow_hook::realtime_shadow(
+    let shadow_terms = shadow_hook::realtime_shadow_terms(
         in.world_position,
         n_lit,
         view_z,
         cam_dist,
         wow_light._wmo_fog[1].z,
         sun_shadow_strength,
+        moon_shadow_strength,
     );
+    let world_shadow = shadow_terms.x;
     // MONKEY (outdoor torch shadows: terrain): the exterior point term, CAST-SHADOWED at night.
     //
     // `in.primary` is the Gouraud (per-vertex, per-vertex-CLAMPED) diffuse, and it stays the only
@@ -734,11 +696,23 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         primary = mix(in.primary, primary_night, ext_night_w);
     }
 
-    // STEP 4: MCSH baked shadow. On the reference path (pixelShaders+specular) terrain is ONE pass
-    // through `terrainp_s.bls`, which carries the MCSH bit in the blend texture's alpha (1.0 lit / 0.0
-    // shadowed) and uses it TWO ways (Q15) — NOT the Q11 separate ambient-tint overlay (that's the
-    // legacy/non-pixelShaders path). Our `shadow_array` R8 is 255=shadowed/0=lit, so `shadow_lit =
-    // 1 - mcsh`. Chunks with no MCSH map (`uv_b.y < 0`) are fully lit.
+    // MONKEY (moon shadows): attenuate the SKY (ambient AND directional) BEFORE adding points
+    // and saturating. Subtracting from primary loses over-gamut torch energy: sky .2 + point 1
+    // must remain 1 under a .35 moon shadow, not .93. Keep the entire off arm above untouched;
+    // neither a zero weight nor a fully lit fragment earns a different Gouraud/clamp path.
+    if (shadow_terms.y < 1.0) {
+        var points = in.point_lit;
+        if (ext_night_w > 0.0) {
+            points = mix(points,
+                point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit), ext_night_w);
+        }
+        primary = clamp(in.base_lit * shadow_terms.y + points, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    // MCSH baked shadow. With `pixelShaders` and `specular` on, terrain is one pass through
+    // `terrainp_s.bls`, which reads the MCSH bit from the blend texture's alpha (1 lit, 0 shadowed)
+    // and uses it twice, below; with them off the reference draws a separate ambient-tint overlay.
+    // Our `shadow_array` is 255 shadowed, 0 lit; a chunk with no MCSH map (`uv_b.y < 0`) is lit.
     var shadow_lit = 1.0;
     let si = in.uv_b.y;
     if (si >= 0.0) {
@@ -756,6 +730,14 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // world shadow fades at night the baked MCSH fades back IN. By day (strength 1) MCSH is fully
     // replaced; at night (strength 0) the authored bake returns; dusk crossfades. Character-only
     // (lane flag off) never suppresses MCSH.
+    // MONKEY (moon shadows): this stays on the SUN weight alone — deliberately. The symmetric
+    // reading ("a moon shadow replaces 35 % of the bake too") lightens MCSH everywhere, including
+    // the ground BEYOND the cascade where the realtime lane resolves nothing and there would be no
+    // replacement for what was removed. The two also compose rather than double-count: the moon
+    // arm scales the light SUM (`primary`, above) and MCSH multiplies the result, and the moon arm
+    // is ≤ 0.35 of a term the bake is already a flat −30 % of. The visible consequence is that a
+    // tree at night wears its baked noon-sun shadow AND a faint moon-direction one — which is worth
+    // eyes on a capture before it is called wrong.
     let world_shadow_lane = wow_light.sh_c16.w > 0.5;
     let mcsh_suppress = select(0.0, sun_shadow_strength, world_shadow_lane);
     let shadow_lit_eff = mix(shadow_lit, 1.0, mcsh_suppress);
@@ -799,8 +781,7 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         tuned = mix(wow_light.fog_color.xyz, tuned, factor);
     }
 
-    // GAMMA LANE (decision 0161): the framebuffer HOLDS gamma bytes — all blending happens in
-    // gamma exactly like the reference's byte framebuffer; the frame's ONE decode lives in the
-    // FFXGlow combine (the last node). Output raw.
+    // Raw gamma out: the framebuffer holds gamma bytes and blends in gamma like the reference's;
+    // the frame's one decode is the FFXGlow combine.
     return vec4<f32>(tuned, 1.0);
 }

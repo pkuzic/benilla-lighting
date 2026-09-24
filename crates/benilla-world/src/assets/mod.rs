@@ -1,10 +1,5 @@
-//! The asset foundation's **plugin shell** — the three systems that drive
-//! [`benilla_assets::WorldAssets`] from inside the client.
-//!
-//! The store itself went down to `benilla-assets` (decision 1164); what could not follow it is
-//! exactly this: opening the chain needs the shared light buffer (`lighting`), evicting the world
-//! art needs the cross-map message (`world_map`), and the residency sweep needs the art-scope
-//! instrument. Three upward reaches, all of them here, none of them in the data core.
+//! Drives [`benilla_assets::WorldAssets`] from the client: each system needs a client piece (the
+//! light buffer, `MapChange`, the art scope), so it lives here rather than in `benilla-assets`.
 
 use bevy::prelude::*;
 use bevy::render::renderer::RenderDevice;
@@ -13,8 +8,7 @@ use crate::art_scope::{ArtScope, ArtSlot};
 use benilla_assets::{AssetSet, RenderConfig, WorldAssets};
 use benilla_formats::open_chain;
 
-/// The asset foundation plugin: opens the **one** patch chain at startup and inserts the shared
-/// [`WorldAssets`] + [`RenderConfig`] that the other subsystems build on.
+/// Opens the patch chain at startup and inserts the shared [`WorldAssets`] and [`RenderConfig`].
 pub(crate) struct AssetPlugin;
 
 impl Plugin for AssetPlugin {
@@ -28,11 +22,8 @@ impl Plugin for AssetPlugin {
     }
 }
 
-/// Drop the world-art dedup on a cross-map transition (`world_map::MapChange` — see its doc for
-/// why a clear is always safe): `textures` + `model_materials` pin every map's world art forever
-/// otherwise (the #bugs teleport leak). The UI sprite caches (`sprites`/`tiled_sprites`/
-/// `portraits`/`masks`) stay — they are game-global UI scope, and their negative entries exist
-/// precisely to stop per-frame re-walks of the chain.
+/// Clears `textures` and `model_materials` on a map change, or they pin every map's art forever.
+/// The UI sprite caches stay: they are global, and their negative entries stop per-frame re-walks.
 fn evict_world_art(
     mut changes: MessageReader<crate::world_map::MapChange>,
     assets: Option<ResMut<WorldAssets>>,
@@ -47,11 +38,8 @@ fn evict_world_art(
     }
 }
 
-/// Expire the world-art dedup by **distance** (decision 0793) — the within-map half of the eviction
-/// above. `textures` is the one that matters for VRAM: a decoded BLP is pinned by the material that
-/// samples it, and a material by this cache, so nothing here dropping is why `images` never fell on a
-/// same-map traverse. The UI sprite caches stay unswept for the same reason they survive a map change
-/// (game-global scope, and their negative entries exist to stop per-frame chain re-walks).
+/// Expires the world-art caches by distance within a map: a cached material pins the decoded BLP it
+/// samples, so `textures` is what frees VRAM. The UI sprite caches stay, as on a map change.
 fn scope_world_art(mut scope: ArtScope, assets: Option<ResMut<WorldAssets>>) {
     if let Some(mut a) = assets {
         scope.apply(&mut a.model_materials, ArtSlot::ClutterMats);
@@ -97,24 +85,12 @@ fn open_world_assets(
         );
         return;
     };
-    // How much terrain is resident is NOT a knob here: the streamer derives its window from the
-    // live `farclip` (`view::ViewDistance`, the player's Terrain Distance setting) the way the
-    // reference does — `terrain_stream::window`, decision 1513. `$WOW_TILE_RADIUS` is retired.
-    // Ground-texture repeats per chunk; tunable live in the panel afterward.
-    let tex_tiles = std::env::var("WOW_TEX_TILES")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(8.0);
-    // See the field doc: the tile-unload budget (B181). Default 1 — even the fastest focus
-    // (boosted free-fly, ~1 stale row/s) produces stale tiles far slower than 60/s drains them.
+    // Stale tiles released per frame: 1 outpaces even boosted free-fly's stale row a second.
     let unload_budget = std::env::var("WOW_TILE_UNLOAD")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
-    commands.insert_resource(RenderConfig {
-        tex_tiles,
-        unload_budget,
-    });
+    commands.insert_resource(RenderConfig { unload_budget });
 
     match open_chain(&data) {
         Ok(chain) => commands.insert_resource(WorldAssets::open(chain, light_buf, torch)),

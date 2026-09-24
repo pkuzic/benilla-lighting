@@ -15,11 +15,9 @@
 //!   **latches** (flag bit1 at its register site) says so with [`Registered::latched`]; a
 //!   structural test insists every row has a reader somewhere in the source.
 //!
-//!   **The reference column has one source**: wow-re's
-//!   `system/cvar/scratch/registered-defaults-census.md` and the regenerable manifest beside it,
-//!   `re/cvar/cvar-register-sites.tsv` — all 214 of the reference's `CVar::Register` sites with
-//!   name, help, flags, default string, callback, category and record global. A new row looks
-//!   its answer up there rather than re-deriving it.
+//!   **The reference column has one source**: all 214 of the reference's `CVar::Register` sites,
+//!   with name, help, flags, default string, callback, category and record global. A new row
+//!   looks its answer up there rather than re-deriving it.
 //!
 //! - **The change callback is a Bevy observer** ([`CvarChanged`]). An accepted move of a row's
 //!   applied value is triggered as one event, and the subsystem that owns the knob observes it
@@ -29,9 +27,9 @@
 //!   written workaround). The registry never applies anything itself: it has no knob, and no arm.
 //!
 //! - **The latch** ([`Row::pending`]): a write to a latched row is staged, `GetCVar` keeps
-//!   answering the applied value, and nothing fires until [`Cvars::commit_latched`] — which is
-//!   the reference's `CVar::Update 0x63e060`, called for the `gx*` rows from inside `RestartGx`
-//!   (the video window's Okay). A staged value that is never committed is dropped at exit, as
+//!   answering the applied value, and nothing fires until [`Cvars::commit_latched`] — the
+//!   reference's `0x639ec0`, `CVar::Commit 0x63e060` on the fourteen gx records, called from
+//!   inside `RestartGx` (the video window's Okay). A staged value that is never committed is dropped at exit, as
 //!   the reference's is (`SaveConfig` writes `rec+0x20`, the applied value).
 //!
 //! - **Boot**: read `benilla-config/config.toml` ([`crate::local_state`]) into the registry and
@@ -85,8 +83,8 @@ pub(crate) struct Registered {
     pub(crate) reference: Reference,
     /// The reference registers it with flag bit1 (`rec+0x1c & 0x2`, decision 2303): a write is
     /// staged in [`Row::pending`] and applied only at the latch boundary
-    /// ([`Cvars::commit_latched`]). Read off `re/cvar/cvar-register-sites.tsv`'s `flags` column
-    /// (2 or 3); a test pins the set.
+    /// ([`Cvars::commit_latched`]). Read off each register site's `flags` argument (2 or 3); a test
+    /// pins the set.
     pub(crate) latched: bool,
 }
 
@@ -110,8 +108,7 @@ impl Registered {
 ///
 /// - **Not what the reference install's `Config.wtf` says.** That file is one player's saved
 ///   *diff*: `SaveConfig 0x63d980` writes only what has moved off its default, so a line's mere
-///   presence is proof the registered default is something *else* (wow-re
-///   `cvar/scratch/graphics-cost-cvar-census.md` §10 — the trap it exists to close).
+///   presence is proof the registered default is something *else*.
 /// - **Not, by itself, what a fresh install ends up running at.** `hwDetect` rewrites sixteen
 ///   video CVars out of `VideoHardware.dbc` before the first frame, and the `useUiScale`-OFF leg
 ///   computes a UI scale of its own. Where the client's own boot code overrides the registered
@@ -210,9 +207,16 @@ pub(crate) fn registered_pairs() -> impl Iterator<Item = (&'static str, &'static
 /// The host-backed CVars. Grows one row per knob a settings page actually wires — never ahead of
 /// the knob (see the module doc) — and every row states where its default stands against the
 /// reference's ([`Registered`]).
+///
+/// Unregistered for want of a reader, though pfUI's `hdgraphic` writes them through `ConsoleExec`:
+/// `lodDist` (`0x688524`, "100.0", read at `0x6afb1d` for the doodad LOD swap), `footstepBias`
+/// (`0x6888b4`, "0.125", read at `0x68fcb6`), `mapObjLightLOD` (`0x6886ec`, "0") and `SkyCloudLOD`
+/// (`0x6d1d33`, "0"). `DistCull` (`0x688570`) and `texLodBias` (`0x6885e2`, whose sink `0x672640`
+/// is `ret 4`) have no reader in the reference either. `maxLOD` is no CVar: none of the 214
+/// `CVar::Register` (`0x63db90`) sites names it.
 pub(crate) const REGISTERED: &[Registered] = &[
-    // The realm the session is on — a REAL 1.12 CVar (`0x83f2d0`, persisted, wow-re
-    // `savedvariables-protocol.md`: the client builds its SavedVariables path from it), and a live
+    // The realm the session is on — a REAL 1.12 CVar (`0x83f2d0`, persisted: the client builds its
+    // SavedVariables path from it through `0x5ab7d0`), and a live
     // Lua consumer in the strongest sense the honest-tree rule asks for. `Ace/AceState.lua:27` does
     // `ace.trim(GetCVar("realmName"))` inside `SetGameState`, which every Ace addon runs at
     // PLAYER_ENTERING_WORLD — so a nil there was `gsub(nil)` and took the whole Ace family down.
@@ -220,14 +224,14 @@ pub(crate) const REGISTERED: &[Registered] = &[
     //
     // The default is EMPTY, deliberately and not as a guess: the value is written from the session's
     // real realm the moment addons load (`ui_script::addons::load_third_party`), so the default only
-    // ever describes a client that has not connected. wow-re records a string
+    // ever describes a client that has not connected. `0x85d684` holds a string
     // `"Last realm connected to"` beside the registration, but that reads like the CVar's HELP text
     // rather than its value and nothing here needs to resolve it — `""` is what `ace.trim` handles
     // cleanly, and inventing a realm name would be worse than admitting we have none yet.
     same("realmName", ""),
-    // The address of the logon server — the reference's own CVar, byte-verified in `WoW.exe`
-    // (the registration's string neighbours are `realmlist.wtf`, "Address of realm list server"
-    // and `us.logon.worldofwarcraft.com:3724`; wow-re `mpq/scratch/startup-order-A.md` row 62).
+    // The address of the logon server — the reference's own CVar (register site `0x5ab6a6`; the
+    // registration's string neighbours are `realmlist.wtf`, "Address of realm list server" and
+    // `us.logon.worldofwarcraft.com:3724`).
     // A **string** row: the registry takes any string for it, and `realmlist::on_cvar` judges it.
     // The default diverges knowingly — see `realmlist::DEFAULT_REALMLIST`.
     deviates(
@@ -239,8 +243,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // The implicit AFK clear (2088) — a REAL 1.12 CVar, byte-read off its own registration
     // (`0x5e24d4 push 0x82e748`, handle taken from the store AFTER the call at `0x5e24ef` into
-    // `[0xc4d68c]`, whose single reader `0x5eb84b` tests `[cvar+0x28]` for non-zero; wow-re
-    // `ui/scratch/afk-dnd-command-law.md` §10). Registered default `"1"`.
+    // `[0xc4d68c]`, whose single reader `0x5eb84b` tests `[cvar+0x28]` for non-zero). Registered
+    // default `"1"`.
     //
     // It gates FIVE implicit clears, not one: any chat send whose type is not `0x14` (which is why
     // `/dnd` clears AFK before marking), plus Jump, forward/back, strafe and turn
@@ -251,7 +255,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("SoundVolume", "1"),
     same("MusicVolume", "0.4"),
     same("AmbienceVolume", "0.6"),
-    // The three 1.12 sound enables (registrar defaults all "1", wow-re B10):
+    // The three 1.12 sound enables (registrar defaults all "1", `0x45737a`/`0x45739b`/`0x460a9d`):
     // `MasterSoundEffects` is the MASTER "Enable All Sound" checkbox (SoundOptionsFrame.lua
     // index 1 — its callback sets the engine-wide pause flag), NOT an SFX-only toggle; 1.12
     // has no `EnableSound`/`EnableSFX` at all.
@@ -259,13 +263,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("EnableMusic", "1"),
     same("EnableAmbience", "1"),
     // Error speech (1815) — the race/sex refusal lines your character says. A real 1.12 CVar
-    // (`CVar::Register` at `0x457877`, registrar default `"1"`; wow-re
-    // `re/cvar/cvar-register-sites.tsv` row 54) and a real 1.12 checkbox: SoundOptionsFrame.lua's
-    // `ENABLE_ERROR_SPEECH`, index 4, which the master enable greys along with Ambience.
+    // (`CVar::Register` at `0x457877`, registrar default `"1"`) and a real 1.12 checkbox:
+    // SoundOptionsFrame.lua's `ENABLE_ERROR_SPEECH`, index 4, which the master enable greys along
+    // with Ambience.
     same("EnableErrorSpeech", "1"),
     // Sound while the window is in the background (1847). **Not a 1.12 CVar and not a 1.12
-    // checkbox**: none of the reference's 214 `CVar::Register` sites names it
-    // (`re/cvar/cvar-register-sites.tsv`), and `SoundOptionsFrame.lua` declares seven checkboxes
+    // checkbox**: none of the reference's 214 `CVar::Register` (`0x63db90`) sites names it, and
+    // `SoundOptionsFrame.lua` declares seven checkboxes
     // (indices 1, 2, 4-8) and four sliders, none of them this. `CVar::Register` is the only
     // creation path, so `Config.wtf` can hold no such key either. The spelling is the later-era
     // engine's — the `autoLootDefault` / `nameplateShowEnemies` posture, where benilla's
@@ -275,10 +279,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // **`same`, not `ours`**, for the nameplate pair's reason: the reference has no CVar to match
     // but it very much has a *behaviour* to match, and it goes quiet in the background —
     // unconditionally, on `WM_ACTIVATE` → event-bus category 2 → `0x7a4860`'s
-    // `FSOUND_SetMute(-3, active ? 0 : 1)`, music included (wow-re
-    // `sound/scratch/focus-mute-law.md`, VERIFIED). "0" IS the reference's own behaviour. The knob
-    // is `SoundConfig::background_sound`, which carries the mechanism and the one disclosed
-    // divergence.
+    // `FSOUND_SetMute(-3, active ? 0 : 1)`, music included. "0" IS the reference's own behaviour.
+    // The knob is `SoundConfig::background_sound`, which carries the mechanism and the one
+    // disclosed divergence.
     same("Sound_EnableSoundWhenGameIsInBG", "0"),
     // Zone reverb (1153). The binary registers this one `"1"` (`0x4573be`) and we register it
     // `"0"` — the only row here that knowingly leaves the registrar's default, because the
@@ -342,8 +345,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("farclip", "350"),
     // **`nearclip` — farclip's other half, and a knob we had been holding as a constant** (2163).
     // `0x68867a` passes name `0x84ffb0` `"nearclip"`, default string `0x84fb48` `"0.1"`, help
-    // "Near clip plane distance", flags `1`, callback `0x688d90`, record `[0xc7f348]` (wow-re
-    // `re/cvar/cvar-register-sites.tsv` row 187).
+    // "Near clip plane distance", flags `1`, callback `0x688d90`, record `[0xc7f348]`.
     //
     // **The reader is the camera, and it re-reads every frame.** `0x511bc0` — the per-frame camera
     // outer, sole caller `0x483094` — stamps `[cam+0x38]` from this record's float before the
@@ -354,11 +356,10 @@ pub(crate) const REGISTERED: &[Registered] = &[
     //
     // **Why it was not registered for so long, and why that reasoning was wrong.** The near plane
     // was a `CAM_NEAR = 1.0/9.0` const documented as the reference's own, on the true finding that
-    // the callback's *derived global* `[0xc7b480]` has one writer and no readers (wow-re
-    // `cvar/scratch/graphics-cost-cvar-census.md` §8 lists `nearclip` among the eleven dead knobs
-    // for exactly that). The camera does not read that global; it reads the record. So the ctor's
+    // the callback's *derived global* `[0xc7b480]` has one writer and no readers. The camera does
+    // not read that global; it reads the record. So the ctor's
     // `0x3de38e39` = 1/9 is overwritten by the first frame's stamp and never reaches a picture —
-    // a verified-but-partial mechanism, which the contract §4 names as the classic trap.
+    // a verified-but-partial mechanism, which docs/METHOD.md §4 names as the classic trap.
     //
     // pfUI's `hdgraphic` writes it (`ConsoleExec("nearClip " .. arg*2/100)`, 0.06..0.30 across its
     // extended stops) — every value inside the reference's own `[0.01, 0.33]`, which is why that
@@ -383,8 +384,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // name and there was nothing for it to toggle (decision 1745).
     //
     // Register site `0x6e731d`, default string `"0"`, record `[0xceac34]`, one reader at
-    // `0x6e53d7` (wow-re `cvar/scratch/registered-defaults-census.md`, 1804's §5 round). **This
-    // row used to cite `0x870dc0` as the record; that is the NAME string** — corrected there.
+    // `0x6e53d7` (1804). **This row used to cite `0x870dc0` as the record; that is the NAME
+    // string**.
     //
     // **benilla ships it ON and the reference registers "0"** — a named deviation that predates
     // this row (`cast_target::AutoSelfCast`): with it off, an unbindable friendly cast falls into
@@ -476,8 +477,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // The overhead-name trio (0992): 1.12's own UnitName* CVars (UIOptionsFrame.lua indices
     // 21/30/67) over the nameplates module's gates. Defaults mirror `NameConfig::default()` and
-    // are the binary's own, byte-read at the `0x6c7470` registrar (wow-re
-    // `object-layer/scratch/overhead-name.md`, name string / default string per row, folded into
+    // are the binary's own, byte-read at the `0x6c7470` registrar (name string / default string
+    // per row, folded into
     // mask `0xce8720`) — `UnitNamePlayer` `0x86c694` → `"1"` `0x82e748`, `UnitNameNPC` `0x86c6a4`
     // and `UnitNameOwn` `0x86c6b0` → `"0"` `0x82e570`. Corroborated the other way by the
     // reference install's own `Config.wtf`, which carries `SET UnitNameNPC "1"` and
@@ -491,13 +492,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // The fourth of the same registrar's five (2149): `UnitNamePlayerGuild` `0x86c680` -> `"1"`
     // `0x82e748`, mask bit `0x10`. It is NOT a show gate like the three above — `ShouldShowName
     // 0x6070a0` consults only bits `0x1/0x2/0x4` — it gates ONE LINE of the player stack, the a5
-    // `"\n<%s>"` guild decoration at `0x609085` (wow-re `object-layer/scratch/overhead-name.md`
-    // Q4 point 3 + the registrar table). Its fifth sibling `UnitNamePlayerPVPTitle` (bit `0x20`,
-    // also `"1"`) has no row: a4's rank prefix needs a faction side `ui_unit` cannot resolve for
-    // an arbitrary player, so there is no reader and 1134 §4 says no key.
+    // `"\n<%s>"` guild decoration at `0x609085`. Its fifth sibling `UnitNamePlayerPVPTitle` (bit
+    // `0x20`, also `"1"`) has no row: a4's rank prefix needs a faction side `ui_unit` cannot
+    // resolve for an arbitrary player, so there is no reader and 1134 §4 says no key.
     same("UnitNamePlayerGuild", "1"),
     // The two V-plate toggles over `VPlateMode` — the engine bitmask `[0xc4da34]`'s bit 0 and
-    // bit 3. 1.12 registers NO nameplate CVar (wow-re, VERIFIED — the bitmask is a plain runtime
+    // bit 3. 1.12 registers NO nameplate CVar (the bitmask is a plain runtime
     // global, persisted FrameXML-side as the `RegisterForSave`'d `NAMEPLATES_ON` /
     // `FRIENDNAMEPLATES_ON`), so these take the LATER-era engine's names: the `autoLootDefault`
     // posture, where benilla's persistence IS the CVar store (0954) and a setting with no 1.12
@@ -530,8 +530,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // reads only `SmallCull`. So its own slider **reads Medium at boot**, which is this row.
     // Mid-1804 this was filed as a deviation against "0" on two true facts that are not the
     // answer: `OptionsFrame.lua:430`'s Defaults ladder yields 0, and `frillDensity` registers 16.
-    // A partly-verified mechanism is not the mechanism (wow-re
-    // `cvar/scratch/registered-defaults-census.md`, the §5 round 1804 dispatched).
+    // A partly-verified mechanism is not the mechanism (1804).
     //
     // What IS still divergent is the grass, and that is a *mapping* difference rather than a
     // default: our stop 1 scatters ×2 (32) where the reference's boot `frillDensity` is 16
@@ -543,8 +542,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("WorldDetail", "1"),
     // The SAME knob in the reference's own unit (2151), and the CVar 1.12 actually registers for
     // it: `0x68862e` passes name `0x8423d8` `"frillDensity"`, default string `0x864644` `"16"`,
-    // help "Terrain frill density", flags `1`, callback `0x688de0`, record `[0xc7f2f4]` (wow-re
-    // `re/cvar/cvar-register-sites.tsv` row 185). The value is **cells visited per chunk**: the
+    // help "Terrain frill density", flags `1`, callback `0x688de0`, record `[0xc7f2f4]`. The value
+    // is **cells visited per chunk**: the
     // callback clamps `[1, 256]` and hands the number to `0x6725a0` → `[0xc7b494]`, which bounds
     // the detail-doodad scatter loop at `0x6bfcfb`/`0x6bff1c`. Our scatter is the byte-exact port
     // of that loop, so `frillDensity` is not a new dial — it is the unit
@@ -582,9 +581,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     //
     // Eight rows, registered by the reference in ONE place — `0x626d00`, a loop over the
     // `{cvarName, defaultValue}` pairs at `0x8629e0` skipping the NULL/empty names, then one
-    // unrolled call for the death range (wow-re `object-layer/scratch/combat-log-chat-law.md`
-    // §5.2). They read as the CVar record's **float** (`+0x24`), unlike the periodic gate below,
-    // which reads the int.
+    // unrolled call for the death range. They read as the CVar record's **float** (`+0x24`), unlike
+    // the periodic gate below, which reads the int.
     //
     // **They are why a damage meter's range slider does something.** `BigWigs/Plugins/Range.lua`
     // and `DPSMate/DPSMate_DataBuilder.lua` both read and write all eight; unregistered, every
@@ -641,9 +639,9 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `assistAttack` (`0x48fc50`, record `[0xb4d8f8]`) — `/assist`'s opt-in second leg: select the
     // basis unit's target AND open the swing on it. Three references image-wide, two of them the
     // shared assist tails; `CanAssist 0x6066f0` is verified NOT on the path. The `"0"` default is
-    // the one wow-re had to correct against itself — its first pass read `"3"` off the *next*
-    // registration's default (`minimapZoom`), the `mov ds:` adjacency trap — so it is worth saying
-    // plainly here: stock `/assist` selects and does not swing.
+    // easy to misread: the *next* registration's default (`minimapZoom`) is `"3"`, and reading it
+    // off instead is the `mov ds:` adjacency trap — so it is worth saying plainly here: stock
+    // `/assist` selects and does not swing.
     same("assistAttack", "0"),
     // ── Mouse-look, per axis: the two CVars whose absence RAISED in the stock window ────────────
     //
@@ -677,26 +675,25 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // **The spelling is FrameXML's, not the binary's**, and that is deliberate: `WoW.exe` holds
     // `mouseSpeed` (capital S, register site `0x402c7b`) while `UIOptionsFrame.lua`'s slider
     // writes `cvar = "mousespeed"`. The reference reconciles them by looking CVars up
-    // case-insensitively (`SStrCmpI`, wow-re `cvar/cvar.md`), and so do we (the registry and
+    // case-insensitively (`SStrCmpI` in `CVar::Lookup 0x63de30`), and so do we (the registry and
     // every observer lowercase first), so both spellings answer. We take the one the interface uses, because
     // that is the one an addon will type.
     //
-    // **The VALUE agrees and the MECHANISM does not** (wow-re
-    // `cvar/scratch/registered-defaults-census.md` §, 1804). The reference's default is not a
+    // **The VALUE agrees and the MECHANISM does not** (1804). The reference's default is not a
     // literal at all: it is `sprintf("%1.1f", SPI_GETMOUSESPEED × 0.1)`, which is `"1.0"` on a
-    // stock Windows host — so "1" is the right number. But its record has **zero readers**: the
-    // slider drives the *operating system's* pointer speed through `SPI_SETMOUSESPEED` (clamped
-    // [0.1, 2.0]), not an in-engine gain. benilla will not reach out and repoint the OS mouse, so
-    // ours is a multiplier over our own per-pixel rate — the same dial, the same range, the same
-    // resting value, a different thing underneath. Recorded here rather than filed as a deviation
-    // because the default is the question this table answers, and the default matches.
+    // stock Windows host — so "1" is the right number. But its record `[0x882704]` has **zero
+    // readers**: the slider drives the *operating system's* pointer speed through
+    // `SPI_SETMOUSESPEED` (callback `0x402ec0`, clamped [0.1, 2.0]), not an in-engine gain.
+    // benilla will not reach out and repoint the OS mouse, so ours is a multiplier over our own
+    // per-pixel rate — the same dial, the same range, the same resting value, a different thing
+    // underneath. Recorded here rather than filed as a deviation because the default is the
+    // question this table answers, and the default matches.
     same("mousespeed", "1"),
     // Max Camera Distance (1140): 1.12's `cameraDistanceMaxFactor` (its MAX_FOLLOW_DIST slider,
     // 1..2 step 0.1) over `cameraDistanceMax`'s 15 yd base. **"1", the reference's registrar
-    // value** (wow-re `ui/scratch/follow-camera.md`: "cameraDistanceMax 15.0,
-    // cameraDistanceMaxFactor 1.0") — so the shipped ceiling is 15 yd, not the 30 this row
-    // registered from 1140 until 1804. `ZoomLimit`'s doc carries why that changed; the slider
-    // still reaches 2.
+    // value** (`cameraDistanceMax` "15.0" `0x84fbd0`, `cameraDistanceMaxFactor` "1.0" `0x82e92c`)
+    // — so the shipped ceiling is 15 yd, not the 30 this row registered from 1140 until 1804.
+    // `ZoomLimit`'s doc carries why that changed; the slider still reaches 2.
     same("cameraDistanceMaxFactor", "1"),
     // Camera Following Style (1493, re-pinned by 1502): 1.12's `cameraSmoothStyle` — the
     // auto-return that swings the camera back behind the character. Registered "1" = Smart, which
@@ -720,12 +717,11 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // **The four 1.12 camera-option toggles** (decision 2149) — the `UIOptionsFrame` checkboxes
     // FOLLOW_TERRAIN / HEAD_BOB / SMART_PIVOT / WATER_COLLISION, all four of which sat on the
     // unbacked-CVar census with a byte-level spec and no feature until now. Defaults are the
-    // registrar's own (`re/cvar/cvar-register-sites.tsv`), and two of them are **"1"** — which is
-    // why building them was not cosmetic: benilla was the divergence on those, not the reference.
+    // registrar's own, and two of them are **"1"** — which is why building them was not cosmetic:
+    // benilla was the divergence on those, not the reference.
     //
-    // `cameraPivot` `[0xbe10a4]` "1" (`0x50bda3`) — smart pivot. Mechanism: wow-re
-    // `ui/scratch/camera-cvar-gates.md` §3 (gate `0x510690`, routing `0x50fee0`, release
-    // `0x5107f0`); ours is `player::camera_dynamics::SmartPivot`.
+    // `cameraPivot` `[0xbe10a4]` "1" (`0x50bda3`) — smart pivot. Mechanism: gate `0x510690`,
+    // routing `0x50fee0`, release `0x5107f0`; ours is `player::camera_dynamics::SmartPivot`.
     same("cameraPivot", "1"),
     // Its two drag-shape thresholds, both read by that routing (`0x50fff5`/`0x510004`) and both
     // in RADIANS of camera rotation — the deltas they are compared against are already scaled by
@@ -752,8 +748,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("cameraWaterCollision", "1"),
     // `cameraTerrainTilt` `[0xbe0fd4]` **"0"** (`0x50bcfd`) — Follow Terrain, and the one of the
     // four that ships OFF, so building it changed nothing until a player ticks the box. Mechanism:
-    // wow-re `camera-cvar-kernels.md` §2 (the ahead-probe and the five-step staircase) and
-    // `camera-smooth-style.md` §9 (the arm); ours is `player::camera_dynamics::TerrainTilt`.
+    // the ahead-probe and the five-step staircase (`0x50d900`) and the arm (`0x50dbc0`); ours is
+    // `player::camera_dynamics::TerrainTilt`.
     same("cameraTerrainTilt", "0"),
     // The ground channel's rate, deg/s (`[0xbe0fc0]`) and the duration bound its `Factor` scales
     // (`[0xbe1050]`/`[0xbe1054]`, seconds). The floor always binds — `20° / 7.5°/s` is 2.67 s
@@ -762,8 +758,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("cameraTerrainTiltTimeMin", "3"),
     same("cameraTerrainTiltTimeMax", "10"),
     // `cameraBobbing` `[0xbe10c0]` **"0"** (`0x50b76d`) — head bob, the fourth of the four and the
-    // second that ships OFF. Mechanism: wow-re `camera-cvar-kernels.md` §4 and
-    // `camera-cvar-gates.md` §2; ours is `player::camera_dynamics::HeadBob`.
+    // second that ships OFF. Mechanism: the kernel `0x511920` and its gate `0x5105e0`; ours is
+    // `player::camera_dynamics::HeadBob`.
     same("cameraBobbing", "0"),
     // Its four numeric siblings. The two amplitudes are in the CVar's own units — the kernel
     // scales both by 1/36 (`[0x7ff9d0]`) to reach yards. `cameraBobbingSmoothSpeed` is the odd one
@@ -781,9 +777,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     //
     // **Byte-read since 1804** — register site `0x48fc34`, default string `"0"`, record
     // `[0xb4d904]`, and a whole-image census finds that record has **no engine reader at all**:
-    // this CVar is FrameXML's alone, which is exactly the shape this row was built for (wow-re
-    // `cvar/scratch/registered-defaults-census.md`). It used to concede "behaviour-derived, not
-    // byte-read"; that hedge is retired.
+    // this CVar is FrameXML's alone, which is exactly the shape this row was built for. It used to
+    // concede "behaviour-derived, not byte-read"; that hedge is retired.
     same("statusBarText", "0"),
     // Enhanced Tooltips (B230): 1.12's `UberTooltips`, the *Enhanced Tooltips* checkbox
     // (`UIOptionsFrame.lua:15`, `USE_UBERTOOLTIPS`). **No host knob** — its consumers are Lua, and
@@ -797,13 +792,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("UberTooltips", "1"),
     // The two chat-bubble switches (1139): 1.12's own registrar CVars over the bubble gate,
     // which held them as `const bool` from 0598 until this window had a page for them. Both are
-    // the binary's own (registrar `0x603280` — wow-re `object-layer/scratch/chat-bubble.md`:
+    // the binary's own (registrar `0x603280`:
     // `ChatBubbles` "1", `ChatBubblesParty` "0"); the party half shipped ON from 0598 to 1804 on
     // the director's `/p` ask, and is a click away on the Chat page.
     same("ChatBubbles", "1"),
     same("ChatBubblesParty", "0"),
     // **The two text filters** (2077) — 1.12's own pair, and both are real features rather than
-    // vestigial switches, which is what the wow-re §5 round behind `text-filter-law.md` settled.
+    // vestigial switches.
     // Registered `"1"` each, byte-read: `0x402e68` (`profanityFilter`, name `0x82e7f4`, callback
     // `0x403570`) and `0x402e8e` (`spamFilter`, name `0x82e7d4`, callback `0x4035b0`), both pushing
     // the shared `"1"` literal `0x82e748`, both category 4.
@@ -818,8 +813,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("spamFilter", "1"),
     // **The loading-screen tip of the day** (2077) — 1.12's own pair, both registered lazily by
     // `CGlueMgr::EnterWorld` on its way to the config flush (`0x46b633` `gameTip` `"0"`,
-    // `0x46b658` `showGameTips` `"1"`, both category 5, neither with a callback or a help string;
-    // wow-re `system/loadingscreen/scratch/game-tip-of-the-day.md`).
+    // `0x46b658` `showGameTips` `"1"`, both category 5, neither with a callback or a help string).
     //
     // `gameTip` is not a preference — it is the **cursor**, and it holds the NEXT row rather than
     // the one on screen, which is why the reference's own `Config.wtf` reads `SET gameTip "34"`
@@ -830,8 +824,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     same("showGameTips", "1"),
     // *Detailed Loot Information* (1589, the Chat page) — 1.12's `showLootSpam`, whose subject is
     // group LOOT ROLLS (its own tooltip: "Uncheck this to hide individual loot roll messages and
-    // only show the winner"). Registered `"1"`, **byte-read**: wow-re's census of `0xb4e2bc`
-    // (`lootroll-chat-and-lifecycle.md` §4) has the register site at `0x48fd1c`, name `0x8430a0`,
+    // only show the winner"). Registered `"1"`, **byte-read**: a census of `0xb4e2bc` has the
+    // register site at `0x48fd1c`, name `0x8430a0`,
     // default string `0x82e748` = "1", **category** 5 — and exactly four references to the global,
     // one writer and three readers, all in the roll-line composers. The knob is
     // [`crate::ui_loot::LootConfig::show_loot_spam`], welded to that default below.
@@ -840,23 +834,23 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // help string says what it does: "Receive notification when guild members log on/off".
     //
     // Registered **`"0"`** — this is one of the few rows that ships a feature OFF, and it is
-    // byte-read rather than chosen: the register site `0x5e24c7` pushes default `0x82e570` = "0"
-    // (§5, wow-re `system/object-layer/scratch/guild-signon-cvar-gate.md`). A stock 1.12 client is
+    // byte-read rather than chosen: the register site `0x5e24c7` pushes default `0x82e570` = "0".
+    // A stock 1.12 client is
     // silent when a guildmate logs in, and a whole-image census of the record global `0xc4d3c4`
     // finds exactly two readers, both inside `SMSG_GUILD_EVENT`'s handler. The knob is
     // [`crate::ui_guild::GuildMemberNotify`]; the other three conjuncts of the line's display
-    // condition live on `ui_guild::apply::event`.
+    // condition live on `ui_guild::net::event`.
     same("guildMemberNotify", "0"),
-    // The minimap's two zoom indices (1131). Byte-verified 1.12 CVars, both registered `"3"`
-    // (wow-re, at the `RegisterCVar 0x63db90` argument slot). No options row drives these — the
+    // The minimap's two zoom indices (1131). 1.12 CVars, both registered `"3"` (`0x48fc6c`,
+    // `0x48fc88`, at the `RegisterCVar 0x63db90` argument slot). No options row drives these — the
     // +/- buttons on the minimap do, through `Minimap:SetZoom`, exactly as in the reference, where
     // `set_zoom` writes the live index and `CVar::Set`s the CVar in one breath. The knob is
     // [`crate::minimap::MinimapZoom`], the widget's live index is seeded from it at UI load.
     same("minimapZoom", "3"),
     same("minimapInsideZoom", "3"),
     // The addon version gate (decision 1292): 1.12's own `checkAddonVersion`, the *Load out of
-    // date AddOns* checkbox INVERTED. Registrar default "1" = check enforced = box unticked —
-    // byte-verified (wow-re `addon-version-gate.md` §1.1: the key appears in Config.wtf exactly
+    // date AddOns* checkbox INVERTED. Registrar default "1" = check enforced = box unticked
+    // (`0x402c3b`; the key appears in Config.wtf exactly
     // while force-load is on and vanishes when it is turned off, `SaveConfig 0x63d980`'s
     // skip-default rule). No host knob: its consumers are the load walk (via the persisted value,
     // [`Cvars::addon_version_check`]) and the gate's live per-query read in the VM.
@@ -867,8 +861,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // real selector — `0x63a3c4` compares the live value case-insensitively against `"OpenGl"`
     // (`0x842a5c`) and `GxDevCreate` builds `CGxDeviceD3d` on anything else — but no shipped
     // `WTF` overrides it, so the stock client is always D3D9 and the whole GL arm is dead code
-    // image-wide (wow-re states this from a dozen nodes; `models/scratch/part-additive-combine.md`
-    // §"the gxApi selector" is the decoded compare).
+    // image-wide.
     //
     // **Here it DESCRIBES, it does not steer** — the `gxColorBits`/`gxDepthBits` posture. benilla
     // renders through wgpu, which has no D3D9 backend to name and no chooser to offer: the backend
@@ -900,14 +893,44 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // FrameXML). The knob is [`crate::video::VideoConfig::vsync`], which the window's
     // `present_mode` follows.
     //
-    // Default "1" is BEHAVIOUR-derived, not byte-read: 1.12's registrar value for this var is not
-    // pinned in wow-re, and "1" is what benilla actually ships — the primary window is born at
+    // Default "1" is BEHAVIOUR-derived, not byte-read: 1.12's registrar value for this var is
+    // unconfirmed, and "1" is what benilla actually ships — the primary window is born at
     // `PresentMode::default()` (Fifo), and a test in `video.rs` welds the two together.
     //
     // Two knowing departures from the reference row, both stated on [`crate::video`]: its
     // `gxRestart = 1` does not apply (wgpu swaps the presentation interval live, so the box takes
     // effect on click), and `$WOW_NOVSYNC=1` overrides it session-only, below.
     same("gxVSync", "1").latched(),
+    // MONKEY (advanced graphics): the one row on the Advanced Graphics page that is not a knob —
+    // it is a NAME for a combination of the rows under it ([`LIGHTING_PRESETS`]). Writing a preset
+    // name writes that preset's members; writing anything else is corrected on the next frame by
+    // [`lighting_quality`], which re-DERIVES the name from the members those rows actually hold.
+    // So the stored value is never stale: it is either a preset every member agrees with, or
+    // `Custom`.
+    //
+    // A STRING row, not an int, so `config.toml` and `/console set lightingQuality Medium` both
+    // read as what they mean — and so the ladder can gain a rung without renumbering a player's
+    // saved value. `Row::numeric` is false for it (the default does not parse as a number), which
+    // is what lets the registry accept a non-numeric write at all; `realmList` is the precedent.
+    ours(
+        "lightingQuality",
+        "High",
+        "benilla's own: the preset ladder over the dynamic light + shadow rows — Off / Low / \
+         Medium / High, or Custom when the members match none of them; the reference has no \
+         realtime light or shadow system to preset",
+    ),
+    // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
+    ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    ours(
+        "waterQuality",
+        "1",
+        "benilla's own: water quality, 0 Classic / 1 Enhanced / 2 High; mirror reflections are opt-in",
+    ),
+    ours(
+        "lavaLightGain",
+        "1",
+        "benilla's own: brightness of lava lighting its surroundings, 0..4 (0 = no glow)",
+    ),
     // Benilla's opt-in realtime shadow-map path, split into two INDEPENDENT lanes over one shared
     // shadow rig (one sun / one map). `worldShadows` = the static world (trees, buildings, foliage)
     // casts realtime shadows and baked MCSH terrain shadows switch off; `characterShadows` =
@@ -967,6 +990,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "shadowCasterReach",
         "1",
         "benilla's own: multiplier on the shadow caster-collection reach, 0.25..2 (1 = unchanged)",
+    ),
+    // MONKEY (moon shadows): how dark a MOON-shadowed fragment is allowed to get at night — the
+    // dial over the night lane's own shadow term (`benilla_world::lighting::MoonShadowStrength`,
+    // bridged by `dynamic_interior` beside the spell gain). `0` is the FAITHFUL null: every
+    // consumer guards on it, so a night at 0 renders as the build before the feature did — which
+    // is also what the Off and Low presets ask for.
+    ours(
+        "moonShadowStrength",
+        "0.35",
+        "benilla's own: how dark a moon-shadowed fragment gets at night, 0..1 (0 = no moon \
+         shadow, the reference's own night)",
     ),
     // MONKEY (dynamic interiors): WMO interiors + their props light from the room's LIVE fixtures
     // instead of the MOCV bake / the baked prop probe (`static_gx.wgsl` `interior_room_light`;
@@ -1087,8 +1121,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // `build_light_data`, so `SetCVar` moves the whole world on the very next frame — which is how
     // "20 % / 30 % darker" gets judged at all, and `1` on either is the restore.
     //
-    // Neither touches the fires: a point light keeps its brightness under both dials, because the
-    // ask is for a darker night AROUND the flame, not a dimmer flame.
+    // Night gain leaves fire lights alone; interior gain also scales interior fixtures,
+    // including their candlelight. Outdoor fires retain their brightness under both dials.
     ours(
         "nightGain",
         "0.45",
@@ -1169,9 +1203,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // Departs from the reference row's `gxRestart = 1` exactly like `gxVSync` above: ours applies
     // on the click.
     // Byte-read `"0"` at register site `0x63a889` — **for enUS**. Three defaults in this binary
-    // are locale-conditional and this is one: `gxWindow` and `gxMaximize` register `"1"` on zhCN,
-    // `AutoInteract` `"1"` on koKR (wow-re `cvar/scratch/registered-defaults-census.md`, which
-    // caught its own instrument publishing a single arm mid-round). benilla is enUS-only, so `"0"`
+    // are locale-conditional and this is one: `gxWindow` and `gxMaximize` (`0x63a8e0`) register
+    // `"1"` on zhCN, `AutoInteract` (`0x603390`) `"1"` on koKR. benilla is enUS-only, so `"0"`
     // is the answer here; the note exists so the next reader does not take a locale-conditional
     // default for an unconditional one.
     same("gxWindow", "0").latched(),
@@ -1229,8 +1262,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // 193-row table that field only ever holds 1 (144 rows) or 2 (49 rows), and the three rows the
     // fallback match can reach all hold 1 — so on any GPU the 2004-era table does not list, which
     // is every machine this client runs on now, the registered string is "1". A 1 is genuinely no
-    // multisampling on both of its backends, not a one-sample mode. (wow-re §5 cross-check,
-    // 2026-08-26, `system/console/scratch/gxmultisample-default.md`; decision 1629.)
+    // multisampling on both of its backends, not a one-sample mode. (Decision 1629.)
     //
     // Latched means a change is PENDING until the next launch — the reference's own callback
     // echoes "set pending gxRestart" — so this row persists and `GetCVar` answers it, while the
@@ -1306,8 +1338,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // channels, or the storm/fog blend, so no server-visible behaviour rides it.
     //
     // The reference registers **`"2"`** at `0x67b806` (flags 0, callback `0x67b870`, name string
-    // `0x8685ac`) — wow-re `cvar/scratch/graphics-cost-cvar-census.md` §4, whose §10 table also
-    // lists this row among the twelve the reference install's `Config.wtf` moves off its default.
+    // `0x8685ac`), and this row is among the twelve the reference install's `Config.wtf` moves off
+    // its default.
     deviates(
         "weatherDensity",
         "3",
@@ -1328,15 +1360,15 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // (`byte[dev+0x20b]` = `CGxFormat +0x07` = `gxWindow`), which is every mode benilla has. So the
     // reader here is not a ramp upload: it is [`crate::ui_gamma::DisplayGamma`], the same curve
     // applied to the same values one stage later, inside the pass that already owns the composited
-    // image's single decode. wow-re `ffxeffects/scratch/whole-frame-grade-verdict.md` §(a) for the
-    // curve and `ui/scratch/video-options-verbs.md` §3 for the verbs.
+    // image's single decode.
     //
     // 1.0 is the identity ramp — load-bearing rather than tidy: at the default this client's
     // output is what it was before the setting existed, so no visual golden moves.
     //
     // **Written `"1.000000"` rather than `"1.0"` or `"1"`, and that is not cosmetic.** Every value
-    // this key ever receives comes through `SetGamma`, whose `SStrPrintf(buf, 0x10, "%f", …)` is
-    // six decimals — so the row that Restore Defaults produces is `"1.000000"`, and a default
+    // this key ever receives comes through `SetGamma 0x4891f0`, whose
+    // `SStrPrintf(buf, 0x10, "%f", …)` is six decimals — so the row that Restore Defaults produces
+    // is `"1.000000"`, and a default
     // string in any other spelling would make it compare *moved* and write a `config.toml` line
     // holding the default value. The slider rows dodge this with their own trailing-zero strip
     // (`OptionsSlider_OnValueChanged`); a row whose store is an engine verb cannot, because the
@@ -1647,12 +1679,22 @@ impl Cvars {
     /// the minimap zoom, the camera views, the remembered character, the loading screen's tip
     /// cursor. Mirrored into the VM, persisted, and observed like any other write.
     pub(crate) fn set(&mut self, name: &str, value: &str) -> SetOutcome {
-        self.write(name, value, false)
+        let outcome = self.write(name, value, false);
+        if name.eq_ignore_ascii_case("lightingQuality") {
+            apply_lighting_preset(self, value);
+        }
+        outcome
     }
 
     /// A write the VM's mirror already made — drained from its change queue.
     pub(crate) fn set_from_vm(&mut self, name: &str, value: &str) -> SetOutcome {
-        self.write(name, value, true)
+        let outcome = self.write(name, value, true);
+        // Apply at the write's position in the queue: a later member edit must win,
+        // including a re-selection of the currently displayed preset.
+        if name.eq_ignore_ascii_case("lightingQuality") {
+            apply_lighting_preset(self, value);
+        }
+        outcome
     }
 
     /// **The table follows a value the engine already applied** — a mirror, not a write: the
@@ -1677,14 +1719,26 @@ impl Cvars {
         true
     }
 
-    /// **The latch boundary** — the reference's `CVar::Update 0x63e060`: every staged value
-    /// becomes the applied one, fires, persists, and reaches the mirror. Returns how many moved.
-    /// Called for the `gx*` rows from `RestartGx` ([`crate::video`]); a row nothing ever commits
-    /// (`SoundBufferSize`, `gxApi`) holds its stage until exit, and loses it there, as the
-    /// reference does.
+    /// **The latch boundary `RestartGx` crosses** — the reference's `0x639ec0`, fourteen
+    /// `CVar::Commit 0x63e060` calls on fourteen gx records (`[0xc4ea90]` … `[0xc4eab4]`,
+    /// `0x639ec0..0x639f5a`): each of THOSE staged values becomes the applied one, fires,
+    /// persists, and reaches the mirror. Returns how many moved.
+    ///
+    /// **Only the `gx*` rows.** A latched row outside the video set is not on that list and
+    /// nothing else commits it: `SoundBufferSize`'s register site (`0x4571ca`) discards the
+    /// record pointer `0x63db90` returns, so no global holds it for any commit to name. It
+    /// holds its stage until exit and loses it there, as the reference's does. Until 2343 this
+    /// walked every row, and a console `SoundBufferSize` rode the next video Okay into the file.
+    ///
+    /// The reference runs a gx CVar's change callback at `SetCVar` time (`0x63df50`), and the
+    /// commit fires nothing; our observers fire here instead. Nothing reads the difference
+    /// today — the appliers are the device rebuild's, and that runs after this boundary.
     pub(crate) fn commit_latched(&mut self) -> usize {
         let mut moved = 0;
         for row in &mut self.rows {
+            if !row.name.starts_with("gx") {
+                continue;
+            }
             let Some(staged) = row.pending.take() else {
                 continue;
             };
@@ -1917,6 +1971,182 @@ impl Plugin for CvarPlugin {
     }
 }
 
+// ─── MONKEY (advanced graphics): the lighting preset ladder ──────────────────────────────────
+
+/// **The one place the presets are written down** — the Advanced Graphics page's `lightingQuality`
+/// ladder, as (name, members) pairs in the order [`derive_lighting_quality`] tries them.
+///
+/// A preset is a NAME FOR A SET OF ROWS, not a knob: applying one writes each member through the
+/// ordinary registry path ([`Cvars::set`]), so every observer, clamp, bridge and save that a
+/// hand-typed `/console set` would run, runs. That is why this table lives beside the registry
+/// rather than in the options window's Lua: the page is one of four ways to reach it (the others
+/// being `/console`, the lighting debug panel, and a hand-edited `config.toml`), and a table
+/// carried by the window would be a table three of them cannot see.
+///
+/// **A preset names only the members it decides.** `Off` says nothing about `shadowMapSize` — with
+/// both shadow lanes off there is no map to size — and Low says nothing about the torch counts,
+/// which its `interiorShadows 0` has already made inert. Derivation matches on exactly the members
+/// a preset lists, so a row nobody's preset mentions never pushes the ladder to `Custom`.
+///
+/// Order matters twice: the ladder reads Off → High for a human, and the first preset whose whole
+/// member list matches wins. The four are mutually exclusive on `characterShadows` /
+/// `worldShadows` / `exteriorShadows`, so no value can answer to two of them — a property
+/// `every_preset_derives_back_to_its_own_name` holds rather than a reader has to check.
+pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
+    // Everything this whole system invented, off — the client as it rendered before any of it
+    // existed. Not "cheap": OFF, so a machine that cannot afford the lanes can say so in one
+    // click, and so a bug report can be split from a taste report in one click too.
+    (
+        "Off",
+        &[
+            ("characterShadows", "0"),
+            ("worldShadows", "0"),
+            ("interiorLight", "0"),
+            ("interiorShadows", "0"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "0"),
+            ("waterQuality", "0"),
+            // MONKEY (volumetric fog): Off preset restores the original atmosphere.
+            ("volumetricFog", "0"),
+            ("lavaLightGain", "0"),
+            ("fireLightGain", "0"),
+            ("nightGain", "1.0"),
+            ("interiorGain", "1.0"),
+            ("moonShadowStrength", "0"),
+            ("fireFlicker", "0"),
+        ],
+    ),
+    // Character silhouettes and lit rooms, and nothing that costs a second shadow pass: no world
+    // lane, no torch maps indoors or out, no moon term, and the smallest sun map on the ladder.
+    (
+        "Low",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "0"),
+            ("shadowMapSize", "1024"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "0"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "1"),
+            ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
+            ("lavaLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+    // Both sun lanes, indoor torch shadows at half the residency, and the moon term — but no
+    // OUTDOOR torch shadows, which are the one lane whose cost is paid in the open world where the
+    // sun lanes are already paying.
+    (
+        "Medium",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "1"),
+            ("shadowMapSize", "2048"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "1"),
+            ("interiorShadowCasters", "6"),
+            ("interiorShadowDynamic", "2"),
+            ("exteriorShadows", "0"),
+            ("spellLightGain", "1"),
+            ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
+            ("lavaLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0.35"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+    // **High IS the shipped default**, member for member — which is a property, not a coincidence:
+    // `the_high_preset_is_the_registered_defaults` welds the two, so a fresh `benilla-config`
+    // reads "High" on this row rather than "Custom".
+    (
+        "High",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "1"),
+            ("shadowMapSize", "2048"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "1"),
+            ("interiorShadowCasters", "12"),
+            ("interiorShadowDynamic", "4"),
+            ("exteriorShadows", "1"),
+            ("spellLightGain", "1"),
+            // Mirror reflections stay opt-in until their cost is measured.
+            ("waterQuality", "1"),
+            // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
+            ("volumetricFog", "1"),
+            ("lavaLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0.35"),
+            ("fireFlicker", "1"),
+        ],
+    ),
+];
+
+/// What the ladder shows when the members match no preset. Not a preset: selecting it writes
+/// nothing, and the next derivation puts back whatever the members really say.
+pub(crate) const LIGHTING_CUSTOM: &str = "Custom";
+
+/// Two registry values are the SAME setting when they are the same number — `"0"`, `"0.00"` and
+/// `"0.0"` all mean a lane that is off, and a preset whose member reads `"1"` must not be called
+/// `Custom` because a slider wrote `"1.00"`. Falls back to a case-insensitive string compare for
+/// the rows that hold words.
+fn same_value(a: &str, b: &str) -> bool {
+    match (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() < 1e-4,
+        _ => a.eq_ignore_ascii_case(b),
+    }
+}
+
+/// **The name the members currently spell** — the first preset every one of whose members matches
+/// the live registry, or [`LIGHTING_CUSTOM`]. This is the only thing `lightingQuality` is ever
+/// allowed to say, which is what keeps the row from going stale behind a `/console` write.
+pub(crate) fn derive_lighting_quality(cvars: &Cvars) -> &'static str {
+    for (name, members) in LIGHTING_PRESETS {
+        let matched = members
+            .iter()
+            .all(|(k, v)| cvars.get(k).is_some_and(|live| same_value(live, v)));
+        if matched {
+            return name;
+        }
+    }
+    LIGHTING_CUSTOM
+}
+
+/// Write one preset's members. Ordinary registry writes: observers, clamps and the save all run.
+/// Unknown names (including `Custom`) write nothing and say so by answering `false`.
+pub(crate) fn apply_lighting_preset(cvars: &mut Cvars, name: &str) -> bool {
+    let Some((_, members)) = LIGHTING_PRESETS
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    else {
+        return false;
+    };
+    for (k, v) in *members {
+        cvars.set(k, v);
+    }
+    true
+}
+
+/// Derive after all ordered writes, before the mirror/observer flush. File loading bypasses
+/// `set`, so saved members remain authoritative even when the saved preset name disagrees.
+fn lighting_quality(cvars: &mut Cvars) {
+    let derived = derive_lighting_quality(cvars);
+    // A derived label is a mirror, never another request to apply a preset.
+    cvars.mirror("lightingQuality", derived);
+}
+
 /// **What the environment took for this session, and what it set it to** — read off the knobs
 /// the env levers already seeded (`RenderScale::default()` reads `$WOW_RENDER_SCALE`, and so
 /// on), so the registry answers `GetCVar` with the value the client is actually running at.
@@ -2119,6 +2349,7 @@ pub(crate) fn sync_cvars(
         }
     }
     let Some(mut script) = script else {
+        lighting_quality(&mut cvars);
         // Nothing to mirror into; a later VM is seeded from the table, which carries it all.
         if cvars.has_outbox() {
             cvars.take_outbox();
@@ -2146,6 +2377,7 @@ pub(crate) fn sync_cvars(
             cvars.set_from_vm(&name, &value);
         }
     }
+    lighting_quality(&mut cvars);
     if seeded.claim(&script) {
         // The file's unclaimed entries go in FIRST (decision 1291): an addon's `RegisterCVar`
         // later starts its key at the saved value. Then the table itself, at its live values.
@@ -2208,8 +2440,12 @@ pub(crate) fn sync_cvars(
         });
     }
     if cvars.has_outbox() {
-        for (name, value) in cvars.take_outbox() {
-            script.set_cvar_host(&name, &value);
+        for (name, _) in cvars.take_outbox() {
+            // A preset may have queued this before a newer VM member edit. Publish
+            // the final registry value, never that older queued snapshot.
+            if let Some(value) = cvars.get(&name) {
+                script.set_cvar_host(&name, value);
+            }
         }
     }
     if cvars.has_events() {
@@ -2249,6 +2485,7 @@ pub(crate) fn fold_dying_vm_cvars(world: &mut World) {
         for (name, value) in changes {
             cvars.set_from_vm(&name, &value);
         }
+        lighting_quality(&mut cvars);
         if cvars.has_outbox() {
             cvars.take_outbox(); // the VM this was for is going away
         }
@@ -2539,7 +2776,7 @@ mod tests {
             d["showLootSpam"] != 0.0,
             LootConfig::default().show_loot_spam
         );
-        // …and the one row that ships a feature OFF, byte-read at `0x5e24c7` (§5).
+        // …and the one row that ships a feature OFF, byte-read at `0x5e24c7`.
         assert_eq!(
             d["guildMemberNotify"] != 0.0,
             crate::ui_guild::GuildMemberNotify::default().0
@@ -2651,7 +2888,7 @@ mod tests {
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
         // ── MONKEY (lighting): the weld for the dynamic light + shadow system's whole row set ──
         //
-        // **All 29, as one census, with the count asserted.** Every one of them lands on
+        // **All 32, as one census, with the count asserted.** Every one of them lands on
         // `VideoConfig` and is read from there per frame (`shadow_core::update_shadows`,
         // `dynamic_interior::bridge`, `torch_shadow`), so a registered default that drifts from
         // the struct's literal is a setting that reads one way in `config.toml` and renders
@@ -2660,7 +2897,12 @@ mod tests {
         // a row, forgot its weld" fail HERE: the length check below is the gate.
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
-        let lighting: [(&str, f32); 29] = [
+        // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
+        let lighting: [(&str, f32); 33] = [
+            ("waterQuality", shadows.water_quality as f32),
+            // MONKEY (volumetric fog): weld registry and renderer defaults.
+            ("volumetricFog", shadows.volumetric_fog as f32),
+            ("lavaLightGain", shadows.lava_light_gain),
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
             ("characterShadows", flag(shadows.character_shadows)),
@@ -2671,6 +2913,8 @@ mod tests {
             ("characterShadowRate", shadows.character_shadow_rate as f32),
             ("worldShadowRate", shadows.world_shadow_rate as f32),
             ("shadowCasterReach", shadows.shadow_caster_reach),
+            // MONKEY (moon shadows): the night lane's own shadow darkness.
+            ("moonShadowStrength", shadows.moon_shadow_strength),
             // MONKEY (dynamic interiors): the room lane's switch and its light law.
             ("interiorLight", flag(shadows.interior_light)),
             ("interiorAmbient", shadows.interior_ambient),
@@ -2710,9 +2954,10 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 29 rows, 29 welds.
+        // row the client does not have; the length is the other half — 33 rows, 33 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
-        assert_eq!(welded.len(), 29, "the lighting lane welds 29 distinct rows");
+        // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
+        assert_eq!(welded.len(), 33, "the lighting lane welds 33 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2727,6 +2972,12 @@ mod tests {
         // candle-lit surfaces moving under +10 % — only true at this number.
         assert_eq!(d["interiorBakeFloor"], 0.12);
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
+        assert_eq!(d["waterQuality"], 1.0, "mirror reflections stay opt-in");
+        assert_eq!(d["lavaLightGain"], 1.0);
+        // The 33rd lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
+        // only one with no `VideoConfig` knob to weld to, because it is a NAME for the rows above
+        // rather than a knob of its own. Its own weld is `the_high_preset_is_the_registered_
+        // defaults` — a fresh config must read "High", not "Custom".
         // ── end MONKEY (lighting) ─────────────────────────────────────────────────────────────
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);
@@ -2734,6 +2985,228 @@ mod tests {
         // goldens is denominated in a 1:1 backdrop, so a registered value other than 1 would
         // silently re-render every one of them through a resample.
         assert_eq!(d["renderScale"], 1.0);
+    }
+
+    // ── MONKEY (advanced graphics): the preset ladder ─────────────────────────────────────────
+
+    /// A registry holding nothing but the registered defaults — the state a fresh
+    /// `benilla-config` boots into, which is what every claim below is measured against.
+    fn fresh_registry() -> Cvars {
+        Cvars::default()
+    }
+
+    /// **The round trip, for every rung**: apply a preset, derive, and get that preset's own name
+    /// back. This is the property the whole ladder rests on — without it the dropdown would show
+    /// `Custom` the instant after the player picked something, which is the exact failure the
+    /// "derived, never stored stale" rule exists to prevent.
+    #[test]
+    fn every_preset_derives_back_to_its_own_name() {
+        for (from, _) in LIGHTING_PRESETS {
+            for (name, _) in LIGHTING_PRESETS {
+                let mut cvars = fresh_registry();
+                apply_lighting_preset(&mut cvars, from);
+                cvars.set("shadowDistance", "120");
+                cvars.set("interiorShadowSoft", "2.5");
+                assert!(apply_lighting_preset(&mut cvars, name), "{name}: applied");
+                assert_eq!(derive_lighting_quality(&cvars), *name, "{from} -> {name}");
+                assert_eq!(cvars.get("shadowDistance"), Some("120"));
+                assert_eq!(cvars.get("interiorShadowSoft"), Some("2.5"));
+                // MONKEY (volumetric fog): Off must remove atmosphere as well as enhanced water.
+                for member in ["fireLightGain", "waterQuality", "volumetricFog", "lavaLightGain", "nightGain", "interiorGain"] {
+                    let expected = if *name == "Off" {
+                        if matches!(member, "fireLightGain" | "waterQuality" | "volumetricFog" | "lavaLightGain") { "0" } else { "1.0" }
+                    } else {
+                        cvars.default_of(member).unwrap()
+                    };
+                    assert!(same_value(cvars.get(member).unwrap(), expected), "{name}/{member}");
+                }
+            }
+        }
+    }
+
+    /// **High is the shipped default, member for member.** A fresh config must read "High" on this
+    /// row rather than "Custom" — otherwise the very first thing a player sees on the page is a
+    /// word that says their settings are a hand-made combination when they have touched nothing.
+    #[test]
+    fn the_high_preset_is_the_registered_defaults() {
+        let cvars = fresh_registry();
+        assert_eq!(derive_lighting_quality(&cvars), "High");
+        assert_eq!(
+            cvars.get("lightingQuality"),
+            Some("High"),
+            "the registered default agrees with what a fresh registry derives"
+        );
+        // …and the table is not merely CONSISTENT with the defaults, it IS them: a member whose
+        // registered default moved without its preset entry moving would still derive "High"
+        // above (both sides move together), so the weld is checked against the row's own default.
+        let (_, members) = LIGHTING_PRESETS
+            .iter()
+            .find(|(n, _)| *n == "High")
+            .expect("the High rung");
+        for (k, v) in *members {
+            assert!(
+                same_value(cvars.default_of(k).expect("a registered member"), v),
+                "{k}: the High preset says {v}, the registry's default says {:?}",
+                cvars.default_of(k)
+            );
+        }
+    }
+
+    /// **One member off the rung is `Custom`** — for every rung, and for every member of it, which
+    /// is the half that keeps the derivation from being a lucky match on a favourite row.
+    #[test]
+    fn one_changed_member_derives_custom() {
+        for (name, members) in LIGHTING_PRESETS {
+            for (k, v) in *members {
+                let mut cvars = fresh_registry();
+                apply_lighting_preset(&mut cvars, name);
+                // Somewhere else on the row's own scale: the flags flip, the numbers move by one.
+                let moved = match v.trim().parse::<f32>() {
+                    Ok(x) if x == 0.0 => "1".to_string(),
+                    Ok(x) if x == 1.0 => "0".to_string(),
+                    Ok(x) => (x + 1.0).to_string(),
+                    Err(_) => format!("{v}x"),
+                };
+                assert_eq!(cvars.set(k, &moved), SetOutcome::Changed, "{name}/{k}");
+                assert_eq!(
+                    derive_lighting_quality(&cvars),
+                    LIGHTING_CUSTOM,
+                    "{name}: {k} moved to {moved} and the ladder still says {name}"
+                );
+            }
+        }
+    }
+
+    /// A value that says the same NUMBER is the same setting: the options window's sliders write
+    /// `"1"`, a hand-edited config may say `"1.0"`, and `%.2f` formatting elsewhere says `"1.00"`.
+    /// A ladder that compared strings would call every one of those `Custom`.
+    #[test]
+    fn the_ladder_compares_numbers_not_spellings() {
+        let mut cvars = fresh_registry();
+        apply_lighting_preset(&mut cvars, "High");
+        for spelling in ["1.0", "1.00", "1"] {
+            cvars.set("spellLightGain", spelling);
+            assert_eq!(derive_lighting_quality(&cvars), "High", "{spelling}");
+        }
+        cvars.set("moonShadowStrength", "0.350");
+        assert_eq!(derive_lighting_quality(&cvars), "High");
+    }
+
+    /// `Custom` is not a rung: picking it writes nothing, so the members — and therefore the name
+    /// the next derivation lands on — are exactly where they were.
+    #[test]
+    fn picking_custom_writes_nothing() {
+        let mut cvars = fresh_registry();
+        apply_lighting_preset(&mut cvars, "Medium");
+        assert!(!apply_lighting_preset(&mut cvars, LIGHTING_CUSTOM));
+        assert!(!apply_lighting_preset(&mut cvars, "Ultra"));
+        assert_eq!(derive_lighting_quality(&cvars), "Medium");
+    }
+
+    /// Every member every rung names is a REGISTERED row — a typo'd member would otherwise make
+    /// its whole preset underivable (a `cvars.get` that answers `None` never matches), and the
+    /// only symptom would be a dropdown stuck on `Custom`.
+    #[test]
+    fn every_preset_member_is_registered_and_inside_its_observers_clamp() {
+        let mut app = cvar_app();
+        for (name, members) in LIGHTING_PRESETS {
+            for (k, value) in *members {
+                assert!(
+                    REGISTERED.iter().any(|r| r.name == *k),
+                    "{name}: member {k} is not registered"
+                );
+                // Drive the real setter: a clamp, integer conversion or map-size snap
+                // must leave every preset value unchanged.
+                apply(&mut app, k, "-1");
+                apply(&mut app, k, value);
+                let video = res::<VideoConfig>(&app);
+                let applied = match *k {
+                    "characterShadows" => video.character_shadows as u32 as f32,
+                    "worldShadows" => video.world_shadows as u32 as f32,
+                    "interiorLight" => video.interior_light as u32 as f32,
+                    "interiorShadows" => video.interior_shadows as u32 as f32,
+                    "exteriorShadows" => video.exterior_shadows as u32 as f32,
+                    "shadowMapSize" => video.shadow_map_size as f32,
+                    "interiorShadowCasters" => video.interior_shadow_casters as f32,
+                    "interiorShadowDynamic" => video.interior_shadow_dynamic as f32,
+                    "spellLightGain" => video.spell_light_gain,
+                    "waterQuality" => video.water_quality as f32,
+                    // MONKEY (volumetric fog): verify presets reach the renderer.
+                    "volumetricFog" => video.volumetric_fog as f32,
+                    "lavaLightGain" => video.lava_light_gain,
+                    "fireLightGain" => video.fire_light_gain,
+                    "moonShadowStrength" => video.moon_shadow_strength,
+                    "fireFlicker" => video.fire_flicker,
+                    "nightGain" => video.night_gain,
+                    "interiorGain" => video.interior_gain,
+                    _ => panic!("add the observer readback for {k}"),
+                };
+                assert_eq!(applied, value.parse::<f32>().unwrap(), "{name}/{k}");
+            }
+        }
+    }
+
+    #[test]
+    fn preset_then_member_edit_survives_sync_observers_and_later_flushes() {
+        for seeded in [false, true] {
+            for flush_preset_first in [false, true] {
+                let mut app = cvar_app();
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .register_cvars(registered_pairs());
+                // Run the production Update schedule without Startup's on-disk config load.
+                if seeded {
+                    app.world_mut().run_schedule(Update);
+                }
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .run("SetCVar('lightingQuality', 'Low')").unwrap();
+                if flush_preset_first {
+                    app.world_mut().run_schedule(Update);
+                    assert_eq!(res::<VideoConfig>(&app).shadow_map_size, 1024);
+                }
+                app.world_mut().non_send_resource_mut::<UiScript>()
+                    .run("SetCVar('shadowMapSize', '4096')").unwrap();
+                for _ in 0..3 {
+                    app.world_mut().run_schedule(Update);
+                    let cvars = res::<Cvars>(&app);
+                    assert_eq!(cvars.get("shadowMapSize"), Some("4096"));
+                    assert_eq!(cvars.get("lightingQuality"), Some(LIGHTING_CUSTOM));
+                    assert_eq!(res::<VideoConfig>(&app).shadow_map_size, 4096);
+                    let script = app.world().non_send_resource::<UiScript>();
+                    assert_eq!(script.cvar("shadowMapSize").as_deref(), Some("4096"));
+                    assert_eq!(script.cvar("lightingQuality").as_deref(), Some(LIGHTING_CUSTOM));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fire_spell_and_lava_gains_above_two_reach_the_video_observer() {
+        let mut app = cvar_app();
+        for value in ["3.25", "4"] {
+            apply(&mut app, "fireLightGain", value);
+            apply(&mut app, "spellLightGain", value);
+            apply(&mut app, "lavaLightGain", value);
+            let expected = value.parse::<f32>().unwrap();
+            assert_eq!(res::<VideoConfig>(&app).fire_light_gain, expected);
+            assert_eq!(res::<VideoConfig>(&app).spell_light_gain, expected);
+            assert_eq!(res::<VideoConfig>(&app).lava_light_gain, expected);
+        }
+    }
+
+    #[test]
+    fn water_and_lava_observers_clamp_and_water_high_is_opt_in() {
+        let mut app = cvar_app();
+        for (value, water, lava) in [("-1", 0, 0.0), ("1.75", 1, 1.75), ("2", 2, 2.0), ("9", 2, 4.0)] {
+            apply(&mut app, "waterQuality", value);
+            apply(&mut app, "lavaLightGain", value);
+            assert_eq!(res::<VideoConfig>(&app).water_quality, water);
+            assert_eq!(res::<VideoConfig>(&app).lava_light_gain, lava);
+        }
+        let mut cvars = fresh_registry();
+        cvars.set("waterQuality", "2");
+        assert_eq!(derive_lighting_quality(&cvars), LIGHTING_CUSTOM);
+        apply_lighting_preset(&mut cvars, "High");
+        assert_eq!(cvars.get("waterQuality"), Some("1"));
     }
 
     /// **Every arm, through the registry and its observers.** The old central `apply_to_knobs`
@@ -3204,7 +3677,7 @@ mod tests {
             .init_resource::<PaneRate>()
             .init_resource::<crate::ui_guild::GuildMemberNotify>()
             .init_resource::<crate::ui_trade::BlockTrades>()
-            .init_resource::<crate::ui_action::AutoSelfCast>()
+            .init_resource::<crate::spell::AutoSelfCast>()
             .init_resource::<crate::perf::FpsJournalSetting>()
             .init_resource::<crate::text_filter::TextFilterSwitches>()
             .init_resource::<crate::game_tip::GameTipSetting>()
@@ -3239,7 +3712,7 @@ mod tests {
             app.add_observer(crate::target::on_cvar);
         },
         |app| {
-            app.add_observer(crate::ui_action::on_cvar);
+            app.add_observer(crate::spell::cast_target::on_cvar);
         },
         |app| {
             app.add_observer(crate::combat_text::on_cvar);
@@ -3488,7 +3961,7 @@ mod tests {
     ///
     /// **`realmName` defaults EMPTY** — empty rather than a guess: the value is written from the
     /// session's real realm by `set_realm_name`, so the default only ever describes a client that
-    /// has not connected. wow-re records `"Last realm connected to"` beside the registration, but
+    /// has not connected. `0x85d684` holds `"Last realm connected to"` beside the registration, but
     /// that reads like the CVar's HELP text rather than its value, and nothing here needs it
     /// resolved — `""` is what `Ace/AceState.lua:27`'s `ace.trim(GetCVar("realmName"))` handles
     /// cleanly, and inventing a realm name would be worse than admitting we have none yet.
@@ -3606,6 +4079,15 @@ mod tests {
         assert_eq!(cvars.set("gxVSync", "0"), SetOutcome::Unchanged);
         assert_eq!(cvars.row("gxVSync").unwrap().pending, None);
         assert_eq!(cvars.commit_latched(), 0);
+        // A latched row outside the gx set is not the video restart's to commit (2343).
+        assert_eq!(cvars.set("SoundBufferSize", "200"), SetOutcome::Staged);
+        assert_eq!(cvars.commit_latched(), 0);
+        assert_eq!(cvars.get("SoundBufferSize"), Some("100"));
+        assert_eq!(
+            cvars.row("SoundBufferSize").unwrap().pending.as_deref(),
+            Some("200")
+        );
+        assert!(!cvars.compose().contains_key("SoundBufferSize"));
         // An unlatched row applies at once, fires, and dirties.
         assert_eq!(cvars.set("MusicVolume", "0.7"), SetOutcome::Changed);
         assert_eq!(cvars.get("MusicVolume"), Some("0.7"));
@@ -3841,10 +4323,10 @@ mod tests {
         }
     }
 
-    /// The eight rows the reference latches that benilla registers, and no other — read off
-    /// `re/cvar/cvar-register-sites.tsv` (`flags` 2 or 3): the sound-init row, and the `gx*`
-    /// block `RestartGx` commits. `trilinear`/`anisotropic`/`farclip` register with `flags = 1`
-    /// there and apply live, so they are deliberately not here.
+    /// The eight rows the reference latches that benilla registers, and no other — read off their
+    /// register sites (`flags` 2 or 3): the sound-init row, and the `gx*` block `RestartGx`
+    /// commits. `trilinear`/`anisotropic`/`farclip` register with `flags = 1` and apply live, so
+    /// they are deliberately not here.
     #[test]
     fn the_latched_rows_are_the_references_own() {
         let mut latched: Vec<&str> = REGISTERED

@@ -112,6 +112,8 @@ pub enum DaylightHow {
     /// fixture is not the sun at all but the LIT room's own light carried across the threshold into
     /// the dark one. See the PORTAL BLEED section near the bottom of this file.
     Bleed,
+    /// MONKEY (lava light): reuses the caster exclusion; no daylight calibration or room claim.
+    Lava,
 }
 
 impl DaylightHow {
@@ -122,6 +124,7 @@ impl DaylightHow {
             DaylightHow::Aperture => "aperture",
             DaylightHow::Boundary => "boundary",
             DaylightHow::Bleed => "bleed",
+            DaylightHow::Lava => "lava",
         }
     }
 }
@@ -1015,7 +1018,7 @@ pub fn update_daylight_fixtures(
             Option<&LightReach>,
             Option<&mut WorldPointLight>,
         ),
-        Without<BleedFixture>,
+        (Without<BleedFixture>, Without<super::LavaLight>),
     >,
     time: Res<Time>,
     mut last_dump: Local<f64>,
@@ -1768,7 +1771,7 @@ pub fn update_bleed_fixtures(
             Option<&LightLane>,
             Option<&super::LightRooms>,
             Has<SyntheticFireLight>,
-            Has<DaylightFixture>,
+            Option<&DaylightFixture>,
             // MONKEY (spellLightGain): last, and it OVERRIDES the synthetic bit below — every spell
             // light also carries [`SyntheticFireLight`], so testing fire first would put a fireball
             // on the hearth dial.
@@ -1828,7 +1831,12 @@ pub fn update_bleed_fixtures(
                 // `DaylightFixture`. Mirroring that exclusion here is what keeps the doorway from
                 // being dimmed twice: a bleed fixture IS a `DaylightFixture`, so the packer will not
                 // scale it, and the gain therefore has to be in the TARGET.
-                let g = if daylight { 1.0 } else { knobs.interior_gain };
+                // MONKEY (lava light): the shared caster exclusion does not make magma sunlight.
+                let g = if daylight.is_some_and(|f| f.how != DaylightHow::Lava) {
+                    1.0
+                } else {
+                    knobs.interior_gain
+                };
                 let c_norm = commit_norm([
                     (c[0] * s * g).max(0.0),
                     (c[1] * s * g).max(0.0),

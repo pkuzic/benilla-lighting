@@ -1,20 +1,11 @@
-//! The **one shared global light** — the faithful replacement for the per-material light copy.
+//! The one shared global light, as the reference has a single scene light every draw reads.
 //!
-//! The real 1.12 client has a single scene light every draw reads; updating it is O(1). We used to
-//! store the resolved [`super::WowLighting`] *per material* and re-push it into every loaded terrain/
-//! model/liquid/wdl material each frame — Bevy then freed+recreated every material's bind group
-//! (`bevy_pbr` material.rs has an explicit "no fast path; we delete and recreate" TODO), a confirmed
-//! ~40fps tax.
-//!
-//! Instead: ONE persistent GPU storage buffer, created once from the main-world [`RenderDevice`]; every
-//! material references it via `#[storage(90, read_only, buffer)]` (a pre-made `Buffer`, baked into the
-//! bind group at prepare, zero per-frame upload — `#[uniform]` can't do this, it always re-allocates). The
-//! material assets are **never mutated after creation**, so no bind group is ever rebuilt. Each frame
-//! [`build_light_data`] (main world) packs the resolved light into a std430 blob and [`upload_light`]
-//! (render world, `PrepareResources`) writes it in place — all bind groups see the new data, zero
-//! rebuilds, regardless of how many tiles/models are loaded or how fast the clock moves.
+//! One persistent storage buffer, which every material binds at `storage(90)`: [`build_light_data`]
+//! packs the resolved light each frame and [`upload_light`] writes it in place. Material assets
+//! are never mutated after creation, since Bevy rebuilds the bind group of a mutated material.
 
 use benilla_formats::LiquidKind;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_resource::{Buffer, BufferDescriptor, BufferUsages};
@@ -29,13 +20,15 @@ use crate::dev_state::DebugState;
 use crate::view::ViewDistance;
 use crate::view::WorldCamera;
 
-/// The shared light, std430-packed as contiguous `vec4<f32>` rows. All-`vec4` so std430 == std140
-/// (each row 16-aligned, no stride surprises). The row order is the canonical layout every shader
-/// bound at `storage(90)` mirrors as a prefix — the WGSL structs in `wow_model.wgsl`/`terrain.wgsl`/
-/// `wow_effect.wgsl`. (`liquid.wgsl`/`wdl.wgsl` reuse the field NAMES but bind their own
-/// per-material uniforms fed by `apply_wow_lighting` — editing this layout does NOT reach them.)
+/// The shared light, std430-packed as `vec4<f32>` rows (all `vec4`, so std430 equals std140). Every
+/// shader that binds the buffer (`wow_model`, `terrain`, `liquid`, `wdl`, `wow_effect`,
+/// `static_gx`) mirrors this row order as a prefix; keep them in sync.
 ///   0 light_ambient (w=Mod2x 1.0) · 1 light_diffuse (w=clamp on) · 2 light_sun (w=dir/SH enable) ·
-///   3 light_spec (w=terrain shininess 20) · 4 fog_color (w=enable) · 5 fog_params (x=start y=end w=farclip) ·
+///   3 light_spec (w=terrain shininess 20) · 4 fog_color (w=enable) · 5 fog_params (x=start y=end
+///      w=farclip; MONKEY (moon shadows) `.z` = the SIGNED directional-shadow weight — `+sun_w`
+///      by day, `−(moon weight × moonShadowStrength)` at night, 0 when neither body casts. The
+///      two are mutually exclusive by [`moon_shadow_weight`], so one float carries both; see
+///      [`pack_shadow_lane`]) ·
 ///   6-8 sh_c10_{r,g,b} · 9-11 sh_c13_{r,g,b} · 12 sh_c16 (.w = the world-shadow flag in the
 ///      integer part, MONKEY (bake floor) `interiorBakeFloor × interiorGain` in the fraction —
 ///      [`BAKE_LANE_SCALE`]) ·
@@ -65,13 +58,9 @@ use crate::view::WorldCamera;
 ///      lighting the floor through a closed door. `[pos.xyz, range]`'s `range` is UNTOUCHED
 ///      (still the 48 yd candidacy constant), so the exterior lanes are byte-identical.
 ///
-/// The GPU buffer is LARGER than this per-frame blob: the interior-prop probe table
-/// (`lighting::prop_probes`, 7 rows per slot) lives at its tail — [`light_blob_bytes`] sizes the
-/// buffer for both, `upload_light` rewrites only this prefix each frame, and `upload_prop_probes`
-/// rewrites the tail only when a prop spawns/despawns. Only `wow_model.wgsl` declares the tail
-/// region — the other shaders mirror the PREFIX and bind the same (larger) buffer, which wgpu
-/// allows. Keeping the probes out of this struct keeps it stack-cheap: the ExtractResource clone
-/// runs every frame, and a ~900 KB by-value blob overflowed a render-thread stack (measured live).
+/// The GPU buffer is larger: the interior-prop probes and the skin-palette regions follow this
+/// prefix. They stay out of this struct because the extract clones it by value every frame, and
+/// ~900 KB overflowed a render thread's stack.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightStd430 {
@@ -79,39 +68,15 @@ struct LightStd430 {
     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
 }
 
-/// Header row count of the canonical layout above (rows 0..=20). Every producer of a light blob
-/// sizes against this — the portrait booth included.
+/// Header row count of the layout above (rows 0..=20), which every light blob sizes against.
 pub const LIGHT_HEADER_ROWS: usize = 21;
 
-/// Pack the **model-lighting core** into `rows` — every row the model shaders' lit lanes derive
-/// from the (ambient, diffuse, sun_dir) triple: rows 0-2 (ambient/diffuse/sun, w = enables), the
-/// SH block (rows 6-11 + row 12 `.xyz`; DC = ambient in the `.w` lanes), and the sun's SH DC
-/// redistribution (row 17 `.yzw`, at intensity 1). Leaves every other row — and row 12 `.w`
-/// (free) / row 17 `.x` (SIDN) — untouched.
-///
-/// The sun's bands are the `Model2.bls` closed form — the SAME [`sh::prop_probe_coeffs`] fold the
-/// interior lane runs, per the disassembly of the shipped ARB program (wow-re
-/// `system/models/scratch/model2-bls-vertex-sh.md`): `E(n) = D·(3 + 16μ + 15μ²)/34`, μ = n·u
-/// toward-light, EVERY band linear in the committed colour `D` — there is no separate amplitude
-/// scalar, and the per-instance intensity lives entirely in that colour (a consumer multiplies
-/// ALL sun terms by I; packed here at I = 1). The peak (μ=1) equals the FFP walls' `D·(N·L)`
-/// peak by construction (the 16/17 accumulate scale exists for exactly that), and the closed form
-/// never goes meaningfully negative — the old trace-fit's ~¼-strength lobe with a negative back
-/// side (shadow-side characters turned blue as the warm channels floored at 0) is superseded.
-///
-/// **The SH block (rows 6-11, row 12 `.xyz`, row 17 `.yzw`) is the live exterior M2 response**
-/// (0803). It was dormant for months — 0410 took the lane off this curve onto a hard-cutoff FFP
-/// matte on the director's look call and nothing consumed the rows — until 0796 refuted the fidelity
-/// premise behind that retirement (the reference's M2 lane IS this SH shader) and 0799 put the two
-/// side by side for the call. Anything that stops writing these rows now renders every exterior
-/// doodad and creature black. The interior-prop and glue-rig lanes are unaffected — they fold their
-/// own probes through the per-instance `prop_probes` table, not these rows.
-///
-/// This is the ONE packer for the scene light ([`build_light_data`]) AND the portrait booth's
-/// studio light (`portrait::setup_booths`): the booth used to hand-copy the layout and rendered
-/// black portraits the day 0354 moved the lit lanes onto rows it never wrote. A producer that
-/// copies the layout goes stale the day the layout moves — so producers don't copy it, they call
-/// this.
+/// Packs the model-lighting core from `(ambient, diffuse, sun_dir)` and leaves every other lane
+/// alone: rows 0-2, the SH block (6-11 and 12 `.xyz`, ambient in the DC `.w` lanes) and the sun's
+/// SH DC on 17 `.yzw`, the exterior M2 lane's light. The sun's bands are `Model2.bls`'s
+/// `E(n) = D·(3 + 16μ + 15μ²)/34`, μ = n·u toward the light, the interior lane's
+/// [`sh::prop_probe_coeffs`] fold: all linear in `D`, so a consumer scales each by the intensity
+/// (packed at 1). Producers call this and never copy the layout.
 pub fn pack_model_core_rows(
     rows: &mut [[f32; 4]; LIGHT_HEADER_ROWS],
     ambient: [f32; 3],
@@ -121,10 +86,9 @@ pub fn pack_model_core_rows(
     rows[0] = [ambient[0], ambient[1], ambient[2], 1.0]; // 0 light_ambient (w=Mod2x 1.0)
     rows[1] = [diffuse[0], diffuse[1], diffuse[2], 1.0]; // 1 light_diffuse (w=clamp on)
     rows[2] = [sun_dir.x, sun_dir.y, sun_dir.z, 1.0]; // 2 light_sun (w=dir/SH enable 1.0)
-                                                      // The sun lobe folded at intensity 1 with NO ambient — ambient rides the DC lanes directly
-                                                      // (it never scales with the per-instance intensity), while the fold's own `.w` output is the
-                                                      // sun's DC redistribution, re-homed onto row 17 `.yzw` so the shader can scale it by I.
     let sun = sh::prop_probe_coeffs([0.0; 3], &[(-sun_dir, diffuse)]);
+    // The sun folds at intensity 1 without ambient: ambient takes the DC lanes unscaled, and the
+    // fold's own DC moves to row 17 `.yzw`, where the shader scales it by the intensity.
     for (i, row) in sun.iter().enumerate().take(6) {
         rows[6 + i] = row.to_array(); // 6-8 sh_c10_{r,g,b} · 9-11 sh_c13_{r,g,b}
     }
@@ -136,28 +100,17 @@ pub fn pack_model_core_rows(
                             // studio portrait takes neither — the frozen look is deliberate)
     rows[12][1] = sun[6].y;
     rows[12][2] = sun[6].z;
-    // 17 `.yzw` — the sun's SH DC redistribution at intensity 1 (`D·(4/17)(0.375+0.9375(uₓ²+u_y²))`
-    // per channel): an SH consumer adds it × the per-instance intensity (dormant since 0410 — see
-    // the doc above). `.x` (SIDN) is the scene's.
+    // 17 `.yzw`: the sun's SH DC at intensity 1; `.x` (SIDN) is the scene's.
     rows[17][1] = sun[0].w;
     rows[17][2] = sun[1].w;
     rows[17][3] = sun[2].w;
 }
 
-/// The reference's committed point-light diffuse is the **RAW** `colour × intensity × modelFade`
-/// — over-gamut values included (VERIFIED at the bytes + OBSERVED live, wow-re
-/// `models/scratch/trace-forensics-overgamut-point-commit-d3d.md`; compose arithmetic
-/// `m2-light-emitter-instances.md` §6b, animate leg `716a67`–`716aa6`).
-///
-/// `0x71ca80` — which two prior rounds read as a clamp01 and then as a peak-normalize — is
-/// actually a lossy **RGBE-style encoder**: it stores a peak-normalized byte colour at
-/// `CGxLight+0x14` *and* the raw peak float `m = max(1, r, g, b)` at `+0x20`, and the device copy
-/// `0x593040` **decodes them right back** (`byte · m/255 ≈ raw channel`) before the GL light is
-/// set. Net effect: identity up to 8-bit peak-relative quantization (≤ ~0.5 %, which we skip). A
-/// night terrain draw in the ring capture commits `(1.2, 1.035, 0.805)` verbatim — over-white
-/// preserved. So we pack the raw product; the saturation the eye sees comes from the *vertex*
-/// clamp of the summed lighting (GL T&L clamps `ambient + sun + Σ points` per vertex BEFORE
-/// interpolation — see `terrain.wgsl`), never from the commit.
+/// The reference commits a point light's diffuse raw, `colour × intensity × modelFade` (composed
+/// at `0x716a67`), over-gamut included: `0x71ca80` stores a peak-normalized byte colour and the
+/// peak `max(1, r, g, b)`, and `0x593040` decodes them back before the GL light is set. Saturation
+/// comes from the per-vertex clamp of the summed lighting, never from the commit. Deviation: the
+/// round trip's 8-bit quantization is skipped, because it moves a channel by under 0.5 %.
 pub fn commit_raw(rgb: [f32; 3]) -> [f32; 3] {
     rgb.map(|c| c.max(0.0))
 }
@@ -204,25 +157,12 @@ const INTERIOR_NEAR_ADMIT: f32 = 90.0;
 /// (0285: each unit picks its ≤3 nearest from this table) bounded.
 const POINT_PACK_RADIUS: f32 = 300.0;
 
-/// **The rooms a point light belongs to** — a WMO's own MOLT fixture (the groups whose MOLR names
-/// it) or one of its props' M2 lights (the groups whose MODR names the prop). Absent on an ADT map
-/// doodad's light, a creature's, a GameObject's: nothing claims those.
-///
-/// The fourth rider of decision 0689's law, after the prop's mesh, its particle clouds and its
-/// ribbon trails. The reference never needs it: a WMO's furniture is instantiated out of each
-/// **visible** group's MODR list, so a torch in a culled room does not exist and registers no
-/// light. Its light-register walk really does have no visibility term of its own — byte-verified,
-/// wow-re `m2-light-emitter-instances.md` §4: the gate for a model entering the register walk is
-/// the scene update-list activation flag `[model+0x10]`, "not visibility, not distance, not LOD",
-/// and the ≤4 cap is purely receiver-side. So the faithful fix is NOT a visibility test bolted onto
-/// the gather; it is that the SOURCE should not be there at all, which is what this component says.
-/// [`build_light_data`] drops the light while its rooms are culled, exactly as the model-visibility
-/// authority drops the prop's own submeshes.
-///
-/// A newtype rather than a bare [`crate::wmo_portal::WmoGroupVis`] on purpose: that component on a
-/// light entity would enlist it in `apply_model_visibility`'s `group_only` query — a `PointLight`
-/// carries `Visibility` and `GlobalTransform`, so it matches — making the model-visibility
-/// authority a second writer on an entity whose `Visibility` nothing reads (decision 0025).
+/// The rooms a point light belongs to: a WMO's MOLT fixture (the groups whose MOLR names it) or a
+/// prop's M2 light (the groups whose MODR names the prop). The reference admits a WMO's props only
+/// in frames the portal walk visits their group (`0x6838f0`, from `0x685d70`), so a culled room's
+/// torch registers no light; [`build_light_data`] drops the light while its rooms are culled. A
+/// newtype, since a bare [`crate::wmo_portal::WmoGroupVis`] would enlist the light in
+/// `apply_model_visibility`.
 #[derive(Component)]
 pub struct LightRooms(pub(crate) crate::wmo_portal::WmoGroupVis);
 
@@ -603,6 +543,28 @@ impl Default for ShadowDistance {
     }
 }
 
+/// MONKEY (moon shadows): how dark a MOON-shadowed fragment gets at night (`moonShadowStrength`,
+/// 0..1, default 0.35), bridged from benilla-app's settings registry exactly as [`ShadowDistance`]
+/// is. `0.35` means a fully moon-shadowed fragment keeps `1 − 0.35 = 65 %` of the night sky (ambient + directional)
+/// term — a hint of a silhouette, not a daylight-hard shadow.
+///
+/// A dial rather than a constant because the honest answer to "how much light does a clear full moon
+/// throw" is *very little* (the reference client casts none at all), and the interesting range —
+/// "just enough that the world is not flat" to "stylised moonlight" — is entirely a taste question
+/// that wants to be answered with the scene on screen.
+///
+/// **`0` is the faithful null.** Every consumer guards on it (the packer refuses to hand the moon a
+/// non-zero weight, and the receivers keep their existing `< 0.999` early-out arm), so a night at
+/// `moonShadowStrength = 0` renders bit-identically to the build before this feature existed.
+#[derive(Resource, Clone, Copy, PartialEq, Debug)]
+pub struct MoonShadowStrength(pub f32);
+
+impl Default for MoonShadowStrength {
+    fn default() -> Self {
+        Self(0.35)
+    }
+}
+
 /// MONKEY (sun shadow perf): the live `shadowFilter` choice, bridged from benilla-app's shadow rig
 /// and extracted into the RENDER world.
 ///
@@ -638,15 +600,13 @@ impl Default for ShadowFilterGaussian {
 pub struct WorldPointLight {
     /// Linear RGB, hue preserved.
     pub color: [f32; 3],
-    /// `4π × authored intensity` — the `PointLight` convention, so the packer's `/(4π)` reads
-    /// the authored product back.
+    /// `4π × authored intensity`, the `PointLight` convention, which the packer's `/(4π)` undoes.
     pub intensity: f32,
-    /// The ≤3-nearest selection-candidacy radius (yd) — see `terrain_stream::point_light`.
+    /// The ≤3-nearest selection radius (yd).
     pub range: f32,
 }
 
-/// Main-world resource holding the packed light for this frame; extracted into the render world where
-/// [`upload_light`] writes it. Rebuilt every frame by [`build_light_data`] (cheap — one std430 pack).
+/// The packed light for this frame, extracted for [`upload_light`].
 #[derive(Resource, Clone, Copy, ExtractResource)]
 struct WowLightData(LightStd430);
 
@@ -659,22 +619,21 @@ impl Default for WowLightData {
     }
 }
 
-/// The one persistent storage buffer all materials bind. Created once in [`create_shared_light_buffer`]
-/// (main world, so material construction can clone it into the `#[storage(90, …)]` field), then cloned
-/// into the render world via `ExtractResource` so [`upload_light`] can write it. `Buffer` clone shares
-/// the same GPU resource.
+/// The persistent storage buffer every material binds, created by [`new_shared_light_buffer`] and
+/// extracted to the render world; a `Buffer` clone shares the GPU resource.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct SharedLightBuffer(pub Buffer);
 
-/// Wire the shared-light infra into the app. `build_light_data` is chained after the lighting resolve
-/// in [`super::LightingPlugin`]; this adds the resource, the extract plugins, the startup buffer
-/// creation, and the render-world upload.
+/// Registers the light pack, the probe publish, their extracts and the render-world uploads.
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
         // MONKEY (room gate): the per-fixture room claims, packed beside the point table.
         .init_resource::<RoomClaimTable>()
         .init_resource::<WorldShadowActive>()
         .init_resource::<ShadowDistance>()
+        // MONKEY (moon shadows): the night directional-shadow strength dial (0 = today's render).
+        .init_resource::<MoonShadowStrength>()
+        .init_resource::<ShadowHandover>()
         // MONKEY (sun shadow perf): the live PCF choice, extracted for `static_gx`'s hand-rolled
         // pipeline (every Bevy-material receiver keys off the view component instead).
         .init_resource::<ShadowFilterGaussian>()
@@ -689,12 +648,8 @@ pub(super) fn register(app: &mut App) {
         .add_plugins(ExtractResourcePlugin::<RoomClaimTable>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
         .add_plugins(ExtractResourcePlugin::<super::prop_probes::PropProbeExtract>::default())
-        // PostUpdate, **after transform propagation**: the point table is packed from each light's
-        // `GlobalTransform`, and a CARRIED light (0587 — the torch in an NPC's hand) is a child of a
-        // moving joint, so its global is only correct once `Propagate` has run. Packed from `Update`
-        // it read the PREVIOUS frame's pose — the pool rubber-banded behind a walking bearer, and a
-        // freshly spawned light packed one frame at the world origin. A world-baked doodad light
-        // never moves, which is why this was invisible until entities started carrying lights.
+        // After transform propagation: a carried light (a torch in a hand) is a child of a moving
+        // joint, so its `GlobalTransform` is this frame's only once `Propagate` has run.
         .add_systems(
             PostUpdate,
             // MONKEY (light lane by position): the lane classifier is chained BEFORE the packer, so
@@ -708,8 +663,7 @@ pub(super) fn register(app: &mut App) {
         )
         // After the spawners (PostUpdate): publish the probe table for extraction on change.
         .add_systems(PostUpdate, super::prop_probes::publish_prop_probes);
-    // Guarded like every other render-side registration in the tree: a headless build (no GPU,
-    // `backends: None`) has no render app, and the schedule tests build the engine that way.
+    // A headless build (no GPU, `backends: None`), as the schedule tests use, has no render app.
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.add_systems(
             Render,
@@ -719,11 +673,8 @@ pub(super) fn register(app: &mut App) {
     }
 }
 
-/// Create the single persistent storage buffer. `RenderDevice` is a main-world resource (inserted in
-/// `RenderPlugin::finish`, available from `Startup` on), so the `assets` foundation builds it alongside
-/// `WorldAssets` (which stores a clone so `model_material` can hand it to every model) and inserts the
-/// returned resource (cloned into the render world for [`upload_light`]). `STORAGE | COPY_DST` (storage
-/// binding + per-frame `write_buffer`).
+/// Creates the shared light buffer, sized by [`light_blob_bytes`], from the main-world
+/// `RenderDevice`; the assets foundation builds it at startup.
 pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
     SharedLightBuffer(device.create_buffer(&BufferDescriptor {
         label: Some("wow_shared_light"),
@@ -733,23 +684,17 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
     }))
 }
 
-/// The full byte size of the shared light BUFFER: the per-frame blob ([`LightStd430`] — 19 header
-/// rows + the point-light table) PLUS the interior-prop probe region PLUS the skin-palette
-/// regions (rig slot table + tint table + rig-origin table + mat-anim table + straddle clip
-/// table + palette rows — decisions 0720/0812/0974/1381/2188) at the tail. **Every buffer bound as
-/// `wow_light` must be at least this big** — `wow_model.wgsl` declares the whole layout,
-/// and wgpu validates bound size against the shader's struct at draw time. The portrait booth's
-/// frozen studio-light buffer sizes itself with this (its table regions stay zeroed ⇒ no scene
-/// point lights and black probes on portraits — the studio look is deliberately static); a
-/// booth's PALETTE and ORIGIN regions are live, kept written by `rig_palette`'s mirror registry.
+/// The shared light buffer's full size: the per-frame blob ([`LIGHT_HEADER_ROWS`] rows and the
+/// point table), the interior-prop probe region and the skin-palette regions. Every buffer bound
+/// as `wow_light` must be this big: wgpu validates the bound size against `wow_model.wgsl`'s
+/// whole layout at each draw.
 pub fn light_blob_bytes() -> u64 {
     per_frame_blob_bytes()
         + (7 * MAX_PROP_PROBES * 16) as u64
         + crate::rig_palette::palette_regions_bytes()
 }
 
-/// Byte size of the per-frame prefix alone (= the probe region's offset — see
-/// `prop_probes::prop_probe_region_offset`).
+/// The per-frame prefix's size, which is also the probe region's offset.
 pub(super) fn per_frame_blob_bytes() -> u64 {
     std::mem::size_of::<LightStd430>() as u64
 }
@@ -761,9 +706,168 @@ pub(super) fn per_frame_blob_bytes() -> u64 {
 /// MONKEY (night fade): realtime-shadow day strength from the celestial sun's height
 /// (`sin(elevation)`): 0 at or below the horizon, ramping to 1 by ~12° so shadows fade out at dusk
 /// and in at dawn. A smoothstep for a soft knee rather than a hard switch at the horizon.
-fn sun_shadow_strength(sun_height: f32) -> f32 {
+/// MONKEY (moon shadows): `pub` because the SHADOW RIG needs the same verdict the packer reaches.
+/// The rig (`benilla_app::shadow_core::manage_rig`) re-aims the one directional light at the moon
+/// exactly when this is 0, and the packer hands the moon a weight exactly when this is 0 — two
+/// copies of that threshold would be two chances to disagree about which body the map holds.
+/// (`blob_shadow.rs` keeps its own three-line mirror, pinned by its own test; that one predates
+/// this export and is deliberately self-contained.)
+pub fn sun_shadow_strength(sun_height: f32) -> f32 {
     let t = (sun_height / 0.208).clamp(0.0, 1.0); // 0.208 ≈ sin(12°)
     t * t * (3.0 - 2.0 * t)
+}
+
+/// MONKEY (moon shadows): the NIGHT half of the one shadow rig's HAND-OVER LAW, in `[0,1]`.
+///
+/// `sun_height` / `moon_height` are `celestial_dir.y` / `moon_dir.y` — the SINE of each body's
+/// elevation, Bevy space. Returns how much the moon is allowed to cast, BEFORE
+/// [`MoonShadowStrength`] scales it.
+///
+/// **Why a hard gate and not a crossfade.** benilla's receivers sample ONE shadow-mapped
+/// directional light (the loop in `shadow_hook.wgsl` ASSIGNS — last light wins), so at any instant
+/// the map holds exactly one body's depth. A weight that overlapped the sun's would be a weight
+/// applied to the WRONG body's map for the duration of the overlap. So the moon's weight is
+/// strictly zero while the sun still has any, and the rig re-aims in the window where BOTH are
+/// zero — `sun_shadow_strength` is exactly 0 at and below the horizon, and this is exactly 0 until
+/// the moon clears the same 12° ramp.
+///
+/// **The gate never actually clips anything**, which is what makes it continuous rather than a
+/// step: with the shipped `DayNight` tables the celestial sun crosses the horizon at ≈20:30 and the
+/// white moon does not clear it until ≈22:17, so `sun_w` and the moon's elevation ramp are never
+/// both positive (asserted over the whole game day by
+/// `the_two_shadow_weights_never_overlap_and_neither_jumps`). The gate is therefore an INVARIANT
+/// guard, not a shaping term: it keeps the single-light rule true even if a zone or a retuned table
+/// ever put the two in the sky together.
+///
+/// The elevation ramp is [`sun_shadow_strength`]'s own curve, evaluated on the moon's height —
+/// deliberately the same smoothstep over the same 0..sin(12°) band, so a body low on the horizon
+/// casts nothing (which is also what keeps a moonrise shadow from stretching to infinity; the RIG
+/// clamps the basis at 18° for the same reason, `shadow_core::MIN_SHADOW_SUN_ELEVATION`).
+pub fn moon_shadow_weight(sun_height: f32, moon_height: f32) -> f32 {
+    if sun_shadow_strength(sun_height) > 0.0 {
+        return 0.0;
+    }
+    sun_shadow_strength(moon_height)
+}
+
+/// MONKEY (moon shadows): one map, one acknowledged body. The app requests the current clock's
+/// body before transform propagation, acknowledges an actual Transform write, then holds zero
+/// through the next frame. Both receivers and blobs read `weight`, never the desired clock weight.
+/// This makes a time jump / midnight enable as safe as the naturally dark dawn/dusk interval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShadowBody {
+    Sun,
+    Moon,
+}
+
+#[derive(Resource, Default)]
+pub struct ShadowHandover {
+    pub aimed: Option<ShadowBody>,
+    pub wanted: Option<ShadowBody>,
+    pub weight: f32,
+    settling: bool,
+    ramp: f32,
+}
+
+impl ShadowHandover {
+    /// Called ONCE per frame, after lighting resolve and the settings bridge. The rig runs before
+    /// Propagate; an acknowledgement from its preceding invocation has therefore propagated now.
+    pub fn request(&mut self, sun: f32, moon: f32, strength: f32, active: bool, dt: f32) {
+        let wanted = active.then_some(if strength > 0.0 && sun <= 0.0 {
+            ShadowBody::Moon
+        } else {
+            ShadowBody::Sun
+        });
+        if wanted != self.wanted || !active {
+            self.wanted = wanted;
+            self.ramp = 0.0;
+            self.weight = 0.0;
+        }
+        if !active {
+            self.aimed = None;
+            self.settling = false;
+            return;
+        }
+        if self.aimed != wanted {
+            self.weight = 0.0;
+            return;
+        }
+        if self.settling {
+            self.settling = false;
+            self.weight = 0.0;
+            return;
+        }
+        // Fixed envelope: 1.5 seconds from zero to full, independent of frame rate/strength.
+        self.ramp = (self.ramp + dt.max(0.0) / 1.5).min(1.0);
+        self.weight = match wanted {
+            Some(ShadowBody::Sun) => pack_shadow_lane(sun * self.ramp, 0.0),
+            Some(ShadowBody::Moon) => pack_shadow_lane(0.0, moon * strength.clamp(0.0, 1.0) * self.ramp),
+            None => 0.0,
+        };
+    }
+
+    /// Only the rig may acknowledge; choosing a body without writing a transform is not ready.
+    pub fn aim_written(&mut self, body: ShadowBody) {
+        if self.aimed != Some(body) {
+            self.aimed = Some(body);
+            self.settling = true;
+            self.ramp = 0.0;
+            self.weight = 0.0;
+        }
+    }
+}
+
+/// MONKEY (moon shadows): the three realtime-shadow dials [`build_light_data`] packs, as ONE
+/// system param.
+///
+/// A bundle rather than three `Res` arguments because the packer had reached Bevy's **16-param
+/// ceiling** — `MoonShadowStrength` was the seventeenth, and the failure is not a helpful one
+/// (`.chain()` reports that a trait bound is unsatisfied on the system TUPLE, naming neither the
+/// system nor the limit). Grouping them is also the honest shape: all three are bridged from the
+/// app's shadow rig, all three ride packed lanes, and a fourth shadow dial now has somewhere to go
+/// that does not cost the next reader an afternoon.
+#[derive(SystemParam)]
+pub(super) struct ShadowLanes<'w> {
+    /// MONKEY (world shadows): the `worldShadows` lane flag, packed into `sh_c16.w` for the MCSH gate.
+    world_active: Res<'w, WorldShadowActive>,
+    /// MONKEY (distance slider): the realtime-shadow render distance, packed for the edge fade.
+    distance: Res<'w, ShadowDistance>,
+    /// MONKEY (moon shadows): the acknowledged signed weight, shared with the rig and blob.
+    handover: Res<'w, ShadowHandover>,
+}
+
+/// MONKEY (moon shadows): the CPU half of the `fog_params.z` pack — ONE SIGNED lane carrying both
+/// directional-shadow weights.
+///
+/// **There is still no free f32** ([`LightStd430`] is 8528 B, pinned by tests and mirrored by three
+/// shaders plus the portrait booth — see [`DAYLIGHT_LANE_SCALE`] for the full accounting). The
+/// daylight floor took `wmo_fog_params.w`'s fraction and the bake floor took `sh_c16.w`'s, so the
+/// two lanes with spare RANGE are spent. This one needs neither: the hand-over law above guarantees
+/// the two weights are **never both non-zero**, so they can share a single lane by SIGN — the
+/// cheapest possible packing, exact in both directions, with no quantisation and no cliff.
+///
+/// `+w` = the sun's weight, `-w` = the moon's (already scaled by [`MoonShadowStrength`]), `0` =
+/// neither (the ≈20:30-22:17 window when the sun has set and the moon has not risen — and every
+/// frame of a build with `moonShadowStrength 0`).
+///
+/// **The shader end** decodes with `max(z, 0)` / `max(-z, 0)` (`shadow_hook.wgsl`'s `sun_shadow_w`
+/// / `moon_shadow_w`). Every pre-existing reader of this lane is either one of those two calls or
+/// already clamped — `clamp(1 - z, 0, 1)` (the three `ext_night_w` decodes) returns 1 for any
+/// negative `z`, which is the same 1 it returned for the 0 that used to be there, so the exterior
+/// torch lane is bit-identical under the new sign. **Keep in sync with those two WGSL functions.**
+pub fn pack_shadow_lane(sun_w: f32, moon_w: f32) -> f32 {
+    debug_assert!(
+        !(sun_w > 0.0 && moon_w > 0.0),
+        "the shadow rig holds ONE body's map: sun {sun_w} and moon {moon_w} cannot both cast"
+    );
+    sun_w - moon_w
+}
+
+/// MONKEY (moon shadows): the SHADER's two decodes, transcribed. Only exist for the round-trip test
+/// below; the real decodes live in `shadow_hook.wgsl`.
+#[cfg(test)]
+fn unpack_shadow_lane(w: f32) -> (f32, f32) {
+    (w.max(0.0), (-w).max(0.0))
 }
 
 /// MONKEY (enclosed day floor): how [`DynamicInteriors::daylight`] rides to the shader — as the
@@ -1163,7 +1267,7 @@ fn build_light_data(
             Option<&FlameFlicker>,
             // MONKEY (darkness gains): the daylight-fixture marker — an interior-lane entry that
             // is the SUN standing in a doorway, not a candle, so `interiorGain` must skip it.
-            Has<super::DaylightFixture>,
+            Option<&super::DaylightFixture>,
             // MONKEY (spellLightGain): the spell-effect marker ([`SpellFxLight`]). Last in the
             // tuple so every positional destructuring below keeps its index — and read for one
             // thing only: WHICH live gain owns this row.
@@ -1178,10 +1282,8 @@ fn build_light_data(
     // disagree about which entry is which.
     mut claims: ResMut<RoomClaimTable>,
     time: Res<Time>,
-    // MONKEY (world shadows): the `worldShadows` lane flag, packed into `sh_c16.w` for the MCSH gate.
-    world_shadow: Res<WorldShadowActive>,
-    // MONKEY (distance slider): the realtime-shadow render distance, packed for the edge fade.
-    shadow_distance: Res<ShadowDistance>,
+    // The three realtime-shadow dials, bundled (see [`ShadowLanes`]).
+    shadow: ShadowLanes,
     // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
     dynamic_interiors: Res<DynamicInteriors>,
     // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
@@ -1217,7 +1319,7 @@ fn build_light_data(
     let (rs, rd, rsa, rda) = l.water_colors(LiquidKind::Still);
     let (os, od, osa, oda) = l.water_colors(LiquidKind::Ocean);
     // Built in a scratch copy and written through `ResMut` only when a row moved: the extract
-    // clones this 8.5 KB blob every frame it reads as changed, and a parked frame changes nothing.
+    // clones this 8.5 KB blob every frame it reads as changed.
     let mut fresh = data.0;
     fresh.rows = [[0.0; 4]; LIGHT_HEADER_ROWS];
     let rows = &mut fresh.rows;
@@ -1234,13 +1336,9 @@ fn build_light_data(
     rows[14] = [rd[0], rd[1], rd[2], rda]; // 14 water river deep
     rows[15] = [os[0], os[1], os[2], osa]; // 15 water ocean shallow
     rows[16] = [od[0], od[1], od[2], oda]; // 16 water ocean deep
-                                           // 17 `.x` — the SIDN night fraction (the windows-glow-at-night ramp: `wow_model.wgsl`
-                                           // multiplies each WMO SIDN material's authored emissive colour by it on the lit lanes).
-                                           // `.yzw` is the core packer's below.
     rows[17][0] = l.sidn_night;
-    // 18/19 — the INTERIOR fog triple (see the layout doc above). 19.zw are free lanes: they
-    // carried retired dials (the 0273/0354-era A/Bs, the point gain, the 0750/0751 sun
-    // calibration). 12.w was free too until 0796 gave it the response A/B (below).
+    // Row 17 `.x` is the SIDN night fraction and `.yzw` the core packer's; 18/19 are the interior
+    // fog triple, and 19.zw and 12.w are free.
     rows[18] = [
         l.wmo_fog_color[0],
         l.wmo_fog_color[1],
@@ -1264,7 +1362,7 @@ fn build_light_data(
     // time in exactly this way, three rows down). See [`BAKE_LANE_SCALE`] for why a fraction is
     // invisible to the one `> 0.5` decode this lane has, and why the product is clamped first.
     rows[12][3] = pack_bake_lane(
-        world_shadow.0,
+        shadow.world_active.0,
         dynamic_interiors.bake_floor,
         dynamic_interiors.interior_gain,
     );
@@ -1274,11 +1372,14 @@ fn build_light_data(
     // sun still casts the right DIRECTION.
     // MONKEY (darkness gains): computed once above — `nightGain` rides this exact same curve, so
     // the dim and the shadow fade can never drift onto two different dusk clocks.
-    rows[5][2] = sun_w;
+    // MONKEY (moon shadows): pack the rig's ACKNOWLEDGED weight, not the clock's desired one.
+    // The body may have changed abruptly this frame; the shared state holds zero until the new
+    // basis has propagated and then ramps. One signed float still keeps the buffer at 8528 bytes.
+    rows[5][2] = shadow.handover.weight;
     // MONKEY (distance slider): the realtime-shadow render distance (yd), packed into the free
     // `_wmo_fog[1].z` / `wmo_fog_params.z` lane (row 19). The receivers' edge fade reads it so the
     // shadow fades at the cascade's actual `maximum_distance`, whatever the slider is set to.
-    rows[19][2] = shadow_distance.0;
+    rows[19][2] = shadow.distance.0;
     // MONKEY (dynamic interiors): the lane's on/off into the free `wmo_fog_params.w` lane (1 = WMO
     // interior surfaces + props light from the room's live fixtures, 0 = the faithful baked path).
     // Its three knobs ride `point_count.yzw`, packed with the table below.
@@ -1404,6 +1505,8 @@ fn build_light_data(
                 // `nightGain` claim it instead — that one dims the night, and a daylight fixture is
                 // already scaled to nothing by its own day envelope (`daylight_target`'s `sun_w`,
                 // the same curve) by the time the night dim is at full strength.
+                // MONKEY (lava light): lava borrows the caster exclusion, not the sun's gain exemption.
+                let daylight = daylight.is_some_and(|f| f.how != super::DaylightHow::Lava);
                 let rgb = if interior && !daylight {
                     rgb.map(|c| c * dynamic_interiors.interior_gain)
                 } else {
@@ -1464,17 +1567,8 @@ fn build_light_data(
     for slot in claims.0[pts.len() * ROOM_CLAIM_STRIDE..].iter_mut() {
         *slot = 0;
     }
-    // `WOW_POINTS_DUMP=1`: print the committed point table once a second — the numeric probe for
-    // "what is actually lighting this ground". A pool that reads wrong is one of a small set of
-    // measurable causes (a duplicate light stacking, a light at the wrong height, an over-driven
-    // colour, a count that shouldn't be there), and every one of them is a number here. Throttled,
-    // and capped at the nearest 8 so a torch-lit town doesn't flood the log.
-    //
-    // `WOW_POINTS_DUMP=frame` drops the throttle. A once-a-second dump can only answer "is the pool
-    // right?", never "is it the *same* pool it was last frame?" — and B38's flicker turned out to
-    // alternate frame to frame, which a 1 Hz sample cannot see at all. Reading a per-second dump as
-    // evidence of per-frame stability is how that light was cleared once already (0665's parked
-    // culling test made the same mistake with a different instrument).
+    // `WOW_POINTS_DUMP=1` prints the nearest 8 packed lights once a second; `=frame` every frame,
+    // which a pool that changes frame to frame needs.
     static POINTS_DUMP: std::sync::OnceLock<Option<std::ffi::OsString>> =
         std::sync::OnceLock::new();
     if let Some(mode) = POINTS_DUMP.get_or_init(|| std::env::var_os("WOW_POINTS_DUMP")) {
@@ -1486,10 +1580,8 @@ fn build_light_data(
         let now = time.elapsed_secs_f64();
         if now - *last_dump >= every {
             *last_dump = now;
-            // How contested the three slots are for the chunk under the camera — the number that
-            // decides whether ground pops as emitters move. Candidacy is the faithful Chebyshev
-            // box (`terrain.wgsl`'s `TERRAIN_REACH`); the old 48-yd sphere is printed beside it so
-            // the over-gather stays visible rather than being taken on trust.
+            // Candidates for the camera chunk's three slots: the Chebyshev box of `terrain.wgsl`'s
+            // `TERRAIN_REACH` (keep in sync), with the 48 yd sphere's count beside it.
             let cell = 533.333_3 / 16.0;
             let half = 32.0 * 533.333_3;
             let snap = |v: f32| (((half + v) / cell).floor() + 0.5) * cell - half;
@@ -1570,14 +1662,8 @@ fn build_light_data(
             }
         }
     }
-    // `WOW_LIGHT_DUMP=frame` (or `=1` for 1 Hz): the WHOLE packed header, bit-exact, per frame.
-    //
-    // The point of dumping every row rather than the interesting ones is that B38 has now eliminated
-    // every *per-material* and *per-instance* shading input by measurement — they are bit-identical
-    // on bright and dim frames alike — which leaves this buffer and the view as the only things that
-    // can still be moving. A dump of selected rows would answer "did ambient move?"; only the full
-    // set answers "did ANY shading input move?", and that is the question worth a run. Rows are
-    // printed as raw f32 bits, so a change far below a printed decimal cannot hide.
+    // `WOW_LIGHT_DUMP=frame` (or `=1` for once a second) prints every packed header row as raw f32
+    // bits, so a change below a printed decimal still shows.
     static LIGHT_DUMP: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
     if let Some(mode) = LIGHT_DUMP.get_or_init(|| std::env::var_os("WOW_LIGHT_DUMP")) {
         let every = if mode.as_os_str() == "frame" {
@@ -1745,6 +1831,79 @@ mod tests {
         }
     }
 
+    // MONKEY (moon shadows): a CPU mirror of the receivers' order, including the exact off arm.
+    fn moon_combine(sky: f32, point: f32, strength: f32, shadow: f32) -> f32 {
+        let factor = 1.0 - strength * (1.0 - shadow);
+        if factor < 1.0 {
+            (sky * factor + point).clamp(0.0, 1.0)
+        } else {
+            (sky + point).clamp(0.0, 1.0)
+        }
+    }
+
+    #[test]
+    fn moon_shadows_preserve_saturated_points_and_attenuate_the_whole_sky() {
+        assert_eq!(moon_combine(0.2, 1.0, 0.35, 0.0), 1.0);
+        assert_eq!(moon_combine(0.2, 0.0, 0.35, 0.0), 0.2 * (1.0 - 0.35));
+        for (sky, point) in [(0.2f32, 0.0f32), (0.2, 1.0), (1.2, 0.1)] {
+            assert_eq!(moon_combine(sky, point, 0.0, 0.0).to_bits(),
+                (sky + point).clamp(0.0, 1.0).to_bits());
+            assert_eq!(moon_combine(sky, point, 0.35, 1.0).to_bits(),
+                (sky + point).clamp(0.0, 1.0).to_bits());
+        }
+    }
+
+    // MONKEY (moon shadows): exercise the REAL state machine, including delayed acknowledgement
+    // (new rig's deferred spawn), the propagation hold, and frame-rate-independent monotone ramp.
+    fn assert_shadow_transition(state: &mut ShadowHandover, body: ShadowBody, strength: f32) {
+        let (sun, moon) = if body == ShadowBody::Sun { (1.0, 0.0) } else { (0.0, 1.0) };
+        for _ in 0..3 {
+            state.request(sun, moon, strength, true, 1.0 / 60.0);
+            assert_eq!(state.weight, 0.0, "no acknowledgement: wrong/absent basis must not cast");
+        }
+        state.aim_written(body);
+        assert_eq!(state.weight, 0.0, "transform-write frame");
+        state.request(sun, moon, strength, true, 1.0 / 60.0);
+        assert_eq!(state.weight, 0.0, "propagation hold frame");
+        let mut previous = 0.0;
+        for _ in 0..91 {
+            state.request(sun, moon, strength, true, 1.0 / 60.0);
+            assert_eq!(state.aimed, state.wanted);
+            assert!(state.weight.abs() >= previous, "monotone hand-over ramp");
+            assert!((state.weight.abs() - previous) <= 1.0 / 90.0 + 1e-6);
+            previous = state.weight.abs();
+        }
+        assert_eq!(state.weight, if body == ShadowBody::Sun { 1.0 } else { -strength });
+    }
+
+    #[test]
+    fn moon_shadow_clock_jumps_wait_for_the_right_basis() {
+        let mut state = ShadowHandover::default();
+        assert_shadow_transition(&mut state, ShadowBody::Sun, 0.35);
+        assert_shadow_transition(&mut state, ShadowBody::Moon, 0.35); // noon -> midnight
+        assert_shadow_transition(&mut state, ShadowBody::Sun, 0.35); // midnight -> noon
+    }
+
+    #[test]
+    fn moon_shadow_midnight_login_and_enable_wait_for_the_rig() {
+        let mut state = ShadowHandover::default();
+        assert_shadow_transition(&mut state, ShadowBody::Moon, 0.35); // login at midnight
+        state.request(0.0, 1.0, 0.35, false, 1.0);
+        assert_eq!(state.weight, 0.0);
+        assert_shadow_transition(&mut state, ShadowBody::Moon, 0.35); // enable rig at midnight
+    }
+
+    #[test]
+    fn moon_shadow_strength_zero_to_enabled_waits_for_the_moon() {
+        let mut state = ShadowHandover::default();
+        state.request(0.0, 1.0, 0.0, true, 0.0);
+        state.aim_written(ShadowBody::Sun);
+        state.request(0.0, 1.0, 0.0, true, 0.0);
+        state.request(0.0, 1.0, 0.0, true, 2.0);
+        assert_eq!(state.weight, 0.0);
+        assert_shadow_transition(&mut state, ShadowBody::Moon, 0.35);
+    }
+
     /// GOLDEN — the **live exterior M2 response** (0803): `wow_model.wgsl`'s doodad/entity lane must
     /// reproduce `E = A + I·D·(4/17)(0.375 + 2μ + 1.875μ²)` off the rows [`pack_model_core_rows`]
     /// writes, with `A` NOT scaling by the per-instance intensity and every sun band scaling by it
@@ -1761,15 +1920,14 @@ mod tests {
     /// channel or row swap in the shader is caught by eye against this, not by this test.
     #[test]
     fn the_sh_response_lane_matches_the_closed_form_at_every_intensity() {
-        // Stormwind, minute ≈1185 — the bands wow-re independently recovered from the reference's
-        // own uploaded shader constants (0796 §1), so the test is anchored on a real committed pair.
+        // A committed Stormwind pair at minute ≈1185, from the reference's uploaded constants.
         let ambient = [102.0 / 255.0, 97.0 / 255.0, 123.0 / 255.0];
         let diffuse = [255.0 / 255.0, 112.0 / 255.0, 0.0];
         let sun_dir = Vec3::new(0.31, -0.82, 0.48).normalize(); // travel dir; to-light = −this
         let mut rows = [[0.0f32; 4]; LIGHT_HEADER_ROWS];
         pack_model_core_rows(&mut rows, ambient, diffuse, sun_dir);
 
-        /// The SH branch of `wow_model.wgsl`'s exterior doodad/entity lane, verbatim.
+        /// The SH branch of `wow_model.wgsl`'s exterior lane, verbatim.
         fn eval_sh_lane(rows: &[[f32; 4]; LIGHT_HEADER_ROWS], n: Vec3, intensity: f32) -> [f32; 3] {
             let quad = [n.x * n.y, n.y * n.z, n.z * n.z, n.x * n.z];
             let x2y2 = n.x * n.x - n.y * n.y;
@@ -1809,9 +1967,7 @@ mod tests {
                 }
             }
         }
-        // The peak is calibrated to the FFP peak by construction (the 16/17 accumulate scale) — so
-        // moving onto this curve changed NOTHING on a surface square to the sun, and the whole
-        // visible difference lives on the shadow side. That is why 0803 read subtle, not dramatic.
+        // At μ = 1 the lobe equals the FFP peak `A + D`, by the 16/17 accumulate scale.
         let peak = eval_sh_lane(&rows, u, 1.0);
         for ch in 0..3 {
             let ffp_peak = ambient[ch] + diffuse[ch]; // ambient + D·max(N·L,0) at N·L = 1
@@ -1822,8 +1978,8 @@ mod tests {
                 ffp_peak
             );
         }
-        // And the mid-back dip really is BELOW ambient — the low-order-SH ringing the reference
-        // authors. Clamping the sun term per-term instead of the sum would erase it.
+        // The mid-back dip goes below ambient, the reference's SH ringing; clamping per term
+        // instead of the sum would erase it.
         let dip = eval_sh_lane(&rows, mid_back, 1.0);
         assert!(
             dip[0] < ambient[0],
@@ -1833,13 +1989,8 @@ mod tests {
         );
     }
 
-    /// GOLDEN — the **commit clamp** (wow-re `m2-light-emitter-instances.md` §6a: `0x71ca80` with
-    /// `w = 1.0` degenerates to clamp01), driven end to end through the real packer so removing the
-    /// clamp from the pack expression fails here rather than in the director's eye.
-    ///
-    /// The held torch is the case that made it visible: authored `(0.467, 0.290, 0.133) × 3.0`, i.e.
-    /// a red channel 40% past white. Unclamped it saturated the MCVT grid far wider than the
-    /// reference and the ground pool read white instead of flame-orange.
+    /// A held torch, authored `(0.467, 0.290, 0.133) × 3.0`, commits its raw product through the
+    /// real packer, red 40% past white (`0x71ca80` encodes, `0x593040` decodes it back).
     #[test]
     fn the_torch_commits_the_raw_authored_product() {
         let mut app = packer_app();
@@ -1853,11 +2004,7 @@ mod tests {
         let rows = &app.world().resource::<WowLightData>().0;
         assert_eq!(rows.rows[20][0], 1.0, "the light packed");
         let rgb = rows.points[1];
-        // The raw authored product — over-white preserved. Two earlier rounds "fixed" this to a
-        // per-channel clamp and then a peak-normalize; the trace-confirmed mechanism is that the
-        // `0x71ca80` encode is decoded straight back by `0x593040`, so the GL light receives the
-        // raw `colour × intensity` (ring capture: a terrain draw commits (1.2, 1.035, 0.805)
-        // verbatim). Saturation belongs to the receiving vertex's lighting clamp, not the commit.
+        // Over-white is kept: saturation is the receiving vertex's clamp, not the commit's.
         assert!(
             (rgb[0] - 1.400_000_1).abs() < 1e-4,
             "red commits raw past white: {rgb:?}"
@@ -1885,6 +2032,9 @@ mod tests {
             .init_resource::<Time>()
             .init_resource::<WorldShadowActive>()
             .init_resource::<ShadowDistance>()
+            // MONKEY (moon shadows): the packer's sixth dial resource.
+            .init_resource::<MoonShadowStrength>()
+            .init_resource::<ShadowHandover>()
             .init_resource::<DynamicInteriors>()
             .init_resource::<FireLightGain>()
             .init_resource::<SpellLightGain>()
@@ -2435,9 +2585,8 @@ mod tests {
                 }
             }
         }
-        // The whole back hemisphere stays non-negative BEFORE ambient — the retired trace-fit's
-        // negative lobe (blue shadow-side characters) must never come back. Closed-form minimum is
-        // −0.0373·C at μ≈−0.53; with ambient ≥ 0.038·D the sum never floors a channel at 0.
+        // Over the back hemisphere the sun term never dips below the closed form's minimum,
+        // −0.0373·C·I at μ ≈ −0.53.
         let zero_amb = {
             let mut r = [[0.0f32; 4]; LIGHT_HEADER_ROWS];
             pack_model_core_rows(&mut r, [0.0; 3], diffuse, sun_dir);
@@ -2452,7 +2601,6 @@ mod tests {
                 + zero_amb[12][0] * (n.x * n.x - n.y * n.y);
             zero_amb[6][3] + zero_amb[17][1] * i + i * (lin + q)
         };
-        // Sweep μ over the back hemisphere: the dip never exceeds the documented −0.0373·C·I.
         for k in 0..=20 {
             let mu = -1.0 + k as f32 / 20.0;
             let n = (u * mu + side * (1.0 - mu * mu).sqrt()).normalize();
@@ -2595,6 +2743,9 @@ mod tests {
                 celestial_dir: Vec3::new(0.0, celestial_y, 0.0),
                 ..base
             });
+            // MONKEY (moon shadows): this gain test models an already-settled sun rig; the
+            // packer now consumes its publication instead of manufacturing a clock-only weight.
+            app.world_mut().resource_mut::<ShadowHandover>().weight = sun_shadow_strength(celestial_y);
             // An EXTERIOR fire, to prove the dial stops at the sky law.
             app.world_mut().spawn((
                 crate::terrain_stream::point_light([1.0, 0.5, 0.25], 2.0),
@@ -2625,6 +2776,194 @@ mod tests {
         // The fire is the same brightness on both frames — which is the point of the feature.
         assert_eq!(day.points[1], night.points[1], "a point light never takes the night dim");
         assert!((night.points[1][0] - 2.0).abs() < 1e-4, "…at its authored value");
+    }
+
+    /// GOLDEN — MONKEY (moon shadows): THE HAND-OVER LAW, swept over the whole game day against
+    /// the REAL `DayNight` tables.
+    ///
+    /// Four properties, and each one is a way the feature breaks in a manner a screenshot cannot
+    /// diagnose:
+    ///
+    /// 1. **Never both.** benilla has exactly ONE shadow-mapped directional light (the receivers
+    ///    ASSIGN over the light loop — last one wins), so the map holds one body's depth at a time.
+    ///    Two non-zero weights at any minute would mean one of them was being applied to the OTHER
+    ///    body's map, which renders as a shadow pointing the wrong way rather than as an error.
+    /// 2. **The gate never clips.** The moon's weight is hard-gated to zero while the sun has any
+    ///    ([`moon_shadow_weight`]), and a hard gate biting on a non-zero value would be a STEP.
+    ///    This asserts the gate is inert with the shipped tables — the moon's own elevation ramp is
+    ///    already 0 everywhere the sun's is positive — so the gate is an invariant guard, not a
+    ///    shaping term.
+    /// 3. **Continuity.** No minute-to-minute jump in either weight, at dusk or at dawn. The
+    ///    threshold is deliberately loose (0.1 per game minute): the point is "no pop", not a
+    ///    derivative bound, and the smoothsteps are far smoother than that.
+    /// 4. **The window is real and it is the blob's.** Between the sun's set and the moon's rise
+    ///    NEITHER casts. That is not a bug to be crossfaded away — the moon is genuinely under the
+    ///    horizon then — and the oval blob covers it at full strength (`blob_shadow::blob_weight`
+    ///    of a zero lane is 1.0). The test pins the window's existence so a future table edit that
+    ///    closed or inverted it has to say so here.
+    #[test]
+    fn the_two_shadow_weights_never_overlap_and_neither_jumps() {
+        let sample = |minute: f32| {
+            let sun_h = super::super::daynight::celestial_sun_direction(minute).y;
+            let moon_h = super::super::daynight::moon_direction(minute).y;
+            (
+                sun_shadow_strength(sun_h),
+                moon_shadow_weight(sun_h, moon_h),
+                // The moon's ramp BEFORE the gate — property 2 needs to see what the gate hid.
+                sun_shadow_strength(moon_h),
+            )
+        };
+        let (mut prev_sun, mut prev_moon, _) = sample(0.0);
+        let (mut dark_minutes, mut moon_minutes, mut sun_minutes) = (0u32, 0u32, 0u32);
+        for m in 1..=1440 {
+            let (sun, moon, ungated) = sample(m as f32);
+            assert!(
+                !(sun > 0.0 && moon > 0.0),
+                "minute {m}: both bodies cast (sun {sun}, moon {moon}) — the rig holds ONE map"
+            );
+            assert!(
+                !(sun > 0.0 && ungated > 0.0),
+                "minute {m}: the moon's elevation ramp ({ungated}) is live while the sun's is \
+                 ({sun}) — the hand-over gate is now CLIPPING a non-zero value, i.e. it has become \
+                 a step in the weight rather than a guard on the invariant"
+            );
+            assert!(
+                (sun - prev_sun).abs() < 0.1,
+                "minute {m}: the sun weight jumped {prev_sun} -> {sun}"
+            );
+            assert!(
+                (moon - prev_moon).abs() < 0.1,
+                "minute {m}: the moon weight jumped {prev_moon} -> {moon}"
+            );
+            if sun > 0.0 {
+                sun_minutes += 1;
+            } else if moon > 0.0 {
+                moon_minutes += 1;
+            } else {
+                dark_minutes += 1;
+            }
+            prev_sun = sun;
+            prev_moon = moon;
+        }
+        assert!(sun_minutes > 600, "the sun should cast most of the day: {sun_minutes} min");
+        assert!(moon_minutes > 200, "the moon should cast most of the night: {moon_minutes} min");
+        assert!(
+            dark_minutes > 60,
+            "the sun sets ~1h45m before the moon rises — the oval blob owns that window, and a \
+             zero here would mean the two bodies had been made to overlap: {dark_minutes} min"
+        );
+    }
+
+    /// MONKEY (moon shadows): the SHADER end of the signed lane, asserted against the shader TEXT.
+    ///
+    /// [`pack_shadow_lane`] and `shadow_hook.wgsl`'s `sun_shadow_w` / `moon_shadow_w` are two
+    /// declarations of ONE encoding, and the failure mode of a drift is not a build error: a
+    /// receiver that went back to reading `fog_params.z` raw would take a NEGATIVE sun weight at
+    /// night and BRIGHTEN every shadowed fragment (`1 − occ·negative > 1`), which reads as a
+    /// glowing patch under a tree, not as a broken decode. `static_gx.wgsl` is this crate's own
+    /// receiver, so it is the copy a `benilla-world` test can see; `terrain.wgsl` and
+    /// `wow_model.wgsl` are `benilla-assets`' and are covered by the naga probes.
+    #[test]
+    fn the_static_gx_receiver_decodes_the_signed_shadow_lane() {
+        let src = include_str!("../shaders/static_gx.wgsl");
+        for call in [
+            "shadow_hook::sun_shadow_w(wow_light.fog_params.z)",
+            "shadow_hook::moon_shadow_w(wow_light.fog_params.z)",
+        ] {
+            assert!(
+                src.contains(call),
+                "static_gx.wgsl no longer decodes the signed shadow lane through `{call}` — a raw \
+                 read of `fog_params.z` takes the MOON's negative weight as the sun's and brightens \
+                 what it should darken"
+            );
+        }
+        // …and the moon arm is still behind its early-out, which is the whole `moonShadowStrength 0`
+        // ⇒ bit-identical-night contract on this receiver.
+        assert!(
+            src.contains("if (world_moon < 1.0) {"),
+            "static_gx.wgsl's moon arm lost its `world_moon < 1.0` guard — every daylight and \
+             feature-off fragment now pays for (and may round through) the night subtraction"
+        );
+    }
+
+    /// GOLDEN — MONKEY (moon shadows): the SIGNED `fog_params.z` pack, both ends.
+    ///
+    /// The lane is one float carrying two mutually-exclusive weights by sign, so the round trip has
+    /// to be exact in both directions — a lossy pack here is a shadow that is silently the wrong
+    /// strength, or (worse) a moon weight leaking into the day arm. [`unpack_shadow_lane`] is the
+    /// transcription of `shadow_hook.wgsl`'s two decodes; if the WGSL and this drift, the assertion
+    /// that a moon frame reads zero on the sun's decode is the one that fires.
+    #[test]
+    fn the_signed_shadow_lane_round_trips_both_weights() {
+        for sun in [0.0f32, 0.25, 0.5, 1.0] {
+            assert_eq!(unpack_shadow_lane(pack_shadow_lane(sun, 0.0)), (sun, 0.0));
+        }
+        for moon in [0.0f32, 0.12, 0.35, 1.0] {
+            assert_eq!(unpack_shadow_lane(pack_shadow_lane(0.0, moon)), (0.0, moon));
+        }
+        // The pre-feature bits: a zero moon weight leaves the lane EXACTLY the sun's own value, so
+        // a `moonShadowStrength 0` build packs the float it always packed.
+        assert_eq!(pack_shadow_lane(1.0, 0.0), 1.0);
+        assert_eq!(pack_shadow_lane(0.0, 0.0), 0.0);
+    }
+
+    /// GOLDEN — MONKEY (moon shadows): the dial's two ends, through the REAL packer.
+    ///
+    /// `moonShadowStrength 0` must pack the byte-identical night frame the build before this
+    /// feature packed — that is the whole "guard it like the existing `world_shadow < 0.999` arm"
+    /// contract, and it is what stands between a faint moon shadow and a renderer whose night rows
+    /// no longer match three rounds of shading forensics. The non-zero arm then proves the strength
+    /// is folded CPU-side (so the receivers carry no extra uniform) and lands NEGATIVE, where the
+    /// sun's own decode (`max(z, 0)`) reads zero out of it.
+    #[test]
+    fn the_moon_strength_dial_is_packed_cpu_side_and_zero_restores_the_old_night() {
+        // Midnight: the sun is 10 degrees under, the white moon is overhead (+55 degrees).
+        let sun_h = super::super::daynight::celestial_sun_direction(0.0).y;
+        let moon_h = super::super::daynight::moon_direction(0.0).y;
+        assert!(sun_h < 0.0 && moon_h > 0.3, "midnight: sun down, moon high ({sun_h}, {moon_h})");
+        let pack = |strength: f32| {
+            let mut app = packer_app();
+            app.world_mut().insert_resource(WowLighting {
+                celestial_dir: Vec3::new(0.0, sun_h, 0.0),
+                moon_dir_white: Vec3::new(0.0, moon_h, 0.0),
+                ..default()
+            });
+            app.world_mut().insert_resource(MoonShadowStrength(strength));
+            let mut handover = app.world_mut().resource_mut::<ShadowHandover>();
+            handover.request(0.0, 1.0, strength, true, 0.0);
+            handover.aim_written(if strength > 0.0 { ShadowBody::Moon } else { ShadowBody::Sun });
+            handover.request(0.0, 1.0, strength, true, 0.0);
+            handover.request(0.0, 1.0, strength, true, 1.5);
+            app.update();
+            app.world().resource::<WowLightData>().0
+        };
+        let off = pack(0.0);
+        assert_eq!(
+            off.rows[5][2], 0.0,
+            "moonShadowStrength 0 must pack the pre-feature night lane, to the bit"
+        );
+        let on = pack(MoonShadowStrength::default().0);
+        assert_eq!(
+            on.rows[5][2], -0.35,
+            "a high moon at the shipped strength packs the FULL weight, negated"
+        );
+        assert_eq!(
+            unpack_shadow_lane(on.rows[5][2]),
+            (0.0, 0.35),
+            "the sun's decode reads zero out of a moon frame"
+        );
+        // Every other row is the same night frame either way — the dial reaches ONE lane.
+        for row in 0..LIGHT_HEADER_ROWS {
+            for c in 0..4 {
+                if (row, c) == (5, 2) {
+                    continue;
+                }
+                assert_eq!(
+                    on.rows[row][c], off.rows[row][c],
+                    "row {row}.{c} moved with moonShadowStrength — the dial owns ONE lane"
+                );
+            }
+        }
     }
 
     /// GOLDEN — MONKEY (darkness gains): `interiorGain` scales all THREE of the room lane's inputs

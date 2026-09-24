@@ -217,6 +217,14 @@ pub(crate) fn boot_windowed_size() -> UVec2 {
 #[derive(Resource, Clone, Copy, PartialEq, Debug)]
 pub(crate) struct VideoConfig {
     pub(crate) vsync: bool,
+    /// Water tier: 0 Classic, 1 Enhanced (default), 2 High with opt-in mirror reflections.
+    /// Published to the water renderer by `dynamic_interior::bridge`.
+    pub(crate) water_quality: u8,
+    // MONKEY (volumetric fog): live camera raymarch tier: 0 Off, 1 Low, 2 High.
+    pub(crate) volumetric_fog: u8,
+    /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
+    /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
+    pub(crate) lava_light_gain: f32,
     /// Whether the STATIC WORLD (trees, buildings, foliage) casts realtime shadows and baked MCSH
     /// terrain shadows are suppressed. Independent of [`Self::character_shadows`] — either drives
     /// the shared shadow rig (`character_shadow` / `world_shadow`).
@@ -267,6 +275,13 @@ pub(crate) struct VideoConfig {
     /// proxies. Trimming it is the direct dial on caster POPULATION — the input to both lanes'
     /// per-rebuild cost — at the risk of a tall caster's shadow popping in as you approach.
     pub(crate) shadow_caster_reach: f32,
+    /// MONKEY (moon shadows): how dark a MOON-shadowed fragment is allowed to get at night
+    /// (`moonShadowStrength`, 0..1, default 0.35 = the fragment keeps 65 % of the night
+    /// directional term). Bridged to [`benilla_world::lighting::MoonShadowStrength`] by
+    /// `dynamic_interior`, beside the spell gain and for the same reasons — one live `f32`, one
+    /// resource, one guard. `0` is the faithful null: every consumer of the resource guards on it,
+    /// so a night at 0 renders as the build before the moon lane existed.
+    pub(crate) moon_shadow_strength: f32,
     /// MONKEY (dynamic interiors): WMO interiors + their props light from the room's live fixtures
     /// (`interiorLight`) instead of the baked path. The three knobs are `interiorAmbient` (base
     /// ambient, 0..1), `interiorFill` (per-fixture bounce gain, 0..2) and `interiorExposure`
@@ -349,8 +364,8 @@ pub(crate) struct VideoConfig {
     /// MONKEY (interior debug): the interior-lane diagnostic overlay (`interiorDebug`, 0..4). See
     /// [`benilla_world::lighting::DynamicInteriors::debug`].
     pub(crate) interior_debug: u32,
-    /// MONKEY (darkness gains): the exterior night dim (`nightGain`, 0.2..1.5, default **0.8** =
-    /// nights 20 % darker). Bridged to `DynamicInteriors::night_gain`, which the light packer folds
+    /// MONKEY (darkness gains): the exterior night dim (`nightGain`, 0.2..1.5, default **0.45** =
+    /// nights 55 % darker). Bridged to `DynamicInteriors::night_gain`, which the light packer folds
     /// into the packed ambient/diffuse/specular rows on a `mix(1, gain, night_w)` ramp — so it is
     /// exactly inert while the sun is up and live the frame it changes after dark.
     pub(crate) night_gain: f32,
@@ -411,6 +426,8 @@ impl Default for VideoConfig {
             character_shadow_rate: crate::shadow_core::DEFAULT_SHADOW_RATE,
             world_shadow_rate: crate::shadow_core::DEFAULT_SHADOW_RATE,
             shadow_caster_reach: 1.0,
+            // MONKEY (moon shadows): 0.35 — a hint of a silhouette, not a daylight-hard shadow.
+            moon_shadow_strength: 0.35,
             // The cvar defaults are the source of truth at load; these only stand in until then.
             interior_light: true,
             interior_ambient: 0.015,
@@ -447,6 +464,10 @@ impl Default for VideoConfig {
             interior_bake_floor: 0.12,
             fire_light_gain: 1.0,
             spell_light_gain: 1.0,
+            water_quality: 1,
+            // MONKEY (volumetric fog): default to the inexpensive atmosphere.
+            volumetric_fog: 1,
+            lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
                 DisplayMode::Windowed
@@ -477,10 +498,9 @@ pub(crate) fn present_mode(vsync: bool) -> PresentMode {
 pub(crate) struct VideoPlugin;
 
 /// **The Video Options block's change callbacks** (decision 2303) — the rows the reference
-/// registers from its one video-options registration block (`0x688470`, wow-re
-/// `cvar/scratch/graphics-cost-cvar-census.md` §2), landing on the resources they drive. Each
-/// arm writes only its own resource, so a `ViewDistance` change is `farclip` moving and nothing
-/// else; the clamps are each row's own, stated beside it.
+/// registers from its one video-options registration block (`0x688470`), landing on the resources
+/// they drive. Each arm writes only its own resource, so a `ViewDistance` change is `farclip`
+/// moving and nothing else; the clamps are each row's own, stated beside it.
 pub(crate) fn on_cvar(
     ev: On<crate::cvars::CvarChanged>,
     mut cfg: ResMut<VideoConfig>,
@@ -507,7 +527,7 @@ pub(crate) fn on_cvar(
         // Display mode (1627) — the reference's own polarity: `1` is WINDOWED (the row is
         // "Windowed Mode"). `apply_window_mode` pushes it to the window when this moves.
         "gxwindow" => cfg.display = display_from_flag(v),
-        // ── MONKEY (lighting): the dynamic light + shadow system's 29 rows ────────────────────
+        // ── MONKEY (lighting): the dynamic light + shadow system's 33 rows ────────────────────
         // They live in THIS observer, and not in one of their own beside `shadow_core` /
         // `dynamic_interior`, because of the law the arm above states: *each arm writes only its
         // own resource*. Every one of these knobs IS a field of [`VideoConfig`] — the lanes read
@@ -523,7 +543,11 @@ pub(crate) fn on_cvar(
         //
         // Clamps are each row's own, stated beside it, exactly as for the reference rows above;
         // the `ours(...)` entries in `cvars::REGISTERED` carry the matching defaults, and
-        // `cvars::tests::registered_defaults_mirror_the_code_truths` welds all 29 pairs.
+        // MONKEY (volumetric fog): the atmospheric tier brings the defaults weld to 33 pairs.
+        "waterquality" => cfg.water_quality = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (volumetric fog): constrain UI/console writes to supported tiers.
+        "volumetricfog" => cfg.volumetric_fog = v.clamp(0.0, 2.0) as u8,
+        "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),
         "shadowdistance" => {
@@ -557,6 +581,10 @@ pub(crate) fn on_cvar(
                 *crate::shadow_core::CASTER_REACH_RANGE.end(),
             )
         }
+        // MONKEY (moon shadows): the night lane's shadow darkness. 0 IS meaningful (the lane off,
+        // bit-identical to the pre-feature night), so it floors at 0 rather than at a
+        // minimum-useful value; 1 is a daylight-hard silhouette by moonlight.
+        "moonshadowstrength" => cfg.moon_shadow_strength = v.clamp(0.0, 1.0),
         // MONKEY (dynamic interiors): the interior lane's on/off + knobs, clamped at the edge like
         // every other numeric row. `dynamic_interior::bridge` publishes them to benilla-world.
         "interiorlight" => cfg.interior_light = ev.flag(),
@@ -674,8 +702,8 @@ pub(crate) fn on_cvar(
         }
         // Weather Intensity, the panel's 0..3 step 1 (2181). The reference's callback is
         // `0x67b870`, a jump table (`0x67b8e8`) mapping 0/1/2/3 onto the quality cells
-        // {0.1, 0.33, 0.66, 1.0} in `[0x8680ec]` (wow-re `graphics-cost-cvar-census.md` §4).
-        // What that table does with an off-grid int is NOT carved, so the clamp here is the
+        // {0.1, 0.33, 0.66, 1.0} in `[0x8680ec]`.
+        // What that table does with an off-grid int is NOT decoded, so the clamp here is the
         // table's own standing posture rather than a fidelity claim — and it costs nothing
         // either way, because `WeatherState::density_gain` already `.min(3)`s its own index.
         "weatherdensity" => weather.weather_density = v.trunc().clamp(0.0, 3.0) as u8,
@@ -788,9 +816,8 @@ fn drain_restart_gx(
     info!("video: RestartGx — {committed} staged setting(s) committed; re-asserting the display mode and present mode");
 }
 
-/// **The reference's own three filters on the resolution list** (wow-re
-/// `ui/scratch/video-options-verbs.md` §1.1, all VERIFIED at `0x48bcfa`–`0x48bd18`), in its own
-/// order: keep iff `w/h >= 1.248`, `w >= 800`, `h >= 600`.
+/// **The reference's own three filters on the resolution list** (`0x48bcfa`–`0x48bd18`), in its
+/// own order: keep iff `w/h >= 1.248`, `w >= 800`, `h >= 600`.
 ///
 /// The aspect constant is `[0x804570]`, the f32 `1.2480000257492065` — chosen just under 5:4 so it
 /// admits 5:4, 4:3, 16:10 and 16:9 and rejects square and portrait modes. It is not a

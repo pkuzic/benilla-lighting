@@ -38,7 +38,11 @@ use benilla_world::wmo_portal::{WmoGroupVis, WmoPortalInstance, WmoRoom};
 // MONKEY (spell light): the effect-side lifecycle this file's spawn helper stamps on — the
 // envelope, the budget and the kill switch all live beside the rest of the effect lifecycle
 // (`spell_fx::lifecycle`), because that is what a spell light's lifetime IS.
-use super::spell_fx::{spell_lights_enabled, SpellLight, SpellLightMode, SPELL_BURST_SPAN};
+// MONKEY (area spell light): `AreaSpellLight` too — the persistent ground lane's marker, stamped
+// here beside the rest of a spell light's tags.
+use super::spell_fx::{
+    spell_lights_enabled, AreaSpellLight, SpellLight, SpellLightMode, SPELL_BURST_SPAN,
+};
 
 /// Spawn a `PointLight` child for each **casting** (`type==1`, not visibility-gated dark) M2 light of
 /// an entity's model.
@@ -127,8 +131,12 @@ pub(super) fn spawn_carried_lights(
                 commands,
                 parent,
                 local,
-                l,
-                fx,
+                SpellLightSource {
+                    color: l.def.diffuse_color,
+                    intensity: l.def.diffuse_intensity,
+                    kind: fx.kind,
+                    onset: fx.onset,
+                },
                 // A GameObject that carries a spell light IS a one-shot: a firework shell, a
                 // trigger's effect model. Nothing on this lane holds.
                 SpellLightMode::Burst {
@@ -210,7 +218,125 @@ pub(super) fn spawn_spell_light(
     let Some((l, fx)) = lights.iter().find_map(|l| l.spell.map(|fx| (l, fx))) else {
         return false;
     };
-    spawn_spell_light_child(commands, root, l.def.position, l, fx, mode).is_some()
+    spawn_spell_light_child(
+        commands,
+        root,
+        l.def.position,
+        SpellLightSource {
+            color: l.def.diffuse_color,
+            intensity: l.def.diffuse_intensity,
+            kind: fx.kind,
+            onset: fx.onset,
+        },
+        mode,
+    )
+    .is_some()
+}
+
+/// MONKEY (area spell light): the ONE light a persistent ground effect throws, hung on the
+/// DynamicObject anchor itself so it lives and dies with the area object.
+///
+/// `kind` is the area lane's own verdict ([`benilla_formats::area_light_kind`] — the model path,
+/// then the spell's school, then the model's hue), and it is handed in rather than read back off
+/// the model because **the model routinely has nothing to read**: Flamestrike's burning patch and
+/// Explosive Trap's are flat animated decals with zero particle emitters, so
+/// `synthesize_spell_light` returns `None` for exactly the effects this feature is about. Where the
+/// model DOES carry a synthesised light we take its colour, intensity and onset (the artist's own
+/// ramp beats any default); where it does not we light it from the school's hue at the area
+/// fallback rung.
+///
+/// The light hangs [`AREA_LIGHT_LIFT`](benilla_formats::AREA_LIGHT_LIFT) above the emitter's own
+/// point — a dynobj sits ON the ground, and the faithful `1/(0.7d + 0.03d²)` falloff at `d → 0`
+/// would blow out the terrain under the centre while the rim of the same patch got nothing.
+///
+/// `radius` is the wire `DYNAMICOBJECT_RADIUS`: it sizes the interior pool
+/// ([`benilla_formats::area_reach`], not the shared intensity bucket — an area effect's footprint
+/// is stated on the wire and guessing it from particle size would be a worse answer than the one we
+/// were handed) and it is the impact dedupe's test radius.
+pub(super) fn spawn_area_spell_light(
+    commands: &mut Commands,
+    lights: &[benilla_assets::ModelLight],
+    kind: benilla_formats::SpellLightKind,
+    anchor: Entity,
+    radius: f32,
+) -> bool {
+    if !kind.lights() {
+        return false;
+    }
+    // The model's own synthesised light, if it has one — its `SpellLightInfo` is deliberately NOT
+    // read: the school is the area lane's (handed in above, school column included) and the onset
+    // is a fact about an emitter's FIRST pass, i.e. a fuse, on an object that loops until the
+    // server destroys it. The ground catches when the object appears.
+    let synth = lights.iter().find(|l| l.spell.is_some());
+    let (local, source) = match synth {
+        Some(l) => (
+            l.def.position,
+            SpellLightSource {
+                color: benilla_formats::area_color(kind, Some(l.def.diffuse_color)),
+                intensity: l.def.diffuse_intensity,
+                kind,
+                onset: 0.0,
+            },
+        ),
+        // The decal-only half: no emitter to read, so the school's own hue at the area rung, hung
+        // over the object's origin (its model has no emitter position either).
+        None => (
+            [0.0, 0.0, 0.0],
+            SpellLightSource {
+                color: benilla_formats::area_color(kind, None),
+                intensity: benilla_formats::AREA_FALLBACK_INTENSITY,
+                kind,
+                onset: 0.0,
+            },
+        ),
+    };
+    let lifted = [
+        local[0],
+        local[1],
+        local[2] + benilla_formats::AREA_LIGHT_LIFT,
+    ];
+    // The breathing phase: seeded from the anchor's bits so two overlapping patches swell out of
+    // step, and stable for the light's whole life (it is baked into the mode, never re-rolled).
+    let phase = (anchor.to_bits() % 1000) as f32 * 0.006_283_2;
+    let Some(glow) = spawn_spell_light_child(
+        commands,
+        anchor,
+        lifted,
+        source,
+        SpellLightMode::Area { phase },
+    ) else {
+        return false;
+    };
+    let reach = benilla_formats::area_reach(radius);
+    commands.entity(glow).insert((
+        AreaSpellLight { radius },
+        // The pool's own size, stated rather than bucketed — see [`benilla_formats::area_reach`].
+        benilla_world::lighting::LightReach(reach),
+    ));
+    if benilla_assets::trace::enabled() {
+        // Beside the shared `spell light` line the helper already wrote: the two numbers only an
+        // area light has, so "did the patch light, and how big was its pool" is answered from the
+        // trace instead of by eye.
+        benilla_assets::trace::line(
+            "fx",
+            &format!("area light e={glow} radius={radius:.1} reach={reach:.1}"),
+        );
+    }
+    true
+}
+
+/// What one spell light is made of, as its spawn site knows it — the synthesised model light's
+/// numbers, or (MONKEY (area spell light)) the area lane's school-derived stand-in for a model that
+/// carries none.
+struct SpellLightSource {
+    /// Linear RGB, hue preserved.
+    color: [f32; 3],
+    /// The authored `diffuse_intensity` the [`point_light`] recipe scales.
+    intensity: f32,
+    /// The school, for the trace and any future per-school gain.
+    kind: benilla_formats::SpellLightKind,
+    /// Seconds from the instance's birth before the light comes up (a firework's fuse).
+    onset: f32,
 }
 
 /// The shared body of the two spawn sites (the effect lanes' [`spawn_spell_light`] and the
@@ -244,14 +370,13 @@ fn spawn_spell_light_child(
     commands: &mut Commands,
     parent: Entity,
     local: [f32; 3],
-    l: &benilla_assets::ModelLight,
-    fx: benilla_assets::SpellLightInfo,
+    fx: SpellLightSource,
     mode: SpellLightMode,
 ) -> Option<Entity> {
     if !spell_lights_enabled() {
         return None;
     }
-    let lit = point_light(l.def.diffuse_color, l.def.diffuse_intensity);
+    let lit = point_light(fx.color, fx.intensity);
     // Born DARK and raised by the envelope: the onset is real time (a firework's fuse), and a
     // light that showed its full strength on its first frame and only then ramped would flash
     // once before every effect it belongs to.
@@ -840,7 +965,7 @@ mod tests {
     }
 
     /// GOLDEN — the carried-light spawn law. Only a **casting** light spawns (`type==1`, not held
-    /// dark by a static `0` visibility key — wow-re `m2-dynamic-lights.md` §9.4, the shape 11 of
+    /// dark by a static `0` visibility key — the gather gates in `0x718960`, the shape 11 of
     /// the corpus's 85 point lights actually ship), it lands as a CHILD of its host bone's joint
     /// so the animation carries it, and its offset is the def position rebased into that bone's
     /// frame (`position − bone_pivot`, wow→bevy). Colour × intensity survives the `PointLight`
