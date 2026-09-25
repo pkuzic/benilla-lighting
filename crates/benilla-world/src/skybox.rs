@@ -542,14 +542,16 @@ fn build_skybox(
                     }
                 }
             }
+            let mut lane_materials = [pair.steady.clone(), pair.fade_blend.clone()];
             let lane = SkyMatLane::register(
                 sub,
                 uv,
                 tint,
                 &mut table,
                 mats.materials(),
-                &[pair.steady.id(), pair.fade_blend.id()],
+                &mut lane_materials,
             );
+            [pair.steady, pair.fade_blend] = lane_materials;
             let mesh = meshes.add(mesh);
             let pose = match sole_bone(sub) {
                 Some(b) if rig.bone_moves(b) => PartPose::Rigid(b),
