@@ -322,17 +322,19 @@ fn build_chunk_clutter(
         if subs.is_empty() {
             continue;
         }
+        // MONKEY (wind): source M2 Z is up. Normalize the actual tuft geometry rather than
+        // trusting texture V (WXL's 3.3.5 detail doodads use inverse V, but vanilla assets are
+        // not guaranteed to). UV_1 stays free here and carries height + per-tuft phase.
+        // MONKEY (fix-wind): one span over ALL of the model's submeshes, so a trunk + canopy pair
+        // bends as one body instead of tearing apart at the seam.
+        let (min_z, max_z) = subs
+            .iter()
+            .flat_map(|sub| sub.positions.iter())
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p[2]), hi.max(p[2]))
+            });
+        let height_span = (max_z - min_z).max(1.0e-4);
         for sub in subs.iter() {
-            // MONKEY (wind): source M2 Z is up. Normalize the actual tuft geometry rather than
-            // trusting texture V (WXL's 3.3.5 detail doodads use inverse V, but vanilla assets are
-            // not guaranteed to). UV_1 stays free here and carries height + per-tuft phase.
-            let (min_z, max_z) = sub
-                .positions
-                .iter()
-                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
-                    (lo.min(p[2]), hi.max(p[2]))
-                });
-            let height_span = (max_z - min_z).max(1.0e-4);
             let vcount = sub.positions.len() * placements.len();
             let mut positions = Vec::with_capacity(vcount);
             let mut uvs = Vec::with_capacity(vcount);
