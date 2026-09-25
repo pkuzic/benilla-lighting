@@ -492,6 +492,11 @@
             enUS = {
                 page = "Advanced Graphics",
                 lightingQuality = "Lighting Quality",
+                -- MONKEY (presets): the Graphics Preset and Render Distance rows.
+                graphicsQuality = "Graphics Preset",
+                renderDistance = "Render Distance",
+                pClassic = "Classic",
+                qUltra = "Ultra",
                 -- MONKEY (volumetric fog): localised atmospheric quality row.
                 volumetricFog = "Volumetric Fog",
                 -- MONKEY (post): HDR excess + halo quality.
@@ -538,6 +543,23 @@
                 windTrees = "Grass + Trees",
                 yards = "%d yd",
                 tips = {
+                    -- MONKEY (presets)
+                    GRAPHICS_QUALITY =
+                        "Sets every graphics setting at once: Lighting Quality and everything it sets, "
+                        .. "Render Distance, Sky Quality, Sky Dithering, Modern Fog, Wet Surfaces in Rain, "
+                        .. "Terrain Blocks Torchlight and the daylight through city windows.\n\n"
+                        .. "Classic is the original client: every enhancement off and the original 350 yd "
+                        .. "view distance. Low and Medium add the enhancements that cost almost nothing; High "
+                        .. "is the recommended look; Ultra raises every quality to its maximum and the view "
+                        .. "distance to 1497 yd, and costs the most.\n\n"
+                        .. "Shadow Distance and Torch Shadow Softness stay as you set them. Changing any "
+                        .. "setting the preset sets shows Custom.",
+                    RENDER_DISTANCE =
+                        "How far the detailed world is drawn, in yards: the same setting as Terrain "
+                        .. "Distance on the Graphics page, with a longer reach. Past 777 yd, the original "
+                        .. "client's limit, the extra distance shows through Modern Fog; with the original "
+                        .. "fog the zone's own fog hides it.\n\n"
+                        .. "Farther costs more memory, loading and GPU time.",
                     LIGHTING_QUALITY =
                         "Sets character, world, indoor torch and outdoor torch shadows; dynamic "
                         .. "interior lighting; moon shadows; volumetric fog; water quality; lava glow; fire and spell brightness; fire flicker; "
@@ -547,6 +569,8 @@
                         .. "night gain 1.0 and interior gain 1.0. All other settings, including "
                         .. "Shadow Distance and Torch Shadow Softness, stay as you set them. "
                         .. "Low, Medium and High use Enhanced water; mirror reflections stay opt-in. "
+                        .. "Ultra also raises shadow resolution to 4096 and the torch shadow counts to 16 and 8, "
+                        .. "and uses High water and High volumetric fog. "
                         .. "Changing a preset member shows Custom when no preset matches.",
                     -- MONKEY (volumetric fog): explain cost and the shadow-map dependency.
                     -- MONKEY (post): Off guarantees the pre-HDR image.
@@ -673,6 +697,11 @@
             ruRU = {
                 page = "Расширенная графика",
                 lightingQuality = "Качество освещения",
+                -- MONKEY (presets): the Graphics Preset and Render Distance rows.
+                graphicsQuality = "Набор графики",
+                renderDistance = "Дальность прорисовки",
+                pClassic = "Классика",
+                qUltra = "Ультра",
                 -- MONKEY (post): Russian HDR excess + halo quality row.
                 bloom = "Свечение",
                 sunShafts = "Солнечные лучи",
@@ -719,6 +748,23 @@
                 windTrees = "Трава + деревья",
                 yards = "%d ярд.",
                 tips = {
+                    -- MONKEY (presets)
+                    GRAPHICS_QUALITY =
+                        "Задаёт все настройки графики сразу: качество освещения и всё, что оно задаёт, "
+                        .. "дальность прорисовки, качество неба, дизеринг неба, современный туман, мокрые "
+                        .. "поверхности в дождь, заслонение огней рельефом и дневной свет в окнах городов.\n\n"
+                        .. "«Классика» — оригинальный клиент: все улучшения выключены, дальность обзора "
+                        .. "прежние 350 ярдов. «Низкое» и «Среднее» добавляют почти бесплатные улучшения; "
+                        .. "«Высокое» — рекомендуемый вид; «Ультра» поднимает всё качество до максимума, а "
+                        .. "дальность — до 1497 ярдов, и стоит дороже всего.\n\n"
+                        .. "Дальность теней и мягкость теней от огня сохраняют ваши значения. Изменение "
+                        .. "любой настройки набора показывает «Своё».",
+                    RENDER_DISTANCE =
+                        "Как далеко рисуется подробный мир, в ярдах: та же настройка, что «Дальность "
+                        .. "обзора» на странице «Графика», но с большим пределом. Дальше 777 ярдов, предела "
+                        .. "оригинального клиента, дополнительное расстояние видно с современным туманом; "
+                        .. "с оригинальным туманом его скрывает туман зоны.\n\n"
+                        .. "Чем дальше, тем больше памяти, загрузки и работы видеокарты.",
                     LIGHTING_QUALITY =
                         "Задаёт тени персонажей, мира и огней внутри и снаружи помещений; "
                         .. "динамическое освещение помещений; лунные тени; объёмный туман; качество воды; свечение лавы; яркость огня и заклинаний; "
@@ -729,7 +775,9 @@
                         .. "источников света, с коэффициентами яркости ночи и помещений 1.0. "
                         .. "Все остальные настройки, включая дальность теней и мягкость теней от огня, "
                         .. "сохраняют ваши значения. «Низкое», «Среднее» и «Высокое» используют улучшенную воду; "
-                        .. "зеркальные отражения включаются отдельно. Изменение настройки набора показывает «Своё», "
+                        .. "зеркальные отражения включаются отдельно. «Ультра» также поднимает разрешение теней "
+                        .. "до 4096 и число теней от огней до 16 и 8, а вода и объёмный туман — «Высокое». "
+                        .. "Изменение настройки набора показывает «Своё», "
                         .. "если ни один набор больше не совпадает.",
                     -- MONKEY (post): localised bloom effect and Off contract.
                     BLOOM =
@@ -912,6 +960,8 @@
             -- the rig they share, and the Graphics page had become the place where a player found
             -- three of eighteen shadow settings and no hint that the other fifteen existed.
             AdvancedGraphics = {
+                -- MONKEY (presets): the ladder over every row below, then the view distance.
+                "RowGraphicsQuality", "RowRenderDistance",
                 -- MONKEY (volumetric fog): include in refresh, defaults and search.
                 "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog",
                 -- MONKEY (sky): the sky tier row.
@@ -1543,7 +1593,20 @@
             for _, rkey in ipairs(OPTIONS_PAGE_ROWS[key]) do
                 local row = getglobal(base .. rkey)
                 row.pending = nil
-                OptionsRow_Set(row, OptionsRow_Default(row))
+                if not row.preset then
+                    OptionsRow_Set(row, OptionsRow_Default(row))
+                end
+            end
+            -- MONKEY (presets): a preset row goes last, so its default rung (the Graphics
+            -- Preset's High) is what the page lands on rather than its members' own defaults.
+            -- `SetCVar` queues only a moved value, so "Custom" (which the host applies as
+            -- nothing) goes first: the rung is then always a queued write, after the members.
+            for _, rkey in ipairs(OPTIONS_PAGE_ROWS[key]) do
+                local row = getglobal(base .. rkey)
+                if row.preset then
+                    OptionsRow_Set(row, "Custom")
+                    OptionsRow_Set(row, OptionsRow_Default(row))
+                end
             end
             OptionsPage_Refresh(key)
         end
@@ -2672,10 +2735,50 @@
                                         <Anchor point="BOTTOMRIGHT"/>
                                     </Anchors>
                                     <Frames>
-                                        <Frame name="$parentRowLightingQuality" inherits="OptionsDropdownRowTemplate">
+                                        <!-- MONKEY (presets): the Graphics Preset. Like Lighting
+                                             Quality below it, ONE CVar: the host's
+                                             `cvars::GRAPHICS_PRESETS` writes the rows and
+                                             re-derives this one every frame. -->
+                                        <Frame name="$parentRowGraphicsQuality" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT"><Offset><AbsDimension x="10" y="-12"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT"><Offset><AbsDimension x="-20" y="-12"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "graphicsQuality",
+                                                    BENILLA_ADVGFX.graphicsQuality,
+                                                    "BENILLA_TOOLTIP_GRAPHICS_QUALITY")
+                                                self.preset = 1
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.pClassic, value = "Classic" },
+                                                    { text = BENILLA_ADVGFX.qLow, value = "Low" },
+                                                    { text = BENILLA_ADVGFX.qMedium, value = "Medium" },
+                                                    { text = BENILLA_ADVGFX.qHigh, value = "High" },
+                                                    { text = BENILLA_ADVGFX.qUltra, value = "Ultra" },
+                                                    { text = BENILLA_ADVGFX.qCustom, value = "Custom" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (presets): `farclip`, the Graphics page's Terrain
+                                             Distance, on the extended range (`view::FARCLIP_RANGE`,
+                                             177..1497 on the 1.12 grid of 60). Live like its
+                                             Graphics twin; both read the one CVar. -->
+                                        <Frame name="$parentRowRenderDistance" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowGraphicsQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowGraphicsQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "farclip",
+                                                    BENILLA_ADVGFX.renderDistance,
+                                                    "BENILLA_TOOLTIP_RENDER_DISTANCE")
+                                                OptionsSliderRow_Setup(self, 177, 1497, 60, "yd")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowLightingQuality" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowRenderDistance" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowRenderDistance" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- The preset ladder. This row writes ONE CVar and
@@ -2701,6 +2804,7 @@
                                                     { text = BENILLA_ADVGFX.qLow, value = "Low" },
                                                     { text = BENILLA_ADVGFX.qMedium, value = "Medium" },
                                                     { text = BENILLA_ADVGFX.qHigh, value = "High" },
+                                                    { text = BENILLA_ADVGFX.qUltra, value = "Ultra" },
                                                     { text = BENILLA_ADVGFX.qCustom, value = "Custom" },
                                                 })
                                             </OnLoad></Scripts>

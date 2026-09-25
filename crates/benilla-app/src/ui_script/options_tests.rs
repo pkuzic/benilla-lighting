@@ -2042,7 +2042,7 @@ fn volumetric_fog_dropdown_is_localised_and_live() {
         s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
-        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[3]").unwrap(), "RowVolumetricFog");
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[5]").unwrap(), "RowVolumetricFog");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowVolumetricFogLabel:GetText()")).unwrap(), title);
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowVolumetricFogDropdownText:GetText()")).unwrap(), labels[1]);
         let _ = s.take_cvar_changes();
@@ -2067,9 +2067,10 @@ fn water_quality_writes_numeric_tiers_with_localised_labels() {
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
         // MONKEY (volumetric fog): account for the atmosphere row after water.
-        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 18);
-        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
-        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[16]").unwrap(), "RowLavaGlow");
+        // MONKEY (presets): Graphics Preset and Render Distance lead the page: 27 -> 29.
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 29);
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[4]").unwrap(), "RowWaterQuality");
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[23]").unwrap(), "RowLavaGlow");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowLavaGlowLabel:GetText()")).unwrap(), lava_label);
         assert!(s.eval::<bool>("return BENILLA_TOOLTIP_WATER_QUALITY == BENILLA_ADVGFX.tips.WATER_QUALITY and BENILLA_TOOLTIP_LAVA_GLOW == BENILLA_ADVGFX.tips.LAVA_GLOW").unwrap());
@@ -3033,6 +3034,15 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "BENILLA_TOOLTIP_LIGHTING_QUALITY",
                 "AdvancedGraphicsRowLightingQuality",
             ),
+            // MONKEY (presets)
+            (
+                "BENILLA_TOOLTIP_GRAPHICS_QUALITY",
+                "AdvancedGraphicsRowGraphicsQuality",
+            ),
+            (
+                "BENILLA_TOOLTIP_RENDER_DISTANCE",
+                "AdvancedGraphicsRowRenderDistance",
+            ),
             (
                 "BENILLA_TOOLTIP_SHADOW_RESOLUTION",
                 "AdvancedGraphicsRowShadowResolution",
@@ -3143,7 +3153,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // changing pages does not change this count, only its entry in BENILLA_OWNED. 81 -> 93.
     // Water Quality and Lava Glow add two more: 93 -> 95.
     // MONKEY (daylight: terrain torch casters): Terrain Blocks Torchlight. 95 -> 96.
-    assert_eq!(checked, 96, "every tipped row carries a live key");
+    // MONKEY (presets): Graphics Preset and Render Distance. +2.
+    assert_eq!(checked, 98, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![

@@ -916,8 +916,21 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "lightingQuality",
         "High",
         "benilla's own: the preset ladder over the dynamic light + shadow rows — Off / Low / \
-         Medium / High, or Custom when the members match none of them; the reference has no \
+         Medium / High / Ultra, or Custom when the members match none of them; the reference has no \
          realtime light or shadow system to preset",
+    ),
+    // MONKEY (presets): the Graphics Preset — `lightingQuality`'s posture one level up, a NAME
+    // for every graphics row at once ([`GRAPHICS_PRESETS`]), re-derived every frame. "High" is
+    // what a player with no saved preset boots into: [`Cvars::seed_graphics_preset`] writes the
+    // High column over every row their `config.toml` does not carry, so the rows themselves keep
+    // their per-lane defaults (Classic-leaning, and `farclip` the reference's 350) and a capture
+    // or a test, which never seeds, keeps them too.
+    ours(
+        "graphicsQuality",
+        "High",
+        "benilla's own: the preset ladder over every graphics row — Classic / Low / Medium / High \
+         / Ultra, or Custom when the rows match none of them; the reference's options have no \
+         such preset",
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
@@ -1733,6 +1746,9 @@ impl Cvars {
         if name.eq_ignore_ascii_case("lightingQuality") {
             apply_lighting_preset(self, value);
         }
+        if name.eq_ignore_ascii_case("graphicsQuality") {
+            apply_graphics_preset(self, value);
+        }
         outcome
     }
 
@@ -1744,7 +1760,36 @@ impl Cvars {
         if name.eq_ignore_ascii_case("lightingQuality") {
             apply_lighting_preset(self, value);
         }
+        if name.eq_ignore_ascii_case("graphicsQuality") {
+            apply_graphics_preset(self, value);
+        }
         outcome
+    }
+
+    /// MONKEY (presets): **the first boot's Graphics Preset** — a player whose `config.toml`
+    /// names no `graphicsQuality` (a new player, or one from before the ladder) gets the
+    /// [`GRAPHICS_DEFAULT`] column written over every governed row the file does not carry and the
+    /// session does not own. Rows the file carries are the player's and stay; the lighting rung
+    /// is left alone, because High on that ladder IS the registered defaults
+    /// (`the_high_preset_is_the_registered_defaults`). Returns how many rows moved.
+    pub(crate) fn seed_graphics_preset(&mut self) -> usize {
+        let carried = |cvars: &Self, k: &str| {
+            cvars.file.keys().any(|f| f.eq_ignore_ascii_case(k)) || cvars.is_session_owned(k)
+        };
+        if carried(self, "graphicsQuality") {
+            return 0;
+        }
+        let col = graphics_column(GRAPHICS_DEFAULT).expect("the default is a rung");
+        let mut moved = 0;
+        for (k, values) in GRAPHICS_PRESETS {
+            if k.eq_ignore_ascii_case("lightingQuality") || carried(self, k) {
+                continue;
+            }
+            if self.set(k, values[col]) == SetOutcome::Changed {
+                moved += 1;
+            }
+        }
+        moved
     }
 
     /// **The table follows a value the engine already applied** — a mirror, not a write: the
@@ -2166,6 +2211,35 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("foliageWind", "2"),
         ],
     ),
+    // MONKEY (presets): High plus every lane at its maximum — the 4096 sun map, all sixteen
+    // resident torch maps with eight of them tracking movers, mirror-reflection water and the
+    // High fog march. Disjoint from High on `shadowMapSize`, so derivation never confuses them.
+    (
+        "Ultra",
+        &[
+            ("characterShadows", "1"),
+            ("worldShadows", "1"),
+            ("shadowMapSize", "4096"),
+            ("interiorLight", "1"),
+            ("interiorShadows", "1"),
+            ("interiorShadowCasters", "16"),
+            ("interiorShadowDynamic", "8"),
+            ("exteriorShadows", "1"),
+            ("spellLightGain", "1"),
+            ("waterQuality", "2"),
+            ("volumetricFog", "2"),
+            ("bloom", "2"),
+            ("sunShafts", "1"),
+            ("colorGrading", "1"),
+            ("lavaLightGain", "1"),
+            ("fireLightGain", "1"),
+            ("nightGain", "0.45"),
+            ("interiorGain", "0.5"),
+            ("moonShadowStrength", "0.35"),
+            ("fireFlicker", "1"),
+            ("foliageWind", "2"),
+        ],
+    ),
 ];
 
 /// What the ladder shows when the members match no preset. Not a preset: selecting it writes
@@ -2219,6 +2293,82 @@ fn lighting_quality(cvars: &mut Cvars) {
     let derived = derive_lighting_quality(cvars);
     // A derived label is a mirror, never another request to apply a preset.
     cvars.mirror("lightingQuality", derived);
+    // MONKEY (presets): after the lighting label, which the graphics ladder reads as a member.
+    let graphics = derive_graphics_quality(cvars);
+    cvars.mirror("graphicsQuality", graphics);
+}
+
+// ─── MONKEY (presets): the Graphics Preset ladder ─────────────────────────────────────────────
+
+/// The Graphics Preset's rungs, in the order [`derive_graphics_quality`] tries them and the
+/// column order of [`GRAPHICS_PRESETS`].
+pub(crate) const GRAPHICS_PRESET_NAMES: [&str; 5] = ["Classic", "Low", "Medium", "High", "Ultra"];
+
+/// The rung a player with no saved preset boots into ([`Cvars::seed_graphics_preset`]).
+pub(crate) const GRAPHICS_DEFAULT: &str = "High";
+
+/// **The one place the Graphics Preset is written down**: one line per governed row, one column
+/// per rung of [`GRAPHICS_PRESET_NAMES`]. `lightingQuality` is itself a row — writing its rung
+/// writes [`LIGHTING_PRESETS`]' members — so every lighting, water, fog, post and wind row the
+/// lighting ladder owns is governed here without a second copy. The other rows are disjoint from
+/// that ladder, which is what lets both labels be right at once.
+///
+/// Classic is the reference client: every lane off, `farclip` at its registered 350. High is
+/// each lane's documented High (LIGHTING.md, WATER.md); Ultra is High at every maximum, and the
+/// only rung past the reference's 777 yd (`FARCLIP_RANGE`); Low and Medium keep the practically
+/// free lanes (sky, dither, modern fog, wet surfaces) and leave the costly ones to High.
+///
+/// A row that lands later is ONE line here; the three pending ones sit commented with their
+/// intended columns until the rows they name are registered (an unregistered member would never
+/// match, and the ladder would read Custom forever).
+#[rustfmt::skip]
+pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
+    //                        Classic  Low    Medium    High    Ultra
+    ("lightingQuality",      ["Off",  "Low", "Medium", "High", "Ultra"]),
+    ("farclip",              ["350",  "350", "477",    "777",  "1497"]),
+    ("skyQuality",           ["0",    "1",   "1",      "2",    "2"]),
+    ("skyDither",            ["0",    "1",   "1",      "1",    "1"]),
+    ("fogModel",             ["0",    "1",   "1",      "1",    "1"]),
+    ("rainSurfaces",         ["0",    "1",   "1",      "1",    "1"]),
+    ("torchTerrainShadows",  ["0",    "0",   "0",      "1",    "1"]),
+    ("daylightWindowSplit",  ["0",    "1",   "1",      "1",    "1"]),
+    // TODO(presets): uncomment each as its row lands from the parallel merge.
+    // ("ambientOcclusion",  ["0",    "0",   "1",      "2",    "2"]),
+    // ("zoneSkyboxes",      ["0",    "1",   "1",      "1",    "1"]),
+    // ("lampFog",           ["0",    "0",   "1",      "2",    "2"]),
+];
+
+/// The column of a rung, matched case-insensitively; `None` for `Custom` or anything else.
+fn graphics_column(name: &str) -> Option<usize> {
+    GRAPHICS_PRESET_NAMES
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name))
+}
+
+/// The rung every governed row currently spells, or [`LIGHTING_CUSTOM`] (the one "Custom" both
+/// ladders show). Reads `lightingQuality`'s DERIVED label, so run it after that is mirrored.
+pub(crate) fn derive_graphics_quality(cvars: &Cvars) -> &'static str {
+    for (col, name) in GRAPHICS_PRESET_NAMES.iter().enumerate() {
+        let matched = GRAPHICS_PRESETS
+            .iter()
+            .all(|(k, v)| cvars.get(k).is_some_and(|live| same_value(live, v[col])));
+        if matched {
+            return name;
+        }
+    }
+    LIGHTING_CUSTOM
+}
+
+/// Write one rung's column through [`Cvars::set`]; `false` (and nothing written) for an unknown
+/// name, `Custom` included.
+pub(crate) fn apply_graphics_preset(cvars: &mut Cvars, name: &str) -> bool {
+    let Some(col) = graphics_column(name) else {
+        return false;
+    };
+    for (k, values) in GRAPHICS_PRESETS {
+        cvars.set(k, values[col]);
+    }
+    true
 }
 
 /// **What the environment took for this session, and what it set it to** — read off the knobs
@@ -2313,6 +2463,11 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
 fn load_config(world: &mut World) {
     let session = session_values(world);
     let stored = stored_config();
+    let stored_kind = match &stored {
+        StoredConfig::Absent => StoredKind::Absent,
+        StoredConfig::Table(_) => StoredKind::Table,
+        StoredConfig::Bad(_) => StoredKind::Bad,
+    };
     let events = {
         let mut cvars = world.resource_mut::<Cvars>();
         for (name, value) in session {
@@ -2334,11 +2489,32 @@ fn load_config(world: &mut World) {
             }
             StoredConfig::Table(table) => cvars.load_file(table),
         }
+        // MONKEY (presets): a player's own run (never a capture, never a malformed file) boots
+        // into the default Graphics Preset over whatever its file leaves unsaid.
+        if seeds_graphics_preset(&stored_kind) {
+            cvars.seed_graphics_preset();
+        }
         cvars.take_events()
     };
     for event in events {
         world.trigger(event);
     }
+}
+
+/// MONKEY (presets): which [`StoredConfig`] arm a boot took, kept past the table's move.
+enum StoredKind {
+    Absent,
+    Table,
+    Bad,
+}
+
+/// MONKEY (presets): whether this boot seeds the default Graphics Preset — a run that reads and
+/// saves a player's `config.toml` and found it absent or well-formed. A capture (hermetic, or on
+/// an explicit fixture) keeps the registered defaults so its A/B stays exact, and a malformed
+/// file is left for the player rather than papered over.
+fn seeds_graphics_preset(kind: &StoredKind) -> bool {
+    let players_file = std::env::var_os("WOW_CAPTURE").is_none() && config_read_path().is_some();
+    players_file && matches!(kind, StoredKind::Absent | StoredKind::Table)
 }
 
 /// What the one read of `config.toml` found.
@@ -3108,6 +3284,8 @@ mod tests {
                 for member in ["fireLightGain", "waterQuality", "volumetricFog", "lavaLightGain", "nightGain", "interiorGain"] {
                     let expected = if *name == "Off" {
                         if matches!(member, "fireLightGain" | "waterQuality" | "volumetricFog" | "lavaLightGain") { "0" } else { "1.0" }
+                    } else if *name == "Ultra" && matches!(member, "waterQuality" | "volumetricFog") {
+                        "2" // MONKEY (presets): Ultra's two maxima over the defaults.
                     } else {
                         cvars.default_of(member).unwrap()
                     };
@@ -3192,8 +3370,210 @@ mod tests {
         let mut cvars = fresh_registry();
         apply_lighting_preset(&mut cvars, "Medium");
         assert!(!apply_lighting_preset(&mut cvars, LIGHTING_CUSTOM));
-        assert!(!apply_lighting_preset(&mut cvars, "Ultra"));
+        assert!(!apply_lighting_preset(&mut cvars, "Epic"));
         assert_eq!(derive_lighting_quality(&cvars), "Medium");
+    }
+
+    // ── MONKEY (presets): the Graphics Preset ladder ──────────────────────────────────────────
+
+    /// Every governed row is registered and names no row the lighting ladder already owns — the
+    /// disjointness that lets both labels be right at once.
+    #[test]
+    fn graphics_rows_are_registered_and_disjoint_from_the_lighting_ladder() {
+        assert_eq!(GRAPHICS_PRESETS.len(), 8, "add the row count with the row");
+        let cvars = fresh_registry();
+        for (k, values) in GRAPHICS_PRESETS {
+            assert!(cvars.get(k).is_some(), "{k}: not registered");
+            for (rung, members) in LIGHTING_PRESETS {
+                assert!(
+                    members.iter().all(|(m, _)| !m.eq_ignore_ascii_case(k)),
+                    "{k} is also a member of lighting {rung}"
+                );
+            }
+            if *k == "lightingQuality" {
+                for v in values {
+                    assert!(
+                        LIGHTING_PRESETS.iter().any(|(n, _)| n == v),
+                        "{v}: a lighting rung"
+                    );
+                }
+            }
+        }
+        // The rungs are distinct columns, so no two can derive to the same name.
+        for a in 0..GRAPHICS_PRESET_NAMES.len() {
+            for b in a + 1..GRAPHICS_PRESET_NAMES.len() {
+                assert!(
+                    GRAPHICS_PRESETS
+                        .iter()
+                        .any(|(_, v)| !same_value(v[a], v[b])),
+                    "{} and {} are the same column",
+                    GRAPHICS_PRESET_NAMES[a],
+                    GRAPHICS_PRESET_NAMES[b]
+                );
+            }
+        }
+    }
+
+    /// **Preset → rows → the same preset**, from every rung to every rung, through the ordinary
+    /// `set` path — with the two rows no preset decides left where the player put them.
+    #[test]
+    fn every_graphics_preset_derives_back_to_its_own_name() {
+        for from in GRAPHICS_PRESET_NAMES {
+            for name in GRAPHICS_PRESET_NAMES {
+                let mut cvars = fresh_registry();
+                cvars.set("graphicsQuality", from);
+                cvars.set("shadowDistance", "120");
+                cvars.set("interiorShadowSoft", "2.5");
+                cvars.set("graphicsQuality", name);
+                lighting_quality(&mut cvars);
+                assert_eq!(derive_graphics_quality(&cvars), name, "{from} -> {name}");
+                assert_eq!(cvars.get("graphicsQuality"), Some(name));
+                let col = graphics_column(name).unwrap();
+                assert_eq!(
+                    cvars.get("lightingQuality"),
+                    Some(GRAPHICS_PRESETS[0].1[col])
+                );
+                assert_eq!(cvars.get("shadowDistance"), Some("120"));
+                assert_eq!(cvars.get("interiorShadowSoft"), Some("2.5"));
+            }
+        }
+    }
+
+    /// Classic is the reference client: the lighting ladder's Off, every programme lane off and
+    /// `farclip` at the reference's registered 350.
+    #[test]
+    fn the_classic_preset_is_every_lane_off_at_the_reference_view_distance() {
+        let mut cvars = fresh_registry();
+        assert!(apply_graphics_preset(&mut cvars, "Classic"));
+        assert_eq!(cvars.get("lightingQuality"), Some("Off"));
+        assert_eq!(cvars.get("farclip"), cvars.default_of("farclip"));
+        for (k, values) in GRAPHICS_PRESETS {
+            if !matches!(*k, "lightingQuality" | "farclip") {
+                assert!(same_value(values[0], "0"), "{k}: Classic leaves it on");
+            }
+        }
+        // Ultra is the one rung past the reference's 777, and inside the extended clamp.
+        let ultra = GRAPHICS_PRESETS
+            .iter()
+            .find(|(k, _)| *k == "farclip")
+            .unwrap()
+            .1[4];
+        let ultra: f32 = ultra.parse().unwrap();
+        assert!(ultra > 777.0 && FARCLIP_RANGE.contains(&ultra));
+    }
+
+    /// **Editing one governed row is Custom** — for every rung and every row of it, the lighting
+    /// rung included (moved by one of ITS members, as the page's lighting rows would).
+    #[test]
+    fn one_changed_graphics_row_derives_custom() {
+        for name in GRAPHICS_PRESET_NAMES {
+            let col = graphics_column(name).unwrap();
+            for (k, values) in GRAPHICS_PRESETS {
+                let mut cvars = fresh_registry();
+                apply_graphics_preset(&mut cvars, name);
+                let (row, moved) = if *k == "lightingQuality" {
+                    let to = if values[col] == "Off" { "1" } else { "0" };
+                    ("characterShadows", to.to_string())
+                } else {
+                    let v: f32 = values[col].parse().unwrap();
+                    let to = if *k == "farclip" {
+                        v + 60.0
+                    } else if v == 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    (*k, to.to_string())
+                };
+                assert_eq!(cvars.set(row, &moved), SetOutcome::Changed, "{name}/{row}");
+                lighting_quality(&mut cvars);
+                assert_eq!(
+                    cvars.get("graphicsQuality"),
+                    Some(LIGHTING_CUSTOM),
+                    "{name}/{row}"
+                );
+                // …and picking the rung again puts every row back.
+                assert!(apply_graphics_preset(&mut cvars, name));
+                lighting_quality(&mut cvars);
+                assert_eq!(
+                    cvars.get("graphicsQuality"),
+                    Some(name),
+                    "{name}/{row} re-pick"
+                );
+            }
+        }
+        let mut cvars = fresh_registry();
+        assert!(!apply_graphics_preset(&mut cvars, LIGHTING_CUSTOM));
+        assert!(!apply_graphics_preset(&mut cvars, "Epic"));
+    }
+
+    /// **A new player boots into High**: the seed writes the High column over a registry with no
+    /// file, and the registered default of the label agrees, so it never reaches `config.toml`.
+    #[test]
+    fn a_fresh_player_is_seeded_to_the_high_graphics_preset() {
+        assert_eq!(
+            fresh_registry().default_of("graphicsQuality"),
+            Some(GRAPHICS_DEFAULT)
+        );
+        let mut cvars = fresh_registry();
+        assert!(cvars.seed_graphics_preset() > 0);
+        lighting_quality(&mut cvars);
+        assert_eq!(cvars.get("graphicsQuality"), Some("High"));
+        assert_eq!(cvars.get("lightingQuality"), Some("High"));
+        assert_eq!(cvars.get("farclip"), Some("777"));
+        assert!(
+            !cvars.compose().contains_key("graphicsQuality"),
+            "the default label is not saved"
+        );
+        // A second boot over what the first one saved seeds nothing.
+        let mut again = fresh_registry();
+        again.load_file(cvars.compose());
+        assert_eq!(again.seed_graphics_preset(), 0);
+        lighting_quality(&mut again);
+        assert_eq!(again.get("graphicsQuality"), Some("High"));
+    }
+
+    /// The seed never overrides the player: a saved preset stops it outright, a saved row keeps
+    /// its value, and a session-owned row (an env lever) is left to the session.
+    #[test]
+    fn the_graphics_seed_leaves_saved_and_session_rows_alone() {
+        let mut saved = fresh_registry();
+        saved.load_file(BTreeMap::from([(
+            "graphicsQuality".into(),
+            "Classic".into(),
+        )]));
+        assert_eq!(saved.seed_graphics_preset(), 0);
+        assert_eq!(saved.get("skyQuality"), saved.default_of("skyQuality"));
+
+        let mut row = fresh_registry();
+        row.load_file(BTreeMap::from([("skyQuality".into(), "1".into())]));
+        row.own_for_session("farclip", Some("500"));
+        row.seed_graphics_preset();
+        lighting_quality(&mut row);
+        assert_eq!(row.get("skyQuality"), Some("1"));
+        assert_eq!(row.get("farclip"), Some("500"));
+        assert_eq!(row.get("fogModel"), Some("1"));
+        assert_eq!(row.get("graphicsQuality"), Some(LIGHTING_CUSTOM));
+    }
+
+    /// Ultra's `farclip` survives the real observer (the extended clamp), and every governed
+    /// row's rung values do too.
+    #[test]
+    fn graphics_rows_pass_their_observers_unclamped() {
+        let mut app = cvar_app();
+        for (col, name) in GRAPHICS_PRESET_NAMES.iter().enumerate() {
+            let farclip = GRAPHICS_PRESETS
+                .iter()
+                .find(|(k, _)| *k == "farclip")
+                .unwrap()
+                .1[col];
+            apply(&mut app, "farclip", farclip);
+            assert_eq!(
+                res::<ViewDistance>(&app).farclip,
+                farclip.parse::<f32>().unwrap(),
+                "{name}"
+            );
+        }
     }
 
     /// Every member every rung names is a REGISTERED row — a typo'd member would otherwise make
@@ -3722,7 +4102,16 @@ mod tests {
         assert!(text.contains("MusicVolume = \"0.75\""), "{text}");
         assert!(!text.contains("MasterVolume"), "defaults stay out:\n{text}");
         let back: LocalConfig = toml::from_str(&text).unwrap();
-        assert_eq!(back.cvars.len(), 1, "a diff, not a dump: {text}");
+        // MONKEY (presets): the file named no `graphicsQuality`, so the first boot seeded the
+        // High rungs over the governed rows; those are the only other entries, and the label
+        // itself, at its default, stays out.
+        let player: Vec<&String> = back
+            .cvars
+            .keys()
+            .filter(|k| !GRAPHICS_PRESETS.iter().any(|(g, _)| g.eq_ignore_ascii_case(k)))
+            .collect();
+        assert_eq!(player.len(), 1, "a diff, not a dump: {text}");
+        assert!(!text.contains("graphicsQuality"), "{text}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -4096,7 +4485,14 @@ mod tests {
         strings.sort_unstable(); // the list is the claim, not where the rows sit in the table
         assert_eq!(
             strings,
-            vec!["gxApi", "gxResolution", "lightingQuality", "realmList", "realmName"]
+            vec![
+                "graphicsQuality",
+                "gxApi",
+                "gxResolution",
+                "lightingQuality",
+                "realmList",
+                "realmName"
+            ]
         );
         let default_of = |name: &str| {
             REGISTERED
@@ -4413,6 +4809,11 @@ mod tests {
                 "GameTooltip's binding-line gate, stock and pfUI (1316)",
             ),
             ("gxApi", "pfUI's system tooltip names the backend (2151)"),
+            (
+                "graphicsQuality",
+                "MONKEY (presets): the Advanced Graphics page's Graphics Preset row; the host \
+                 writes and derives it here in cvars.rs",
+            ),
             (
                 "useUiScale",
                 "UIOptionsFrame.lua and OptionsFrame.lua branch on it to gate the uiScale slider",
