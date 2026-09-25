@@ -55,6 +55,15 @@ pub struct SkyExt {
     /// none), `y` the sun azimuth `atan2(sun.z, sun.x)` in radians, `zw` reserved.
     #[uniform(100)]
     pub(crate) warp: Vec4,
+    /// MONKEY (fog): `MonkeyFrame` fog rows 1-3 (sun fog, end fog, model/sun dir), so the dome's
+    /// horizon takes the same Modern fog colour as the world (`fog_hook::fog_sky_horizon`). All
+    /// zero (Classic) leaves the dome untouched.
+    #[uniform(100)]
+    pub(crate) mf_fog1: Vec4,
+    #[uniform(100)]
+    pub(crate) mf_fog2: Vec4,
+    #[uniform(100)]
+    pub(crate) mf_fog3: Vec4,
 }
 
 impl MaterialExtension for SkyExt {
@@ -183,6 +192,10 @@ fn setup_sky(
             sky4: col([0.78, 0.86, 0.95]),
             fog: col([0.55, 0.72, 0.92]),
             warp: Vec4::ZERO, // update_sky_colors fills S + sun azimuth each frame
+            // MONKEY (fog)
+            mf_fog1: Vec4::ZERO,
+            mf_fog2: Vec4::ZERO,
+            mf_fog3: Vec4::ZERO,
         },
     });
     commands.spawn((
@@ -244,6 +257,8 @@ fn apply_sky_visibility(
 /// Push the time-of-day sky stops and fog colour (`WowLighting`) into the dome material.
 fn update_sky_colors(
     light: Res<WowLighting>,
+    // MONKEY (fog): the Modern fog rows for the horizon.
+    monkey: Res<crate::lighting::MonkeyFrame>,
     dome: Query<&MeshMaterial3d<SkyMaterial>, With<Sky>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
 ) {
@@ -270,11 +285,21 @@ fn update_sky_colors(
         0.0,
         0.0,
     );
+    // MONKEY (fog): rows 1-3 as packed for the light buffer (the clock lanes are not read here).
+    let rows = monkey.pack(0.0, 0.0);
+    let mf = [
+        Vec4::from_array(rows[1]),
+        Vec4::from_array(rows[2]),
+        Vec4::from_array(rows[3]),
+    ];
     benilla_assets::write_gated(
         &mut materials,
         &handle.0,
         |m| {
-            m.extension.sky0 != sky[0]
+            m.extension.mf_fog1 != mf[0]
+                || m.extension.mf_fog2 != mf[1]
+                || m.extension.mf_fog3 != mf[2]
+                || m.extension.sky0 != sky[0]
                 || m.extension.sky1 != sky[1]
                 || m.extension.sky2 != sky[2]
                 || m.extension.sky3 != sky[3]
@@ -290,6 +315,9 @@ fn update_sky_colors(
             m.extension.sky4 = sky[4];
             m.extension.fog = fog;
             m.extension.warp = warp;
+            m.extension.mf_fog1 = mf[0];
+            m.extension.mf_fog2 = mf[1];
+            m.extension.mf_fog3 = mf[2];
         },
     );
 }

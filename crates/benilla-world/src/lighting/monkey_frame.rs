@@ -17,7 +17,7 @@
 //! | 0 `fog_a` | height_fog_density, height_fog_height, height_fog_falloff | curve_blend |
 //! | 1 `fog_b` | sun_fog_rgb | sun_fog_strength |
 //! | 2 `fog_c` | end_fog_rgb | end_fog_distance |
-//! | 3 `fog_d` | fog_model (0 classic, 1 modern), sun_fog_angle, 0 | 0 |
+//! | 3 `fog_d` | fog_model (0 classic; Modern = the scene fog end, yd, ≥ 1), sun_fog_angle, sun dir oct.x | sun dir oct.y |
 //! | 4 `wind_a` | dir_x, dir_y, speed | gust |
 //! | 5 `wind_b` | time_s, sway_strength, grass_strength | tree_strength |
 //! | 6 `wet_a` | rain_rate, wetness, ripple_time_s | snow |
@@ -64,6 +64,11 @@ pub struct MonkeyFrame {
     pub sun_fog_strength: f32,
     /// Cosine threshold of the sun-fog lobe.
     pub sun_fog_angle: f32,
+    /// MONKEY (fog): the sun direction (Bevy space), octahedral-encoded (`fog_model::oct_encode`).
+    pub sun_fog_dir: [f32; 2],
+    /// MONKEY (fog): the scene fog end (yd) the Modern law applies to; packed as `fog_d.x`, so an
+    /// interior WMO span (a different end) stays classic.
+    pub fog_scene_end: f32,
     /// Gamma 0..1.
     pub end_fog_rgb: [f32; 3],
     pub end_fog_distance: f32,
@@ -94,9 +99,10 @@ impl MonkeyFrame {
     /// The 16 packed rows. `time_of_day` (0..1) and `night` (0..1) are the packer's own inputs.
     pub fn pack(&self, time_of_day: f32, night: f32) -> [[f32; 4]; MONKEY_FRAME_ROWS] {
         let mut rows = [[0.0f32; 4]; MONKEY_FRAME_ROWS];
+        // MONKEY (fog): Modern packs the scene fog end (never below 1) as its flag.
         let model = match self.fog_model {
             FogModel::Classic => 0.0,
-            FogModel::Modern => 1.0,
+            FogModel::Modern => self.fog_scene_end.max(1.0),
         };
         rows[0] = [
             self.height_fog_density,
@@ -108,7 +114,7 @@ impl MonkeyFrame {
         rows[1] = [s[0], s[1], s[2], self.sun_fog_strength];
         let e = self.end_fog_rgb;
         rows[2] = [e[0], e[1], e[2], self.end_fog_distance];
-        rows[3] = [model, self.sun_fog_angle, 0.0, 0.0];
+        rows[3] = [model, self.sun_fog_angle, self.sun_fog_dir[0], self.sun_fog_dir[1]];
         rows[4] = [self.wind_dir[0], self.wind_dir[1], self.wind_speed, self.wind_gust];
         rows[5] = [self.wind_time_s, self.sway_strength, self.grass_strength, self.tree_strength];
         rows[6] = [self.rain_rate, self.wetness, self.ripple_time_s, self.snow];
@@ -144,6 +150,8 @@ mod tests {
             end_fog_rgb: [9.0, 10.0, 11.0],
             end_fog_distance: 12.0,
             sun_fog_angle: 13.0,
+            sun_fog_dir: [0.5, -0.5],
+            fog_scene_end: 444.0,
             wind_dir: [14.0, 15.0],
             wind_speed: 16.0,
             wind_gust: 17.0,
@@ -162,7 +170,7 @@ mod tests {
         assert_eq!(r[0], [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(r[1], [5.0, 6.0, 7.0, 8.0]);
         assert_eq!(r[2], [9.0, 10.0, 11.0, 12.0]);
-        assert_eq!(r[3], [1.0, 13.0, 0.0, 0.0]);
+        assert_eq!(r[3], [444.0, 13.0, 0.5, -0.5]);
         assert_eq!(r[4], [14.0, 15.0, 16.0, 17.0]);
         assert_eq!(r[5], [18.0, 19.0, 20.0, 21.0]);
         assert_eq!(r[6], [22.0, 23.0, 24.0, 25.0]);

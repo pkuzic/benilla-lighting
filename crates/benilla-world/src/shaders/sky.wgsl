@@ -5,6 +5,8 @@
     forward_io::VertexOutput,
     mesh_view_bindings::view,
 }
+// MONKEY (fog): the Modern fog colour at the horizon.
+#import benilla::fog_hook
 
 struct SkyColors {
     sky0: vec4<f32>, // zenith (90°)
@@ -14,6 +16,10 @@ struct SkyColors {
     sky4: vec4<f32>, // 1.8°
     fog: vec4<f32>,  // horizon (0°) and below: LightIntBand row 7
     warp: vec4<f32>, // x = dawn/dusk warp strength S (0 = off), y = sun azimuth (rad), zw reserved
+    // MONKEY (fog): MonkeyFrame fog1..fog3 (all zero = Classic).
+    mf_fog1: vec4<f32>,
+    mf_fog2: vec4<f32>,
+    mf_fog3: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky: SkyColors;
 
@@ -83,6 +89,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Raw gamma out: the reference draws the sky as raw DBC bytes, sRGB off (`0x6d4940`).
-    let rgb = col;
+    // MONKEY (fog): Modern eases the low band into the world's far fog colour; Classic = `col`.
+    let rgb = fog_hook::fog_sky_horizon(col, sky.fog.rgb, dir, sky.mf_fog1, sky.mf_fog2, sky.mf_fog3);
     return vec4<f32>(rgb, 1.0);
 }

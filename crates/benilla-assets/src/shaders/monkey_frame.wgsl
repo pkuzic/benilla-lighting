@@ -14,7 +14,7 @@ struct MonkeyFrame {
     fog_a: vec4<f32>,  // height_fog_density, height_fog_height (world Y, yd), height_fog_falloff, curve_blend
     fog_b: vec4<f32>,  // sun_fog_rgb (gamma 0..1), sun_fog_strength
     fog_c: vec4<f32>,  // end_fog_rgb (gamma 0..1), end_fog_distance (yd)
-    fog_d: vec4<f32>,  // fog_model (0 classic, 1 modern), sun_fog_angle (cos), 0, 0
+    fog_d: vec4<f32>,  // fog_model (0 classic; modern = scene fog end yd >= 1), sun_fog_angle (cos), sun dir (octahedral xy)
     wind_a: vec4<f32>, // dir_x, dir_y (unit, world XZ: .x = world x, .y = world z), speed (yd/s), gust 0..1
     wind_b: vec4<f32>, // time_s, sway_strength, grass_strength, tree_strength
     wet_a: vec4<f32>,  // rain_rate 0..1, wetness 0..1, ripple_time_s, snow 0..1
