@@ -32,11 +32,9 @@ where they stand. Do not remove either.
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (Gerstner crests, High) + `crates/benilla-world/src/liquid/waves.rs` | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `sea/Spectrum.*`, `sea/Ocean.*` | Gerstner displacement and fold-driven crest whitecaps; the CPU swimmer sample inverts the same displacement (ported) |
 | `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
 | `crates/benilla-app/src/post/grading.rs` + `crates/benilla-app/src/post/grading.wgsl` | `wxl-retail-grading` | `Grading.*`, `shaders/Grading.ps.hlsl` | 32³ LUT convention, strength control and strip lookup mathematics, with the strip uploaded as a native 3D texture (ported from the GPL-3.0-or-later source implementation, Copyright (C) 2026 WarcraftXL) |
-
 | `crates/benilla-world/src/shaders/sky_fx.wgsl` | `wxl-retail-clouds` | `Clouds.cpp`, `Clouds.hpp` | Domain-warped billow fbm (quintic value noise, 0.6 cotton blend, 0.55 octave gain) for the cloud detail |
 | `crates/benilla-world/src/shaders/cloud.wgsl` | `wxl-retail-clouds` | `Clouds.cpp` | The 3-tap march toward the sun (self-shadow, ambient floor) and the one-tap silver lining |
 | `crates/benilla-world/src/clouds/layer.rs` (`update_cloud_fx`) | `wxl-retail-clouds` | `Clouds.cpp` | March direction = the sun projected on the sheet, strength folded by its flatness (noon clouds evenly lit) |
-
 | `crates/benilla-world/src/wind/mod.rs` | `wxl-experimental-wind` | `field/Wind.hpp`, `field/Wind.cpp` | Stateless three-sine gust and veer field, default profile, and weather gain (ported) |
 | `crates/benilla-assets/src/shaders/wind_hook.wgsl` | `wxl-experimental-wind` | `grass/GrassWind.hpp`, `grass/GrassWind.cpp` | Two-wave grass sway, gust response, lean, blade phase/variance, distance fade and radial parting (ported; extended to eight benders) |
 | `crates/benilla-assets/src/shaders/wow_model.wgsl` (MONKEY wind hook) | `wxl-experimental-wind` | `grass/GrassWind.cpp` | Grass vertex displacement call seam (technique) |
