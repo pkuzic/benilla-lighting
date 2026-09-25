@@ -610,9 +610,7 @@
                         .. "It does nothing by day and does not require Dynamic Interior Lighting.",
                     TORCH_TERRAIN_SHADOWS =
                         "Lets the ground itself take part in outdoor torch shadows: a hill or a "
-                        .. "bank between a fire and the slope behind it blocks the fire's light.
-
-"
+                        .. "bank between a fire and the slope behind it blocks the fire's light.\n\n"
                         .. "Adds the nearby terrain to each outdoor fire's shadow map when it is "
                         .. "rebuilt; the per-frame cost is small. Needs Outdoor Torch Shadows.",
                     TORCH_SOFT =
