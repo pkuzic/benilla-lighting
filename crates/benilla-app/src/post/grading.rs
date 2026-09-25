@@ -25,7 +25,7 @@ use bevy::{
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
         view::ViewTarget,
-        RenderApp, RenderStartup,
+        Render, RenderApp, RenderStartup, RenderSystems,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -73,6 +73,10 @@ impl Plugin for GradingPlugin {
         render_app
             .insert_resource(GradeShader(shader))
             .add_systems(RenderStartup, init_pipeline)
+            .add_systems(
+                Render,
+                prepare_uniforms.in_set(RenderSystems::PrepareResources),
+            )
             .add_render_graph_node::<ViewNodeRunner<GradeNode>>(Core3d, GradeLabel)
             .add_render_graph_edges(
                 Core3d,
@@ -344,17 +348,47 @@ fn init_pipeline(
     });
 }
 
+/// MONKEY (polish): the view's uniform, created once and rewritten in prepare, like bloom's.
+#[derive(Component)]
+struct GradeUniformBuffer(Buffer);
+
+fn prepare_uniforms(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    views: Query<(Entity, &GradeView, Option<&GradeUniformBuffer>)>,
+) {
+    for (entity, grade, buffer) in &views {
+        let rows = [grade.control.to_array()];
+        match buffer {
+            Some(buffer) => queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&rows)),
+            None => {
+                let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("post_grading_uniform"),
+                    contents: bytemuck::cast_slice(&rows),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                commands.entity(entity).insert(GradeUniformBuffer(buffer));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct GradeNode;
 
 impl ViewNode for GradeNode {
-    type ViewQuery = (&'static ViewTarget, &'static GradeView);
+    type ViewQuery = (
+        &'static ViewTarget,
+        &'static GradeView,
+        &'static GradeUniformBuffer,
+    );
 
     fn run<'w>(
         &self,
         _graph: &mut RenderGraphContext,
         context: &mut RenderContext<'w>,
-        (target, grade): QueryItem<'w, '_, Self::ViewQuery>,
+        (target, grade, uniform): QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
         let settings = world.resource::<GradePipeline>();
@@ -367,10 +401,6 @@ impl ViewNode for GradeNode {
             return Ok(());
         };
         let device = context.render_device();
-        let mut uniform = UniformBuffer::from(GradeUniform {
-            control: grade.control,
-        });
-        uniform.write_buffer(device, world.resource::<RenderQueue>());
         let out = target.post_process_write();
         let bind = device.create_bind_group(
             "post_grading",
@@ -381,7 +411,7 @@ impl ViewNode for GradeNode {
                 &day.texture_view,
                 &night.texture_view,
                 &settings.lut_sampler,
-                uniform.binding().unwrap(),
+                uniform.0.as_entire_binding(),
             )),
         );
         let diagnostics = context.diagnostic_recorder();

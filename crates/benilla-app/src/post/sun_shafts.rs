@@ -165,6 +165,10 @@ const MASK_FORMAT: TextureFormat = TextureFormat::R8Unorm;
 #[derive(Component)]
 struct ShaftMask(CachedTexture);
 
+/// MONKEY (polish): the view's uniform, created once and rewritten in prepare, like bloom's.
+#[derive(Component)]
+struct ShaftUniform(Buffer);
+
 #[derive(Component)]
 struct ViewShaftPipeline(CachedRenderPipelineId);
 
@@ -277,17 +281,31 @@ fn prepare_pipelines(
     }
 }
 
-/// The half-size mask target, rounded up so an odd edge column still has a texel.
+/// The half-size mask target, rounded up so an odd edge column still has a texel, and the
+/// view's uniform, written in place.
 fn prepare_masks(
     mut commands: Commands,
     mut textures: ResMut<TextureCache>,
     device: Res<RenderDevice>,
-    views: Query<(Entity, &ExtractedCamera), With<ShaftView>>,
+    queue: Res<RenderQueue>,
+    views: Query<(Entity, &ExtractedCamera, &ShaftView, Option<&ShaftUniform>)>,
 ) {
-    for (entity, camera) in &views {
+    for (entity, camera, shaft, uniform) in &views {
         let Some(size) = camera.physical_viewport_size else {
             continue;
         };
+        let rows = [shaft.sun.to_array(), shaft.color.to_array()];
+        match uniform {
+            Some(uniform) => queue.write_buffer(&uniform.0, 0, bytemuck::cast_slice(&rows)),
+            None => {
+                let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("post_sun_shafts_uniform"),
+                    contents: bytemuck::cast_slice(&rows),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                commands.entity(entity).insert(ShaftUniform(buffer));
+            }
+        }
         let mask = textures.get(
             &device,
             TextureDescriptor {
@@ -316,16 +334,18 @@ impl ViewNode for ShaftNode {
     type ViewQuery = (
         &'static ViewTarget,
         &'static ViewDepthTexture,
+        // Gates the pass: the mask and uniform outlive a disabled frame.
         &'static ShaftView,
         &'static ViewShaftPipeline,
         &'static ShaftMask,
+        &'static ShaftUniform,
     );
 
     fn run<'w>(
         &self,
         _graph: &mut RenderGraphContext,
         context: &mut RenderContext<'w>,
-        (target, depth, shaft, id, mask): QueryItem<'w, '_, Self::ViewQuery>,
+        (target, depth, _, id, mask, uniform): QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
         let cache = world.resource::<PipelineCache>();
@@ -350,8 +370,6 @@ impl ViewNode for ShaftNode {
             &cache.get_bind_group_layout(&settings.mask_layouts[multisampled]),
             &BindGroupEntries::single(depth.view()),
         );
-        let mut uniform = UniformBuffer::from(*shaft);
-        uniform.write_buffer(device, world.resource::<RenderQueue>());
         let out = target.post_process_write();
         let bind = device.create_bind_group(
             "post_sun_shafts",
@@ -360,7 +378,7 @@ impl ViewNode for ShaftNode {
                 out.source,
                 &settings.sampler,
                 &mask.0.default_view,
-                uniform.binding().unwrap(),
+                uniform.0.as_entire_binding(),
             )),
         );
         let diagnostics = context.diagnostic_recorder();
