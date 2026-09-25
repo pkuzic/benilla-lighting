@@ -110,11 +110,16 @@ impl M2BatchMaterials<'_> {
     /// (`[CM2Model+0x180]`, from the interior crossfade `[0xce9bdc]`) scales every batch's alpha,
     /// and `0 < A < 1` promotes a batch to SRC_ALPHA blending (`0x70c190`): `fade_blend` is that
     /// twin, or `steady` when the batch already blends.
+    ///
+    /// MONKEY (skybox): `uv` and `tint` are the batch's texture-transform and colour loops, the
+    /// material's seed and identity; [`crate::skybox_anim`] drives their rows.
     pub fn skybox(
         &mut self,
         sub: &benilla_formats::RenderSubmesh,
         texture: Option<Handle<Image>>,
         order: u16,
+        uv: Option<&std::sync::Arc<benilla_formats::UvAnim>>,
+        tint: Option<&std::sync::Arc<benilla_formats::RgbAnim>>,
     ) -> Option<SkyboxBatch> {
         let light = self.light.as_ref()?.0.clone();
         let torch = self.torch.binds()?;
@@ -136,10 +141,9 @@ impl M2BatchMaterials<'_> {
                 sub.env_map,
                 ShadeSel::Lit, // unread: every shipped skybox batch is UNLIT (0x01)
                 order,
-                // No texture-transform or colour loop: neither shipped skybox authors one. Wiring
-                // one needs the `M2Model` lane's `Arc`, which the material key identifies it by.
-                None,
-                None,
+                // MONKEY (skybox): the loops' `Arc`s, which the material key identifies them by.
+                uv,
+                tint,
                 None, // M2: no MOBA class, no SIDN, no WINDOW
                 None,
                 false,
@@ -159,6 +163,40 @@ impl M2BatchMaterials<'_> {
             mk(true)
         };
         Some(SkyboxBatch { steady, fade_blend })
+    }
+
+    /// MONKEY (skybox): the flag `0x4` fog cone's material: an untextured, unlit, two-sided blend
+    /// on the sky lane, its colour the vertex colour times the tint row the skybox lane writes.
+    pub fn sky_fog_cone(&mut self, order: u16) -> Option<Handle<WowModelMaterial>> {
+        let light = self.light.as_ref()?.0.clone();
+        let torch = self.torch.binds()?;
+        Some(model_material(
+            &mut self.cache.0,
+            &mut self.materials,
+            None,
+            ModelBlend::Blend,
+            true,
+            false,
+            false,
+            true, // unlit
+            false,
+            false,
+            true,  // never writes depth
+            false, // …and always tests it
+            benilla_formats::FogPolicy::Off,
+            false,
+            ShadeSel::Lit,
+            order,
+            None,
+            None,
+            None,
+            None,
+            false,
+            true, // the sky lane
+            &light,
+            &torch,
+            None,
+        ))
     }
 
     /// One steady material lit by a render target's own light buffer (a portrait booth, the model
