@@ -219,10 +219,10 @@ fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
     let energy = clamp(water.mode.y, 0.0, 1.0);
     let tempo = mix(0.4, 1.0, sqrt(energy));
     var displacement = vec3<f32>(0.0);
-    var j00 = 1.0;
-    var j01 = 0.0;
-    var j10 = 0.0;
-    var j11 = 1.0;
+    var jacobian_xx = 1.0;
+    var jacobian_xz = 0.0;
+    var jacobian_zx = 0.0;
+    var jacobian_zz = 1.0;
     for (var i = 0u; i < 2u; i += 1u) {
         let wave = WATER_WAVES[i];
         let direction = vec2<f32>(cos(wave.x), sin(wave.x));
@@ -234,12 +234,12 @@ fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
         displacement += vec3<f32>(direction.x * horizontal * cos(phase),
             amplitude * sin(phase), direction.y * horizontal * cos(phase));
         let compression = horizontal * k * sin(phase);
-        j00 -= compression * direction.x * direction.x;
-        j01 -= compression * direction.x * direction.y;
-        j10 -= compression * direction.y * direction.x;
-        j11 -= compression * direction.y * direction.y;
+        jacobian_xx -= compression * direction.x * direction.x;
+        jacobian_xz -= compression * direction.x * direction.y;
+        jacobian_zx -= compression * direction.y * direction.x;
+        jacobian_zz -= compression * direction.y * direction.y;
     }
-    let fold = max(1.0 - (j00 * j11 - j01 * j10), 0.0);
+    let fold = max(1.0 - (jacobian_xx * jacobian_zz - jacobian_xz * jacobian_zx), 0.0);
     return vec4<f32>(displacement, fold);
 }
 
@@ -251,7 +251,7 @@ fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
 // clock is MonkeyFrame `wet_a.z` (wraps at 1000 s; the rates are multiples of 1/1000, so the wrap is
 // seamless). Dry (`wet_a.x == 0`), WMO interior pools, interior-fog rooms, and pixels too far or too
 // coarse to hold a ring return zero.
-fn ripple_hash2(p: vec2<f32>) -> vec2<f32> {
+fn ripple_hash(p: vec2<f32>) -> vec2<f32> {
     var q = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
     q += dot(q, q.yzx + 33.33);
     return fract((q.xx + q.yz) * q.zy);
@@ -275,16 +275,16 @@ fn rain_ripple_normal(world_xz: vec2<f32>, footprint: f32, distance: f32, room: 
             for (var i = -1; i <= 1; i += 1) {
                 let cell = base + vec2<f32>(f32(i), f32(j));
                 let seed = cell + vec2<f32>(f32(layer) * 57.0, f32(layer) * 113.0);
-                let h = ripple_hash2(seed);
-                let h2 = ripple_hash2(seed + 19.19);
+                let h = ripple_hash(seed);
+                let h_alt = ripple_hash(seed + 19.19);
                 // Each period re-rolls whether this cell rains, so the pattern does not repeat.
                 let cycle = wet_row.z * rate + h.x;
-                let roll = ripple_hash2(seed + floor(cycle) * 7.31).x;
+                let roll = ripple_hash(seed + floor(cycle) * 7.31).x;
                 if roll > rain * 0.85 {
                     continue;
                 }
                 let phase = fract(cycle);
-                let centre = (cell + 0.5 + (h2 - 0.5) * 0.6) * c;
+                let centre = (cell + 0.5 + (h_alt - 0.5) * 0.6) * c;
                 let to_p = world_xz - centre;
                 let d = length(to_p);
                 let radius = phase * 0.6 * c;
@@ -363,8 +363,8 @@ fn caustic_point(cell: vec2<f32>) -> vec2<f32> {
 fn caustic_edges(p: vec2<f32>, t: f32) -> f32 {
     let cell = floor(p);
     let f = fract(p);
-    var d1 = 8.0;
-    var d2 = 8.0;
+    var nearest_distance = 8.0;
+    var next_distance = 8.0;
     for (var j = -1; j <= 1; j += 1) {
         for (var i = -1; i <= 1; i += 1) {
             let g = vec2<f32>(f32(i), f32(j));
@@ -373,10 +373,15 @@ fn caustic_edges(p: vec2<f32>, t: f32) -> f32 {
             let o = 0.5 + 0.38 * sin(vec2<f32>(t * 0.83, t * 0.71) + 6.2831853 * h);
             let r = g + o - f;
             let d = dot(r, r);
-            if d < d1 { d2 = d1; d1 = d; } else if d < d2 { d2 = d; }
+            if d < nearest_distance {
+                next_distance = nearest_distance;
+                nearest_distance = d;
+            } else if d < next_distance {
+                next_distance = d;
+            }
         }
     }
-    return sqrt(d2) - sqrt(d1);
+    return sqrt(next_distance) - sqrt(nearest_distance);
 }
 
 // Two webs at incommensurate scales and rates: the fine one draws the lines, the coarse one sets
@@ -554,7 +559,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // `+ t/period` with a crest-count that RISES with depth ⇒ a crest of fixed phase slides to
     // shallower water as time runs: the train travels shoreward.
     let shore_phase = 6.2831853 * (shore_g + t / SHORE_PERIOD);
-    let shore_phase2 = 6.2831853 * (1.9 * shore_g + t / (SHORE_PERIOD * 0.62)) + 2.1;
+    let shore_phase_secondary = 6.2831853 * (1.9 * shore_g + t / (SHORE_PERIOD * 0.62)) + 2.1;
     // Steepness rises as it shoals (3.5 → 0.75 yd), collapses into the break below ~0.35 yd, and
     // is gone past the band's offshore edge.
     let shoal = smoothstep(3.5, 0.75, vertical_depth);
@@ -579,7 +584,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // and a wavenumber, so a gentle beach and a steep one roll with the same visible strength
     // instead of one washing out and the other exploding.
     let shore_grad = SHORE_TILT * shore_gain
-        * (cos(shore_phase) + 0.45 * cos(shore_phase2)) * offshore;
+        * (cos(shore_phase) + 0.45 * cos(shore_phase_secondary)) * offshore;
 
     let shore = select(1.0, swell_shore_fade(in.depth), ocean_mesh);
     let wave = water_waves(p, t, length(eye_pos), footprint, shore, false);
@@ -642,7 +647,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // it9-water-beach-top). The PHASE is a function of the depth itself and is continuous, so a term
     // driven by the phase alone cannot facet. The tilt stays at 0.09 for a little specular life.
     let shore_crest = pow(max(sin(shore_phase), 0.0), 2.0)
-        + 0.45 * pow(max(sin(shore_phase2), 0.0), 2.0);
+        + 0.45 * pow(max(sin(shore_phase_secondary), 0.0), 2.0);
     rgb += shore_gain * shore_crest * 0.13 * lighting * vec3<f32>(0.72, 0.95, 0.90);
     if !ocean_mesh {
         // Keep the zone's green-blue absorption under warm dusk illumination.
@@ -758,17 +763,17 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         let interior_fixture = colour.w >= 0.5;
         if interior_fixture != (water.lane.x > 1.5) { continue; }
         let delta = water_light[21u + 2u * i].xyz - in.world_position.xyz;
-        let d2 = dot(delta, delta);
-        if d2 >= distances[3] { continue; }
+        let squared_distance = dot(delta, delta);
+        if squared_distance >= distances[3] { continue; }
         var slot = 3u;
         loop {
             if slot == 0u { break; }
-            if d2 >= distances[slot - 1u] { break; }
+            if squared_distance >= distances[slot - 1u] { break; }
             distances[slot] = distances[slot - 1u];
             nearest[slot] = nearest[slot - 1u];
             slot -= 1u;
         }
-        distances[slot] = d2;
+        distances[slot] = squared_distance;
         nearest[slot] = i;
     }
     for (var j = 0u; j < 4u; j += 1u) {

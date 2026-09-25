@@ -388,25 +388,25 @@ fn torch_map_shadow(
     if (dot(normal, normal) > 1e-12) {
         let a = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0),
                        abs(normal.x) > abs(normal.z));
-        let t1 = cross(normal, a);
-        let t2 = cross(normal, t1);
+        let tangent_first = cross(normal, a);
+        let tangent_second = cross(normal, tangent_first);
         // d(clip) along each tangent, then through the perspective divide:
         // `d(ndc) = (d(clip).xyz - ndc * d(clip).w) / clip.w`.
-        let c1 = view_proj * vec4<f32>(t1, 0.0);
-        let c2 = view_proj * vec4<f32>(t2, 0.0);
+        let clip_first = view_proj * vec4<f32>(tangent_first, 0.0);
+        let clip_second = view_proj * vec4<f32>(tangent_second, 0.0);
         let inv_w = 1.0 / clip.w;
-        let g1 = (c1.xyz - ndc * c1.w) * inv_w;
-        let g2 = (c2.xyz - ndc * c2.w) * inv_w;
-        let u1 = g1.xy * vec2<f32>(0.5, -0.5);   // the same ndc -> uv flip `uv` above uses
-        let u2 = g2.xy * vec2<f32>(0.5, -0.5);
+        let grad_first = (clip_first.xyz - ndc * clip_first.w) * inv_w;
+        let grad_second = (clip_second.xyz - ndc * clip_second.w) * inv_w;
+        let uv_first = grad_first.xy * vec2<f32>(0.5, -0.5);   // the same ndc -> uv flip `uv` above uses
+        let uv_second = grad_second.xy * vec2<f32>(0.5, -0.5);
         // Solve `dot(grad, u_i) = g_i.z` for i = 1, 2. `det` collapses only as the plane goes
         // EDGE-ON to the fixture, where the plane projects to a line in the map, `max(N·L, 0)` has
         // already taken the lit term to zero, and a zero gradient is the right answer anyway.
-        let det = u1.x * u2.y - u1.y * u2.x;
+        let det = uv_first.x * uv_second.y - uv_first.y * uv_second.x;
         if (abs(det) > 1e-9) {
             let inv = 1.0 / det;
-            grad = vec2<f32>((g1.z * u2.y - u1.y * g2.z) * inv,
-                             (u1.x * g2.z - g1.z * u2.x) * inv);
+            grad = vec2<f32>((grad_first.z * uv_second.y - uv_first.y * grad_second.z) * inv,
+                             (uv_first.x * grad_second.z - grad_first.z * uv_second.x) * inv);
         }
     }
     // …and the ceiling on what any one tap may be moved by. See `TORCH_SLOPE_MAX`.
@@ -420,24 +420,24 @@ fn torch_map_shadow(
     let search = base * TORCH_PCSS_SEARCH * inv_dims;
     // MONKEY (slope bias): the offsets are NAMED so the search's reference and its sample are the
     // same displacement, exactly as in the PCF kernel below.
-    let s0 = vec2<f32>(-1.0, -1.0) * search;
-    let s1 = vec2<f32>( 1.0, -1.0) * search;
-    let s2 = vec2<f32>(-1.0,  1.0) * search;
-    let s3 = vec2<f32>( 1.0,  1.0) * search;
-    let b0 = torch_map_depth(depth_tex, layer, uv + s0, dims);
-    let b1 = torch_map_depth(depth_tex, layer, uv + s1, dims);
-    let b2 = torch_map_depth(depth_tex, layer, uv + s2, dims);
-    let b3 = torch_map_depth(depth_tex, layer, uv + s3, dims);
+    let search_offset_a = vec2<f32>(-1.0, -1.0) * search;
+    let search_offset_b = vec2<f32>( 1.0, -1.0) * search;
+    let search_offset_c = vec2<f32>(-1.0,  1.0) * search;
+    let search_offset_d = vec2<f32>( 1.0,  1.0) * search;
+    let blocker_a = torch_map_depth(depth_tex, layer, uv + search_offset_a, dims);
+    let blocker_b = torch_map_depth(depth_tex, layer, uv + search_offset_b, dims);
+    let blocker_c = torch_map_depth(depth_tex, layer, uv + search_offset_c, dims);
+    let blocker_d = torch_map_depth(depth_tex, layer, uv + search_offset_d, dims);
     var blocker = 0.0;
     var blockers = 0.0;
     // MONKEY (slope bias): the SEARCH is plane-corrected too, and it has to be. Left on the flat
     // reference, a grazing floor detects ITSELF as its own blocker, and the penumbra width below is
     // then estimated from a depth difference that is pure bias error — a pool that goes soft with
     // nothing in it. Same law, same `grad`, same clamp as the taps.
-    if (b0 > torch_plane_ref(ref_depth, grad, s0, slope_lim)) { blocker += b0; blockers += 1.0; }
-    if (b1 > torch_plane_ref(ref_depth, grad, s1, slope_lim)) { blocker += b1; blockers += 1.0; }
-    if (b2 > torch_plane_ref(ref_depth, grad, s2, slope_lim)) { blocker += b2; blockers += 1.0; }
-    if (b3 > torch_plane_ref(ref_depth, grad, s3, slope_lim)) { blocker += b3; blockers += 1.0; }
+    if (blocker_a > torch_plane_ref(ref_depth, grad, search_offset_a, slope_lim)) { blocker += blocker_a; blockers += 1.0; }
+    if (blocker_b > torch_plane_ref(ref_depth, grad, search_offset_b, slope_lim)) { blocker += blocker_b; blockers += 1.0; }
+    if (blocker_c > torch_plane_ref(ref_depth, grad, search_offset_c, slope_lim)) { blocker += blocker_c; blockers += 1.0; }
+    if (blocker_d > torch_plane_ref(ref_depth, grad, search_offset_d, slope_lim)) { blocker += blocker_d; blockers += 1.0; }
 
     // MONKEY (pcss) 2/3 — PENUMBRA WIDTH. `radius` stays at `base` when the search found nothing: a
     // caster thinner than the search box (a chair leg, a tent rope, a candlestick) must NOT be
@@ -463,33 +463,33 @@ fn torch_map_shadow(
     // MONKEY (slope bias): every tap carries its OWN plane-corrected reference. With `grad` zero -
     // a receiver square-on to the fixture, or a zero normal - `torch_plane_ref` returns `ref_depth`
     // unchanged and this kernel is the shipped one bit-for-bit.
-    let p0 = vec2<f32>(-0.5, -0.5) * texel;
-    let p1 = vec2<f32>( 0.5, -0.5) * texel;
-    let p2 = vec2<f32>(-0.5,  0.5) * texel;
-    let p3 = vec2<f32>( 0.5,  0.5) * texel;
+    let pcf_offset_a = vec2<f32>(-0.5, -0.5) * texel;
+    let pcf_offset_b = vec2<f32>( 0.5, -0.5) * texel;
+    let pcf_offset_c = vec2<f32>(-0.5,  0.5) * texel;
+    let pcf_offset_d = vec2<f32>( 0.5,  0.5) * texel;
     var sum = 0.0;
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + p0, layer,
-                                     torch_plane_ref(ref_depth, grad, p0, slope_lim));
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + p1, layer,
-                                     torch_plane_ref(ref_depth, grad, p1, slope_lim));
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + p2, layer,
-                                     torch_plane_ref(ref_depth, grad, p2, slope_lim));
-    sum += textureSampleCompareLevel(depth_tex, comp, uv + p3, layer,
-                                     torch_plane_ref(ref_depth, grad, p3, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_a, layer,
+                                     torch_plane_ref(ref_depth, grad, pcf_offset_a, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_b, layer,
+                                     torch_plane_ref(ref_depth, grad, pcf_offset_b, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_c, layer,
+                                     torch_plane_ref(ref_depth, grad, pcf_offset_c, slope_lim));
+    sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_d, layer,
+                                     torch_plane_ref(ref_depth, grad, pcf_offset_d, slope_lim));
     var pcf = sum * 0.25;
     if (radius > TORCH_PCSS_WIDE) {
-        let p4 = vec2<f32>(-1.0,  0.0) * texel;
-        let p5 = vec2<f32>( 1.0,  0.0) * texel;
-        let p6 = vec2<f32>( 0.0, -1.0) * texel;
-        let p7 = vec2<f32>( 0.0,  1.0) * texel;
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + p4, layer,
-                                         torch_plane_ref(ref_depth, grad, p4, slope_lim));
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + p5, layer,
-                                         torch_plane_ref(ref_depth, grad, p5, slope_lim));
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + p6, layer,
-                                         torch_plane_ref(ref_depth, grad, p6, slope_lim));
-        sum += textureSampleCompareLevel(depth_tex, comp, uv + p7, layer,
-                                         torch_plane_ref(ref_depth, grad, p7, slope_lim));
+        let pcf_offset_e = vec2<f32>(-1.0,  0.0) * texel;
+        let pcf_offset_f = vec2<f32>( 1.0,  0.0) * texel;
+        let pcf_offset_g = vec2<f32>( 0.0, -1.0) * texel;
+        let pcf_offset_h = vec2<f32>( 0.0,  1.0) * texel;
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_e, layer,
+                                         torch_plane_ref(ref_depth, grad, pcf_offset_e, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_f, layer,
+                                         torch_plane_ref(ref_depth, grad, pcf_offset_f, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_g, layer,
+                                         torch_plane_ref(ref_depth, grad, pcf_offset_g, slope_lim));
+        sum += textureSampleCompareLevel(depth_tex, comp, uv + pcf_offset_h, layer,
+                                         torch_plane_ref(ref_depth, grad, pcf_offset_h, slope_lim));
         pcf = sum * 0.125;
     }
     // Phase 5: the six cube faces tile the whole sphere, so there is no cone edge to soften — a fade
