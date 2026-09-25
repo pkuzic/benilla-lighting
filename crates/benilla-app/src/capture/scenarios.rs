@@ -1414,6 +1414,44 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 1170,
         ui: None,
     },
+    // MONKEY (lampfog): lampFog 0/2 A/B set. Kept at the END so parallel lane tables merge cleanly.
+    // Goldshire square: the Lion's Pride fixtures and outdoor lamps share one night frame.
+    Scenario {
+        name: "lampfog-goldshire-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0],
+        look: [-9450.0, 20.0, 61.0],
+        minute: 0,
+        ui: None,
+    },
+    // Stormwind Trade District from the established city-scale camera, after dark.
+    Scenario {
+        name: "lampfog-stormwind-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-8833.38, 628.63, 96.0],
+        look: [-8809.1, 672.3, 94.0],
+        minute: 0,
+        ui: None,
+    },
+    // Goldshire's east road, looking through the known exterior lamp at (-9477, 53, 60). This is
+    // deliberately not the fence instrument: that camera looks down at an unlit verge at night.
+    Scenario {
+        name: "lampfog-elwynn-road-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-9505.0, 36.0, 61.5],
+        look: [-9455.0, 75.0, 59.0],
+        minute: 0,
+        ui: None,
+    },
+    // Exact Goldshire framing at noon: lampFog 0 and 2 must be pixel-identical.
+    Scenario {
+        name: "lampfog-goldshire-day",
+        map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0],
+        look: [-9450.0, 20.0, 61.0],
+        minute: 720,
+        ui: None,
+    },
 ];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing
