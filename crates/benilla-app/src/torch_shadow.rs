@@ -1273,10 +1273,12 @@ fn update_torch_shadows(
                 collect_torch_entities(&ents, true, &gather, &mut positions, &mut indices);
             if with_terrain {
                 if let (Some(t), Some(a)) = (&ents.terrain, &ents.adt_tiles) {
+                    let t0 = std::time::Instant::now();
                     let tris = benilla_world::terrain_stream::append_terrain_torch_triangles(
                         t, a, slot.pos, range, &mut positions, &mut indices);
                     if std::env::var_os("WOW_TORCH_TRACE").is_some() {
-                        info!("torch-terrain: slot {i} +{tris} ground tris within {range:.0} yd");
+                        info!("torch-terrain: slot {i} +{tris} ground tris within {range:.0} yd in {:.3} ms",
+                            t0.elapsed().as_secs_f64() * 1e3);
                     }
                 }
             }
