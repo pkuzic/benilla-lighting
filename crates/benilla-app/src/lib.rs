@@ -79,6 +79,8 @@ mod volumetric_fog;
 mod monkey_gfx;
 // MONKEY (post): optional world-only HDR post-processing.
 mod post;
+// MONKEY (sky): the skyQuality cvar bridge.
+mod sky_quality;
 mod entities;
 mod fishing_line;
 mod footprints;

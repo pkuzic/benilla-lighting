@@ -932,6 +932,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours("bloom", "2", "benilla's own: HDR emissive bloom, 0 Off / 1 Low / 2 High"),
     ours("sunShafts", "1", "benilla's own: depth-occluded screen-space sun shafts"),
     ours("colorGrading", "1", "benilla's own: zone and day/night 32-cube colour grade"),
+    // MONKEY (sky): the sky tier; the High graphics preset sets 2.
+    ours(
+        "skyQuality",
+        "0",
+        "benilla's own: sky quality, 0 Classic / 1 Enhanced (smooth gradient, sun glow, stars) / \n         2 High (+ detailed sun-lit clouds)",
+    ),
     ours(
         "waterQuality",
         "1",

@@ -3000,6 +3000,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
         const BENILLA_OWNED: &[(&str, &str)] = &[
             // MONKEY (volumetric fog): the row owns a translated tooltip too.
             ("BENILLA_TOOLTIP_VOLUMETRIC_FOG", "AdvancedGraphicsRowVolumetricFog"),
+            // MONKEY (sky): the sky tier row owns its translated tooltip.
+            ("BENILLA_TOOLTIP_SKY_QUALITY", "AdvancedGraphicsRowSkyQuality"),
             ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
             ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),

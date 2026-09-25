@@ -69,6 +69,8 @@ impl Plugin for CloudsPlugin {
                     layer::apply_cloud_visibility
                         .after(crate::skybox::SkyboxResolve)
                         .after(crate::liquid::SubmersionVerdict),
+                    // MONKEY (sky): the High cloud shading's per-frame inputs.
+                    layer::update_cloud_fx.in_set(crate::lighting::LightingConsumeSet),
                 ),
             )
             // Camera-anchored after transform propagation, like the sky dome.

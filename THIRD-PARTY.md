@@ -33,6 +33,10 @@ where they stand. Do not remove either.
 | `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
 | `crates/benilla-app/src/post/grading.rs` + `crates/benilla-app/src/post/grading.wgsl` | `wxl-retail-grading` | `Grading.*`, `shaders/Grading.ps.hlsl` | 32³ LUT convention, strength control and strip lookup mathematics, with the strip uploaded as a native 3D texture (ported from the GPL-3.0-or-later source implementation, Copyright (C) 2026 WarcraftXL) |
 
+| `crates/benilla-world/src/shaders/sky_fx.wgsl` | `wxl-retail-clouds` | `Clouds.cpp`, `Clouds.hpp` | Domain-warped billow fbm (quintic value noise, 0.6 cotton blend, 0.55 octave gain) for the cloud detail |
+| `crates/benilla-world/src/shaders/cloud.wgsl` | `wxl-retail-clouds` | `Clouds.cpp` | The 3-tap march toward the sun (self-shadow, ambient floor) and the one-tap silver lining |
+| `crates/benilla-world/src/clouds/layer.rs` (`update_cloud_fx`) | `wxl-retail-clouds` | `Clouds.cpp` | March direction = the sun projected on the sheet, strength folded by its flatness (noon clouds evenly lit) |
+
 Planned (not yet in the tree): breaker index from `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
-(`field/Wind.*`, `grass/GrassWind.*`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
+(`field/Wind.*`, `grass/GrassWind.*`).
 The lane that ports one adds its row here.
