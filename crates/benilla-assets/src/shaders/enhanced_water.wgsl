@@ -22,6 +22,8 @@
 #import bevy_pbr::mesh_view_bindings::{view, globals}
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var scene_depth: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var scene_colour: texture_2d<f32>;
@@ -86,8 +88,9 @@ fn water_fog(world_pos: vec3<f32>, room_fog: u32) -> vec4<f32> {
     }
     if colour.w <= 0.5 { return vec4<f32>(colour.rgb, 1.0); }
     let eye_z = -(view.view_from_world * vec4<f32>(world_pos, 1.0)).z;
-    let factor = clamp((span.y - eye_z) / max(span.y - span.x, 0.001), 0.0, 1.0);
-    return vec4<f32>(colour.rgb, factor);
+    // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl), as a factor; classic is bit-identical.
+    return fog_hook::fog_sample(colour.rgb, span, eye_z, world_pos, view.world_position, true,
+        water_light.monkey);
 }
 
 // True where this surface takes the Enhanced path: water (not magma/slime), a tier above

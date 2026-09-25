@@ -20,6 +20,8 @@
 #import benilla::shadow_hook
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var layer_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var alpha_array: texture_2d_array<f32>;
@@ -780,9 +782,9 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // the per-pixel form is what survives Bevy's mesh interpolators without a custom slot.
     if (wow_light.fog_color.w > 0.5) {
         let eye_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
-        let denom = max(wow_light.fog_params.y - wow_light.fog_params.x, 0.001);
-        let factor = clamp((wow_light.fog_params.y - eye_z) / denom, 0.0, 1.0);
-        tuned = mix(wow_light.fog_color.xyz, tuned, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        tuned = fog_hook::apply_fog(tuned, wow_light.fog_color.xyz, wow_light.fog_params.xy, eye_z,
+            in.world_position.xyz, view.world_position, true, wow_light.monkey);
     }
 
     // Raw gamma out: the framebuffer holds gamma bytes and blends in gamma like the reference's;

@@ -19,6 +19,8 @@
 
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 /// How far the band reaches inside the far-clip wall: the reference's far-band near plane
 /// `farclip - 33.0` (`[0x8101b0]`, about one WDL outer cell).
@@ -81,6 +83,10 @@ fn fragment(in: WdlVsOut) -> WdlFsOut {
     var rgb = vec3<f32>(1.0);
     if (w.fog_color.w > 0.5) {
         rgb = w.fog_color.xyz;
+        // MONKEY (p0 fog hook): the hull's own pair (start 0, end 1 yd) through the shared law, so
+        // a new fog model colours the horizon the way it colours the world; classic = the line above.
+        rgb = fog_hook::apply_fog(vec3<f32>(1.0), rgb, vec2<f32>(0.0, 1.0), eye_z,
+            in.world_position.xyz, view.world_position, true, w.monkey);
     }
 
     var out: WdlFsOut;

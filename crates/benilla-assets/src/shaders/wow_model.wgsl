@@ -22,6 +22,8 @@
 #import benilla::shadow_hook
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 // bevy_pbr 0.18.1's `forward_io::FragmentOutput`. No depth output: a fragment depth write costs
 // the pipeline early-Z, so the sky lane pins its depth in the vertex stage.
@@ -1720,13 +1722,13 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let fog_policy = (u32(m.clutter_fade.z) >> 4u) & 7u;
     if (fog_color.w > 0.5 && fog_policy != 4u) {
         let eye_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
-        let denom = max(fog_span.y - fog_span.x, 0.001);
-        let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
         var fog_rgb = fog_color.xyz;
         if (fog_policy == 1u) { fog_rgb = vec3<f32>(0.0); }
         else if (fog_policy == 2u) { fog_rgb = vec3<f32>(1.0); }
         else if (fog_policy == 3u) { fog_rgb = vec3<f32>(0.50196078); }
-        rgb = mix(fog_rgb, rgb, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        rgb = fog_hook::apply_fog(rgb, fog_rgb, fog_span, eye_z, in.world_position.xyz,
+            view.world_position, fog_policy == 0u, wow_light.monkey);
     }
 
 

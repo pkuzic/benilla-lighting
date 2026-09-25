@@ -12,6 +12,8 @@
 #import benilla::shadow_hook
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -1980,9 +1982,9 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         fog_span = wow_light.wmo_fog_params.xy;
     }
     if (fog_color.w > 0.5 && (in.word & WORD_FOG_OFF) == 0u) {
-        let denom = max(fog_span.y - fog_span.x, 0.001);
-        let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
-        rgb = mix(fog_color.xyz, rgb, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        rgb = fog_hook::apply_fog(rgb, fog_color.xyz, fog_span, eye_z, in.world_position.xyz,
+            view.world_position, true, wow_light.monkey);
     }
     // Gamma-space output; alpha pinned 1.0, every draw here is opaque.
     return vec4<f32>(rgb, 1.0);

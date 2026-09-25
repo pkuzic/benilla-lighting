@@ -35,6 +35,10 @@ is its own module, documented in `WATER.md`.
 ## Where the code lives
 
 - **Shaders**: `crates/benilla-assets/src/shaders/shadow_hook.wgsl` (shared shadow sampling),
+  `fog_hook.wgsl` (MONKEY p0: the ONE distance-fog law — `fog_linear`, `fog_sample`, `apply_fog`;
+  terrain, wow_model, static_gx, liquid, enhanced_water, wow_effect and wdl all call it; classic is
+  bit-identical to the old per-shader copies, and `MonkeyFrame.fog_model` = 1 is the FOG lane's
+  extension point), `monkey_frame.wgsl` (the MonkeyFrame struct),
   `crates/benilla-world/src/shaders/torch_depth.wgsl`, and the lighting lanes inside
   `static_gx.wgsl`, `wow_model.wgsl` and `terrain.wgsl`. The three receivers mirror each other; the
   comments say where.

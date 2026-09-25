@@ -32,6 +32,8 @@
 #import benilla::enhanced_water::{water_active, water_swell, enhanced_water, WaterFragment}
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var frames: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var frames_samp: sampler;
@@ -132,9 +134,9 @@ fn apply_fog(rgb: vec3<f32>, world_pos: vec3<f32>, room_fog: u32) -> vec3<f32> {
         return rgb;
     }
     let eye_z = -(view.view_from_world * vec4<f32>(world_pos, 1.0)).z;
-    let denom = max(fog_span.y - fog_span.x, 0.001);
-    let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
-    return mix(fog_color.xyz, rgb, factor);
+    // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+    return fog_hook::apply_fog(rgb, fog_color.xyz, fog_span, eye_z, world_pos, view.world_position,
+        true, wow_light.monkey);
 }
 
 @vertex
