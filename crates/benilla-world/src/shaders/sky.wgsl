@@ -5,8 +5,11 @@
     forward_io::VertexOutput,
     mesh_view_bindings::view,
 }
-// MONKEY (sky): the Enhanced/High library (smooth gradient, sun glow, night sky).
+// MONKEY (sky): the Enhanced/High library (smooth gradient, sun glow, night sky), compiled only
+// into the `SKY_FX` pipeline so Classic keeps the reference's exact code.
+#ifdef SKY_FX
 #import benilla_world::sky_fx
+#endif
 
 struct SkyColors {
     sky0: vec4<f32>, // zenith (90°)
@@ -77,6 +80,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // MONKEY (sky): Enhanced/High. The same stops through a monotone cubic in linear light, then
     // the sun glow and the night sky added in linear light, back to gamma, dithered.
+#ifdef SKY_FX
     if (sky.fx.x >= 0.5) {
         let stops = array<vec3<f32>, 6>(
             sky_fx::srgb_to_linear(sky.fog.rgb),
@@ -109,6 +113,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let out = sky_fx::linear_to_srgb(lin) + vec3<f32>(sky_fx::dither_tri(in.position.xy));
         return vec4<f32>(clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
+#endif
 
     // Elevation gradient, linear between rings like the reference's Gouraud-shaded dome.
     var col: vec3<f32>;

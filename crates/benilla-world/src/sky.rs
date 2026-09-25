@@ -32,6 +32,7 @@ pub type SkyMaterial = ExtendedMaterial<StandardMaterial, SkyExt>;
 /// The five sky stops, zenith to horizon, and the fog colour on one binding (100); `sky.wgsl`'s
 /// struct must match this field order.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
+#[bind_group_data(SkyFxKey)]
 pub struct SkyExt {
     /// `SkyColor0`: zenith (90°).
     #[uniform(100)]
@@ -67,6 +68,19 @@ pub struct SkyExt {
     pub(crate) glow: Vec4,
 }
 
+/// MONKEY (sky): the pipeline key: Enhanced/High compile `SKY_FX` into `sky.wgsl`; Classic keeps
+/// the reference's code with nothing added.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SkyFxKey {
+    fx: bool,
+}
+
+impl From<&SkyExt> for SkyFxKey {
+    fn from(e: &SkyExt) -> Self {
+        Self { fx: e.fx.x >= 0.5 }
+    }
+}
+
 impl MaterialExtension for SkyExt {
     /// The shared sky vertex stage, which pins depth to the far plane ([`crate::sky_order`]).
     fn vertex_shader() -> ShaderRef {
@@ -83,8 +97,14 @@ impl MaterialExtension for SkyExt {
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
+        key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // MONKEY (sky): the Enhanced/High branch.
+        if key.bind_group_data.fx {
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("SKY_FX".into());
+            }
+        }
         if let Some(depth) = descriptor.depth_stencil.as_mut() {
             depth.depth_write_enabled = false;
         }

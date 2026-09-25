@@ -29,6 +29,7 @@ pub type CloudMaterial = ExtendedMaterial<StandardMaterial, CloudExt>;
 /// The colored cloud texture. The color math is CPU-side as in the reference, so the texels are
 /// raw gamma bytes in a non-sRGB texture.
 #[derive(Asset, AsBindGroup, Clone, TypePath)]
+#[bind_group_data(CloudFxKey)]
 pub struct CloudExt {
     /// The colored tile, alpha the coverage, re-uploaded each regen (`0x58ac70`).
     #[texture(100)]
@@ -41,6 +42,19 @@ pub struct CloudExt {
     /// MONKEY (sky): the Light.dbc cloud sun colour (`rgb`, gamma) and the march strength (`w`).
     #[uniform(102)]
     pub(crate) lit: Vec4,
+}
+
+/// MONKEY (sky): the pipeline key: High compiles `SKY_FX_CLOUDS` into `cloud.wgsl`; below High
+/// the reference's code runs with nothing added.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CloudFxKey {
+    high: bool,
+}
+
+impl From<&CloudExt> for CloudFxKey {
+    fn from(e: &CloudExt) -> Self {
+        Self { high: e.fx.x >= 1.5 }
+    }
 }
 
 impl MaterialExtension for CloudExt {
@@ -57,8 +71,14 @@ impl MaterialExtension for CloudExt {
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
+        key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // MONKEY (sky): the High cloud branch.
+        if key.bind_group_data.high {
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("SKY_FX_CLOUDS".into());
+            }
+        }
         sky_pipeline_state(descriptor);
         Ok(())
     }

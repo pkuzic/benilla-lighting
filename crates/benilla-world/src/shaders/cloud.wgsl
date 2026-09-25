@@ -7,7 +7,9 @@
 // Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-clouds, Clouds.cpp.
 
 #import bevy_pbr::forward_io::VertexOutput
+#ifdef SKY_FX_CLOUDS
 #import benilla_world::sky_fx
+#endif
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var cloud_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var cloud_samp: sampler;
@@ -21,6 +23,7 @@ struct CloudFx {
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> cfx: CloudFx;
 
+#ifdef SKY_FX_CLOUDS
 // MONKEY (sky): coverage with detail at a sheet point; `oct` detail octaves.
 fn detailed_cover(uv: vec2<f32>, oct: i32) -> f32 {
     let a = textureSampleLevel(cloud_tex, cloud_samp, uv, 0.0).a;
@@ -29,13 +32,16 @@ fn detailed_cover(uv: vec2<f32>, oct: i32) -> f32 {
     }
     return sky_fx::cloud_erode(a, sky_fx::cloud_detail(uv, cfx.fx.y, oct));
 }
+#endif
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(cloud_tex, cloud_samp, in.uv);
     var a = texel.a;
     var rgb = texel.rgb;
-    // MONKEY (sky): High only; Classic and Enhanced keep the kernel's texels as they are.
+    // MONKEY (sky): High only (the `SKY_FX_CLOUDS` pipeline); Classic and Enhanced keep the
+    // kernel's texels as they are.
+#ifdef SKY_FX_CLOUDS
     if (cfx.fx.x >= 1.5) {
         let n = sky_fx::cloud_detail(in.uv, cfx.fx.y, 4);
         a = sky_fx::cloud_erode(a, n);
@@ -44,19 +50,20 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let strength = cfx.lit.w;
         if (a > 0.003 && strength > 0.0) {
             let sd = cfx.fx.zw;
-            let step = 0.011;
-            var occl = detailed_cover(in.uv + sd * step, 2);
-            occl += detailed_cover(in.uv + sd * step * 2.0, 2) * 0.75;
-            occl += detailed_cover(in.uv + sd * step * 3.5, 2) * 0.5;
+            let stp = 0.011;
+            var occl = detailed_cover(in.uv + sd * stp, 2);
+            occl += detailed_cover(in.uv + sd * stp * 2.0, 2) * 0.75;
+            occl += detailed_cover(in.uv + sd * stp * 3.5, 2) * 0.5;
             let transmit = exp(-occl * 1.44 * strength);
             // WarcraftXL's ambient floor 0.55, softened toward the painted texel.
             let light = 0.62 + 0.38 * transmit;
-            let ahead = detailed_cover(in.uv + sd * step * 1.5, 2);
+            let ahead = detailed_cover(in.uv + sd * stp * 1.5, 2);
             let rim = max(ahead - a, 0.0) * (1.0 - a) * transmit * strength;
             rgb = rgb * mix(1.0, light, strength) + cfx.lit.rgb * rim * 0.9;
             rgb = min(rgb, vec3<f32>(1.0));
         }
     }
+#endif
 #ifdef VERTEX_COLORS
     a *= in.color.a; // the dome's rim fade (ring alphas)
 #endif

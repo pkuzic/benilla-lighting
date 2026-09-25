@@ -183,7 +183,7 @@ fn star_field(dir: vec3<f32>, t: f32, px: f32, band: f32) -> vec3<f32> {
     let base = floor(p);
     let f = p - base;
     let o = select(vec3<f32>(-1.0), vec3<f32>(1.0), f > vec3<f32>(0.5));
-    let density = 0.035 * (1.0 + 2.5 * band);
+    let density = 0.022 * (1.0 + 2.5 * band);
     var acc = vec3<f32>(0.0);
     for (var i = 0u; i < 8u; i++) {
         let off = vec3<f32>(f32(i & 1u), f32((i >> 1u) & 1u), f32((i >> 2u) & 1u)) * o;
