@@ -481,6 +481,10 @@ fn build_skybox(
             {
                 mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, sub.vertex_colors.clone());
             }
+            // MONKEY (skybox): stage 1 reads UV set B.
+            if let Some(st) = sub.stage1.as_ref().filter(|s| s.uvs.len() == sub.positions.len()) {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, st.uvs.clone());
+            }
             mesh.insert_indices(Indices::U32(sub.indices.clone()));
             // The batch's authored address mode: Caverns of Time's belts wrap their UVs.
             let texture = sub
@@ -493,9 +497,41 @@ fn build_skybox(
             // The authored batch order after the layer's base (0 is unordered): every batch shares
             // one sort distance.
             let order = base + u16::try_from(i + 1).unwrap_or(0);
-            let Some(pair) = mats.skybox(sub, texture, order, uv.as_ref(), tint.as_ref()) else {
+            let Some(mut pair) = mats.skybox(sub, texture, order, uv.as_ref(), tint.as_ref())
+            else {
                 return; // light buffer vanished mid-build; `built` is unlatched, so we retry
             };
+            // MONKEY (skybox): a two-texture batch takes its own copies with stage 1 bound, so
+            // the deduped one-texture materials stay as they were.
+            if let Some(st) = sub.stage1.as_ref().filter(|s| s.uvs.len() == sub.positions.len()) {
+                let tex1 = st
+                    .texture
+                    .as_deref()
+                    .and_then(|t| world_assets.texture(t, (st.wrap_x, st.wrap_y), &mut images));
+                let mode = if st.mod2x { 2.0 } else { 1.0 };
+                let mut with_stage1 = |h: &Handle<WowModelMaterial>| {
+                    let mut m = crate::model_render::lazy::with_material_mut(
+                        mats.materials(),
+                        h.id(),
+                        |m| m.clone(),
+                    )?;
+                    m.extension.stage1 = Vec4::new(mode, 0.0, 0.0, 0.0);
+                    m.extension.stage1_texture = tex1.clone();
+                    Some(mats.materials().add(m))
+                };
+                let shared = pair.fade_blend == pair.steady;
+                if let Some(steady) = with_stage1(&pair.steady) {
+                    let fade = if shared {
+                        Some(steady.clone())
+                    } else {
+                        with_stage1(&pair.fade_blend)
+                    };
+                    if let Some(fade) = fade {
+                        pair.steady = steady;
+                        pair.fade_blend = fade;
+                    }
+                }
+            }
             let lane = SkyMatLane::register(
                 sub,
                 uv,

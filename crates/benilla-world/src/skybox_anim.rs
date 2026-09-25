@@ -313,6 +313,9 @@ pub(crate) struct SkyMatLane {
     pub(crate) uv: Option<(u16, [f32; 2], Arc<benilla_formats::UvAnim>)>,
     pub(crate) affine: Option<(u16, AffineLoops)>,
     pub(crate) tint: Option<(u16, [f32; 3], Arc<benilla_formats::RgbAnim>)>,
+    /// Stage 1's translation row (absolute, no seed) and affine row.
+    pub(crate) stage1_uv: Option<(u16, benilla_formats::UvAnim)>,
+    pub(crate) stage1_affine: Option<(u16, AffineLoops)>,
 }
 
 /// The rotation and scaling channels of a texture transform, slot 0's loops.
@@ -383,11 +386,36 @@ impl SkyMatLane {
                 lane.tint = Some((slot, seed, tint));
             }
         }
+        // Stage 1: rows only where it moves; row 0 is the identity.
+        if let Some(st) = &sub.stage1 {
+            if let Some(uv) = st.uv_anim.clone() {
+                if let Some(slot) = table.alloc() {
+                    write(materials, &|m| m.extension.stage1.z = f32::from(slot));
+                    lane.stage1_uv = Some((slot, uv));
+                }
+            }
+            if st.uv_rot.is_some() || st.uv_scale.is_some() {
+                if let Some(slot) = table.alloc() {
+                    write(materials, &|m| m.extension.stage1.w = f32::from(slot));
+                    lane.stage1_affine = Some((
+                        slot,
+                        AffineLoops {
+                            rot: st.uv_rot.clone(),
+                            scale: st.uv_scale.clone(),
+                        },
+                    ));
+                }
+            }
+        }
         lane
     }
 
     pub(crate) fn any(&self) -> bool {
-        self.uv.is_some() || self.affine.is_some() || self.tint.is_some()
+        self.uv.is_some()
+            || self.affine.is_some()
+            || self.tint.is_some()
+            || self.stage1_uv.is_some()
+            || self.stage1_affine.is_some()
     }
 
     /// Write this frame's rows: the delta from each seed, quantized as the shared lane does.
@@ -410,6 +438,29 @@ impl SkyMatLane {
             );
         }
         if let Some((slot, loops)) = &self.affine {
+            let q = loops
+                .rot
+                .as_ref()
+                .map_or([0.0, 0.0, 0.0, 1.0], |l| l.sample(l.clock(band_t, gseq_now)));
+            let s = loops
+                .scale
+                .as_ref()
+                .map_or([1.0, 1.0], |l| l.sample(l.clock(band_t, gseq_now)));
+            table.set(*slot, crate::mat_anim_table::affine_row(q, s));
+        }
+        if let Some((slot, a)) = &self.stage1_uv {
+            let v = a.sample(a.clock(band_t, gseq_now));
+            table.set(
+                *slot,
+                [
+                    benilla_assets::quantize(v[0], 4096.0),
+                    benilla_assets::quantize(v[1], 4096.0),
+                    0.0,
+                    0.0,
+                ],
+            );
+        }
+        if let Some((slot, loops)) = &self.stage1_affine {
             let q = loops
                 .rot
                 .as_ref()

@@ -71,6 +71,8 @@ pub struct WowModelKey {
     /// The WMO-skybox lane (`clutter_fade.z` bit 13, `model_render::SKY_DEPTH_MARKER`), a key axis
     /// because only this model's depth is pinned.
     sky_depth: bool,
+    /// MONKEY (skybox): a second texture stage (`stage1.x`), the `WOW_STAGE1` shader def.
+    stage1: bool,
     // The WMO batch order is deliberately not a key axis (a pipeline per batch index stalls a
     // city's first sight): the file-order layering (`0x6b4f10`/`0x6b5190`) rides `sun_scale.y`.
 }
@@ -89,6 +91,7 @@ impl From<&WowModelExt> for WowModelKey {
             zfill: markers & 0x200 != 0,
             far_side: markers & 0x800 != 0,
             sky_depth: markers & 0x2000 != 0,
+            stage1: e.stage1.x > 0.5,
         }
     }
 }
@@ -122,6 +125,14 @@ pub struct WowModelExt {
     /// tint, `z` = the texture-transform affine, `w` = the UI tile's cell clip.
     #[uniform(100)]
     pub anim_slots: Vec4,
+    /// MONKEY (skybox): a two-texture batch's stage 1: `x` = 0 none, 1 Mod, 2 Mod2x; `z`/`w` = the
+    /// `matanim` rows of its translation and affine, read on UV set B. `0` on every other batch.
+    #[uniform(100)]
+    pub stage1: Vec4,
+    /// MONKEY (skybox): stage 1's texture; `None` (the fallback image) unless `stage1.x > 0`.
+    #[texture(94)]
+    #[sampler(95)]
+    pub stage1_texture: Option<Handle<Image>>,
     /// The shared global light (`lighting::global_light`), updated in place once a frame; the
     /// vertex stage reads its point-light table, since Bevy's clusterable lights are fragment-only.
     #[storage(90, read_only, buffer, visibility(vertex, fragment))]
@@ -252,6 +263,13 @@ impl MaterialExtension for WowModelExt {
         if key.bind_group_data.far_side {
             if let Some(ds) = descriptor.depth_stencil.as_mut() {
                 ds.bias.constant = 0;
+            }
+        }
+        // MONKEY (skybox): the second texture stage compiles only where a batch has one.
+        if key.bind_group_data.stage1 {
+            descriptor.vertex.shader_defs.push("WOW_STAGE1".into());
+            if let Some(fragment) = descriptor.fragment.as_mut() {
+                fragment.shader_defs.push("WOW_STAGE1".into());
             }
         }
         // The skybox pins clip z to 0, reverse-Z far, in the vertex stage; its bias is sort-only.

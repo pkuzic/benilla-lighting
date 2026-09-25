@@ -323,6 +323,9 @@ pub fn model_material(
                 },
                 // Zero until a sampler registers this material and bakes its table slot in once.
                 anim_slots: Vec4::ZERO,
+                // MONKEY (skybox): no second stage.
+                stage1: Vec4::ZERO,
+                stage1_texture: None,
                 light_buf: light.clone(),
                 // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
                 torch_depth: torch.depth.clone(),
@@ -446,6 +449,9 @@ pub fn zfill_material(
                 tint: Vec4::new(1.0, 1.0, 1.0, 0.0),
                 sidn: Vec4::ZERO,
                 anim_slots: Vec4::ZERO,
+                // MONKEY (skybox): no second stage.
+                stage1: Vec4::ZERO,
+                stage1_texture: None,
                 light_buf: light.clone(),
                 // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
                 torch_depth: torch.depth.clone(),
