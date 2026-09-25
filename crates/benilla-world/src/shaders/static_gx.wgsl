@@ -52,6 +52,11 @@ struct WowLight {
     points: array<vec4<f32>, 512>,
     // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
     monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
     // lighting::prop_probes: 8192 slots of 7 rows; the buffer's later regions are not mirrored.
     prop_probes: array<vec4<f32>, 57344>,
 }
@@ -1993,10 +1998,21 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     if ((in.word & WORD_UNLIT) != 0u) {
         rgb = folded;
     }
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
     // MONKEY (wet): rain on sky-exposed surfaces (wet_hook.wgsl); interior, unlit and dry = untouched.
     let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
         // MONKEY (fix-wet): lit WMO windows (WORD_WINDOW) are not darkened by rain either.
-        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT | WORD_WINDOW)) != 0u),
+        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT | WORD_WINDOW)) != 0u) * wet_open,
         wow_light.monkey);
     rgb = wet.albedo;
     if (wet.boost > 0.0) {
