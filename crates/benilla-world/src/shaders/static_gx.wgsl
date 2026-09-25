@@ -14,6 +14,8 @@
 #import benilla::monkey_frame
 // MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
 #import benilla::fog_hook
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -1971,6 +1973,14 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     // Unlit (M2 UNLIT 0x01, WMO UNLIT on an exterior group): texture × vertex colour, no light.
     if ((in.word & WORD_UNLIT) != 0u) {
         rgb = folded;
+    }
+    // MONKEY (wet): rain on sky-exposed surfaces (wet_hook.wgsl); interior, unlit and dry = untouched.
+    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
+        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT)) != 0u), wow_light.monkey);
+    rgb = wet.albedo;
+    if (wet.boost > 0.0) {
+        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),
+            L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, world_shadow), vec3<f32>(1.0));
     }
     // Planar eye-Z fog; other fog modes belong to blends never admitted here. The interior triple
     // keys on the per-frame record bit, not `WORD_INTERIOR`: the client sets it per group under

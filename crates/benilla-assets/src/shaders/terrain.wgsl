@@ -22,6 +22,8 @@
 #import benilla::monkey_frame
 // MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
 #import benilla::fog_hook
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var layer_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var alpha_array: texture_2d_array<f32>;
@@ -755,9 +757,19 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     //   specular = per-vertex sheen · gloss_mask · shadow → gated to ZERO in shadow (no sheen in shade)
     // (`tex·primary` is the MODULATE-1× diffuse; the sheen is added after, separate-specular.) Then
     // LDR-clamp; gamma/byte throughout; raw gamma out (GAMMA LANE, 0161).
+    // MONKEY (wet): rain-darkened ground + puddles (wet_hook.wgsl); a dry frame returns `color`.
+    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_lit, in.world_position.xyz, 1.0,
+        wow_light.monkey), n_lit, in.world_position.xyz, wow_light.monkey);
+    color = wet.albedo;
     let diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
     let spec_term = in.specular * specmask * spec_gate;
     var tuned = clamp(diffuse_term + spec_term, vec3<f32>(0.0), vec3<f32>(1.0));
+    // MONKEY (wet): the wet sheen, and the authored `_s` sheen brightens with it.
+    if (wet.boost > 0.0) {
+        tuned = clamp(tuned + spec_term * wet.boost + wet_hook::wet_sheen(wet.boost, n_lit,
+            normalize(view.world_position - in.world_position.xyz), -normalize(wow_light.light_sun.xyz),
+            wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, spec_gate), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
 
     // MONKEY (torch debug, interiorDebug 2 on TERRAIN): the ground's OWN cube-map sampling as
     // greyscale, the same instrument static_gx and wow_model already paint on walls and bodies. The

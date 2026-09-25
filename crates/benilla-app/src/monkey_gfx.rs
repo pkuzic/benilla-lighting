@@ -5,17 +5,33 @@
 //! | cvar | values | default | Graphics preset High | resource |
 //! |---|---|---|---|---|
 //! | `skyDither` | 0 Off / 1 On | 0 | 1 | `benilla_world::ffx_glow::SkyDither` |
+//! | `rainSurfaces` | 0 Off / 1 On | 1 | 1 | `benilla_world::weather::RainSurfaces` |
 
 use bevy::prelude::*;
 use benilla_world::ffx_glow::SkyDither;
+use benilla_world::weather::RainSurfaces; // MONKEY (wet)
 
 /// The programme's cvar observer (registered by [`MonkeyGfxPlugin`]).
-pub(crate) fn on_cvar(ev: On<crate::cvars::CvarChanged>, mut dither: ResMut<SkyDither>) {
-    if ev.key().as_str() == "skydither" {
-        let want = ev.num() >= 0.5;
-        if dither.0 != want {
-            dither.0 = want;
+pub(crate) fn on_cvar(
+    ev: On<crate::cvars::CvarChanged>,
+    mut dither: ResMut<SkyDither>,
+    mut rain: ResMut<RainSurfaces>, // MONKEY (wet)
+) {
+    match ev.key().as_str() {
+        "skydither" => {
+            let want = ev.num() >= 0.5;
+            if dither.0 != want {
+                dither.0 = want;
+            }
         }
+        // MONKEY (wet): wet surfaces + rain ripples.
+        "rainsurfaces" => {
+            let want = ev.num() >= 0.5;
+            if rain.0 != want {
+                rain.0 = want;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -25,6 +41,8 @@ pub(crate) struct MonkeyGfxPlugin;
 
 impl Plugin for MonkeyGfxPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SkyDither>().add_observer(on_cvar);
+        app.init_resource::<SkyDither>()
+            .init_resource::<RainSurfaces>() // MONKEY (wet)
+            .add_observer(on_cvar);
     }
 }

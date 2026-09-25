@@ -15,7 +15,8 @@
 
 struct WetSurface {
     albedo: vec3<f32>,
-    // Gloss weight for `wet_sheen`: 0 dry, ~1 a soaked top face, up to ~1.6 in a terrain puddle.
+    // Gloss weight for `wet_sheen`: 0 dry, ~1 a soaked top face, up to 2 in a terrain puddle (the
+    // part above 1 is standing water: a flat mirror of the sky).
     boost: f32,
 }
 
@@ -68,13 +69,13 @@ fn wet_puddles(s: WetSurface, n: vec3<f32>, world_pos: vec3<f32>, mf: MonkeyFram
         return o;
     }
     let xz = world_pos.xz;
-    let field = 0.65 * wet_noise(xz * 0.11) + 0.35 * wet_noise(xz * 0.43 + 17.0);
+    let field = 0.65 * wet_noise(xz * 0.17) + 0.35 * wet_noise(xz * 0.53 + 17.0);
     let level = smoothstep(0.94, 0.99, n.y);
     // Puddles grow with the wetness: the threshold falls as the ground soaks.
     let edge = mix(0.8, 0.6, smoothstep(0.4, 1.0, wet0.y));
     let puddle = smoothstep(edge, edge + 0.06, field) * level * smoothstep(0.35, 0.8, wet0.y);
-    o.albedo = o.albedo * (1.0 - 0.4 * puddle);
-    o.boost = max(o.boost, 1.6 * puddle);
+    o.albedo = o.albedo * (1.0 - 0.45 * puddle);
+    o.boost = max(o.boost, 2.0 * puddle);
     return o;
 }
 
@@ -89,5 +90,8 @@ fn wet_sheen(boost: f32, n: vec3<f32>, to_view: vec3<f32>, to_light: vec3<f32>,
     let nl = max(dot(n, to_light), 0.0);
     let spec = pow(max(dot(n, h), 0.0), 80.0) * smoothstep(0.0, 0.15, nl);
     let fres = 0.03 + 0.97 * pow(1.0 - clamp(dot(n, to_view), 0.0, 1.0), 5.0);
-    return boost * (sun_rgb * (0.9 * spec * shadow) + sky_rgb * (0.28 * fres));
+    let gloss = min(boost, 1.0);
+    let mirror = max(boost - 1.0, 0.0);
+    return sun_rgb * ((0.9 * gloss + 1.2 * mirror) * spec * shadow)
+        + sky_rgb * (gloss * min(0.25 * fres, 0.2) + mirror * (0.22 + 0.3 * fres));
 }

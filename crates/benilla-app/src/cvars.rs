@@ -928,6 +928,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own: faint screen dither against sky and fog banding, 0 Off / 1 On",
     ),
+    // MONKEY (wet): rain darkens and glosses sky-exposed surfaces and rings the water. Default 1
+    // (only visible while it rains or the ground dries); the Graphics preset's High sets 1.
+    ours(
+        "rainSurfaces",
+        "1",
+        "benilla's own: rain wets sky-exposed surfaces and rings the water, 0 Off / 1 On",
+    ),
     ours(
         "waterQuality",
         "1",

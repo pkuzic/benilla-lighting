@@ -22,6 +22,8 @@
 #import benilla::shadow_hook
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
 // MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
 #import benilla::fog_hook
 
@@ -1706,6 +1708,18 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let is_mod2x = (u32(m.clutter_fade.z) & 256u) != 0u;
     if ((is_mod || is_mod2x) && !is_wmo) {
         rgb = base.rgb;
+    }
+
+    // MONKEY (wet): rain on sky-exposed WMO/M2 surfaces (wet_hook.wgsl); interior, glue booth, unlit,
+    // Mod/Mod2x, additive and dry = untouched.
+    let wet_dry = is_interior || interior_fogged || is_rig || is_emissive || is_mod || is_mod2x
+        || (u32(m.clutter_fade.z) & 4u) != 0u;
+    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz, select(1.0, 0.0, wet_dry),
+        wow_light.monkey);
+    rgb = wet.albedo;
+    if (wet.boost > 0.0) {
+        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),
+            L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, player_shadow), vec3<f32>(1.0));
     }
 
     // Linear fog by planar eye depth, as in terrain.wgsl. Per-batch colour policy (`clutter_fade.z`
