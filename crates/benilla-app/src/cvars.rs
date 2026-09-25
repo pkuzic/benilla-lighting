@@ -3719,6 +3719,7 @@ mod tests {
         // MONKEY (p0 graphics programme)
         |app| {
             app.init_resource::<benilla_world::ffx_glow::SkyDither>();
+            app.init_resource::<benilla_world::weather::RainSurfaces>(); // MONKEY (wet)
             app.add_observer(crate::monkey_gfx::on_cvar);
         },
         |app| {
