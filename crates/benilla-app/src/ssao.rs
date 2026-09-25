@@ -10,7 +10,7 @@
 //! bright pixels (lit windows, flames, sunlit sand) are protected; fade 45-90 yd (Low) / 60-120 yd (High).
 //!
 //! cvar `ambientOcclusion`: 0 Off (pass not scheduled, image unchanged), 1 Low, 2 High.
-//! `WOW_AO=0|1|2` overrides it for the session; `WOW_AO_DEBUG=1..4` writes a diagnostic view
+//! `WOW_AO=0|1|2` overrides it for the session; `WOW_AO_DEBUG=1..5` writes a diagnostic view
 //! (factor, protection, distance, raw occlusion); `WOW_AO_GAIN/RADIUS/BIAS/STRENGTH` tune it.
 use crate::video::VideoConfig;
 use benilla_world::{liquid::WaterDepthLabel, view::WorldCamera};
@@ -50,8 +50,8 @@ struct AoView {
     params: Vec4,
     /// Distance fade start and end (yd), bright-pixel protection ramp (gamma max channel).
     fade: Vec4,
-    /// x = debug view (0 off, 1 AO factor, 2 protection, 3 distance/50, 4 raw occlusion),
-    /// y = occlusion gain.
+    /// x = debug view (0 off, 1 AO factor, 2 protection, 3 distance/50, 4 raw occlusion,
+    /// 5 surface smoothness, MONKEY (followups)), y = occlusion gain.
     debug: Vec4,
 }
 
@@ -87,11 +87,11 @@ impl AoView {
     }
 }
 
-/// `WOW_AO_DEBUG=1..4`: write a diagnostic term instead of darkening the scene.
+/// `WOW_AO_DEBUG=1..5`: write a diagnostic term instead of darkening the scene.
 fn debug_mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        std::env::var("WOW_AO_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(4)
+        std::env::var("WOW_AO_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(5)
     })
 }
 

@@ -5,7 +5,8 @@
 //   STAGE_BLUR   half resolution: 4x4 depth-aware box; the 4x4 Bayer rotation cancels inside it.
 //   STAGE_APPLY  full resolution: joint-bilateral upsample, output multiplied into the scene.
 // Stored texel: r = occlusion 0..1 (fade applied), g = view distance (SKY_DIST for sky),
-// b = bright-pixel protection 0..1.
+// b = bright-pixel protection 0..1, a (MONKEY (followups)) = surface smoothness 0..1 after
+// STAGE_AO (0 where both neighbours on an axis jump in depth), 1 - foliage mask after STAGE_BLUR.
 #import bevy_render::view::View
 
 struct Ao {
@@ -13,7 +14,7 @@ struct Ao {
     params: vec4<f32>,
     // Distance fade start and end in yards, protection luma ramp start and end.
     fade: vec4<f32>,
-    // x: debug view (0 off, 1 factor, 2 protection, 3 distance/50, 4 raw occlusion); y: gain.
+    // x: debug view (0 off, 1 factor, 2 protection, 3 distance/50, 4 raw occlusion, 5 smoothness); y: gain.
     debug: vec4<f32>,
 }
 
@@ -99,6 +100,20 @@ fn ao_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let dy = select(p - pu, pd - p, abs(pd.z - p.z) < abs(p.z - pu.z));
     var n = normalize(cross(dx, dy));
     if (dot(n, p) > 0.0) { n = -n; }
+    // MONKEY (followups): cutout leaves scatter depth spikes through a canopy, and there the taps
+    // are noise. The spike is the smaller of the two one-sided steps two pixels out, capped by the
+    // second difference, which is ~0 on any plane (even at grazing angles) and on a silhouette
+    // (one side continuous). Contact creases stay smooth, so contact shadows keep full strength.
+    // The blur turns the spike DENSITY of its window into the foliage mask.
+    let ax = neighbour(f + vec2(2, 0), p).z - p.z;
+    let bx = p.z - neighbour(f - vec2(2, 0), p).z;
+    let ay = neighbour(f + vec2(0, 2), p).z - p.z;
+    let by = p.z - neighbour(f - vec2(0, 2), p).z;
+    let spike = max(
+        min(min(abs(ax), abs(bx)), abs(ax - bx)),
+        min(min(abs(ay), abs(by)), abs(ay - by)),
+    );
+    let smooth_surface = 1.0 - smoothstep(0.01, 0.04, spike / dist);
 
     let count = u32(ao.params.z);
     let rot = (bayer4(h) + 0.5) * (6.2831853 / 16.0);
@@ -119,7 +134,7 @@ fn ao_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         occ += w * max(0.0, dot(v, n) * inverseSqrt(vv + 1e-6) - ao.params.w);
     }
     occ = saturate(ao.debug.y * occ / f32(count)) * fade;
-    return vec4(occ, dist, protect, 1.0);
+    return vec4(occ, dist, protect, smooth_surface);
 }
 #endif
 
@@ -130,7 +145,17 @@ fn blur_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let size = vec2<i32>(textureDimensions(raw));
     let c = textureLoad(raw, h, 0);
     if (c.g >= SKY_DIST) { return c; }
-    let tolerance = 0.04 * c.g + 0.05;
+    // MONKEY (followups): foliage = spike density over the window. There the depth test would
+    // reject every leaf neighbour and keep the grain, so the tolerance widens and the leftover
+    // occlusion is scaled down; a window of smooth surfaces keeps the tight edge and full AO.
+    var spikes = 0.0;
+    for (var y = -2; y <= 1; y += 1) {
+        for (var x = -2; x <= 1; x += 1) {
+            spikes += 1.0 - textureLoad(raw, clamp(h + vec2(x, y), vec2<i32>(0), size - vec2<i32>(1)), 0).a;
+        }
+    }
+    let foliage = saturate(spikes / 16.0 * 4.0);
+    let tolerance = (0.04 * c.g + 0.05) * (1.0 + 10.0 * foliage);
     var sum = 0.0;
     var weight = 0.0;
     for (var y = -2; y <= 1; y += 1) {
@@ -141,7 +166,7 @@ fn blur_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
             weight += w;
         }
     }
-    return vec4(sum / max(weight, 1e-4), c.g, c.b, 1.0);
+    return vec4(sum / max(weight, 1e-4) * (1.0 - 0.4 * foliage), c.g, c.b, 1.0 - foliage);
 }
 #endif
 
@@ -162,6 +187,7 @@ fn apply_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let t = hc - floor(hc);
     var occ = 0.0;
     var protect = 0.0;
+    var smooth_surface = 0.0;
     var weight = 0.0;
     for (var j = 0; j < 4; j += 1) {
         let o = vec2(j & 1, j >> 1u);
@@ -170,6 +196,7 @@ fn apply_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let w = b.x * b.y / (0.02 + abs(s.g - dist) / dist) + 1e-5;
         occ += s.r * w;
         protect += s.b * w;
+        smooth_surface += s.a * w;
         weight += w;
     }
     occ /= weight;
@@ -178,6 +205,8 @@ fn apply_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     // Red = positive view distance, green = negative (a sign error), both / 50 yd.
     if (mode == 3u) { return vec4(saturate(dist / 50.0), saturate(-dist / 50.0), 0.0, 1.0); }
     if (mode == 4u) { return vec4(1.0 - occ, 1.0 - occ, 1.0 - occ, 1.0); }
+    // MONKEY (followups): 5 = foliage mask (black = treated as foliage).
+    if (mode == 5u) { let m = smooth_surface / weight; return vec4(m, m, m, 1.0); }
     let k = 1.0 - ao.params.y * occ * (1.0 - protect);
     return vec4(k, k, k, 1.0);
 }
