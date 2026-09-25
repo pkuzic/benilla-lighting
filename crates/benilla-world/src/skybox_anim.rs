@@ -435,7 +435,8 @@ mod tests {
     use super::*;
 
     fn spin_rig() -> SkyRig {
-        // One parentless bone at pivot (1,0,0) turning about +Y over 4 s, linear.
+        // One parentless bone at pivot (1,0,0) turning 135° about +Y over 4 s, linear; the quarter
+        // turn falls at 8/3 s.
         SkyRig {
             parents: vec![-1],
             pivots: vec![Vec3::X],
@@ -443,7 +444,7 @@ mod tests {
                 rotation: Channel {
                     keys: vec![
                         (0.0, Quat::IDENTITY),
-                        (4.0, Quat::from_rotation_y(std::f32::consts::PI)),
+                        (4.0, Quat::from_rotation_y(std::f32::consts::FRAC_PI_2 * 1.5)),
                     ],
                     linear: true,
                 },
@@ -458,8 +459,8 @@ mod tests {
     #[test]
     fn a_bone_turns_about_its_pivot() {
         let rig = spin_rig();
-        let m = rig.pose(rig.band_time(4.0 + 2.0), 0.0)[0];
-        // Half way: a quarter turn about the pivot; the pivot itself stays put.
+        let m = rig.pose(rig.band_time(4.0 + 8.0 / 3.0), 0.0)[0];
+        // A quarter turn about the pivot; the pivot itself stays put.
         assert!(m.transform_point3(Vec3::X).abs_diff_eq(Vec3::X, 1e-5));
         let p = m.transform_point3(Vec3::new(2.0, 0.0, 0.0));
         assert!(p.abs_diff_eq(Vec3::new(1.0, 0.0, -1.0), 1e-5), "{p}");
@@ -477,7 +478,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let pose = rig.pose(2.0, 0.0);
+        let pose = rig.pose(8.0 / 3.0, 0.0);
         let p = pose[1].transform_point3(Vec3::new(2.0, 0.0, 0.0));
         // Lifted by the child, then turned a quarter by the parent.
         assert!(p.abs_diff_eq(Vec3::new(1.0, 1.0, -1.0), 1e-5), "{p}");

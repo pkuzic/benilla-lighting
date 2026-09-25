@@ -1381,6 +1381,15 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     },    // MONKEY (skybox): zone skyboxes (run with `WOW_ZONE_SKYBOXES=1`) and the two stock skybox
     // lanes. Karazahn40 (Turtle map 814) is the one stock sphere naming a clear-slot skybox
     // (Light 553, HellfireSkyBox); the zone shots need the sky patch.
+    // The stock MOSB lane: Stratholme_B's groups flagged 0x40000, weight = the interior crossfade.
+    Scenario {
+        name: "skybox-stratholme-noon",
+        map: Some(329),
+        eye: SKYBOX_STRAT_EYE,
+        look: SKYBOX_STRAT_LOOK,
+        minute: 720,
+        ui: None,
+    },
     Scenario {
         name: "skybox-karazhan-noon",
         map: Some(814),
@@ -1550,6 +1559,8 @@ pub(crate) fn ui_opted_in() -> bool {
 
 // MONKEY (skybox): the skybox shots, eye just above the ground at a sphere's centre, pitched up so
 // the upper frame is sky.
+const SKYBOX_STRAT_EYE: [f32; 3] = [3450.0, -3380.0, 150.0];
+const SKYBOX_STRAT_LOOK: [f32; 3] = [3600.0, -3300.0, 200.0];
 const SKYBOX_KZ_EYE: [f32; 3] = [-6474.0, -2912.0, 40.0];
 const SKYBOX_KZ_LOOK: [f32; 3] = [-6300.0, -2800.0, 95.0];
 const SKYBOX_STEPPES_EYE: [f32; 3] = [-7979.0, -2571.0, 260.0];
