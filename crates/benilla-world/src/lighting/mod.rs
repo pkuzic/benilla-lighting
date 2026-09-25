@@ -422,6 +422,10 @@ mod ordering_tests {
                 "lighting/daylight.rs",
                 "update_daylight_fixtures + update_bleed_fixtures: PostUpdate",
             ),
+            (
+                "clouds/layer.rs",
+                "update_cloud_fx is registered in CloudsPlugin with LightingConsumeSet",
+            ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
