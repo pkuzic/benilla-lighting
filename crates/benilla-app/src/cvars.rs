@@ -3224,6 +3224,10 @@ mod tests {
                     "bloom" => video.bloom as f32,
                     "sunShafts" => video.sun_shafts as u32 as f32,
                     "colorGrading" => video.color_grading as u32 as f32,
+                    // MONKEY (integration): wind is bridged directly to its world resource rather
+                    // than through VideoConfig, but it is still a preset member and needs the same
+                    // real-observer clamp weld as every VideoConfig-backed row above.
+                    "foliageWind" => res::<benilla_world::wind::FoliageWind>(&app).0 as f32,
                     "lavaLightGain" => video.lava_light_gain,
                     "fireLightGain" => video.fire_light_gain,
                     "moonShadowStrength" => video.moon_shadow_strength,
