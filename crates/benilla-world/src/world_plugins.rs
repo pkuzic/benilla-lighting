@@ -80,6 +80,8 @@ impl PluginGroup for WorldPlugins {
             .add(crate::world_map::WorldMapPlugin)
             .add(crate::lighting::LightingPlugin)
             // Sky dome: the Light.dbc gradient backdrop (camera-centred), driven by the lighting.
+            // MONKEY (sky): before the sky, whose dome imports its WGSL library.
+            .add(crate::sky_fx::SkyFxPlugin)
             .add(crate::sky::SkyPlugin)
             // The WMO skybox, after `SkyPlugin`, whose dome it stands down.
             .add(crate::skybox::SkyboxPlugin)

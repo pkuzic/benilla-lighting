@@ -75,6 +75,8 @@ mod doodad_events;
 // MONKEY (volumetric fog): optional near-field atmosphere plugin.
 mod volumetric_fog;
 mod dynamic_interior;
+// MONKEY (sky): the skyQuality cvar bridge.
+mod sky_quality;
 mod entities;
 mod fishing_line;
 mod footprints;

@@ -5,6 +5,8 @@
     forward_io::VertexOutput,
     mesh_view_bindings::view,
 }
+// MONKEY (sky): the Enhanced/High library (smooth gradient, sun glow, night sky).
+#import benilla_world::sky_fx
 
 struct SkyColors {
     sky0: vec4<f32>, // zenith (90°)
@@ -14,6 +16,13 @@ struct SkyColors {
     sky4: vec4<f32>, // 1.8°
     fog: vec4<f32>,  // horizon (0°) and below: LightIntBand row 7
     warp: vec4<f32>, // x = dawn/dusk warp strength S (0 = off), y = sun azimuth (rad), zw reserved
+    // MONKEY (sky): x = skyQuality (0 Classic), y = sky clock (s), z = night-sky alpha, w = glow
+    // strength.
+    fx: vec4<f32>,
+    // MONKEY (sky): xyz = camera to the visible sun, w unused.
+    sun: vec4<f32>,
+    // MONKEY (sky): rgb = glow colour (gamma), w unused.
+    glow: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky: SkyColors;
 
@@ -64,6 +73,41 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         s2c = mix(warp_one(sky.sky2.rgb, g0, warp_s), warp_one(sky.sky2.rgb, g1, warp_s), f);
         s3 = mix(warp_one(sky.sky3.rgb, g0, warp_s), warp_one(sky.sky3.rgb, g1, warp_s), f);
         s4 = mix(warp_one(sky.sky4.rgb, g0, warp_s), warp_one(sky.sky4.rgb, g1, warp_s), f);
+    }
+
+    // MONKEY (sky): Enhanced/High. The same stops through a monotone cubic in linear light, then
+    // the sun glow and the night sky added in linear light, back to gamma, dithered.
+    if (sky.fx.x >= 0.5) {
+        let stops = array<vec3<f32>, 6>(
+            sky_fx::srgb_to_linear(sky.fog.rgb),
+            sky_fx::srgb_to_linear(s4),
+            sky_fx::srgb_to_linear(s3),
+            sky_fx::srgb_to_linear(s2c),
+            sky_fx::srgb_to_linear(s1),
+            sky_fx::srgb_to_linear(sky.sky0.rgb),
+        );
+        var lin = sky_fx::smooth_gradient(elev, stops);
+        // Sun glow: a halo tinted by the sun and fog colours, faded at night and under cloud on the
+        // CPU; below the horizon it thins out over the fog band.
+        if (sky.fx.w > 0.0) {
+            let below = smoothstep(-0.12, 0.02, dir.y);
+            lin += sky_fx::srgb_to_linear(sky.glow.rgb)
+                * (sky.fx.w * below * sky_fx::sun_glow(dir, normalize(sky.sun.xyz)));
+        }
+        // Night sky: stars and the Milky Way, fixed to world directions, thinned toward the
+        // horizon. The cloud dome draws over this, so clouds hide it where they stand.
+        let night = sky.fx.z;
+        // The pixel's size in star-grid units; derivatives stay in uniform control flow.
+        let px = length(fwidth(dir)) * sky_fx::STAR_GRID * 0.5;
+        if (night > 0.0 && dir.y > 0.0) {
+            let band = sky_fx::galaxy_band(dir);
+            let stars = sky_fx::star_field(dir, sky.fx.y, max(px, 1e-4), band)
+                * smoothstep(0.0, 0.2, dir.y);
+            let milky = sky_fx::milky_way(dir, band) * 0.05 * smoothstep(0.03, 0.35, dir.y);
+            lin += (stars * 0.85 + milky) * night;
+        }
+        let out = sky_fx::linear_to_srgb(lin) + vec3<f32>(sky_fx::dither_tri(in.position.xy));
+        return vec4<f32>(clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
 
     // Elevation gradient, linear between rings like the reference's Gouraud-shaded dome.

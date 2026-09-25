@@ -245,6 +245,8 @@ impl PluginGroup for GamePlugins {
             .add(crate::dynamic_interior::DynamicInteriorPlugin)
             // MONKEY (volumetric fog): bridge the live setting to Bevy.
             .add(crate::volumetric_fog::VolumetricFogPlugin)
+            // MONKEY (sky): the sky tier bridge.
+            .add(crate::sky_quality::SkyQualityPlugin)
             // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
             // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
             .add(crate::realmlist::RealmlistPlugin)

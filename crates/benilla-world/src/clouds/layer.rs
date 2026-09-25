@@ -34,6 +34,13 @@ pub struct CloudExt {
     #[texture(100)]
     #[sampler(101)]
     pub(crate) texels: Handle<Image>,
+    /// MONKEY (sky): `x` the sky tier (detail at 2), `y` the sky clock, `zw` the unit direction
+    /// toward the glow body on the sheet ([`update_cloud_fx`]).
+    #[uniform(102)]
+    pub(crate) fx: Vec4,
+    /// MONKEY (sky): the Light.dbc cloud sun colour (`rgb`, gamma) and the march strength (`w`).
+    #[uniform(102)]
+    pub(crate) lit: Vec4,
 }
 
 impl MaterialExtension for CloudExt {
@@ -156,6 +163,9 @@ pub(super) fn setup_cloud_layer(
         },
         extension: CloudExt {
             texels: image.clone(),
+            // MONKEY (sky): Classic until `update_cloud_fx` reads the tier.
+            fx: Vec4::ZERO,
+            lit: Vec4::ZERO,
         },
     });
     commands.spawn((
@@ -211,6 +221,48 @@ pub(super) fn follow_cloud_dome(
     tf.rotation = Quat::IDENTITY;
     tf.scale = Vec3::splat(far * 0.87);
     *gt = GlobalTransform::from(*tf);
+}
+
+/// MONKEY (sky): feeds the High cloud shading.
+/// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-clouds, Clouds.cpp.
+/// The march walks the sheet toward the glow body
+/// (sun by day, moon by night), scaled by how far the body sits off the zenith (a noon sun has no
+/// direction on the sheet worth marching, as in WarcraftXL) and by the kernel's own glow envelope.
+pub(super) fn update_cloud_fx(
+    light: Res<crate::lighting::WowLighting>,
+    quality: Res<crate::sky_fx::SkyQuality>,
+    clock: Res<crate::sky_fx::SkyClock>,
+    layer: Option<Res<CloudLayer>>,
+    mut materials: ResMut<Assets<CloudMaterial>>,
+) {
+    let Some(layer) = layer else {
+        return;
+    };
+    let (fx, lit) = if quality.high() {
+        let body = light.cloud_glow_dir;
+        let flat = Vec2::new(body.x, body.z);
+        let len = flat.length();
+        let d = if len > 1e-3 { flat / len } else { Vec2::ZERO };
+        let strength =
+            (len * 1.6).min(1.0) * light.cloud_glow_track * (1.0 - 0.75 * light.storm_bcc);
+        let q = |v: f32| benilla_assets::quantize(v, 4096.0);
+        let sun = light.cloud_colors[0];
+        (
+            Vec4::new(f32::from(quality.0), clock.secs, q(d.x), q(d.y)),
+            Vec4::new(q(sun[0]), q(sun[1]), q(sun[2]), q(strength.clamp(0.0, 1.0))),
+        )
+    } else {
+        (Vec4::ZERO, Vec4::ZERO)
+    };
+    benilla_assets::write_gated(
+        &mut materials,
+        &layer.material,
+        |m| m.extension.fx != fx || m.extension.lit != lit,
+        |m| {
+            m.extension.fx = fx;
+            m.extension.lit = lit;
+        },
+    );
 }
 
 #[cfg(test)]

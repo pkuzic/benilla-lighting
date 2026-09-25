@@ -11,6 +11,8 @@ use bevy::prelude::*;
 pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/sky_vertex.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/sky.wgsl");
+    // MONKEY (sky): the Enhanced/High library `sky.wgsl` and `cloud.wgsl` import.
+    bevy::asset::embedded_asset!(app, "shaders/sky_fx.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/star.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/cloud.wgsl");
     bevy::asset::embedded_asset!(app, "shaders/celestial.wgsl");
@@ -59,6 +61,7 @@ mod tests {
         // `wow_model.wgsl`); 7 since 1429 added `static_gx.wgsl` (the B1 retained pass);
         // 8 since 2016 added `sky_vertex.wgsl` (the sky's shared far-depth vertex stage);
         // 9 since the torch-shadow Phase 1 added `torch_depth.wgsl` (the interior depth map).
-        assert_eq!(found, 9, "the engine's shader set changed size");
+        // MONKEY (sky): 10 with `sky_fx.wgsl`, the sky's Enhanced/High library.
+        assert_eq!(found, 10, "the engine's shader set changed size");
     }
 }

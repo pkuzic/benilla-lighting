@@ -55,6 +55,16 @@ pub struct SkyExt {
     /// none), `y` the sun azimuth `atan2(sun.z, sun.x)` in radians, `zw` reserved.
     #[uniform(100)]
     pub(crate) warp: Vec4,
+    /// MONKEY (sky): `x` the [`crate::sky_fx::SkyQuality`] tier (0 = Classic, the fields below
+    /// unused), `y` the sky clock in seconds, `z` the night-sky alpha, `w` the sun-glow strength.
+    #[uniform(100)]
+    pub(crate) fx: Vec4,
+    /// MONKEY (sky): camera to the visible sun (`xyz`).
+    #[uniform(100)]
+    pub(crate) sun: Vec4,
+    /// MONKEY (sky): the glow colour, gamma (`rgb`).
+    #[uniform(100)]
+    pub(crate) glow: Vec4,
 }
 
 impl MaterialExtension for SkyExt {
@@ -183,6 +193,10 @@ fn setup_sky(
             sky4: col([0.78, 0.86, 0.95]),
             fog: col([0.55, 0.72, 0.92]),
             warp: Vec4::ZERO, // update_sky_colors fills S + sun azimuth each frame
+            // MONKEY (sky): Classic until update_sky_colors reads the tier.
+            fx: Vec4::ZERO,
+            sun: Vec4::Y,
+            glow: Vec4::ZERO,
         },
     });
     commands.spawn((
@@ -242,8 +256,13 @@ fn apply_sky_visibility(
 }
 
 /// Push the time-of-day sky stops and fog colour (`WowLighting`) into the dome material.
+#[allow(clippy::too_many_arguments)]
 fn update_sky_colors(
     light: Res<WowLighting>,
+    // MONKEY (sky): the tier, the sky clock and the cloud cover over the sun.
+    quality: Res<crate::sky_fx::SkyQuality>,
+    clock: Res<crate::sky_fx::SkyClock>,
+    clouds: Res<crate::clouds::CloudCoverage>,
     dome: Query<&MeshMaterial3d<SkyMaterial>, With<Sky>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
 ) {
@@ -270,11 +289,16 @@ fn update_sky_colors(
         0.0,
         0.0,
     );
+    // MONKEY (sky): the Enhanced/High inputs; all zero at Classic so the write gate stays quiet.
+    let (fx, sun_v, glow) = sky_fx_inputs(&light, *quality, clock.secs, &clouds);
     benilla_assets::write_gated(
         &mut materials,
         &handle.0,
         |m| {
-            m.extension.sky0 != sky[0]
+            m.extension.fx != fx
+                || m.extension.sun != sun_v
+                || m.extension.glow != glow
+                || m.extension.sky0 != sky[0]
                 || m.extension.sky1 != sky[1]
                 || m.extension.sky2 != sky[2]
                 || m.extension.sky3 != sky[3]
@@ -290,6 +314,38 @@ fn update_sky_colors(
             m.extension.sky4 = sky[4];
             m.extension.fog = fog;
             m.extension.warp = warp;
+            m.extension.fx = fx;
+            m.extension.sun = sun_v;
+            m.extension.glow = glow;
         },
     );
+}
+
+/// MONKEY (sky): the dome's Enhanced/High uniforms, `(fx, sun, glow)`; zeros at Classic.
+fn sky_fx_inputs(
+    light: &WowLighting,
+    quality: crate::sky_fx::SkyQuality,
+    secs: f32,
+    clouds: &crate::clouds::CloudCoverage,
+) -> (Vec4, Vec4, Vec4) {
+    if !quality.enhanced() {
+        return (Vec4::ZERO, Vec4::Y, Vec4::ZERO);
+    }
+    let sun = light.celestial_dir.normalize_or(Vec3::Y);
+    // The cover at the glare point, the same sample the flare's occlusion reads.
+    let cover = clouds.coverage(sun * 12.0);
+    let strength = crate::sky_fx::glow_strength(sun.y, cover, light.storm_bcc);
+    // Warm toward the sun colour, grounded in the fog colour so dusk glows orange, noon pale.
+    let tint = Vec3::from(light.celestial_tint);
+    let fog = Vec3::from(light.fog_color);
+    let glow = fog.lerp(tint, 0.6);
+    // The night sky follows the star curve, thinned by storm weather.
+    let night = (light.star_alpha * (1.0 - light.storm_bcc)).clamp(0.0, 1.0);
+    // Quantized like every other lane here, so an idle frame writes nothing.
+    let q = |v: f32| benilla_assets::quantize(v, 4096.0);
+    (
+        Vec4::new(f32::from(quality.0), secs, q(night), q(strength)),
+        Vec4::new(q(sun.x), q(sun.y), q(sun.z), 0.0),
+        Vec4::new(q(glow.x), q(glow.y), q(glow.z), 0.0),
+    )
 }

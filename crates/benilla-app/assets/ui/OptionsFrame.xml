@@ -494,6 +494,8 @@
                 lightingQuality = "Lighting Quality",
                 -- MONKEY (volumetric fog): localised atmospheric quality row.
                 volumetricFog = "Volumetric Fog",
+                -- MONKEY (sky): the sky tier row.
+                skyQuality = "Sky Quality",
                 fogOff = "Off",
                 waterQuality = "Water Quality",
                 waterClassic = "Classic",
@@ -534,6 +536,12 @@
                     -- MONKEY (volumetric fog): explain cost and the shadow-map dependency.
                     VOLUMETRIC_FOG =
                         "Off disables volumetric fog. Low adds nearby haze and sun or moon shafts with fewer steps; High uses more steps for smoother shafts. Mist is heavier at dawn and in bad weather, and subtle indoors. Shafts require shadows; with shadows off only haze remains.",
+                    -- MONKEY (sky): what each sky tier adds.
+                    SKY_QUALITY =
+                        "Classic is the original client's sky. Enhanced smooths the sky's colour "
+                        .. "gradient, adds a soft glow around the sun and a starry night sky with the "
+                        .. "Milky Way. High also gives the clouds finer detail and sunlit edges. "
+                        .. "Costs very little.",
                     WATER_QUALITY =
                         "Classic is the original client's water. Enhanced adds soft shorelines, "
                         .. "animated foam around shores and objects, moving wave highlights, sky reflection "
@@ -618,6 +626,8 @@
                 lightingQuality = "Качество освещения",
                 -- MONKEY (volumetric fog): Russian atmospheric quality row.
                 volumetricFog = "Объёмный туман",
+                -- MONKEY (sky): the sky tier row.
+                skyQuality = "Качество неба",
                 fogOff = "Выкл",
                 waterQuality = "Качество воды",
                 waterClassic = "Классическое",
@@ -660,6 +670,12 @@
                     -- MONKEY (volumetric fog): localised effect and cost explanation.
                     VOLUMETRIC_FOG =
                         "Выкл отключает объёмный туман. Низкое добавляет дымку вблизи и лучи солнца или луны с меньшим числом шагов; Высокое использует больше шагов для более плавных лучей. Туман гуще на рассвете и в непогоду, а в помещениях слабее. Для лучей нужны тени; без теней остаётся только дымка.",
+                    -- MONKEY (sky): what each sky tier adds.
+                    SKY_QUALITY =
+                        "«Классическое» — небо оригинального клиента. «Улучшенное» сглаживает "
+                        .. "цветовой переход неба, добавляет мягкое сияние вокруг солнца и звёздное "
+                        .. "ночное небо с Млечным Путём. «Высокое» также добавляет облакам мелкие "
+                        .. "детали и освещённые солнцем края. Почти не влияет на производительность.",
                     WATER_QUALITY =
                         "«Классическое» — вода оригинального клиента. «Улучшенное» добавляет плавные переходы у берегов, "
                         .. "анимированную пену у берегов и вокруг объектов, подвижные блики на волнах, отражение неба "
@@ -796,6 +812,8 @@
             AdvancedGraphics = {
                 -- MONKEY (volumetric fog): include in refresh, defaults and search.
                 "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog",
+                -- MONKEY (sky): the sky tier row.
+                "RowSkyQuality",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
@@ -2602,10 +2620,26 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- MONKEY (sky): the sky tier, Classic / Enhanced / High. -->
+                                        <Frame name="$parentRowSkyQuality" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "skyQuality", BENILLA_ADVGFX.skyQuality,
+                                                    "BENILLA_TOOLTIP_SKY_QUALITY")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.waterClassic, value = "0" },
+                                                    { text = BENILLA_ADVGFX.waterEnhanced, value = "1" },
+                                                    { text = BENILLA_ADVGFX.waterHigh, value = "2" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowSkyQuality" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowSkyQuality" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",

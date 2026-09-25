@@ -921,6 +921,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (sky): the sky tier; the High graphics preset sets 2.
+    ours(
+        "skyQuality",
+        "0",
+        "benilla's own: sky quality, 0 Classic / 1 Enhanced (smooth gradient, sun glow, stars) / \n         2 High (+ detailed sun-lit clouds)",
+    ),
     ours(
         "waterQuality",
         "1",

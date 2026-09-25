@@ -144,6 +144,8 @@ pub mod rig_rider;
 pub mod schedule;
 mod shaders;
 pub mod sky;
+// MONKEY (sky): the sky quality tier and the Enhanced/High inputs.
+pub mod sky_fx;
 pub mod sky_order;
 pub mod skybox;
 pub mod static_gx;

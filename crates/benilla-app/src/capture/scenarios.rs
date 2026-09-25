@@ -253,6 +253,8 @@ pub(super) enum SubjectKind {
 pub(super) const GROUND_EYE: [f32; 3] = [-8980.0, -160.0, 110.0];
 pub(super) const GROUND_LOOK: [f32; 3] = [-8949.95, -132.49, 84.0];
 pub(super) const SKY_EYE: [f32; 3] = [-8980.0, -160.0, 112.0];
+/// MONKEY (sky): 80 yd over the Northshire sky eye, above every canopy.
+pub(super) const SKY_HIGH_EYE: [f32; 3] = [-8980.0, -160.0, 190.0];
 pub(super) const SKY_LOOK: [f32; 3] = [-8740.0, 80.0, 168.0]; // up + out: horizon in the lower third, dome above
 
 // Farmhouse viewpoints (decision 0071): compass looks from the human-start login spot. Kept
@@ -1379,39 +1381,48 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
-    // MONKEY (sky): the sky lane's fixtures. Dusk looks from the Goldshire lake toward the low sun
-    // (az 45°, elev ≈5° at 20:00); night looks away from the moon at 01:00 (stars at full curve);
-    // zenith is the high dome at night. Overcast is `sky-overcast` under `WOW_WEATHER=rain,0.6`.
+    // MONKEY (sky): the sky lane's fixtures, from 80 yd above Northshire (clear of the canopy).
+    // Dusk faces the low sun (az 45°, elev ≈5° at 20:00); night faces away from the moon at 01:00
+    // (full star curve); zenith looks nearly straight up; overcast is meant for
+    // `WOW_WEATHER=1,0.5`; noon faces away from the sun.
     Scenario {
         name: "sky-elwynn-dusk",
         map: Some(MAP_AZEROTH),
-        eye: WATER_EYE,
-        look: [-9315.0, -98.6, 102.3],
+        eye: SKY_HIGH_EYE,
+        look: [-8770.0, 50.0, 232.0],
         minute: 1200,
         ui: None,
     },
     Scenario {
         name: "sky-elwynn-night",
         map: Some(MAP_AZEROTH),
-        eye: WATER_EYE,
-        look: [-9739.0, -522.6, 210.8],
+        eye: SKY_HIGH_EYE,
+        look: [-9164.0, -344.0, 340.0],
         minute: 60,
         ui: None,
     },
     Scenario {
         name: "sky-zenith-night",
         map: Some(MAP_AZEROTH),
-        eye: SKY_EYE,
-        look: [-9050.7, -230.7, 387.0],
+        eye: SKY_HIGH_EYE,
+        look: [-9017.0, -197.0, 485.0],
         minute: 60,
         ui: None,
     },
     Scenario {
         name: "sky-overcast",
         map: Some(MAP_AZEROTH),
-        eye: SKY_EYE,
-        look: [-8797.0, 23.0, 264.0],
+        eye: SKY_HIGH_EYE,
+        look: [-9185.0, 45.0, 268.0],
         minute: 1000,
+        ui: None,
+    },
+    Scenario {
+        name: "sky-noon",
+        map: Some(MAP_AZEROTH),
+        eye: SKY_HIGH_EYE,
+        look: [-9185.0, -365.0, 268.0],
+        minute: 720,
         ui: None,
     },
 ];
