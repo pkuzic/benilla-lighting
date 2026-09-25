@@ -2278,7 +2278,7 @@ fn load_config(world: &mut World) {
         // outlives the GPU it described.
         cvars.own_for_session("gxApi", None);
         match stored {
-            StoredConfig::Absent => {} // no file, hermetic capture, or no install
+            StoredConfig::Absent => {} // no file, capture without a fixture, or no install
             StoredConfig::Bad(msg) => {
                 // A malformed file is preserved, not clobbered: nothing loads, but nothing
                 // saves over it either until a change actually happens — and the warn names
@@ -2296,7 +2296,7 @@ fn load_config(world: &mut World) {
 
 /// What the one read of `config.toml` found.
 enum StoredConfig {
-    /// No file, no install, or a hermetic capture — every value is its registered default.
+    /// No file, no install, or a capture without an explicit fixture — use registered defaults.
     Absent,
     /// The file's `[cvars]` table.
     Table(BTreeMap<String, String>),
@@ -2320,8 +2320,8 @@ enum StoredConfig {
 /// law can legitimately move under a run. The thing worth having exactly one of is this function,
 /// not its result.
 fn stored_config() -> StoredConfig {
-    let Some(path) = crate::local_state::config_path() else {
-        return StoredConfig::Absent; // hermetic capture, or no install — session-only state
+    let Some(path) = config_read_path() else {
+        return StoredConfig::Absent; // capture without a fixture, or no install — session-only
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
@@ -2335,6 +2335,18 @@ fn stored_config() -> StoredConfig {
             path.display()
         )),
     }
+}
+
+/// MONKEY (integration): a capture may opt into one explicit, read-only CVar fixture through
+/// `BENILLA_HOME`. All other local state stays hermetic and [`save_config`] still sees no path,
+/// so deterministic A/B homes can select graphics tiers without a capture writing anything back.
+fn config_read_path() -> Option<std::path::PathBuf> {
+    if std::env::var_os("WOW_CAPTURE").is_some() {
+        return std::env::var_os("BENILLA_HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| home.join("config.toml"));
+    }
+    crate::local_state::config_path()
 }
 
 /// One CVar as `config.toml` holds it, matched case-insensitively — **before the `App` exists**
@@ -4287,6 +4299,38 @@ mod tests {
             app.world().resource::<Cvars>().get("gxMultisample"),
             Some("4"),
             "a file value is applied, not staged: the reference's LoadFile runs before Register"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// MONKEY (integration): deterministic graphics A/B captures may read one explicit fixture,
+    /// but the local-state law still exposes no writable capture path.
+    #[test]
+    fn a_capture_can_read_an_explicit_cvar_fixture_without_enabling_writes() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = std::env::temp_dir().join(format!(
+            "benilla-capture-cvar-fixture-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
+        crate::local_state::write_atomic(
+            &tmp.join("config.toml"),
+            "[cvars]\nbloom = \"0\"\nsunShafts = \"0\"\ncolorGrading = \"0\"\n",
+        )
+        .unwrap();
+        let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        let _c = EnvGuard::set("WOW_CAPTURE", "post-lava-searing");
+
+        assert_eq!(boot_cvar("bloom").as_deref(), Some("0"));
+        assert_eq!(boot_cvar("sunShafts").as_deref(), Some("0"));
+        assert_eq!(boot_cvar("colorGrading").as_deref(), Some("0"));
+        assert_eq!(
+            crate::local_state::config_path(),
+            None,
+            "capture fixtures are read-only; persistence remains hermetic"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
