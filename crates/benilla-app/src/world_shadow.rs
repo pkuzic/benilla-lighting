@@ -49,7 +49,31 @@ impl Plugin for WorldShadowPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(MaterialPlugin::<CutoutShadowCasterMaterial>::default())
             .init_resource::<WorldLane>()
+            // MONKEY (followups): refresh the static caster cache when streamed geometry arrives.
+            // This used to live in the volumetric-fog plugin and so only ran with that cvar on.
+            .add_systems(Last, refresh_streamed_shadows.before(ShadowSet::Lanes))
             .add_systems(Last, update_world_shadows.in_set(ShadowSet::Lanes));
+    }
+}
+
+/// MONKEY (followups): the static caster rebuilds on 16 yd of camera drift, so a standing camera
+/// never picks up trees and doodads that stream in later. Invalidate it whenever the retained
+/// scene's residency changes, while world shadows are on (Classic has them off, so it is inert).
+fn refresh_streamed_shadows(
+    video: Res<VideoConfig>,
+    gx: Option<Res<StaticGx>>,
+    mut lane: ResMut<WorldLane>,
+    mut seen: Local<Option<u64>>,
+) {
+    if !video.world_shadows {
+        *seen = None;
+        return;
+    }
+    let Some(gx) = gx else { return };
+    let generation = gx.torch_residency_generation();
+    if *seen != Some(generation) {
+        lane.invalidate_static();
+        *seen = Some(generation);
     }
 }
 
@@ -106,7 +130,7 @@ struct CutoutCaster {
 
 /// The world lane's retained casters.
 #[derive(Resource, Default)]
-// MONKEY (volumetric fog): allow the fog plugin to invalidate a stale streamed caster cache.
+// MONKEY (volumetric fog, followups): the streamed-residency refresh invalidates the cache.
 pub(crate) struct WorldLane {
     /// The cached static caster — the retained `static_gx` world (trees + buildings), rebuilt on drift.
     static_caster: Option<Entity>,
@@ -123,8 +147,7 @@ pub(crate) struct WorldLane {
     env_rate: RebuildRate,
 }
 
-// MONKEY (volumetric fog): retain ownership of the cache here; the fog plugin decides
-// when streamed geometry needs a fresh map, without changing the legacy Off path.
+// MONKEY (followups): `refresh_streamed_shadows` decides when streamed geometry needs a fresh map.
 impl WorldLane {
     pub(crate) fn invalidate_static(&mut self) {
         self.static_rebuilt_at = None;
@@ -358,4 +381,31 @@ fn teardown(
     }
     // The mesh the gate was pacing is gone — re-arm so a re-enable builds on its first frame.
     lane.env_rate.reset();
+}
+
+// MONKEY (followups): the refresh must not depend on volumetric fog.
+#[cfg(test)]
+mod streamed_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn shadow_cache_refresh_runs_without_volumetric_fog_and_is_quiet_when_unchanged() {
+        let mut app = App::new();
+        let mut video = VideoConfig::default();
+        video.volumetric_fog = 0;
+        video.world_shadows = false;
+        app.insert_resource(video)
+            .init_resource::<StaticGx>()
+            .init_resource::<WorldLane>()
+            .add_systems(Update, refresh_streamed_shadows);
+        app.world_mut().clear_trackers();
+        app.world_mut().run_schedule(Update);
+        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
+        app.world_mut().resource_mut::<VideoConfig>().world_shadows = true;
+        app.world_mut().run_schedule(Update);
+        assert!(app.world().resource_ref::<WorldLane>().is_changed());
+        app.world_mut().clear_trackers();
+        app.world_mut().run_schedule(Update);
+        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
+    }
 }

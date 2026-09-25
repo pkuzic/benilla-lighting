@@ -5,11 +5,9 @@
 use crate::{
     shadow_core::{ShadowSet, ShadowSun},
     video::VideoConfig,
-    world_shadow::WorldLane,
 };
 use benilla_world::{
     lighting::{ResolvedPointLight, ResolvedPointLights, WorldTime, WowLighting},
-    static_gx::StaticGx,
     view::WorldCamera,
     weather::WeatherState,
     wmo_portal::CameraInteriorClaim,
@@ -119,7 +117,8 @@ impl Plugin for VolumetricFogPlugin {
             shaft_gain,
         })
         .add_plugins(ExtractComponentPlugin::<FogView>::default())
-        .add_systems(Last, refresh_streamed_shadows.before(ShadowSet::Lanes))
+        // MONKEY (followups): the streamed-caster refresh moved to `world_shadow.rs`; it no longer
+        // depends on this cvar.
         .add_systems(Last, update_fog.after(ShadowSet::Lanes));
         // Keep headless policy tests independent of the renderer.
         if !app.is_plugin_added::<AssetPlugin>() {
@@ -146,27 +145,6 @@ impl Plugin for VolumetricFogPlugin {
                     Node3d::StartMainPassPostProcessing,
                 ),
             );
-    }
-}
-
-// The legacy caster cache otherwise misses streamed trees at a stationary camera.
-// Off must leave even this old cache behaviour untouched for the exact baseline.
-fn refresh_streamed_shadows(
-    video: Res<VideoConfig>,
-    override_value: Res<FogOverride>,
-    gx: Option<Res<StaticGx>>,
-    mut lane: ResMut<WorldLane>,
-    mut seen: Local<Option<u64>>,
-) {
-    if override_value.fog.unwrap_or(video.volumetric_fog) == 0 || !video.world_shadows {
-        *seen = None;
-        return;
-    }
-    let Some(gx) = gx else { return };
-    let generation = gx.torch_residency_generation();
-    if *seen != Some(generation) {
-        lane.invalidate_static();
-        *seen = Some(generation);
     }
 }
 
@@ -703,28 +681,6 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn shadow_cache_refresh_is_gated_and_quiet_when_unchanged() {
-        let mut app = App::new();
-        app.init_resource::<VideoConfig>()
-            .init_resource::<StaticGx>()
-            .init_resource::<WorldLane>()
-            .insert_resource(FogOverride {
-                fog: Some(0),
-                lamp: None,
-                shaft_gain: 2.0,
-            })
-            .add_systems(Update, refresh_streamed_shadows);
-        app.world_mut().clear_trackers();
-        app.world_mut().run_schedule(Update);
-        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
-        app.world_mut().resource_mut::<FogOverride>().fog = Some(1);
-        app.world_mut().run_schedule(Update);
-        assert!(app.world().resource_ref::<WorldLane>().is_changed());
-        app.world_mut().clear_trackers();
-        app.world_mut().run_schedule(Update);
-        assert!(!app.world().resource_ref::<WorldLane>().is_changed());
-    }
     #[test]
     fn dawn_weather_and_rooms_control_density() {
         let noon = density(720.0, 0.0, false);
