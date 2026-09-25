@@ -16,6 +16,8 @@
 #import benilla::fog_hook
 // MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
 #import benilla::emissive_hook
+// MONKEY (wind): shared foliage vertex displacement; tree shadows intentionally stay static.
+#import benilla::wind_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -105,6 +107,8 @@ const WORD_HAS_VC: u32 = 134217728u;   // 1 << 27: the batch authors vertex colo
 // INTERIOR without WMO is an interior M2 prop, the entity shader's `interior_prop =
 // flags.z && !flags.x`: probe lighting, interior fog, no point lights.
 const WORD_MATTE: u32 = 268435456u;    // 1 << 28: ShadeSel::Matte, fixed intensity 1.0
+// MONKEY (wind): alpha-tested leaf batch of a classified static tree/bush model.
+const WORD_FOLIAGE_WIND: u32 = 536870912u; // 1 << 29
 
 // MONKEY (room gate): record column `w` bits 15..=26 — this item's ROOM KEY, packed as
 // `group + 1`, so **0 means the item names no room** and takes every fixture (a terrain-cell item,
@@ -1284,8 +1288,15 @@ fn vertex(v: GxVertex) -> GxVsOut {
         return out;
     }
     // Camera-relative for f32 precision: the recentred vertex plus (cell origin - camera).
-    let p_cam = v.position + (cell.origin.xyz - view.world_position);
-    let world = v.position + cell.origin.xyz;
+    var p_cam = v.position + (cell.origin.xyz - view.world_position);
+    var world = v.position + cell.origin.xyz;
+    // MONKEY (wind): placement anchor is already baked per vertex. Only classified leaf-card
+    // batches carry the bit; animated doodads were rejected before this retained path.
+    if ((v.word & WORD_FOLIAGE_WIND) != 0u) {
+        let offset = wind_hook::tree_offset(world, v.anchor, view.world_position, wow_light.monkey);
+        world += offset;
+        p_cam += offset;
+    }
     out.world_position = vec4<f32>(world, 1.0);
     let view_rot = mat3x3<f32>(
         view.view_from_world[0].xyz,

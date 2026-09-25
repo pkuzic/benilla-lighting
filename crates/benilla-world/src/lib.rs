@@ -160,6 +160,7 @@ pub mod vis_chain;
 pub mod water_fx;
 pub mod wdl;
 pub mod weather;
+pub mod wind; // MONKEY (wind): shared stateless gust/veer field and foliage quality gate
 pub mod wmo_portal;
 pub mod world_census;
 pub mod world_map;

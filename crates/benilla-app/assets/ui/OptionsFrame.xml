@@ -528,12 +528,16 @@
                 interiorDarkness = "Interior Darkness",
                 -- MONKEY (p0 skyDither)
                 skyDither = "Sky Dithering",
+                -- MONKEY (wind)
+                foliageWind = "Foliage Wind",
+                windGrass = "Grass",
+                windTrees = "Grass + Trees",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
                         "Sets character, world, indoor torch and outdoor torch shadows; dynamic "
                         .. "interior lighting; moon shadows; volumetric fog; water quality; lava glow; fire and spell brightness; fire flicker; "
-                        .. "and night and interior darkness. Low, Medium and High also set shadow "
+                        .. "foliage wind; and night and interior darkness. Low, Medium and High also set shadow "
                         .. "resolution; Medium and High also set resident and moving torch shadow counts.\n\n"
                         .. "Off restores the original client's look: Classic water, no volumetric fog, lava glow or synthesised fire lights, "
                         .. "night gain 1.0 and interior gain 1.0. All other settings, including "
@@ -644,6 +648,11 @@
                     SKY_DITHER =
                         "Adds a faint noise to the final image so smooth sky and fog gradients do not "
                         .. "break into visible bands. Off is the original client's look. Practically free.",
+                    -- MONKEY (wind)
+                    FOLIAGE_WIND =
+                        "Grass bends in two travelling wind waves and parts around nearby characters. "
+                        .. "Grass + Trees also gives classified tree and bush foliage a gentle sway.\n\n"
+                        .. "Off makes no vertex displacement and restores the unchanged image. Tree shadows stay static.",
                 },
             },
             ruRU = {
@@ -685,6 +694,10 @@
                 interiorDarkness = "Темнота помещений",
                 -- MONKEY (p0 skyDither)
                 skyDither = "Дизеринг неба",
+                -- MONKEY (wind)
+                foliageWind = "Ветер листвы",
+                windGrass = "Трава",
+                windTrees = "Трава + деревья",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -811,6 +824,11 @@
                         "Добавляет едва заметный шум в итоговое изображение, чтобы плавные переходы цвета "
                         .. "неба и тумана не распадались на полосы. Выключено — вид оригинального клиента. "
                         .. "Почти ничего не стоит.",
+                    -- MONKEY (wind)
+                    FOLIAGE_WIND =
+                        "Трава гнётся двумя бегущими волнами ветра и расступается вокруг персонажей. "
+                        .. "Трава + деревья также добавляет мягкое качание листвы деревьев и кустов.\n\n"
+                        .. "Выключено не смещает вершины и восстанавливает исходный вид. Тени деревьев остаются неподвижными.",
                 },
             },
         }
@@ -877,6 +895,8 @@
                 "RowNightDarkness", "RowInteriorDarkness",
                 -- MONKEY (p0 skyDither)
                 "RowSkyDither",
+                -- MONKEY (wind): appended for conflict-free lane merges.
+                "RowFoliageWind",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -2983,6 +3003,23 @@
                                                 OptionsRow_OnLoad(self, "skyDither",
                                                     BENILLA_ADVGFX.skyDither,
                                                     "BENILLA_TOOLTIP_SKY_DITHER")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (wind): three foliage tiers; appended at the end of the page. -->
+                                        <Frame name="$parentRowFoliageWind" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowSkyDither" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowSkyDither" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "foliageWind",
+                                                    BENILLA_ADVGFX.foliageWind,
+                                                    "BENILLA_TOOLTIP_FOLIAGE_WIND")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.qOff, value = "0" },
+                                                    { text = BENILLA_ADVGFX.windGrass, value = "1" },
+                                                    { text = BENILLA_ADVGFX.windTrees, value = "2" },
+                                                })
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

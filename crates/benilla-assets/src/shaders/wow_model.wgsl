@@ -8,6 +8,8 @@
 // the tuft, which the reference writes onto the clutter vertex.
 // Not built: a specular term (the M2 per-material shininess is only inferred) and the WMO
 // per-group authored colour.
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module
+// wxl-experimental-wind, grass/GrassWind.cpp (grass vertex displacement seam).
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -26,6 +28,8 @@
 #import benilla::fog_hook
 // MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
 #import benilla::emissive_hook
+// MONKEY (wind): WarcraftXL-derived grass motion and the matching tree fade-twin motion.
+#import benilla::wind_hook
 
 // bevy_pbr 0.18.1's `forward_io::FragmentOutput`. No depth output: a fragment depth write costs
 // the pipeline early-Z, so the sky lane pins its depth in the vertex stage.
@@ -1077,8 +1081,27 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
     // Precision: camera-relative to clip space; `clip_from_world × p_world` cancels
     // catastrophically with camera and geometry near 9 k yd. `world_position` is absolute again:
     // lighting and fog need no such precision.
-    let p_cam = (frame_from_local * vec4<f32>(vertex.position, 1.0)).xyz
+    var p_cam = (frame_from_local * vec4<f32>(vertex.position, 1.0)).xyz
         + (frame_origin - view.world_position);
+    // MONKEY (wind): clutter UV_B is `(height-from-base, per-tuft phase)` authored by clutter.rs;
+    // UV_0 and vertex colour alpha retain their texture/cutout meanings.
+#ifdef VERTEX_UVS_B
+    if (m.clutter_fade.w > 0.5) {
+        let world = p_cam + view.world_position;
+        p_cam += wind_hook::grass_offset(
+            world, vertex.uv_b.x, vertex.uv_b.y, view.world_position, wow_light.monkey
+        );
+    }
+#endif
+    // MONKEY (wind): a retained tree inside its fade band renders here. StaticGx marks only its
+    // alpha-tested leaf batches in MeshTag bit 18; use the same anchor/field maths to avoid a pop.
+    let wind_tag = mesh_functions::get_tag(vertex.instance_index);
+    if ((wind_tag & 262144u) != 0u && m.clutter_fade.w <= 0.5) {
+        let world = p_cam + view.world_position;
+        p_cam += wind_hook::tree_offset(
+            world, frame_origin, view.world_position, wow_light.monkey
+        );
+    }
     out.world_position = vec4<f32>(p_cam + view.world_position, 1.0);
     let view_rot = mat3x3<f32>(
         view.view_from_world[0].xyz,

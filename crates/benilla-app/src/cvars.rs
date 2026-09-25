@@ -938,6 +938,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own: sky quality, 0 Classic / 1 Enhanced (smooth gradient, sun glow, stars) / \n         2 High (+ detailed sun-lit clouds)",
     ),
+    // MONKEY (wind): one tier controls the grass-only and grass-plus-tree receivers.
+    ours(
+        "foliageWind",
+        "2",
+        "benilla's own: foliage wind, 0 Off / 1 Grass / 2 Grass + trees",
+    ),
     ours(
         "waterQuality",
         "1",
@@ -2041,6 +2047,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorGain", "1.0"),
             ("moonShadowStrength", "0"),
             ("fireFlicker", "0"),
+            // MONKEY (wind): Off is the exact zero-displacement path.
+            ("foliageWind", "0"),
         ],
     ),
     // Character silhouettes and lit rooms, and nothing that costs a second shadow pass: no world
@@ -2068,6 +2076,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorGain", "0.5"),
             ("moonShadowStrength", "0"),
             ("fireFlicker", "1"),
+            // MONKEY (wind): Low animates the denser grass lane only.
+            ("foliageWind", "1"),
         ],
     ),
     // Both sun lanes, indoor torch shadows at half the residency, and the moon term — but no
@@ -2098,6 +2108,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorGain", "0.5"),
             ("moonShadowStrength", "0.35"),
             ("fireFlicker", "1"),
+            // MONKEY (wind): Medium and High include classified trees.
+            ("foliageWind", "2"),
         ],
     ),
     // **High IS the shipped default**, member for member — which is a property, not a coincidence:
@@ -2129,6 +2141,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("interiorGain", "0.5"),
             ("moonShadowStrength", "0.35"),
             ("fireFlicker", "1"),
+            // MONKEY (wind): High preset = grass plus classified trees.
+            ("foliageWind", "2"),
         ],
     ),
 ];
@@ -3010,8 +3024,9 @@ mod tests {
         for (name, want) in lighting {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
-        // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 36 rows, 36 welds.
+        // …and the census is the VideoConfig-backed row set. A name here that nothing registers
+        // would weld against a row the client does not have; the length is the other half — 37
+        // VideoConfig rows, 37 welds. MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
         assert_eq!(welded.len(), 37, "the lighting lane welds 37 distinct rows");
@@ -3031,10 +3046,10 @@ mod tests {
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
         assert_eq!(d["waterQuality"], 1.0, "mirror reflections stay opt-in");
         assert_eq!(d["lavaLightGain"], 1.0);
-        // The 33rd lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
-        // only one with no `VideoConfig` knob to weld to, because it is a NAME for the rows above
-        // rather than a knob of its own. Its own weld is `the_high_preset_is_the_registered_
-        // defaults` — a fresh config must read "High", not "Custom".
+        // `lightingQuality` and MONKEY (wind) `foliageWind` deliberately are not in that census:
+        // neither is a `VideoConfig` knob. The former names the rows above; its own weld is
+        // `the_high_preset_is_the_registered_defaults`. The latter bridges directly to the
+        // world-owned `FoliageWind` resource in `monkey_gfx`.
         // ── end MONKEY (lighting) ─────────────────────────────────────────────────────────────
         // The pane half-rate (1444) welds to the portrait knob's shipped default.
         assert_eq!(d["boothHalfRate"] != 0.0, PaneRate::default().half);

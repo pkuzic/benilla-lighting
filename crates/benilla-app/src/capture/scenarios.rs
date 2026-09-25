@@ -1562,6 +1562,36 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: None,
     },
+    // MONKEY wind: keep these at the END of the table. They are the three visual instruments for
+    // W1: authored grass weight/lean, static-tree classification/sway, and the viewer bender.
+    Scenario {
+        name: "wind-grass-elwynn",
+        map: Some(MAP_AZEROTH),
+        // Inside the grassy hill that the earlier long shot put beyond clutter's 70 yd horizon.
+        eye: [-9460.0, 45.0, 60.5],
+        look: [-9442.0, 27.0, 57.5],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "wind-forest-elwynn",
+        map: Some(MAP_AZEROTH),
+        // East of Goldshire looking south-west across the lake and Elwynn forest.
+        eye: [-9380.0, -30.0, 80.0],
+        look: [-9600.0, -200.0, 62.0],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "wind-player-parting",
+        map: Some(MAP_AZEROTH),
+        eye: [-9472.0, 57.0, 60.5],
+        look: [-9460.0, 45.0, 57.5],
+        minute: 720,
+        // The capture plugin stands a real player at `look` without opting into the HUD: this is
+        // a world-image instrument, and UI script errors must not cover the grass it measures.
+        ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking

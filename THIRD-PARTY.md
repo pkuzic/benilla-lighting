@@ -37,6 +37,10 @@ where they stand. Do not remove either.
 | `crates/benilla-world/src/shaders/cloud.wgsl` | `wxl-retail-clouds` | `Clouds.cpp` | The 3-tap march toward the sun (self-shadow, ambient floor) and the one-tap silver lining |
 | `crates/benilla-world/src/clouds/layer.rs` (`update_cloud_fx`) | `wxl-retail-clouds` | `Clouds.cpp` | March direction = the sun projected on the sheet, strength folded by its flatness (noon clouds evenly lit) |
 
-Planned (not yet in the tree): breaker index from `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
-(`field/Wind.*`, `grass/GrassWind.*`).
+| `crates/benilla-world/src/wind/mod.rs` | `wxl-experimental-wind` | `field/Wind.hpp`, `field/Wind.cpp` | Stateless three-sine gust and veer field, default profile, and weather gain (ported) |
+| `crates/benilla-assets/src/shaders/wind_hook.wgsl` | `wxl-experimental-wind` | `grass/GrassWind.hpp`, `grass/GrassWind.cpp` | Two-wave grass sway, gust response, lean, blade phase/variance, distance fade and radial parting (ported; extended to eight benders) |
+| `crates/benilla-assets/src/shaders/wow_model.wgsl` (MONKEY wind hook) | `wxl-experimental-wind` | `grass/GrassWind.cpp` | Grass vertex displacement call seam (technique) |
+| `crates/benilla-world/src/clutter.rs` (MONKEY wind attributes) | `wxl-experimental-wind` | `grass/GrassWind.cpp` | Per-blade bend weight and per-tuft phase inputs (technique; height replaces WXL's unverified texture-V weight) |
+
+Planned (not yet in the tree): breaker index from `sea/Shore.hpp`, `shaders/Wave.hlsli`.
 The lane that ports one adds its row here.

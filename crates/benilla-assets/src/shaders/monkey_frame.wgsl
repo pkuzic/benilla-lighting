@@ -8,8 +8,8 @@
 //
 // Coordinates are Bevy world space (Y up, 1 unit = 1 yd), the space of the receivers'
 // `world_position`: WoW `(x, y, z)` is Bevy `(-y, z, -x)` (`benilla_assets::coords::wow_to_bevy`).
-// Member names carry no trailing digit: naga_oil refuses a composable-module identifier that
-// naga's namer would rewrite (`fog0` -> `fog0_`), so the rows are `fog_a..fog_d`, `wind_a/b`, `wet_a`.
+// Member names carry no trailing digit: naga_oil refuses composable-module identifiers that its
+// namer would rewrite, so the rows are `fog_a..fog_d`, `wind_a/b`, `wet_a`.
 struct MonkeyFrame {
     fog_a: vec4<f32>,  // height_fog_density, height_fog_height (world Y, yd), height_fog_falloff, curve_blend
     fog_b: vec4<f32>,  // sun_fog_rgb (gamma 0..1), sun_fog_strength
