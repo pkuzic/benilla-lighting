@@ -196,6 +196,8 @@ impl Plugin for SkyboxPlugin {
                     // After the lighting resolve, so the weight is this frame's crossfade, as the
                     // fog's is.
                     .after(crate::lighting::LightingResolveSet)
+                    // MONKEY (integration): a `WowLighting` reader joins the consume set.
+                    .in_set(crate::lighting::LightingConsumeSet)
                     .in_set(SkyboxResolve),
             )
             // Camera-anchored placement runs after propagation, off this frame's camera pose.

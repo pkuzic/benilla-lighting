@@ -514,7 +514,8 @@ mod tests {
 
         // The chain's own source is the authority on what is wired — not a hand-copied list here,
         // which would be the very drift this test exists to catch.
-        let this_file = include_str!("ui_session.rs");
+        // MONKEY (integration): a CRLF checkout must still find the function's closing brace.
+        let this_file = include_str!("ui_session.rs").replace("\r\n", "\n");
         let chain = this_file
             .split_once("pub(crate) fn feed_interact_npc")
             .expect("feed_interact_npc")

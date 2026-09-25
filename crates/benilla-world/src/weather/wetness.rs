@@ -124,7 +124,15 @@ fn wetness_tick(
 pub(super) fn register(app: &mut App) {
     app.init_resource::<RainSurfaces>()
         .init_resource::<Wetness>()
-        .add_systems(Update, wetness_tick.after(WeatherTick));
+        // MONKEY (integration): after the wind rows and before the resolve, so the three
+        // `MonkeyFrame` writers run in one declared order.
+        .add_systems(
+            Update,
+            wetness_tick
+                .after(WeatherTick)
+                .after(crate::wind::WindTick)
+                .before(crate::lighting::LightingResolveSet),
+        );
 }
 
 #[cfg(test)]

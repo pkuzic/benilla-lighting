@@ -112,10 +112,11 @@ impl Plugin for AmbientOcclusionPlugin {
         if !app.is_plugin_added::<AssetPlugin>() {
             return;
         }
+        // MONKEY (integration): the crate's shader convention — embedded by `shaders::plugin`.
         let shader = app
-            .world_mut()
-            .resource_mut::<Assets<Shader>>()
-            .add(Shader::from_wgsl(include_str!("shaders/ssao.wgsl"), "ssao.wgsl"));
+            .world()
+            .resource::<AssetServer>()
+            .load("embedded://benilla_app/shaders/ssao.wgsl");
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };

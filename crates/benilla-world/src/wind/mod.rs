@@ -207,8 +207,10 @@ fn update_wind(
 fn update_benders(
     quality: Res<FoliageWind>,
     viewer: Res<crate::view::Viewer>,
-    viewer_unit: Query<&Transform, (With<ViewerUnit>, With<WorldUnit>)>,
-    units: Query<(&Transform, &WorldUnit), Without<ViewerUnit>>,
+    // MONKEY (integration): `GlobalTransform` (last propagation), not `Transform`, so the scan is
+    // not an undeclared order against every unit mover in `Update`.
+    viewer_unit: Query<&GlobalTransform, (With<ViewerUnit>, With<WorldUnit>)>,
+    units: Query<(&GlobalTransform, &WorldUnit), Without<ViewerUnit>>,
     mut frame: ResMut<MonkeyFrame>,
 ) {
     frame.bender_count = 0;
@@ -220,7 +222,7 @@ fn update_benders(
     // no-avatar fallback that lets the parting instrument exercise the same receiver.
     let Some(player) = viewer
         .at
-        .or_else(|| viewer_unit.single().ok().map(|t| t.translation))
+        .or_else(|| viewer_unit.single().ok().map(|t| t.translation()))
     else {
         return;
     };
@@ -231,7 +233,7 @@ fn update_benders(
     // unit just to retain seven entries.
     let mut nearby = [(f32::INFINITY, Vec3::ZERO, 1.5); 7];
     for (transform, unit) in &units {
-        let at = transform.translation;
+        let at = transform.translation();
         let d2 = (at.xz() - player.xz()).length_squared();
         if d2 > 40.0 * 40.0 || d2 >= nearby[6].0 {
             continue;
@@ -253,6 +255,11 @@ fn update_benders(
     }
 }
 
+/// MONKEY (integration): the wind writers' set, so other `MonkeyFrame` writers (wetness) and the
+/// viewer publish can order against it.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindTick;
+
 /// Installs the shared field after this frame's weather ramp has resolved.
 pub struct WindPlugin;
 
@@ -260,7 +267,18 @@ impl Plugin for WindPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WindField>()
             .init_resource::<FoliageWind>()
-            .add_systems(Update, (update_wind, update_benders).after(WeatherTick));
+            // MONKEY (integration): one ordered writer run of `MonkeyFrame`'s wind rows, before
+            // the lighting resolve (the fog model writes the same resource there).
+            .add_systems(
+                Update,
+                (update_wind, update_benders)
+                    .chain()
+                    .in_set(WindTick)
+                    .after(WeatherTick)
+                    // The camera pose copy also writes `GlobalTransform` (on the camera only).
+                    .after(crate::view::publish_camera_pose)
+                    .before(crate::lighting::LightingResolveSet),
+            );
     }
 }
 

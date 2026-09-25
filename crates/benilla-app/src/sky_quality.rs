@@ -13,7 +13,11 @@ pub(crate) struct SkyQualityPlugin;
 
 impl Plugin for SkyQualityPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<SkyQuality>().add_systems(Update, bridge);
+        app.init_resource::<SkyQuality>().add_systems(
+            Update,
+            // MONKEY (integration): the tier lands before the sky and cloud readers.
+            bridge.before(benilla_world::lighting::LightingConsumeSet),
+        );
     }
 }
 

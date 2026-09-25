@@ -91,7 +91,8 @@ impl Plugin for SkyFxPlugin {
         });
         let quality = SkyQuality(SkyQuality::env_override().unwrap_or(0));
         app.insert_resource(quality)
-            .add_systems(Update, tick_sky_clock);
+            // MONKEY (integration): the clock ticks before its readers (sky colours, cloud FX).
+            .add_systems(Update, tick_sky_clock.before(crate::lighting::LightingConsumeSet));
     }
 }
 

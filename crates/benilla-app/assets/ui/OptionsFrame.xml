@@ -693,9 +693,7 @@
                     DAYLIGHT_WINDOW_SPLIT =
                         "Large city buildings take daylight through each window on its own instead of "
                         .. "treating a whole wall of windows as one opening, so halls like the cathedral "
-                        .. "catch the sun pane by pane.
-
-Applies to buildings loaded after the change. "
+                        .. "catch the sun pane by pane.\n\nApplies to buildings loaded after the change. "
                         .. "Off is the earlier look.",
                     -- MONKEY (lampfog)
                     LAMP_FOG =
@@ -921,9 +919,7 @@ Applies to buildings loaded after the change. "
                     DAYLIGHT_WINDOW_SPLIT =
                         "Большие городские здания пропускают дневной свет через каждое окно отдельно, "
                         .. "а не через всю стену окон как один проём, поэтому залы вроде собора "
-                        .. "освещаются солнцем окно за окном.
-
-Действует для зданий, загруженных после "
+                        .. "освещаются солнцем окно за окном.\n\nДействует для зданий, загруженных после "
                         .. "изменения. Выключено — прежний вид.",
                     -- MONKEY (lampfog)
                     LAMP_FOG =

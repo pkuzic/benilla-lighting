@@ -1089,7 +1089,15 @@ pub(crate) mod schedule_tests {
     /// the net drain's. Same tree, the class dropped, nothing else moved: 5,052 + 556.
     /// **5,554 (decision 2345)** — lowered: the TAB scan stopped reading `Visibility` (the draw
     /// election's verdict), which ended its pairs with every `Visibility` writer.
-    const UPDATE_ACTIONABLE_CEILING: usize = 5_554;
+    /// **5,582 (MONKEY integration round 3, graphics programme)** — measured on the merged tree
+    /// after declaring the orders the lanes had left out (wind → wetness → fog-model writers of
+    /// `MonkeyFrame`; the viewer publish before its new readers; the sky clock and sky tier before
+    /// the consume set; the grass benders on `GlobalTransform` and after the camera-pose copy).
+    /// What remains, read off the dump: 13 pairs of `skybox::animate_skyboxes` against the
+    /// `MatAnimTable` allocators (attach/spawn/doodad systems) — the allocator case of 2300, the
+    /// skybox writes only the rows it owns — and one pair each of the new systems against the two
+    /// exclusive systems (`finish_colliders`, `apply_net_updates`), the 2343 class.
+    const UPDATE_ACTIONABLE_CEILING: usize = 5_582;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
