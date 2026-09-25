@@ -1391,7 +1391,7 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     },
     Scenario {
         name: "ao-character", map: Some(MAP_AZEROTH),
-        eye: [-9497.6, 57.6, 57.6], look: [-9500.00, 56.00, 56.9], minute: 720,
+        eye: [-9495.2, 60.8, 59.0], look: [-9500.00, 56.00, 56.9], minute: 720,
         ui: Some(UiFixture::Subject { kind: SubjectKind::Creature, at: SUBJECT_SUN }),
     },
 ];

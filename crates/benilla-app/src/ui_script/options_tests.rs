@@ -2081,7 +2081,8 @@ fn ambient_occlusion_dropdown_is_localised_and_live() {
         s.run(on_load).unwrap();
         assert_eq!(s.eval::<String>("return self.title").unwrap(), title);
         assert!(s.eval::<bool>("return getglobal(self.tip) == BENILLA_ADVGFX.tips.AMBIENT_OCCLUSION and string.len(getglobal(self.tip)) > 80").unwrap());
-        for (tier, label) in labels.iter().enumerate() {
+        // High first: the registered default is Off, and rewriting the same value is no change.
+        for (tier, label) in labels.iter().enumerate().rev() {
             assert_eq!(s.eval::<String>(&format!("return self.choices[{}].text", tier + 1)).unwrap(), *label);
             let _ = s.take_cvar_changes();
             s.run(&format!("SetCVar(self.cvar, self.choices[{}].value)", tier + 1)).unwrap();
