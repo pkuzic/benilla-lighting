@@ -531,7 +531,14 @@ pub(super) fn register(app: &mut App) {
     app.init_resource::<ShelterGrid>()
         .init_resource::<ShelterExtract>()
         .add_plugins(ExtractResourcePlugin::<ShelterExtract>::default())
-        .add_systems(Update, tick_shelter.after(super::wetness::wetness_tick));
+        // MONKEY (integration): it reads MonkeyFrame.wetness, which the resolve set's fog model also
+        // writes; run it with wetness, before that set (an undeclared order otherwise).
+        .add_systems(
+            Update,
+            tick_shelter
+                .after(super::wetness::wetness_tick)
+                .before(crate::lighting::LightingResolveSet),
+        );
     if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
         render_app.add_systems(
             Render,
