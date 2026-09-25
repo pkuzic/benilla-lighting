@@ -64,6 +64,11 @@ struct WowLight {
     points: array<vec4<f32>, 512>,
     // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
     monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 
@@ -757,9 +762,20 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     //   specular = per-vertex sheen · gloss_mask · shadow → gated to ZERO in shadow (no sheen in shade)
     // (`tex·primary` is the MODULATE-1× diffuse; the sheen is added after, separate-specular.) Then
     // LDR-clamp; gamma/byte throughout; raw gamma out (GAMMA LANE, 0161).
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
     // MONKEY (wet): rain-darkened ground + puddles (wet_hook.wgsl); a dry frame returns `color`.
-    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_lit, in.world_position.xyz, 1.0,
-        wow_light.monkey), n_lit, in.world_position.xyz, wow_light.monkey);
+    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_lit, in.world_position.xyz,
+        wet_open, wow_light.monkey), n_lit, in.world_position.xyz, wet_open, wow_light.monkey);
     color = wet.albedo;
     let diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
     let spec_term = in.specular * specmask * spec_gate;

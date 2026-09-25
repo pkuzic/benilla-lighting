@@ -16,6 +16,7 @@ use bevy::prelude::*;
 use crate::dev_state::DebugState;
 
 mod precip;
+pub mod shelter; // MONKEY (rainshelter): the rain-occlusion height map the wet lane reads
 mod wetness; // MONKEY (wet): surface wetness + the rain-ripple clock -> MonkeyFrame wet0
 pub use wetness::{RainSurfaces, Wetness};
 
@@ -312,6 +313,7 @@ impl Plugin for WeatherPlugin {
             .add_systems(Update, weather_tick.in_set(WeatherTick));
         precip::register(app);
         wetness::register(app); // MONKEY (wet)
+        shelter::register(app); // MONKEY (rainshelter)
     }
 }
 

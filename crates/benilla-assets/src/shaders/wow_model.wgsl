@@ -132,6 +132,11 @@ struct WowLight {
     points: array<vec4<f32>, 512>,
     // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
     monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
     // The interior-prop SH probes, 7 rows per slot (`MAX_PROP_PROBES` = 8192 slots). Only this
     // shader declares this tail; the other shaders bind the same buffer by its prefix.
     prop_probes: array<vec4<f32>, 57344>,
@@ -1762,8 +1767,19 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // Mod/Mod2x, additive and dry = untouched.
     let wet_dry = is_interior || interior_fogged || is_rig || is_emissive || is_mod || is_mod2x
         || (u32(m.clutter_fade.z) & 4u) != 0u;
-    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz, select(1.0, 0.0, wet_dry),
-        wow_light.monkey);
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
+    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
+        select(1.0, 0.0, wet_dry) * wet_open, wow_light.monkey);
     rgb = wet.albedo;
     if (wet.boost > 0.0) {
         rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),

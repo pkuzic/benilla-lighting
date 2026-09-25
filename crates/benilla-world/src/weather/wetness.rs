@@ -85,7 +85,7 @@ fn env_overrides() -> &'static EnvOverrides {
     })
 }
 
-fn wetness_tick(
+pub(super) fn wetness_tick(
     time: Res<Time<Real>>,
     state: Res<WeatherState>,
     cvar: Res<RainSurfaces>,

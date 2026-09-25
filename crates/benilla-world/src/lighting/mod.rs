@@ -66,6 +66,7 @@ pub use global_light::{
 pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
 // The std430 layout stays in the crate: off-world producers state values through `LightBlob`,
 // never a row index.
+pub(crate) use global_light::per_frame_blob_bytes; // MONKEY (rainshelter)
 pub(crate) use prop_probes::prop_probe_region_offset;
 pub use resolve::WmoCrossfade;
 use resolve::{apply_sky_backdrop, setup_lighting, update_time_lighting};

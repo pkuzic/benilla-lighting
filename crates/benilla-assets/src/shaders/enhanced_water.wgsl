@@ -25,6 +25,8 @@
 #import bevy_pbr::mesh_view_bindings::{view, globals}
 // MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
 #import benilla::monkey_frame
+// MONKEY (rainshelter): the shelter-grid lookup the surface receivers share.
+#import benilla::wet_hook
 // MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
 #import benilla::fog_hook
 
@@ -64,6 +66,25 @@ fn water_monkey() -> monkey_frame::MonkeyFrame {
     m.misc = water_light[MONKEY_ROW + 7u];
     for (var i = 0u; i < 8u; i++) { m.benders[i] = water_light[MONKEY_ROW + 8u + i]; }
     return m;
+}
+
+// MONKEY (rainshelter): the rain-occlusion grid right after the MonkeyFrame block
+// (`weather/shelter.rs`): two header rows, then the packed cell words, four to a row.
+const SHELTER_ROW: u32 = 549u;
+fn water_shelter_word(i: u32) -> u32 {
+    return bitcast<u32>(water_light[SHELTER_ROW + 2u + i / 4u][i % 4u]);
+}
+// 1 open .. 0 under a bridge or a roof.
+fn water_rain_open(world_pos: vec3<f32>) -> f32 {
+    let hdr = water_light[SHELTER_ROW];
+    let cfg = water_light[SHELTER_ROW + 1u];
+    let st = wet_hook::shelter_taps(world_pos, hdr, cfg);
+    if (st.live <= 0.0) {
+        return 1.0;
+    }
+    return 1.0 - wet_hook::shelter_amount(st, water_shelter_word(st.idx.x),
+        water_shelter_word(st.idx.y), water_shelter_word(st.idx.z), water_shelter_word(st.idx.w),
+        world_pos.y, cfg);
 }
 
 // What the fragment stage hands over: the three varyings this module reads.
@@ -256,13 +277,16 @@ fn ripple_hash(p: vec2<f32>) -> vec2<f32> {
     q += dot(q, q.yzx + 33.33);
     return fract((q.xx + q.yz) * q.zy);
 }
-fn rain_ripple_normal(world_xz: vec2<f32>, footprint: f32, distance: f32, room: bool) -> vec2<f32> {
+fn rain_ripple_normal(world_pos: vec3<f32>, footprint: f32, distance: f32, room: bool) -> vec2<f32> {
     let wet_row = water_monkey().wet_a;
     let rain = clamp(wet_row.x, 0.0, 1.0);
     if rain <= 0.0 || water.lane.x > 1.5 || room {
         return vec2<f32>(0.0);
     }
-    let reach = (1.0 - smoothstep(35.0, 60.0, distance)) * (1.0 - smoothstep(0.05, 0.14, footprint));
+    let world_xz = world_pos.xz;
+    // MONKEY (rainshelter): no rings under a bridge or a roof.
+    let reach = (1.0 - smoothstep(35.0, 60.0, distance)) * (1.0 - smoothstep(0.05, 0.14, footprint))
+        * water_rain_open(world_pos);
     if reach <= 0.0 {
         return vec2<f32>(0.0);
     }
@@ -595,7 +619,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         open_sea_fold = water_gerstner(p, t, shore).w;
     }
     // One surface gradient: the procedural bands and the shore break.
-    let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xz, footprint,
+    let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xyz, footprint,
         length(eye_pos), in.room_fog != 0u && water.lane.w > 0.5);
     var n = normalize(vec3<f32>(-surf_grad.x, 1.0, -surf_grad.y));
     if dot(n, to_view) < 0.0 { n = -n; }

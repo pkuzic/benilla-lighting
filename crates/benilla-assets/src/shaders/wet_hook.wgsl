@@ -13,6 +13,57 @@
 
 #import benilla::monkey_frame::MonkeyFrame
 
+// MONKEY (rainshelter): the four cells around a fragment in the camera-centred shelter grid.
+// `hdr` = `[origin_x, origin_z, 1 / cell, active]`, `cfg` = `[base_y, cells per side, 0, 0]`;
+// `live` is 0 when the map is off or the fragment lies outside it (open sky).
+struct ShelterTaps {
+    idx: vec4<u32>,
+    frac: vec2<f32>,
+    live: f32,
+}
+
+fn shelter_taps(world_pos: vec3<f32>, hdr: vec4<f32>, cfg: vec4<f32>) -> ShelterTaps {
+    var t: ShelterTaps;
+    t.idx = vec4<u32>(0u);
+    t.frac = vec2<f32>(0.0);
+    t.live = 0.0;
+    if (hdr.w < 0.5) {
+        return t;
+    }
+    let g = (world_pos.xz - hdr.xy) * hdr.z - 0.5;
+    let gf = floor(g);
+    if (gf.x < 0.0 || gf.y < 0.0 || gf.x + 1.0 > cfg.y - 1.0 || gf.y + 1.0 > cfg.y - 1.0) {
+        return t;
+    }
+    let side = u32(cfg.y);
+    let first = u32(gf.y) * side + u32(gf.x);
+    t.idx = vec4<u32>(first, first + 1u, first + side, first + side + 1u);
+    t.frac = g - gf;
+    t.live = 1.0;
+    return t;
+}
+
+// One cell: low half `(top − base_y) × 64 + 32768`, high half the soft cover as unorm16
+// (`shelter::pack_cell`). Sheltered when a covered top lies a yard or more above the fragment; the
+// roof's own surface (at `top`) stays open.
+fn shelter_cell(word: u32, y_rel: f32) -> f32 {
+    let top = (f32(word & 0xffffu) - 32768.0) / 64.0;
+    let cover = f32(word >> 16u) / 65535.0;
+    return cover * smoothstep(0.5, 1.5, top - y_rel);
+}
+
+// How sheltered the fragment is, 0 open .. 1 under cover, bilinear over the four cells.
+fn shelter_amount(t: ShelterTaps, wa: u32, wb: u32, wc: u32, wd: u32, world_y: f32,
+    cfg: vec4<f32>) -> f32 {
+    if (t.live <= 0.0) {
+        return 0.0;
+    }
+    let y_rel = world_y - cfg.x;
+    let near = mix(shelter_cell(wa, y_rel), shelter_cell(wb, y_rel), t.frac.x);
+    let far = mix(shelter_cell(wc, y_rel), shelter_cell(wd, y_rel), t.frac.x);
+    return clamp(mix(near, far, t.frac.y), 0.0, 1.0);
+}
+
 struct WetSurface {
     albedo: vec3<f32>,
     // Gloss weight for `wet_sheen`: 0 dry, ~1 a soaked top face, up to 2 in a terrain puddle (the
@@ -61,11 +112,13 @@ fn wet_noise(p: vec2<f32>) -> f32 {
 }
 
 // Terrain bonus: puddle patches on flat ground once it is well soaked — darker, and a stronger
-// gloss weight so they read as standing water catching the sky.
-fn wet_puddles(s: WetSurface, n: vec3<f32>, world_pos: vec3<f32>, mf: MonkeyFrame) -> WetSurface {
+// gloss weight so they read as standing water catching the sky. MONKEY (rainshelter): `exposure`
+// as for `wet_surface`, so no puddle forms under cover.
+fn wet_puddles(s: WetSurface, n: vec3<f32>, world_pos: vec3<f32>, exposure: f32,
+    mf: MonkeyFrame) -> WetSurface {
     let wet_row = mf.wet_a;
     var o = s;
-    if (wet_row.y <= 0.0) {
+    if (wet_row.y <= 0.0 || exposure <= 0.0) {
         return o;
     }
     let xz = world_pos.xz;
@@ -73,7 +126,8 @@ fn wet_puddles(s: WetSurface, n: vec3<f32>, world_pos: vec3<f32>, mf: MonkeyFram
     let level = smoothstep(0.94, 0.99, n.y);
     // Puddles grow with the wetness: the threshold falls as the ground soaks.
     let edge = mix(0.8, 0.6, smoothstep(0.4, 1.0, wet_row.y));
-    let puddle = smoothstep(edge, edge + 0.06, field) * level * smoothstep(0.35, 0.8, wet_row.y);
+    let puddle = smoothstep(edge, edge + 0.06, field) * level * smoothstep(0.35, 0.8, wet_row.y)
+        * clamp(exposure, 0.0, 1.0);
     o.albedo = o.albedo * (1.0 - 0.45 * puddle);
     o.boost = max(o.boost, 2.0 * puddle);
     return o;
