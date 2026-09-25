@@ -38,6 +38,11 @@ behind each constant.
 | Zone skyboxes | the painted sky a zone's `LightParams` names (clear-weather slot, storm slot lerped by the storm blend) for the living, fading in by the Light sphere falloff with the modern client's crossfade (ghost > WMO > zone); extended `LightSkybox.dbc` flags `0x1` day cycle, `0x2` keep sun/moon/stars/clouds, `0x4` fog-colour horizon cone, plus a celestial second model; every skybox now plays its bones, texture transforms, colour and alpha tracks (`benilla-world/src/skybox.rs`, `skybox_anim.rs`, `benilla-formats/src/light/skybox.rs`) | Advanced Graphics → Zone Skyboxes, cvar `zoneSkyboxes` (0 Off default, 1 On; High = 1), env `WOW_ZONE_SKYBOXES=0\|1` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
+`zoneSkyboxes = 0` disables only the added living-player zone slot. WMO and ghost skyboxes are
+the reference 1.12 slots, so their fidelity fixes remain active in Classic: authored colour and
+alpha tracks affect the layer, non-white M2 colours reach the mesh, deterministic captures pose at
+their pinned time, and the batch-order base reserves the lower celestial band and final fog cone.
+
 Players reach all of it from **Options -> Advanced Graphics** (a Graphics Preset over everything, a Render Distance slider, a Lighting Quality preset Off / Low / Medium / High / Ultra plus the individual rows; Classic / Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
 Bright presets.
 

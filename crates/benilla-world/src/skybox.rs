@@ -24,6 +24,13 @@
 //! the game day, `0x2` keeps the celestial pass, `0x4` draws a fog-colour cone over the horizon;
 //! a celestial model draws as a layer under its main model. Every batch animates
 //! ([`crate::skybox_anim`]): bones, texture transforms, colour and alpha tracks.
+//!
+//! MONKEY (reviewfix): those M2-fidelity repairs deliberately also apply when `zoneSkyboxes` is
+//! off. The reference WMO and ghost slots animate their authored colour/alpha and texture tracks,
+//! use non-white M2 colours, and draw batches in authored order; deterministic captures pose those
+//! same tracks at their pinned time rather than substituting the bind pose. The main-order offset
+//! only leaves room for a celestial under-layer and the final fog cone. The cvar gates the added
+//! zone slot, not fixes to the two 1.12 slots.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -48,7 +55,8 @@ use benilla_formats::{SKYBOX_FOG_BLEND, SKYBOX_FULL_DAY, SKYBOX_KEEP_CELESTIAL};
 const SHOW_SKYBOX: u32 = 0x40000;
 
 /// MONKEY (skybox): batch-order base of a main model's batches; a celestial layer takes `1..`, so
-/// it draws first, under the main model, and the fog cone takes [`FOG_CONE_ORDER`], last.
+/// it draws first, under the main model, and the fog cone takes [`FOG_CONE_ORDER`], last. MONKEY
+/// (reviewfix): this ordering also protects the reference WMO/ghost slots when zone skyboxes are off.
 const MAIN_ORDER_BASE: u16 = 24;
 /// MONKEY (skybox): the fog cone's batch order, the band's last distinct step.
 const FOG_CONE_ORDER: u16 = 56;
