@@ -39,7 +39,7 @@ pub use flicker::{flame_kind_for, flicker_seed, FlameFlicker, FlameKind, Flicker
 pub use global_light::{
     interior_reach, m2_light_reach, new_shared_light_buffer, DynamicInteriors, FireLightGain,
     ClaimFade, LightLane, LightLitRooms, LightReach, LightRooms, RoomClaimTable,
-    SharedLightBuffer,
+    ResolvedPointLight, ResolvedPointLights, SharedLightBuffer,
     ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
     WorldShadowActive,
 };
