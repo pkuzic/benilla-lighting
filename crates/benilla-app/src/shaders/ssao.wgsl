@@ -13,6 +13,8 @@ struct Ao {
     params: vec4<f32>,
     // Distance fade start and end in yards, protection luma ramp start and end.
     fade: vec4<f32>,
+    // x: debug view (0 off, 1 factor, 2 protection, 3 distance/50, 4 raw occlusion); y: gain.
+    debug: vec4<f32>,
 }
 
 const SKY_DIST: f32 = 60000.0;
@@ -116,7 +118,7 @@ fn ao_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let w = saturate(1.0 - vv / r2);
         occ += w * max(0.0, dot(v, n) * inverseSqrt(vv + 1e-6) - ao.params.w);
     }
-    occ = saturate(2.0 * occ / f32(count)) * fade;
+    occ = saturate(ao.debug.y * occ / f32(count)) * fade;
     return vec4(occ, dist, protect, 1.0);
 }
 #endif
@@ -148,7 +150,11 @@ fn blur_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 fn apply_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec2<i32>(frag.xy);
     let z = depth_at(p);
-    if (is_sky(z)) { return vec4(1.0); }
+    let mode = u32(ao.debug.x);
+    if (is_sky(z)) {
+        // Sky is magenta in the diagnostic views, so "depth reads as sky" is visible.
+        return select(vec4(1.0), vec4(1.0, 0.0, 1.0, 1.0), mode >= 2u);
+    }
     let dist = -view_at(p, z).z;
     let size = vec2<i32>(textureDimensions(source));
     let hc = frag.xy * 0.5 - 0.5;
@@ -168,6 +174,10 @@ fn apply_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     }
     occ /= weight;
     protect /= weight;
+    if (mode == 2u) { return vec4(protect, protect, protect, 1.0); }
+    // Red = positive view distance, green = negative (a sign error), both / 50 yd.
+    if (mode == 3u) { return vec4(saturate(dist / 50.0), saturate(-dist / 50.0), 0.0, 1.0); }
+    if (mode == 4u) { return vec4(1.0 - occ, 1.0 - occ, 1.0 - occ, 1.0); }
     let k = 1.0 - ao.params.y * occ * (1.0 - protect);
     return vec4(k, k, k, 1.0);
 }

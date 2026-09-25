@@ -6,11 +6,12 @@
 //! blur, then a joint-bilateral upsample MULTIPLIED into the main colour attachment (the MSAA
 //! attachment when multisampled, so the resolve and every later pass see it). It runs before
 //! the water depth/colour copy and before transparents, so water, particles and UI are
-//! untouched and refraction sees the darkened bed. Sky, distant pixels (fade 35-80 yd) and
-//! bright pixels (lit windows, flames, sunlit sand) are protected.
+//! untouched and refraction sees the darkened bed. Sky, distant pixels and
+//! bright pixels (lit windows, flames, sunlit sand) are protected; fade 45-90 yd (Low) / 60-120 yd (High).
 //!
 //! cvar `ambientOcclusion`: 0 Off (pass not scheduled, image unchanged), 1 Low, 2 High.
-//! `WOW_AO=0|1|2` overrides it for the session; `WOW_AO_DEBUG=1` writes the AO term itself.
+//! `WOW_AO=0|1|2` overrides it for the session; `WOW_AO_DEBUG=1..4` writes a diagnostic view
+//! (factor, protection, distance, raw occlusion); `WOW_AO_GAIN/RADIUS/BIAS/STRENGTH` tune it.
 use crate::video::VideoConfig;
 use benilla_world::{liquid::WaterDepthLabel, view::WorldCamera};
 use bevy::{
@@ -49,21 +50,53 @@ struct AoView {
     params: Vec4,
     /// Distance fade start and end (yd), bright-pixel protection ramp (gamma max channel).
     fade: Vec4,
+    /// x = debug view (0 off, 1 AO factor, 2 protection, 3 distance/50, 4 raw occlusion),
+    /// y = occlusion gain.
+    debug: Vec4,
+}
+
+/// Dev tuning knob `WOW_AO_<name>=<f32>`, read once per name; `None` keeps the tier value.
+fn tuning(name: &'static str) -> Option<f32> {
+    static KNOBS: std::sync::Mutex<Vec<(&'static str, Option<f32>)>> = std::sync::Mutex::new(Vec::new());
+    let mut knobs = KNOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, v)) = knobs.iter().find(|(n, _)| *n == name) {
+        return *v;
+    }
+    let v = std::env::var(format!("WOW_AO_{name}"))
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    knobs.push((name, v));
+    v
 }
 
 impl AoView {
     fn tier(tier: u8) -> Self {
-        let (radius, strength, samples) = if tier >= 2 { (1.5, 0.55, 12.0) } else { (1.2, 0.5, 6.0) };
+        let (radius, strength, samples) = if tier >= 2 { (1.5, 0.7, 12.0) } else { (1.2, 0.65, 6.0) };
+        // Outdoor contacts (house bases, trunks) sit 30-60 yd out; Low stops sooner.
+        let fade = if tier >= 2 { (60.0, 120.0) } else { (45.0, 90.0) };
+        let radius = tuning("RADIUS").unwrap_or(radius);
+        let strength = tuning("STRENGTH").unwrap_or(strength).min(1.0);
+        let bias = tuning("BIAS").unwrap_or(0.05);
+        let gain = tuning("GAIN").unwrap_or(6.0);
         Self {
-            params: Vec4::new(radius, strength, samples, 0.1),
-            fade: Vec4::new(35.0, 80.0, 0.7, 0.95),
+            params: Vec4::new(radius, strength, samples, bias),
+            fade: Vec4::new(fade.0, fade.1, 0.7, 0.95),
+            debug: Vec4::new(debug_mode() as f32, gain, 0.0, 0.0),
         }
     }
 }
 
+/// `WOW_AO_DEBUG=1..4`: write a diagnostic term instead of darkening the scene.
+fn debug_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("WOW_AO_DEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(4)
+    })
+}
+
 fn debug_view() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_AO_DEBUG").as_deref() == Ok("1"))
+    debug_mode() != 0
 }
 
 impl Plugin for AmbientOcclusionPlugin {
