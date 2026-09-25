@@ -1,32 +1,39 @@
 // MONKEY (post): screen-space radial blur through sky pixels in the scene depth.
+// MONKEY (polish): two passes. `SHAFT_MASK` reads the depth once per half-resolution texel into
+// a sky mask; the blur then samples that mask 28 times instead of the full-size depth.
 
 #import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput
 
+#ifdef SHAFT_MASK
+
+#ifdef MULTISAMPLED
+@group(0) @binding(0) var depth: texture_depth_multisampled_2d;
+#else
+@group(0) @binding(0) var depth: texture_depth_2d;
+#endif
+
+@fragment
+fn fs_mask(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<i32>(textureDimensions(depth));
+    let p = min(vec2<i32>(in.position.xy) * 2, dims - vec2<i32>(1));
+    // MONKEY (fix-post): one sample, not a max over all of them: the march is a blur.
+    // Only the cleared / sky-pinned depth (exactly 0 on infinite reverse-Z) is sky; a ramp on
+    // `near / z` would move with the live `nearclip` cvar and pour shafts through far terrain.
+    let sky = select(0.0, 1.0, textureLoad(depth, p, 0) <= 1.0e-7);
+    return vec4(sky, 0.0, 0.0, 1.0);
+}
+
+#else
+
 @group(0) @binding(0) var scene: texture_2d<f32>;
 @group(0) @binding(1) var scene_sampler: sampler;
-#ifdef MULTISAMPLED
-@group(0) @binding(2) var depth: texture_depth_multisampled_2d;
-#else
-@group(0) @binding(2) var depth: texture_depth_2d;
-#endif
+@group(0) @binding(2) var mask: texture_2d<f32>;
 
 struct Shafts {
     sun: vec4<f32>,
     color: vec4<f32>,
 };
 @group(0) @binding(3) var<uniform> shafts: Shafts;
-
-fn scene_depth(uv: vec2<f32>) -> f32 {
-    let dims = textureDimensions(depth);
-    let p = vec2<i32>(clamp(uv, vec2(0.0), vec2(0.999999)) * vec2<f32>(dims));
-#ifdef MULTISAMPLED
-    // MONKEY (fix-post): one sample, not a max over all of them: the march is a blur, and the
-    // per-sample loop cost 28 x N loads per pixel (224 at 8x).
-    return textureLoad(depth, p, 0);
-#else
-    return textureLoad(depth, p, 0);
-#endif
-}
 
 @fragment
 fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
@@ -41,10 +48,8 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         if (i >= count) { break; }
         uv += step_uv;
         decay *= 0.965;
-        // MONKEY (fix-post): only the cleared / sky-pinned depth (exactly 0 on infinite reverse-Z)
-        // is sky. The old ramp read d = near / z, so it moved with the live `nearclip` cvar and
-        // let shafts pour through terrain beyond ~125 yd at nearclip 0.01.
-        let sky = select(0.0, 1.0, scene_depth(uv) <= 1.0e-7);
+        // The clamp-to-edge bilinear tap is the old clamped depth read, pre-thresholded.
+        let sky = textureSampleLevel(mask, scene_sampler, uv, 0.0).r;
         light += sky * decay;
         norm += decay;
     }
@@ -56,3 +61,5 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let rays = light / max(norm, 0.0001) * radial * radial;
     return vec4(base.rgb + shafts.color.rgb * rays * shafts.sun.z * 0.16, base.a);
 }
+
+#endif
