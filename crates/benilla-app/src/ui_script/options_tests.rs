@@ -3140,7 +3140,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
     // and Interior Darkness. The three rows that MOVED onto it are already in the 81: a row
     // changing pages does not change this count, only its entry in BENILLA_OWNED. 81 -> 93.
     // Water Quality and Lava Glow add two more: 93 -> 95.
-    assert_eq!(checked, 95, "every tipped row carries a live key");
+    // MONKEY (daylight: terrain torch casters): Terrain Blocks Torchlight. 95 -> 96.
+    assert_eq!(checked, 96, "every tipped row carries a live key");
     assert_eq!(
         untipped,
         vec![
@@ -3272,7 +3273,8 @@ fn every_flavor_of_row_raises_its_plate_from_the_page_it_lives_on() {
     // whose descriptions are all benilla's.
     // Water Quality and Lava Glow add two more: 93 -> 95.
     // MONKEY (volumetric fog): the atmosphere dropdown adds one more described row.
-    assert_eq!(raised, 96, "every row but Auto Loot raises a description");
+    // MONKEY (daylight: terrain torch casters): …and Terrain Blocks Torchlight one more.
+    assert_eq!(raised, 97, "every row but Auto Loot raises a description");
 }
 
 /// The **Combat page** (decision 1134) — the first rows in this window whose store is a
