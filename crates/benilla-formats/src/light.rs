@@ -11,9 +11,12 @@ use crate::dbc::{f32_at, parse, str_at, u32_at};
 use crate::Chain;
 
 mod atmosphere;
+// MONKEY (fog): `LightFogBand.dbc`, the modern fog fields.
+mod fog_band;
 mod tables;
 
 pub use atmosphere::Atmosphere;
+pub use fog_band::{FogBand, FogBandCatalog, FOG_BANDS_PER_PARAM};
 use atmosphere::{
     FB_CLOUD_DENSITY, FB_FOG_END, FB_FOG_START_MULT, IB_AMBIENT, IB_CLOUD_GBASE, IB_CLOUD_SLOPE,
     IB_CLOUD_SUN, IB_DIFFUSE, IB_FOG_COLOR, IB_OCEAN_DEEP, IB_OCEAN_SHALLOW, IB_RIVER_DEEP,
@@ -507,6 +510,66 @@ impl LightCatalog {
             }
         }
         acc
+    }
+
+    /// MONKEY (fog): the `LightParams` ids [`Self::sample_blended`] folds, in its order, each with its
+    /// lerp weight (the base first at 1.0). A side table keyed by `LightParams` (`LightFogBand.dbc`)
+    /// blends through this with the same law. Magma and slime give their fixed row alone.
+    pub fn blend_chain(
+        &self,
+        map: u32,
+        pos: [f32; 3],
+        stormy: bool,
+        submersion: Submersion,
+        ghost: bool,
+    ) -> Vec<(u32, f32)> {
+        if let Some(p) = submersion.fixed_param() {
+            if self.has_param(p) {
+                return vec![(p, 1.0)];
+            }
+        }
+        let slot = weather_slot(ghost, stormy, submersion.is_water());
+        let param_of = |l: &Light| match l.params[slot] {
+            0 => l.params[SLOT_CLEAR],
+            p => p,
+        };
+        let mut chain = Vec::new();
+        let map_has_no_light = !self.lights.iter().any(|l| l.map == map);
+        if let Some(base) = self
+            .lights
+            .iter()
+            .find(|l| l.map == map && l.global)
+            .or_else(|| {
+                map_has_no_light
+                    .then(|| self.lights.iter().find(|l| l.id == FALLBACK_LIGHT_ID))
+                    .flatten()
+            })
+        {
+            let p = param_of(base);
+            if p >= 1 {
+                chain.push((p, 1.0));
+            }
+        }
+        let mut locals: Vec<(f32, &Light)> = self
+            .lights
+            .iter()
+            .filter(|l| l.map == map && !l.global)
+            .filter_map(|l| {
+                let d = (0..3)
+                    .map(|i| (l.pos[i] - pos[i]).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                (d <= l.falloff_end).then_some((d, l))
+            })
+            .collect();
+        locals.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for (dist, l) in locals {
+            let p = param_of(l);
+            if p >= 1 {
+                chain.push((p, blend_alpha(dist, l.falloff_start, l.falloff_end)));
+            }
+        }
+        chain
     }
 
     /// Debug: the spheres near `pos`, nearest first (the blend applies them farthest first), then
