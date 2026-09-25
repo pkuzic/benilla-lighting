@@ -519,6 +519,8 @@
                 spellLights = "Spell Lights",
                 nightDarkness = "Night Darkness",
                 interiorDarkness = "Interior Darkness",
+                -- MONKEY (ao): localised contact-shadow row.
+                ambientOcclusion = "Ambient Occlusion",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
@@ -611,6 +613,13 @@
                         "Scales interior fixture light and room ambient, including the light from "
                         .. "lamps and candles. Lower values make both dimmer.\n\n"
                         .. "1.0 leaves these inputs unchanged. Free at any setting.",
+                    -- MONKEY (ao): what the contact shadows touch and what they spare.
+                    AMBIENT_OCCLUSION =
+                        "Soft contact shadows where surfaces meet: under props and furniture, in the corners "
+                        .. "between walls and floors, and around characters' feet. Low uses fewer samples; "
+                        .. "High is smoother and reaches a little further.\n\n"
+                        .. "Fades out with distance and spares the sky, water, lit windows and flames. "
+                        .. "Off leaves the image unchanged.",
                 },
             },
             ruRU = {
@@ -643,6 +652,8 @@
                 spellLights = "Свет от заклинаний",
                 nightDarkness = "Темнота ночи",
                 interiorDarkness = "Темнота помещений",
+                -- MONKEY (ao): Russian contact-shadow row.
+                ambientOcclusion = "Затенение окружения",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -743,6 +754,13 @@
                         "Масштабирует свет светильников и фоновое освещение помещений, включая "
                         .. "свет ламп и свечей. Меньшие значения ослабляют и то и другое.\n\n"
                         .. "1.0 оставляет эти составляющие без изменений. Ничего не стоит при любом значении.",
+                    -- MONKEY (ao): Russian contact-shadow explanation.
+                    AMBIENT_OCCLUSION =
+                        "Мягкие контактные тени там, где поверхности соприкасаются: под предметами и мебелью, "
+                        .. "в углах между стенами и полом, у ног персонажей. «Низкое» использует меньше выборок; "
+                        .. "«Высокое» — более плавное и захватывает чуть больше.\n\n"
+                        .. "Ослабевает с расстоянием и не затрагивает небо, воду, освещённые окна и пламя. "
+                        .. "«Выкл» оставляет изображение без изменений.",
                 },
             },
         }
@@ -801,6 +819,8 @@
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
                 "RowFireLight", "RowFireFlicker", "RowSpellLights", "RowLavaGlow",
                 "RowNightDarkness", "RowInteriorDarkness",
+                -- MONKEY (ao): appended so the other rows keep their indices.
+                "RowAmbientOcclusion",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -2825,6 +2845,22 @@
                                                     BENILLA_ADVGFX.interiorDarkness,
                                                     "BENILLA_TOOLTIP_INTERIOR_DARKNESS")
                                                 OptionsSliderRow_Setup(self, 0.2, 1.5, 0.05, "darkness")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (ao): numeric tiers through the existing localised dropdown. -->
+                                        <Frame name="$parentRowAmbientOcclusion" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowInteriorDarkness" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowInteriorDarkness" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "ambientOcclusion", BENILLA_ADVGFX.ambientOcclusion,
+                                                    "BENILLA_TOOLTIP_AMBIENT_OCCLUSION")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.fogOff, value = "0" },
+                                                    { text = BENILLA_ADVGFX.qLow, value = "1" },
+                                                    { text = BENILLA_ADVGFX.qHigh, value = "2" },
+                                                })
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

@@ -74,6 +74,8 @@ mod doodad_events;
 /// MONKEY (dynamic interiors): the cvar → benilla-world bridge for the fixture-lit interior lane.
 // MONKEY (volumetric fog): optional near-field atmosphere plugin.
 mod volumetric_fog;
+// MONKEY (ao): optional screen-space ambient occlusion plugin.
+mod ssao;
 mod dynamic_interior;
 mod entities;
 mod fishing_line;

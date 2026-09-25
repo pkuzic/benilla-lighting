@@ -187,8 +187,9 @@ fn init_pipeline(mut commands: Commands, shader: Res<DepthShader>, cache: Res<Pi
     commands.insert_resource(DepthPipelines { layouts, pipelines, colour_layout, colour_pipeline });
 }
 
+// MONKEY (ao): public so the AO pass can order itself before the opaque copies.
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct WaterDepthLabel;
+pub struct WaterDepthLabel;
 #[derive(Default)]
 struct DepthNode;
 

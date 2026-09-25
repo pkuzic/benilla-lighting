@@ -921,6 +921,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (ao): opt-in contact shadows; the High graphics preset value is 2.
+    ours("ambientOcclusion", "0", "benilla's own: screen-space ambient occlusion, 0 Off / 1 Low / 2 High"),
     ours(
         "waterQuality",
         "1",
@@ -2974,6 +2976,9 @@ mod tests {
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
         assert_eq!(d["waterQuality"], 1.0, "mirror reflections stay opt-in");
         assert_eq!(d["lavaLightGain"], 1.0);
+        // MONKEY (ao): registry and renderer agree, and the lane ships Off.
+        assert_eq!(d["ambientOcclusion"], shadows.ambient_occlusion as f32);
+        assert_eq!(d["ambientOcclusion"], 0.0, "ambient occlusion is opt-in");
         // The 33rd lighting row, `lightingQuality`, is deliberately NOT in that census: it is the
         // only one with no `VideoConfig` knob to weld to, because it is a NAME for the rows above
         // rather than a knob of its own. Its own weld is `the_high_preset_is_the_registered_
