@@ -645,6 +645,19 @@ struct ModelClock {
     pose: Vec<Affine3A>,
 }
 
+/// MONKEY (skybox): `WOW_SKYBOX_T=<secs>` holds a capture's skybox clock there instead of 0, to
+/// photograph an animated sky mid-loop.
+fn capture_t() -> f32 {
+    static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("WOW_SKYBOX_T")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|t: &f32| t.is_finite())
+            .unwrap_or(0.0)
+    })
+}
+
 /// MONKEY (skybox): pose every shown skybox and run its material loops on the model's clock:
 /// sequence 0 at `duration × day fraction` under flag `0x1`, else the scene clock. A capture holds
 /// `t = 0` unless the day drives the clock.
@@ -676,7 +689,7 @@ fn animate_skyboxes(
             let g = if deterministic { 0.0 } else { f64::from(now) };
             (rig.duration * day, g, true)
         } else if deterministic {
-            (0.0, 0.0, true)
+            (capture_t(), f64::from(capture_t()), true)
         } else {
             (now, f64::from(now), true)
         };
