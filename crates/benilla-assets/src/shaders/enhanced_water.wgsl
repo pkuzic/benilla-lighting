@@ -6,6 +6,8 @@
 // author iThorgrim. Its author permits reuse of that code in this module provided the author and
 // the original project are named; this notice is that attribution and must stay with the module.
 // A block that ports WarcraftXL code says so where it stands and is listed in WATER.md.
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-experimental-water, shaders/Surface.ps.hlsl, render/Refraction.cpp, render/Noise.cpp, sea/Shore.hpp.
+// MONKEY (p0 credits): every WarcraftXL-derived file is listed in THIRD-PARTY.md (benilla root).
 //
 // This file is the whole module on the shader side. `liquid.wgsl` (upstream's liquid renderer)
 // carries three hooks only: the import, `water_swell` in its vertex stage, and a branch at the top

@@ -12,7 +12,8 @@ player picks it, and every part of it can be switched off.
 ## Credits
 
 - **Original project: [WarcraftXL](https://github.com/WarcraftXL)** — the `wxl-experimental-water`
-  module for the 1.12 client.
+  module, a client extension for the 3.3.5a (build 12340) client (C++ / D3D9 / HLSL), used here as
+  reference code and ported to WGSL/Rust for the 1.12 renderer.
 - **Author: iThorgrim.**
 
 The WarcraftXL water module is the design reference for this one, and its author has given
@@ -21,8 +22,11 @@ named. This section is that attribution; it must travel with the module (this fi
 `enhanced_water.wgsl` header) wherever the module is copied or shared.
 
 Rule for contributors: a file that ports code or a technique from WarcraftXL says so in its header
-(`Portions derived from WarcraftXL wxl-experimental-water by iThorgrim, used with permission`) and
-the technique is listed in the table below. Do not remove either.
+(`Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module <module>, <source
+files>.`; blocks inside a file keep their `Portions derived from WarcraftXL ...` line), the
+technique is listed in the table below, and the file is listed in
+[`THIRD-PARTY.md`](THIRD-PARTY.md), the one table of every WarcraftXL-derived file across the
+fork. Do not remove any of them.
 
 | Technique | Status here | From WarcraftXL |
 |---|---|---|

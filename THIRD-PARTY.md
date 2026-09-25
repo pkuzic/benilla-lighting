@@ -1,0 +1,38 @@
+# Third-party credits
+
+Code and techniques this fork takes from other projects, with the files they landed in. Vendored
+components under `third_party/` carry their own licences beside them and are listed in `README.md`.
+
+## WarcraftXL
+
+- **Project: [WarcraftXL](https://github.com/WarcraftXL)** — client extensions for the **3.3.5a**
+  (build 12340) client, written in C++ with D3D9 / HLSL.
+- **Author: iThorgrim.**
+
+WarcraftXL's code is reused here on the condition that the author and the original project are
+named. This file, and the header line in each file below, is that attribution; keep both wherever
+the code is copied or shared.
+
+**Rule for contributors.** A file that ports code or a technique from WarcraftXL carries this line
+in its header:
+
+```
+Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module <module>, <source files>.
+```
+
+and gets a row in the table below. Blocks inside a file that port a specific routine also say so
+where they stand. Do not remove either.
+
+| Benilla file | WarcraftXL module | Source files | What was taken |
+|---|---|---|---|
+| `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (DEPTH LOOK block) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `render/Refraction.cpp` | Per-channel Beer-Lambert extinction over the view path through the water column, the body as a lerp from scattered colour to what is behind by the transmittance, normal-bent scene-copy refraction scaled by the water depth (ported) |
+| `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (caustics) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `render/Noise.cpp` | Two caustic layers at incommensurate scales and rates, multiplied (ported; our layers are built from animated cell edges, not value noise) |
+| `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (HIGH reflections) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl` | Screen-space reflection of the scene copy along an almost-planar normal, masked by the screen edge and by rays turning back toward the eye (principle; ours is a bisected march against the scene depth, not a single probe) |
+| `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (beach surf, `on_bed`) | `wxl-experimental-water` | `sea/Shore.hpp`, `shaders/Shore.hlsli` | Shore surf limited by the terrain column, so objects standing in the water never foam (principle) |
+| `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
+
+Planned (not yet in the tree): Gerstner trains, breaker index and crest-fold foam from
+`sea/Spectrum.*`, `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
+(`field/Wind.*`, `grass/GrassWind.*`); colour grading from `wxl-retail-grading`
+(`Grading.*`, `shaders/Grading.ps.hlsl`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
+The lane that ports one adds its row here.

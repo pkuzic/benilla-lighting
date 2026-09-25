@@ -96,4 +96,5 @@ Debug tracing: `WOW_TORCH_TRACE=1`, `WOW_POINTS_DUMP=1`, `WOW_SHADOW_TRACE=1`, a
 
 ## Licence
 
-Same as upstream: MIT OR Apache-2.0.
+Same as upstream: MIT OR Apache-2.0. Code and techniques taken from other projects (WarcraftXL,
+by iThorgrim) are credited file by file in [`THIRD-PARTY.md`](THIRD-PARTY.md).
