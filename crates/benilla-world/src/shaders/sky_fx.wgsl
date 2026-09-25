@@ -7,6 +7,15 @@
 #define_import_path benilla_world::sky_fx
 
 const TAU: f32 = 6.2831853;
+// MONKEY (fix-sky): the sky clock's wrap (`sky_fx::SKY_CLOCK_WRAP_S`, a day). Twinkle rates are
+// whole cycles per wrap, so the stars never jump at the wrap.
+const SKY_WRAP: f32 = 86400.0;
+
+// The phase of a `rate` rad/s oscillator, rounded to whole cycles per wrap.
+fn wrap_phase(t: f32, rate: f32) -> f32 {
+    let cycles = round(rate * SKY_WRAP / TAU);
+    return fract(cycles * (t / SKY_WRAP)) * TAU;
+}
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
     let lo = c / 12.92;
@@ -201,7 +210,8 @@ fn star_field(dir: vec3<f32>, t: f32, px: f32, band: f32) -> vec3<f32> {
         let sigma = px * (0.55 + 0.7 * mag);
         let spot = exp(-d * d / (2.0 * sigma * sigma));
         let tw_amp = 0.18 + 0.3 * (1.0 - clamp(dir.y, 0.0, 1.0));
-        let tw = 1.0 + tw_amp * sin(t * (1.3 + 3.1 * j.x) + TAU * j.y) * sin(t * (0.6 + 1.7 * j.z) + TAU * h.z);
+        let tw = 1.0 + tw_amp * sin(wrap_phase(t, 1.3 + 3.1 * j.x) + TAU * j.y)
+            * sin(wrap_phase(t, 0.6 + 1.7 * j.z) + TAU * h.z);
         // Star colour: mostly white, a few warm and a few blue-white.
         let tint = mix(vec3<f32>(0.78, 0.86, 1.0), vec3<f32>(1.0, 0.88, 0.72), h.z);
         acc += tint * (b * spot * tw);

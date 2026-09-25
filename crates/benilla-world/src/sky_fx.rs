@@ -36,13 +36,22 @@ impl SkyQuality {
     }
 }
 
-/// The sky's own animation clock (star twinkle, cloud detail drift), seconds wrapped to an hour so
-/// the shader's `sin` keeps its precision. Frozen in capture mode, at `$WOW_CAPTURE_SKY_T` or 0.
+/// The sky's own animation clock (star twinkle, cloud detail drift), seconds wrapped to a day.
+/// Frozen in capture mode, at `$WOW_CAPTURE_SKY_T` or 0.
+///
+/// MONKEY (fix-sky): it wrapped hourly in f32, and every star's twinkle jumped at the wrap. Now it
+/// accumulates in f64 and wraps at [`SKY_CLOCK_WRAP_S`]; the shader's twinkle rates are whole
+/// cycles per wrap (seamless). The High cloud-detail drift still re-patterns at the wrap, once
+/// per 24 h of continuous play.
 #[derive(Resource, Default)]
 pub struct SkyClock {
     pub secs: f32,
+    acc: f64,
     frozen: Option<f32>,
 }
+
+/// The sky clock's wrap in seconds; `sky_fx.wgsl`'s `SKY_WRAP` must match.
+pub const SKY_CLOCK_WRAP_S: f64 = 86_400.0;
 
 /// How strongly the glow shows: a broad halo at `GLOW_GAIN` × the sun colour at the sun itself.
 pub(crate) const GLOW_GAIN: f32 = 0.22;
@@ -77,6 +86,7 @@ impl Plugin for SkyFxPlugin {
         });
         app.insert_resource(SkyClock {
             secs: frozen.unwrap_or(0.0),
+            acc: 0.0,
             frozen,
         });
         let quality = SkyQuality(SkyQuality::env_override().unwrap_or(0));
@@ -92,7 +102,8 @@ fn tick_sky_clock(time: Res<Time>, mut clock: ResMut<SkyClock>) {
         }
         return;
     }
-    clock.secs = (clock.secs + time.delta_secs()) % 3600.0;
+    clock.acc = (clock.acc + time.delta_secs_f64()) % SKY_CLOCK_WRAP_S;
+    clock.secs = clock.acc as f32;
 }
 
 #[cfg(test)]
