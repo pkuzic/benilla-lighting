@@ -99,9 +99,12 @@ impl FogBandCatalog {
             return None;
         }
         let base = (p - 1) * FOG_BANDS_PER_PARAM + 1;
-        let rows: Vec<Option<f32>> = (0..FOG_BANDS_PER_PARAM)
-            .map(|b| self.bands.get(&(base + b)).and_then(|band| sample_float(band, time)))
-            .collect();
+        // MONKEY (fix-fog): a fixed array, no per-frame Vec (review B11).
+        let rows: [Option<f32>; FOG_BANDS_PER_PARAM as usize] = std::array::from_fn(|b| {
+            self.bands
+                .get(&(base + b as u32))
+                .and_then(|band| sample_float(band, time))
+        });
         if rows.iter().all(Option::is_none) {
             return None;
         }
