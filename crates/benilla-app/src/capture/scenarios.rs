@@ -1567,7 +1567,7 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     Scenario {
         name: "wind-grass-elwynn",
         map: Some(MAP_AZEROTH),
-        // MONKEY (integration): keep the lane's verified open-grass framing. The unverified closer
+        // MONKEY (integration): restore the lane's earlier world-visible framing. The closer
         // handoff coordinates put the camera inside a Goldshire building and showed no grass.
         eye: [-9505.0, 85.0, 64.0],
         look: [-9460.0, 45.0, 57.0],
