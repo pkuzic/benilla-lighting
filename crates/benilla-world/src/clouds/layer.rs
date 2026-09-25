@@ -12,7 +12,7 @@ use bevy::pbr::{
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, Buffer, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
     TextureDimension, TextureFormat,
 };
 use bevy::shader::ShaderRef;
@@ -35,13 +35,18 @@ pub struct CloudExt {
     #[texture(100)]
     #[sampler(101)]
     pub(crate) texels: Handle<Image>,
-    /// MONKEY (sky): `x` the sky tier (detail at 2), `y` the sky clock, `zw` the unit direction
-    /// toward the glow body on the sheet ([`update_cloud_fx`]).
+    /// MONKEY (sky): `x` the sky tier (detail at 2), `y` reserved (0; the clock is
+    /// [`Self::clock`]), `zw` the unit direction toward the glow body on the sheet
+    /// ([`update_cloud_fx`]).
     #[uniform(102)]
     pub(crate) fx: Vec4,
     /// MONKEY (sky): the Light.dbc cloud sun colour (`rgb`, gamma) and the march strength (`w`).
     #[uniform(102)]
     pub(crate) lit: Vec4,
+    /// MONKEY (polish): the shared sky clock ([`crate::sky_fx::SkyClockBuffer`]), outside the
+    /// uniform so the drift never rewrites the material.
+    #[storage(103, read_only, buffer)]
+    pub(crate) clock: Buffer,
 }
 
 /// MONKEY (sky): the pipeline key: High compiles `SKY_FX_CLOUDS` into `cloud.wgsl`; below High
@@ -159,7 +164,11 @@ pub(super) fn setup_cloud_layer(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<CloudMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    clock: Option<Res<crate::sky_fx::SkyClockBuffer>>,
 ) {
+    let Some(clock) = clock else {
+        return;
+    };
     let image = images.add(Image::new(
         Extent3d {
             width: COLS as u32,
@@ -186,6 +195,7 @@ pub(super) fn setup_cloud_layer(
             // MONKEY (sky): Classic until `update_cloud_fx` reads the tier.
             fx: Vec4::ZERO,
             lit: Vec4::ZERO,
+            clock: clock.0.clone(),
         },
     });
     commands.spawn((
@@ -251,7 +261,6 @@ pub(super) fn follow_cloud_dome(
 pub(super) fn update_cloud_fx(
     light: Res<crate::lighting::WowLighting>,
     quality: Res<crate::sky_fx::SkyQuality>,
-    clock: Res<crate::sky_fx::SkyClock>,
     layer: Option<Res<CloudLayer>>,
     mut materials: ResMut<Assets<CloudMaterial>>,
 ) {
@@ -268,7 +277,7 @@ pub(super) fn update_cloud_fx(
         let q = |v: f32| benilla_assets::quantize(v, 4096.0);
         let sun = light.cloud_colors[0];
         (
-            Vec4::new(f32::from(quality.0), clock.secs, q(d.x), q(d.y)),
+            Vec4::new(f32::from(quality.0), 0.0, q(d.x), q(d.y)),
             Vec4::new(q(sun[0]), q(sun[1]), q(sun[2]), q(strength.clamp(0.0, 1.0))),
         )
     } else {

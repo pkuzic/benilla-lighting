@@ -1,4 +1,7 @@
 //! MONKEY (post): screen-space sun shafts from the visible sky depth.
+//!
+//! MONKEY (polish): the depth is read once per half-resolution texel into an R8 sky mask
+//! (`fs_mask`, the only MSAA-specialised stage); the 28-tap radial blur then samples the mask.
 
 use super::bloom::BloomLabel;
 use crate::video::VideoConfig;
@@ -11,6 +14,7 @@ use bevy::{
     ecs::query::QueryItem,
     prelude::*,
     render::{
+        camera::ExtractedCamera,
         diagnostic::RecordDiagnostics,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_graph::{
@@ -18,7 +22,8 @@ use bevy::{
         },
         render_resource::{binding_types::*, *},
         renderer::{RenderContext, RenderDevice, RenderQueue},
-        view::{Msaa, ViewDepthTexture, ViewTarget},
+        texture::{CachedTexture, TextureCache},
+        view::{ViewDepthTexture, ViewTarget},
         Render, RenderApp, RenderStartup, RenderSystems,
     },
 };
@@ -54,7 +59,13 @@ impl Plugin for SunShaftsPlugin {
             .insert_resource(ShaftShader(shader))
             .init_resource::<SpecializedRenderPipelines<ShaftPipeline>>()
             .add_systems(RenderStartup, init_pipeline)
-            .add_systems(Render, prepare_pipelines.in_set(RenderSystems::Prepare))
+            .add_systems(
+                Render,
+                (
+                    prepare_pipelines.in_set(RenderSystems::Prepare),
+                    prepare_masks.in_set(RenderSystems::PrepareResources),
+                ),
+            )
             .add_render_graph_node::<ViewNodeRunner<ShaftNode>>(Core3d, ShaftLabel)
             .add_render_graph_edges(
                 Core3d,
@@ -139,11 +150,24 @@ struct ShaftShader(Handle<Shader>);
 
 #[derive(Resource)]
 struct ShaftPipeline {
-    layouts: [BindGroupLayoutDescriptor; 2],
+    /// The blur's layout; the mask's per MSAA (`[single, multisampled]`).
+    layout: BindGroupLayoutDescriptor,
+    mask_layouts: [BindGroupLayoutDescriptor; 2],
+    masks: [CachedRenderPipelineId; 2],
     shader: Handle<Shader>,
     fullscreen: FullscreenShader,
     sampler: Sampler,
 }
+
+/// The half-resolution sky mask the blur marches through.
+const MASK_FORMAT: TextureFormat = TextureFormat::R8Unorm;
+
+#[derive(Component)]
+struct ShaftMask(CachedTexture);
+
+/// MONKEY (polish): the view's uniform, created once and rewritten in prepare, like bloom's.
+#[derive(Component)]
+struct ShaftUniform(Buffer);
 
 #[derive(Component)]
 struct ViewShaftPipeline(CachedRenderPipelineId);
@@ -154,29 +178,61 @@ struct ShaftLabel;
 fn init_pipeline(
     mut commands: Commands,
     device: Res<RenderDevice>,
+    cache: Res<PipelineCache>,
     shader: Res<ShaftShader>,
     fullscreen: Res<FullscreenShader>,
 ) {
-    let layouts = [false, true].map(|multisampled| {
+    let layout = BindGroupLayoutDescriptor::new(
+        "post_sun_shafts_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::FRAGMENT,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                sampler(SamplerBindingType::Filtering),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                uniform_buffer::<ShaftView>(false),
+            ),
+        ),
+    );
+    let mask_layouts = [false, true].map(|multisampled| {
         BindGroupLayoutDescriptor::new(
-            "post_sun_shafts_layout",
-            &BindGroupLayoutEntries::sequential(
+            "post_sun_shafts_mask_layout",
+            &BindGroupLayoutEntries::single(
                 ShaderStages::FRAGMENT,
-                (
-                    texture_2d(TextureSampleType::Float { filterable: true }),
-                    sampler(SamplerBindingType::Filtering),
-                    if multisampled {
-                        texture_depth_2d_multisampled()
-                    } else {
-                        texture_depth_2d()
-                    },
-                    uniform_buffer::<ShaftView>(false),
-                ),
+                if multisampled {
+                    texture_depth_2d_multisampled()
+                } else {
+                    texture_depth_2d()
+                },
             ),
         )
     });
+    let masks = [false, true].map(|multisampled| {
+        let mut shader_defs = vec!["SHAFT_MASK".into()];
+        if multisampled {
+            shader_defs.push("MULTISAMPLED".into());
+        }
+        cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some("post_sun_shafts_mask".into()),
+            layout: vec![mask_layouts[multisampled as usize].clone()],
+            vertex: fullscreen.to_vertex_state(),
+            fragment: Some(FragmentState {
+                shader: shader.0.clone(),
+                shader_defs,
+                entry_point: Some("fs_mask".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: MASK_FORMAT,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            ..default()
+        })
+    });
     commands.insert_resource(ShaftPipeline {
-        layouts,
+        layout,
+        mask_layouts,
+        masks,
         shader: shader.0.clone(),
         fullscreen: fullscreen.clone(),
         sampler: device.create_sampler(&SamplerDescriptor {
@@ -190,19 +246,16 @@ fn init_pipeline(
 }
 
 impl SpecializedRenderPipeline for ShaftPipeline {
-    type Key = (TextureFormat, bool);
+    type Key = TextureFormat;
 
-    fn specialize(&self, (format, multisampled): Self::Key) -> RenderPipelineDescriptor {
+    fn specialize(&self, format: Self::Key) -> RenderPipelineDescriptor {
         RenderPipelineDescriptor {
             label: Some("post_sun_shafts".into()),
-            layout: vec![self.layouts[multisampled as usize].clone()],
+            layout: vec![self.layout.clone()],
             vertex: self.fullscreen.to_vertex_state(),
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
-                shader_defs: multisampled
-                    .then(|| "MULTISAMPLED".into())
-                    .into_iter()
-                    .collect(),
+                shader_defs: vec![],
                 entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
                     format,
@@ -220,22 +273,65 @@ fn prepare_pipelines(
     cache: Res<PipelineCache>,
     pipeline: Res<ShaftPipeline>,
     mut specialized: ResMut<SpecializedRenderPipelines<ShaftPipeline>>,
-    views: Query<(Entity, &ViewTarget, &Msaa), With<ShaftView>>,
-    all_views: Query<(&ViewTarget, &Msaa), With<Camera3d>>,
+    views: Query<(Entity, &ViewTarget), With<ShaftView>>,
+    all_views: Query<&ViewTarget, With<Camera3d>>,
 ) {
     // MONKEY (integration): warm every reachable key on every 3-D view, feature on or off, so the
     // compile happens under the entry cover and never live when the player turns the row on.
-    // (Named in `pipe_warm/menagerie.rs`'s custom-lane census.)
-    for (target, msaa) in &all_views {
-        specialized.specialize(&cache, &pipeline, (target.main_texture_format(), msaa.samples() > 1));
+    // (Named in `pipe_warm/menagerie.rs`'s custom-lane census.) The mask pipelines (per MSAA) are
+    // queued once at init, so only the blur's format key needs warming here.
+    for target in &all_views {
+        specialized.specialize(&cache, &pipeline, target.main_texture_format());
     }
-    for (entity, target, msaa) in &views {
-        let id = specialized.specialize(
-            &cache,
-            &pipeline,
-            (target.main_texture_format(), msaa.samples() > 1),
-        );
+    for (entity, target) in &views {
+        let id = specialized.specialize(&cache, &pipeline, target.main_texture_format());
         commands.entity(entity).insert(ViewShaftPipeline(id));
+    }
+}
+
+/// The half-size mask target, rounded up so an odd edge column still has a texel, and the
+/// view's uniform, written in place.
+fn prepare_masks(
+    mut commands: Commands,
+    mut textures: ResMut<TextureCache>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    views: Query<(Entity, &ExtractedCamera, &ShaftView, Option<&ShaftUniform>)>,
+) {
+    for (entity, camera, shaft, uniform) in &views {
+        let Some(size) = camera.physical_viewport_size else {
+            continue;
+        };
+        let rows = [shaft.sun.to_array(), shaft.color.to_array()];
+        match uniform {
+            Some(uniform) => queue.write_buffer(&uniform.0, 0, bytemuck::cast_slice(&rows)),
+            None => {
+                let buffer = device.create_buffer_with_data(&BufferInitDescriptor {
+                    label: Some("post_sun_shafts_uniform"),
+                    contents: bytemuck::cast_slice(&rows),
+                    usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                });
+                commands.entity(entity).insert(ShaftUniform(buffer));
+            }
+        }
+        let mask = textures.get(
+            &device,
+            TextureDescriptor {
+                label: Some("post_sun_shafts_mask"),
+                size: Extent3d {
+                    width: size.x.div_ceil(2).max(1),
+                    height: size.y.div_ceil(2).max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: MASK_FORMAT,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        );
+        commands.entity(entity).insert(ShaftMask(mask));
     }
 }
 
@@ -246,19 +342,27 @@ impl ViewNode for ShaftNode {
     type ViewQuery = (
         &'static ViewTarget,
         &'static ViewDepthTexture,
+        // Gates the pass: the mask and uniform outlive a disabled frame.
         &'static ShaftView,
         &'static ViewShaftPipeline,
+        &'static ShaftMask,
+        &'static ShaftUniform,
     );
 
     fn run<'w>(
         &self,
         _graph: &mut RenderGraphContext,
         context: &mut RenderContext<'w>,
-        (target, depth, shaft, id): QueryItem<'w, '_, Self::ViewQuery>,
+        (target, depth, _, id, mask, uniform): QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
         let cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = cache.get_render_pipeline(id.0) else {
+        let settings = world.resource::<ShaftPipeline>();
+        let multisampled = (depth.texture.sample_count() > 1) as usize;
+        let (Some(pipeline), Some(mask_pipeline)) = (
+            cache.get_render_pipeline(id.0),
+            cache.get_render_pipeline(settings.masks[multisampled]),
+        ) else {
             return Ok(());
         };
         if !depth
@@ -268,24 +372,45 @@ impl ViewNode for ShaftNode {
         {
             return Ok(());
         }
-        let settings = world.resource::<ShaftPipeline>();
         let device = context.render_device();
-        let mut uniform = UniformBuffer::from(*shaft);
-        uniform.write_buffer(device, world.resource::<RenderQueue>());
+        let mask_bind = device.create_bind_group(
+            "post_sun_shafts_mask",
+            &cache.get_bind_group_layout(&settings.mask_layouts[multisampled]),
+            &BindGroupEntries::single(depth.view()),
+        );
         let out = target.post_process_write();
         let bind = device.create_bind_group(
             "post_sun_shafts",
-            &cache.get_bind_group_layout(
-                &settings.layouts[(depth.texture.sample_count() > 1) as usize],
-            ),
+            &cache.get_bind_group_layout(&settings.layout),
             &BindGroupEntries::sequential((
                 out.source,
                 &settings.sampler,
-                depth.view(),
-                uniform.binding().unwrap(),
+                &mask.0.default_view,
+                uniform.0.as_entire_binding(),
             )),
         );
         let diagnostics = context.diagnostic_recorder();
+        {
+            let mut pass = context
+                .command_encoder()
+                .begin_render_pass(&RenderPassDescriptor {
+                    label: Some("post_sun_shafts_mask"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &mask.0.default_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: Operations::default(),
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+            let span = diagnostics.pass_span(&mut pass, "post_sun_shafts_mask");
+            pass.set_pipeline(mask_pipeline);
+            pass.set_bind_group(0, &mask_bind, &[]);
+            pass.draw(0..3, 0..1);
+            span.end(&mut pass);
+        }
         let mut pass = context
             .command_encoder()
             .begin_render_pass(&RenderPassDescriptor {

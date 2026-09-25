@@ -54,14 +54,18 @@ fn hash_cell(p: vec2<i32>, salt: u32) -> f32 {
 
 // Value noise with the quintic fade: the cubic's second-derivative seam shows as square plateaus
 // on a slowly drifting sky (the WarcraftXL note).
-fn value_noise_plane(p: vec2<f32>, salt: u32) -> f32 {
+// MONKEY (polish): the lattice repeats every `period` cells, so a shift by `period` is no change.
+fn value_noise_plane(p: vec2<f32>, salt: u32, period: i32) -> f32 {
     let i = vec2<i32>(floor(p));
     let f = fract(p);
     let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    let a = hash_cell(i, salt);
-    let b = hash_cell(i + vec2<i32>(1, 0), salt);
-    let c = hash_cell(i + vec2<i32>(0, 1), salt);
-    let d = hash_cell(i + vec2<i32>(1, 1), salt);
+    let per = vec2<i32>(period);
+    let lo = ((i % per) + per) % per;
+    let hi = (lo + vec2<i32>(1)) % per;
+    let a = hash_cell(lo, salt);
+    let b = hash_cell(vec2<i32>(hi.x, lo.y), salt);
+    let c = hash_cell(vec2<i32>(lo.x, hi.y), salt);
+    let d = hash_cell(hi, salt);
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
@@ -244,6 +248,15 @@ fn milky_way(dir: vec3<f32>, band: f32) -> vec3<f32> {
 
 // ---- S3: cloud detail -------------------------------------------------------------------------
 
+// MONKEY (polish): the detail field loops over the sky clock's wrap. It tiles every `CLOUD_TILE`
+// cells of the detail plane (octave o every `CLOUD_TILE << o` of its own lattice; the half-rate
+// warp every `CLOUD_TILE / 2`), and the drift covers whole tiles per wrap, so the field at
+// `SKY_WRAP` is the field at 0. One tile is 64 / 36 of the sheet, wider than the dome's UV.
+const CLOUD_TILE: i32 = 64;
+// Tiles of drift per wrap on u and v: 0.01111 and 0.00444 cells/s, WarcraftXL's 0.011 and 0.0043
+// rounded to whole tiles.
+const CLOUD_DRIFT_TILES: vec2<f32> = vec2<f32>(15.0, 6.0);
+
 // WarcraftXL's billow blend: fold each octave toward rounded puffs by `cotton` (0.6).
 fn billow(v: f32) -> f32 {
     return v + (1.0 - abs(2.0 * v - 1.0) - v) * 0.6;
@@ -256,7 +269,7 @@ fn cloud_billow(p: vec2<f32>, octaves: i32) -> f32 {
     var tot = 0.0;
     var q = p;
     for (var o = 0; o < octaves; o++) {
-        s += a * billow(value_noise_plane(q, u32(o) * 57u));
+        s += a * billow(value_noise_plane(q, u32(o) * 57u, CLOUD_TILE << u32(o)));
         tot += a;
         a *= 0.55;
         q = q * 2.0 + vec2<f32>(3.7, 1.9);
@@ -267,8 +280,14 @@ fn cloud_billow(p: vec2<f32>, octaves: i32) -> f32 {
 // The detail field in [0, 1] on the sheet: a broad warp twists the domain before the billowed fbm
 // is read, which turns thresholded blobs into cauliflower edges.
 fn cloud_detail(uv: vec2<f32>, t: f32, octaves: i32) -> f32 {
-    let p = uv * 36.0 + vec2<f32>(0.011, 0.0043) * t;
-    let w = vec2<f32>(value_noise_plane(p * 0.5, 173u), value_noise_plane(p * 0.5 + 5.3, 219u)) - 0.5;
+    // The drift modulo one tile: seamless at the wrap, and small enough to keep f32 precision.
+    let drift = fract(CLOUD_DRIFT_TILES * (t / SKY_WRAP)) * f32(CLOUD_TILE);
+    let p = uv * 36.0 + drift;
+    let half_tile = CLOUD_TILE / 2;
+    let w = vec2<f32>(
+        value_noise_plane(p * 0.5, 173u, half_tile),
+        value_noise_plane(p * 0.5 + 5.3, 219u, half_tile),
+    ) - 0.5;
     return cloud_billow(p + w * 2.6, octaves);
 }
 
