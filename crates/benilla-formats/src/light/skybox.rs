@@ -94,6 +94,19 @@ pub(super) fn load_skyboxes(chain: &mut Chain, file: &str) -> Result<HashMap<u32
     Ok(m)
 }
 
+/// MONKEY (reviewfix): build the deterministic reverse index used by WMO and ghost path lookups.
+/// The lowest id wins when patched tables alias one model with multiple rows.
+pub(super) fn index_paths(skyboxes: &HashMap<u32, SkyboxDef>) -> HashMap<String, u32> {
+    let mut by_path = HashMap::with_capacity(skyboxes.len());
+    for (&id, def) in skyboxes {
+        by_path
+            .entry(def.path.to_ascii_lowercase())
+            .and_modify(|old: &mut u32| *old = (*old).min(id))
+            .or_insert(id);
+    }
+    by_path
+}
+
 /// The modern collector's step: dedupe by model with the larger alpha, then scale every other
 /// entry by `1 − alpha` (`addSkyBox` steps 1 and 4).
 pub(super) fn collect(list: &mut Vec<ZoneSkybox>, id: u32, alpha: f32) {
@@ -126,9 +139,10 @@ impl LightCatalog {
 
     /// The row whose model is `path`, for a MOSB skybox the table also names.
     pub fn skybox_def_by_path(&self, path: &str) -> Option<&SkyboxDef> {
-        self.skyboxes
-            .values()
-            .find(|d| d.path.eq_ignore_ascii_case(path))
+        let path = crate::models::model_path(path).to_ascii_lowercase();
+        self.skybox_by_path
+            .get(&path)
+            .and_then(|id| self.skyboxes.get(id))
     }
 
     /// The skybox the slot's param names; a weather slot without one falls back to the clear
@@ -232,6 +246,23 @@ mod tests {
         collect(&mut l, 1, 1.0);
         collect(&mut l, 2, 0.0);
         assert_eq!(l, vec![ZoneSkybox { id: 1, weight: 1.0 }]);
+    }
+
+    #[test]
+    fn duplicate_paths_resolve_to_the_lowest_id() {
+        let def = |path: &str| SkyboxDef {
+            path: path.into(),
+            flags: 0,
+            celestial: None,
+        };
+        let skyboxes = HashMap::from([
+            (17, def(r"environments\stars\shared.m2")),
+            (3, def(r"ENVIRONMENTS\STARS\SHARED.M2")),
+            (9, def(r"environments\stars\other.m2")),
+        ]);
+        let paths = index_paths(&skyboxes);
+        assert_eq!(paths.get(r"environments\stars\shared.m2"), Some(&3));
+        assert_eq!(paths.get(r"environments\stars\other.m2"), Some(&9));
     }
 
     /// The installed chain loads in either layout.

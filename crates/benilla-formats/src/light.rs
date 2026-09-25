@@ -181,6 +181,9 @@ pub struct LightCatalog {
     /// other rows are MOSB skyboxes. MONKEY (skybox): flags and the celestial model ride along
     /// ([`SkyboxDef`]), read from either table layout.
     skyboxes: HashMap<u32, SkyboxDef>,
+    /// MONKEY (reviewfix): normalised model path в†’ lowest matching `LightSkybox` id. Some patched
+    /// tables alias a model with different flags; path lookup must not depend on `HashMap` order.
+    skybox_by_path: HashMap<String, u32>,
 }
 
 fn light_schema() -> Schema {
@@ -328,6 +331,7 @@ impl LightCatalog {
         };
         // MONKEY (skybox): both layouts, keyed by the header's field count.
         let skyboxes = skybox::load_skyboxes(chain, LIGHT_SKYBOX)?;
+        let skybox_by_path = skybox::index_paths(&skyboxes);
         Ok(LightCatalog {
             lights,
             int_bands,
@@ -337,6 +341,7 @@ impl LightCatalog {
             light_params_water_alpha,
             light_params_skybox,
             skyboxes,
+            skybox_by_path,
         })
     }
 
