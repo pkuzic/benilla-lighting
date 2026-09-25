@@ -7,16 +7,19 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use benilla_dbc::{FieldType, Schema, SchemaField};
 
-use crate::dbc::{f32_at, parse, str_at, u32_at};
+use crate::dbc::{f32_at, parse, u32_at};
 use crate::Chain;
 
 mod atmosphere;
 // MONKEY (fog): `LightFogBand.dbc`, the modern fog fields.
 mod fog_band;
+// MONKEY (skybox): the extended LightSkybox layout and the zone skybox walk.
+mod skybox;
 mod tables;
 
 pub use atmosphere::Atmosphere;
 pub use fog_band::{FogBand, FogBandCatalog, FOG_BANDS_PER_PARAM};
+pub use skybox::{SkyboxDef, ZoneSkybox, SKYBOX_FOG_BLEND, SKYBOX_FULL_DAY, SKYBOX_KEEP_CELESTIAL};
 use atmosphere::{
     FB_CLOUD_DENSITY, FB_FOG_END, FB_FOG_START_MULT, IB_AMBIENT, IB_CLOUD_GBASE, IB_CLOUD_SLOPE,
     IB_CLOUD_SUN, IB_DIFFUSE, IB_FOG_COLOR, IB_OCEAN_DEEP, IB_OCEAN_SHALLOW, IB_RIVER_DEEP,
@@ -174,9 +177,10 @@ pub struct LightCatalog {
     /// `LightParams` id → `lightSkyboxID` ([`LP_SKYBOX`]), for its non-zero rows only.
     light_params_skybox: HashMap<u32, u32>,
     /// `LightSkybox.dbc` id → model chain path, spelled as a WMO MOSB skybox is so one model never
-    /// builds twice. Only id 3 (`DeathClouds.mdx`) is reachable from `LightParams`; the other five
-    /// rows are MOSB skyboxes.
-    skyboxes: HashMap<u32, String>,
+    /// builds twice. Stock 1.12 reaches only id 3 (`DeathClouds.mdx`) from `LightParams`; the
+    /// other rows are MOSB skyboxes. MONKEY (skybox): flags and the celestial model ride along
+    /// ([`SkyboxDef`]), read from either table layout.
+    skyboxes: HashMap<u32, SkyboxDef>,
 }
 
 fn light_schema() -> Schema {
@@ -322,22 +326,8 @@ impl LightCatalog {
             }
             (glow, highlight, water_alpha, skybox)
         };
-        let skyboxes = {
-            let bytes = chain
-                .read_file(LIGHT_SKYBOX)
-                .with_context(|| format!("reading {LIGHT_SKYBOX}"))?;
-            let mut schema = Schema::new("LightSkybox");
-            schema.add_field(SchemaField::new("ID", FieldType::UInt32));
-            schema.add_field(SchemaField::new("Name", FieldType::String));
-            let rs = parse(&bytes, schema, "LightSkybox")?;
-            let mut m = HashMap::with_capacity(rs.records().len());
-            for r in rs.records() {
-                if let (Some(id), Some(path)) = (u32_at(r, 0), str_at(&rs, r, 1)) {
-                    m.insert(id, crate::models::model_path(&path));
-                }
-            }
-            m
-        };
+        // MONKEY (skybox): both layouts, keyed by the header's field count.
+        let skyboxes = skybox::load_skyboxes(chain, LIGHT_SKYBOX)?;
         Ok(LightCatalog {
             lights,
             int_bands,
@@ -441,7 +431,7 @@ impl LightCatalog {
     pub fn ghost_skybox(&self, map: u32, pos: [f32; 3]) -> Option<&str> {
         let light = self.pick_light(map, pos)?;
         let id = self.light_params_skybox.get(&light.params[SLOT_DEATH])?;
-        self.skyboxes.get(id).map(String::as_str)
+        self.skyboxes.get(id).map(|d| d.path.as_str())
     }
 
     /// The reference's area-light blend: from the map's global light, lerp toward each local

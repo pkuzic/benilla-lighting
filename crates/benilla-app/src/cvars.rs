@@ -967,6 +967,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (ao): opt-in contact shadows; the High graphics preset value is 2.
     ours("ambientOcclusion", "0", "benilla's own: screen-space ambient occlusion, 0 Off / 1 Low / 2 High"),
+    // MONKEY (skybox): the living player's zone skybox from `LightParams`; High sets 1.
+    ours(
+        "zoneSkyboxes",
+        "0",
+        "benilla's own: draw the zone skybox LightParams names for the living, 0 Off / 1 On; the          reference draws a DBC skybox only for the ghost",
+    ),
     ours(
         "waterQuality",
         "1",

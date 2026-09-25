@@ -59,8 +59,14 @@ struct ModelParams {
     // Rows of `wow_light.matanim`, 0 = identity: x = UV scroll, y = tint, z = texture-transform
     // affine, w = the UI tile's cell clip.
     anim_slots: vec4<f32>,
+    // MONKEY (skybox): stage 1 of a two-texture batch: x = 0 none / 1 Mod / 2 Mod2x, z/w = the
+    // matanim rows of its translation and affine.
+    stage1: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
+// MONKEY (skybox): stage 1's texture, the fallback image off `WOW_STAGE1`.
+@group(#{MATERIAL_BIND_GROUP}) @binding(94) var stage1_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(95) var stage1_sampler: sampler;
 
 // A fully covered character shadow retains 45% of the authored model lighting.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
@@ -1320,6 +1326,22 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         base_color.a = base_color.a * ramp;
     }
 
+    // MONKEY (skybox): stage 1 multiplies in on UV set B, moved by its own texture transform
+    // (the stage-0 law above): colour ×1 (Mod) or ×2 (Mod2x), alpha ×1.
+#ifdef WOW_STAGE1
+#ifdef VERTEX_UVS_B
+    {
+        let t1 = wow_light.matanim[u32(m.stage1.z)];
+        let a1 = wow_light.matanim[u32(m.stage1.w)];
+        let d1 = (in.uv_b + t1.xy - vec2<f32>(0.5, 0.5)) * vec2<f32>(1.0 + a1.z, 1.0 + a1.w);
+        let c1 = 1.0 + a1.x;
+        let uv1 = vec2<f32>(0.5 + d1.x * c1 - d1.y * a1.y, 0.5 + d1.x * a1.y + d1.y * c1);
+        let s1 = textureSampleBias(stage1_texture, stage1_sampler, uv1, view.mip_bias);
+        let k1 = select(1.0, 2.0, m.stage1.x > 1.5);
+        base_color = vec4<f32>(base_color.rgb * s1.rgb * k1, base_color.a * s1.a);
+    }
+#endif
+#endif
     // The MeshTag (mesh_tag.rs): bit 31 = highlight, bit 30 = interior fog; payload bits 0-5 = the
     // fade alpha (a zero payload is untagged, opaque), 19-29 = the rig slot, 6-13 = the ground
     // shade (0 lit, 255 MCSH-shadowed) or, on an interior-prop material, 6-18 = the SH-probe slot.

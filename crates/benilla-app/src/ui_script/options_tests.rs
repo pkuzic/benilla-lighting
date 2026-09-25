@@ -2164,8 +2164,8 @@ fn water_quality_writes_numeric_tiers_with_localised_labels() {
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
         // MONKEY (volumetric fog): account for the atmosphere row after water.
-        // MONKEY (integration): all programme rows (sky, post, dither, fog, wet, wind, ao, lamp fog, window split) counted.
-        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 30);
+        // MONKEY (integration): all programme rows (sky, post, dither, fog, wet, wind, ao, lamp fog, window split, zone skyboxes) counted.
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 31);
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[21]").unwrap(), "RowLavaGlow");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
@@ -3106,6 +3106,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ("BENILLA_TOOLTIP_LAMP_FOG", "AdvancedGraphicsRowLampFog"),
             // MONKEY (integration): the daylight window split row.
             ("BENILLA_TOOLTIP_DAYLIGHT_WINDOW_SPLIT", "AdvancedGraphicsRowDaylightWindowSplit"),
+            // MONKEY (skybox): the zone skybox row.
+            ("BENILLA_TOOLTIP_ZONE_SKYBOXES", "AdvancedGraphicsRowZoneSkyboxes"),
             ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
             ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),

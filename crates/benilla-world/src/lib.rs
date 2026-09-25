@@ -148,6 +148,8 @@ pub mod sky;
 pub mod sky_fx;
 pub mod sky_order;
 pub mod skybox;
+// MONKEY (skybox): the skybox rig and material loops.
+mod skybox_anim;
 pub mod static_gx;
 pub mod static_merge;
 pub mod straddle;

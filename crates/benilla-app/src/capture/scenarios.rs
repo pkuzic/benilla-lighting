@@ -1703,6 +1703,82 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: None,
     },
+    // MONKEY (skybox): zone skyboxes (run with `WOW_ZONE_SKYBOXES=1`) and the two stock skybox
+    // lanes. Karazahn40 (Turtle map 814) is the one stock sphere naming a clear-slot skybox
+    // (Light 553, HellfireSkyBox); the zone shots need the sky patch.
+    // The stock MOSB lane: Stratholme_B's groups flagged 0x40000, weight = the interior crossfade.
+    Scenario {
+        name: "skybox-stratholme-noon",
+        map: Some(329),
+        eye: SKYBOX_STRAT_EYE,
+        look: SKYBOX_STRAT_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-karazhan-noon",
+        map: Some(814),
+        eye: SKYBOX_KZ_EYE,
+        look: SKYBOX_KZ_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-karazhan-night",
+        map: Some(814),
+        eye: SKYBOX_KZ_EYE,
+        look: SKYBOX_KZ_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-steppes-noon",
+        map: Some(MAP_AZEROTH),
+        eye: SKYBOX_STEPPES_EYE,
+        look: SKYBOX_STEPPES_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-steppes-night",
+        map: Some(MAP_AZEROTH),
+        eye: SKYBOX_STEPPES_EYE,
+        look: SKYBOX_STEPPES_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-blasted-noon",
+        map: Some(MAP_AZEROTH),
+        eye: SKYBOX_BLASTED_EYE,
+        look: SKYBOX_BLASTED_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-blasted-night",
+        map: Some(MAP_AZEROTH),
+        eye: SKYBOX_BLASTED_EYE,
+        look: SKYBOX_BLASTED_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-hyjal-noon",
+        map: Some(MAP_KALIMDOR),
+        eye: SKYBOX_HYJAL_EYE,
+        look: SKYBOX_HYJAL_LOOK,
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "skybox-hyjal-night",
+        map: Some(MAP_KALIMDOR),
+        eye: SKYBOX_HYJAL_EYE,
+        look: SKYBOX_HYJAL_LOOK,
+        minute: 0,
+        ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking
@@ -1822,6 +1898,19 @@ fn scenario_declares_ui() -> bool {
 pub(crate) fn ui_opted_in() -> bool {
     std::env::var("WOW_CAPTURE_UI").as_deref() == Ok("1") || scenario_declares_ui()
 }
+
+// MONKEY (skybox): the skybox shots, eye just above the ground at a sphere's centre, pitched up so
+// the upper frame is sky.
+const SKYBOX_STRAT_EYE: [f32; 3] = [3450.0, -3380.0, 150.0];
+const SKYBOX_STRAT_LOOK: [f32; 3] = [3600.0, -3300.0, 200.0];
+const SKYBOX_KZ_EYE: [f32; 3] = [-6474.0, -2912.0, 40.0];
+const SKYBOX_KZ_LOOK: [f32; 3] = [-6300.0, -2800.0, 95.0];
+const SKYBOX_STEPPES_EYE: [f32; 3] = [-7979.0, -2571.0, 260.0];
+const SKYBOX_STEPPES_LOOK: [f32; 3] = [-7800.0, -2450.0, 320.0];
+const SKYBOX_BLASTED_EYE: [f32; 3] = [-11300.0, -3073.0, 30.0];
+const SKYBOX_BLASTED_LOOK: [f32; 3] = [-11120.0, -2960.0, 90.0];
+const SKYBOX_HYJAL_EYE: [f32; 3] = [4637.0, -4461.0, 1130.0];
+const SKYBOX_HYJAL_LOOK: [f32; 3] = [4800.0, -4350.0, 1230.0];
 
 #[cfg(test)]
 mod ui_opt_in_tests {

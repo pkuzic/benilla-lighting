@@ -83,6 +83,8 @@ mod post;
 mod sky_quality;
 // MONKEY (ao): optional screen-space ambient occlusion plugin.
 mod ssao;
+// MONKEY (skybox): the zoneSkyboxes cvar bridge.
+mod zone_skybox;
 mod entities;
 mod fishing_line;
 mod footprints;
