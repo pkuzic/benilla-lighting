@@ -59,3 +59,36 @@ fn grass_offset(
     }
     return vec3<f32>(xz.x, 0.0, xz.y);
 }
+
+// MONKEY (wind): our tree/bush design (WarcraftXL has no tree wind). Only leaf-card batches call
+// this: a low-frequency crown sway, small leaf flutter, stable anchor phase and distance fade.
+fn tree_offset(
+    world: vec3<f32>,
+    anchor: vec3<f32>,
+    camera: vec3<f32>,
+    frame: MonkeyFrame,
+) -> vec3<f32> {
+    if (frame.wind1.w <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let h = max(world.y - anchor.y, 0.0);
+    // A one-yard bush still needs a crown; tree leaf cards generally begin above this range and
+    // therefore reach full weight, while the first 0.15 yd remains a planted base.
+    let crown = smoothstep(0.15, 1.5, h);
+    let weight = crown * crown;
+    let dir = normalize(frame.wind0.xy + vec2<f32>(1.0e-6, 0.0));
+    let cross = vec2<f32>(-dir.y, dir.x);
+    let phase = fract(sin(dot(anchor.xz, vec2<f32>(0.173, 0.317))) * 43758.5453) * WIND_TAU;
+    let travel = frame.wind0.z * 0.08 * frame.wind1.x;
+    let slow = sin(dot(dir, world.xz) * (WIND_TAU / 34.0) - travel + phase);
+    let side = sin(dot(cross, world.xz) * (WIND_TAU / 21.0) - travel * 0.61 + phase * 1.7);
+    let flutter = sin(frame.wind1.x * 2.3 + dot(world.xz, vec2<f32>(1.7, 2.1)) + phase * 2.0);
+    let gust = 0.75 + frame.wind0.w * 0.5;
+    let fade = 1.0 / (1.0 + distance(camera, world) * 0.006);
+    let xz = (
+        dir * (0.045 + slow * 0.055)
+        + cross * side * 0.025
+        + dir * flutter * 0.012
+    ) * weight * gust * fade * frame.wind1.y * frame.wind1.w;
+    return vec3<f32>(xz.x, 0.0, xz.y);
+}

@@ -1091,6 +1091,15 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
         );
     }
 #endif
+    // MONKEY (wind): a retained tree inside its fade band renders here. StaticGx marks only its
+    // alpha-tested leaf batches in MeshTag bit 18; use the same anchor/field maths to avoid a pop.
+    let wind_tag = mesh_functions::get_tag(vertex.instance_index);
+    if ((wind_tag & 262144u) != 0u && m.clutter_fade.w <= 0.5) {
+        let world = p_cam + view.world_position;
+        p_cam += wind_hook::tree_offset(
+            world, frame_origin, view.world_position, wow_light.monkey
+        );
+    }
     out.world_position = vec4<f32>(p_cam + view.world_position, 1.0);
     let view_rot = mat3x3<f32>(
         view.view_from_world[0].xyz,

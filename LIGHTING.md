@@ -25,6 +25,7 @@ behind each constant.
 | Ground-effect spells | Flamestrike, Rain of Fire, Consecration, Flare and fire traps light the ground for their duration; frost and nature areas stay dark | `spellLightGain` |
 | Volumetric fog | near-field haze that converges on the zone fog colour (clear within 10 yd, full by 150 yd; mistier at dawn and in bad weather, faint indoors) and sun/moon light shafts through gaps, sampled from the shadow map; own fullscreen pass after the main pass (`benilla-app/src/volumetric_fog.rs`) | Advanced Graphics → Volumetric Fog (Off/Low/High), cvar `volumetricFog`, env `WOW_VOLFOG=0\|1\|2` |
 | Sky dithering | a faint screen-space dither in the FFXGlow combine so smooth sky and fog gradients do not band (MONKEY p0; was env-only) | Advanced Graphics → Sky Dithering, cvar `skyDither` 0/1 (default 0, Graphics preset High = 1), env `WOW_DITHER=1` still forces it on; bridge in `benilla-app/src/monkey_gfx.rs` |
+| Foliage wind | one weather-fed gust/veer field drives grass and classified tree/bush foliage; grass also parts around the player and nearby units | Advanced Graphics → Foliage Wind, cvar `foliageWind` 0 Off / 1 Grass / 2 Grass + Trees (High = 2), capture override `WOW_FOLIAGE_WIND`; field and benders in `benilla-world/src/wind/` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
 Players reach all of it from **Options -> Advanced Graphics** (a Lighting Quality preset Off / Low / Medium / High plus the individual rows; Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
@@ -52,6 +53,9 @@ is its own module, documented in `WATER.md`.
   `character_shadow.rs`, `world_shadow.rs`, `blob_shadow.rs`, `entities/carried_light.rs`,
   `entities/spell_fx/lifecycle.rs`, `dynamic_interior.rs`, `debug_panel/lighting_controls.rs`, and
   the cvars in `cvars.rs` / `video.rs`.
+- **Wind**: `wind/mod.rs` resolves the WXL-derived shared field and nearest-unit benders;
+  `clutter.rs` authors blade weights/phases; `static_gx` classifies and marks alpha-tested leaf
+  batches. `wind_hook.wgsl` owns the displacement shared by clutter, retained trees and fade twins.
 - **Tools**: `benilla-extract <Data> wmolights <wmo> [--verts <group>]`, `wmolamps`, `m2firescan`
   print the inputs the system works from (groups, batch classes, portals, claims, flame emitters).
 
@@ -80,6 +84,8 @@ is its own module, documented in `WATER.md`.
   (`benilla-world/src/lighting/monkey_frame.rs`); `global_light::pack_monkey_frame` packs it after
   the point table and fills `time_of_day` / `night` itself. All zero = no visual change.
 - World lights use upstream's `WorldPointLight`, never Bevy's `PointLight`.
+- Foliage wind is vertex-only. Tree and leaf shadow meshes stay static; the small mismatch is the
+  accepted first-stage cost/complexity tradeoff.
 - WGSL only fails at pipeline creation, so a shader edit is verified by running a world scene, not
   by `cargo check`.
 - Exterior point lights are selected per draw unit (12 slots, ranked against the chunk's box); the
