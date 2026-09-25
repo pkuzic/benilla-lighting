@@ -113,6 +113,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             sky_fx::srgb_to_linear(sky.sky0.rgb),
         );
         var lin = sky_fx::smooth_gradient(elev, stops);
+        // MONKEY (fix-sky): the Modern fog horizon goes into the gradient, in linear light, BEFORE
+        // the glow and stars, so the fog wall meets the dome without a seam and the sunset halo is
+        // not erased at 0° (the Classic tail below applies it to `col` instead).
+        if (fog_hook::fog_is_modern(sky.mf_fog_d)) {
+            let far = fog_hook::fog_modern_colour(
+                sky.fog.rgb, dir, 1.0e9, sky.mf_fog_b, sky.mf_fog_c, sky.mf_fog_d,
+            );
+            let w = 1.0 - smoothstep(0.0, 0.26179939, asin(clamp(dir.y, -1.0, 1.0)));
+            lin = mix(lin, sky_fx::srgb_to_linear(far), w);
+        }
         // Sun glow: a halo tinted by the sun and fog colours, faded at night and under cloud on the
         // CPU; below the horizon it thins out over the fog band.
         if (sky.fx.w > 0.0) {
@@ -133,13 +143,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             lin += (stars * 0.85 + milky) * night;
         }
         let out = sky_fx::linear_to_srgb(lin) + vec3<f32>(sky_fx::dither_tri(in.position.xy));
-        col = clamp(out, vec3<f32>(0.0), vec3<f32>(1.0));
+        // The horizon is already in: skip the Classic-path tail.
+        return vec4<f32>(clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
     }
 #endif
 
     // Raw gamma out: the reference draws the sky as raw DBC bytes, sRGB off (`0x6d4940`).
-    // MONKEY (fog): Modern eases the low band into the world's far fog colour after either the
-    // Classic or Enhanced/High gradient path; Classic returns `col` unchanged.
+    // MONKEY (fog): Modern eases the low band into the world's far fog colour after the Classic
+    // gradient (Enhanced/High mixes it in above); Classic fog returns `col` unchanged.
     let rgb = fog_hook::fog_sky_horizon(
         col, sky.fog.rgb, dir, sky.mf_fog_b, sky.mf_fog_c, sky.mf_fog_d,
     );
