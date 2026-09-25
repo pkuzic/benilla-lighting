@@ -1806,6 +1806,64 @@ impl Cvars {
         moved
     }
 
+    /// MONKEY (followups): **re-apply the saved presets to rows the file does not carry.** A saved
+    /// rung name implies every governed row matched it when the file was written (the label is
+    /// re-derived every frame), and a row at its registered default is not saved. So a governed
+    /// row ABSENT from the file is one that was registered after the save (or held a rung value
+    /// equal to its default): it takes the saved rung's value, not its own registered default.
+    /// Rows the file carries and session-owned rows are never touched; `Custom` (or no saved
+    /// name) writes nothing. The lighting rung is the file's own `lightingQuality`, or else the
+    /// saved Graphics rung's. Returns how many rows moved.
+    pub(crate) fn reapply_saved_presets(&mut self) -> usize {
+        let carried = |cvars: &Self, k: &str| {
+            cvars.file.keys().any(|f| f.eq_ignore_ascii_case(k)) || cvars.is_session_owned(k)
+        };
+        let saved = |cvars: &Self, k: &str| {
+            if cvars.is_session_owned(k) {
+                return None;
+            }
+            cvars
+                .file
+                .iter()
+                .find(|(f, _)| f.eq_ignore_ascii_case(k))
+                .map(|(_, v)| v.clone())
+        };
+        let mut moved = 0;
+        let col = saved(self, "graphicsQuality").and_then(|v| graphics_column(v.trim()));
+        if let Some(col) = col {
+            for (k, values) in GRAPHICS_PRESETS {
+                if k.eq_ignore_ascii_case("lightingQuality") || carried(self, k) {
+                    continue;
+                }
+                if self.set(k, values[col]) == SetOutcome::Changed {
+                    moved += 1;
+                }
+            }
+        }
+        let lighting = saved(self, "lightingQuality").or_else(|| {
+            let col = col?;
+            GRAPHICS_PRESETS
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("lightingQuality"))
+                .map(|(_, values)| values[col].to_string())
+        });
+        let members = lighting.and_then(|name| {
+            LIGHTING_PRESETS
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name.trim()))
+                .map(|(_, members)| *members)
+        });
+        for (k, v) in members.unwrap_or(&[]) {
+            if carried(self, k) {
+                continue;
+            }
+            if self.set(k, v) == SetOutcome::Changed {
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// **The table follows a value the engine already applied** — a mirror, not a write: the
     /// applied value moves, the config dirties, the VM's mirror learns it, and **no observer
     /// fires**, because the knob is already there. For a second registered spelling of one knob
@@ -2501,7 +2559,11 @@ fn load_config(world: &mut World) {
                 // the file.
                 warn!("{msg}");
             }
-            StoredConfig::Table(table) => cvars.load_file(table),
+            StoredConfig::Table(table) => {
+                cvars.load_file(table);
+                // MONKEY (followups): rows registered after the save follow the saved preset.
+                cvars.reapply_saved_presets();
+            }
         }
         // MONKEY (presets): a player's own run (never a capture, never a malformed file) boots
         // into the default Graphics Preset over whatever its file leaves unsaid.
@@ -3550,6 +3612,105 @@ mod tests {
         assert_eq!(again.seed_graphics_preset(), 0);
         lighting_quality(&mut again);
         assert_eq!(again.get("graphicsQuality"), Some("High"));
+    }
+
+    /// MONKEY (followups): a saved Graphics rung fills the governed rows the file lacks (a row
+    /// registered after the save) with the rung's value; rows the file carries stay; Custom and
+    /// no saved name write nothing.
+    #[test]
+    fn a_saved_graphics_preset_fills_rows_missing_from_the_file() {
+        // An Ultra save made before `ambientOcclusion` / `lampFog` existed.
+        let file = BTreeMap::from([
+            ("graphicsQuality".to_string(), "Ultra".to_string()),
+            ("lightingQuality".to_string(), "Ultra".to_string()),
+            ("farclip".to_string(), "1497".to_string()),
+            ("zoneSkyboxes".to_string(), "0".to_string()), // the player's own later edit
+        ]);
+        let mut cvars = fresh_registry();
+        cvars.load_file(file);
+        assert!(cvars.reapply_saved_presets() > 0);
+        assert_eq!(cvars.get("ambientOcclusion"), Some("2"));
+        assert_eq!(cvars.get("lampFog"), Some("2"));
+        assert_eq!(cvars.get("farclip"), Some("1497"));
+        assert_eq!(cvars.get("zoneSkyboxes"), Some("0"), "a saved row stays");
+        // The lighting members follow Ultra too.
+        assert_eq!(cvars.get("shadowMapSize"), Some("4096"));
+        assert_eq!(cvars.get("volumetricFog"), Some("2"));
+
+        // Medium without a saved lighting rung: the Graphics rung's lighting rung applies.
+        let mut medium = fresh_registry();
+        medium.load_file(BTreeMap::from([(
+            "graphicsQuality".to_string(),
+            "Medium".to_string(),
+        )]));
+        medium.reapply_saved_presets();
+        assert_eq!(medium.get("ambientOcclusion"), Some("1"));
+        assert_eq!(medium.get("farclip"), Some("477"));
+        lighting_quality(&mut medium);
+        assert_eq!(medium.get("lightingQuality"), Some("Medium"));
+        assert_eq!(medium.get("graphicsQuality"), Some("Medium"));
+
+        // Custom writes nothing; neither does a file with no preset name.
+        for file in [
+            BTreeMap::from([("graphicsQuality".to_string(), LIGHTING_CUSTOM.to_string())]),
+            BTreeMap::from([("skyQuality".to_string(), "1".to_string())]),
+        ] {
+            let mut custom = fresh_registry();
+            custom.load_file(file);
+            assert_eq!(custom.reapply_saved_presets(), 0);
+            assert_eq!(
+                custom.get("ambientOcclusion"),
+                custom.default_of("ambientOcclusion")
+            );
+        }
+
+        // A session-owned row is left to the session.
+        let mut owned = fresh_registry();
+        owned.own_for_session("farclip", Some("500"));
+        owned.load_file(BTreeMap::from([(
+            "graphicsQuality".to_string(),
+            "Ultra".to_string(),
+        )]));
+        owned.reapply_saved_presets();
+        assert_eq!(owned.get("farclip"), Some("500"));
+        assert_eq!(owned.get("ambientOcclusion"), Some("2"));
+    }
+
+    /// MONKEY (followups): a saved Lighting Quality rung fills the lighting members the file
+    /// lacks; members the file carries stay; Custom writes nothing.
+    #[test]
+    fn a_saved_lighting_preset_fills_members_missing_from_the_file() {
+        let mut cvars = fresh_registry();
+        cvars.load_file(BTreeMap::from([
+            ("lightingQuality".to_string(), "Ultra".to_string()),
+            ("volumetricFog".to_string(), "1".to_string()),
+        ]));
+        assert!(cvars.reapply_saved_presets() > 0);
+        assert_eq!(cvars.get("shadowMapSize"), Some("4096"));
+        assert_eq!(cvars.get("interiorShadowCasters"), Some("16"));
+        assert_eq!(cvars.get("volumetricFog"), Some("1"), "a saved member stays");
+        // No Graphics rung saved: the graphics rows keep their defaults.
+        assert_eq!(
+            cvars.get("ambientOcclusion"),
+            cvars.default_of("ambientOcclusion")
+        );
+
+        let mut off = fresh_registry();
+        off.load_file(BTreeMap::from([(
+            "lightingQuality".to_string(),
+            "Off".to_string(),
+        )]));
+        off.reapply_saved_presets();
+        assert_eq!(off.get("worldShadows"), Some("0"));
+        lighting_quality(&mut off);
+        assert_eq!(off.get("lightingQuality"), Some("Off"));
+
+        let mut custom = fresh_registry();
+        custom.load_file(BTreeMap::from([(
+            "lightingQuality".to_string(),
+            LIGHTING_CUSTOM.to_string(),
+        )]));
+        assert_eq!(custom.reapply_saved_presets(), 0);
     }
 
     /// The seed never overrides the player: a saved preset stops it outright, a saved row keeps
