@@ -1379,6 +1379,41 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // MONKEY (sky): the sky lane's fixtures. Dusk looks from the Goldshire lake toward the low sun
+    // (az 45°, elev ≈5° at 20:00); night looks away from the moon at 01:00 (stars at full curve);
+    // zenith is the high dome at night. Overcast is `sky-overcast` under `WOW_WEATHER=rain,0.6`.
+    Scenario {
+        name: "sky-elwynn-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: WATER_EYE,
+        look: [-9315.0, -98.6, 102.3],
+        minute: 1200,
+        ui: None,
+    },
+    Scenario {
+        name: "sky-elwynn-night",
+        map: Some(MAP_AZEROTH),
+        eye: WATER_EYE,
+        look: [-9739.0, -522.6, 210.8],
+        minute: 60,
+        ui: None,
+    },
+    Scenario {
+        name: "sky-zenith-night",
+        map: Some(MAP_AZEROTH),
+        eye: SKY_EYE,
+        look: [-9050.7, -230.7, 387.0],
+        minute: 60,
+        ui: None,
+    },
+    Scenario {
+        name: "sky-overcast",
+        map: Some(MAP_AZEROTH),
+        eye: SKY_EYE,
+        look: [-8797.0, 23.0, 264.0],
+        minute: 1000,
+        ui: None,
+    },
 ];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing
