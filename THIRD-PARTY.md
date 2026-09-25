@@ -30,9 +30,12 @@ where they stand. Do not remove either.
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (HIGH reflections) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl` | Screen-space reflection of the scene copy along an almost-planar normal, masked by the screen edge and by rays turning back toward the eye (principle; ours is a bisected march against the scene depth, not a single probe) |
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (beach surf, `on_bed`) | `wxl-experimental-water` | `sea/Shore.hpp`, `shaders/Shore.hlsli` | Shore surf limited by the terrain column, so objects standing in the water never foam (principle) |
 | `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
+| `crates/benilla-world/src/wind/mod.rs` | `wxl-experimental-wind` | `field/Wind.hpp`, `field/Wind.cpp` | Stateless three-sine gust and veer field, default profile, and weather gain (ported) |
+| `crates/benilla-assets/src/shaders/wind_hook.wgsl` | `wxl-experimental-wind` | `grass/GrassWind.hpp`, `grass/GrassWind.cpp` | Two-wave grass sway, gust response, lean, blade phase/variance, distance fade and radial parting (ported; extended to eight benders) |
+| `crates/benilla-assets/src/shaders/wow_model.wgsl` (MONKEY wind hook) | `wxl-experimental-wind` | `grass/GrassWind.cpp` | Grass vertex displacement call seam (technique) |
+| `crates/benilla-world/src/clutter.rs` (MONKEY wind attributes) | `wxl-experimental-wind` | `grass/GrassWind.cpp` | Per-blade bend weight and per-tuft phase inputs (technique; height replaces WXL's unverified texture-V weight) |
 
 Planned (not yet in the tree): Gerstner trains, breaker index and crest-fold foam from
-`sea/Spectrum.*`, `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
-(`field/Wind.*`, `grass/GrassWind.*`); colour grading from `wxl-retail-grading`
+`sea/Spectrum.*`, `sea/Shore.hpp`, `shaders/Wave.hlsli`; colour grading from `wxl-retail-grading`
 (`Grading.*`, `shaders/Grading.ps.hlsl`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
 The lane that ports one adds its row here.

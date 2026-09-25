@@ -9,6 +9,7 @@ use bevy::prelude::*;
 
 use crate::lighting::MonkeyFrame;
 use crate::weather::{storm_blend, WeatherState, WeatherTick};
+use crate::world_unit::{ViewerUnit, WorldUnit};
 
 const TAU: f64 = std::f64::consts::TAU;
 const RATIOS: [f64; 3] = [1.0, 0.437, 0.1913];
@@ -151,6 +152,57 @@ fn update_wind(
     frame.tree_strength = if quality.0 >= 2 { 1.0 } else { 0.0 };
 }
 
+/// MONKEY (wind): player first, then the seven nearest streamed units in the 40-yard bubble.
+/// MonkeyFrame stores Bevy world coordinates and a per-body 1.5–2 yard radius.
+fn update_benders(
+    quality: Res<FoliageWind>,
+    viewer: Res<crate::view::Viewer>,
+    viewer_unit: Query<&Transform, (With<ViewerUnit>, With<WorldUnit>)>,
+    units: Query<(&Transform, &WorldUnit), Without<ViewerUnit>>,
+    mut frame: ResMut<MonkeyFrame>,
+) {
+    frame.bender_count = 0;
+    if quality.0 == 0 {
+        return;
+    }
+    // Capture/world-viewer fixtures have no live Player resource, but can still publish a real
+    // ViewerUnit. In play `Viewer::at` remains authoritative; the entity transform is only the
+    // no-avatar fallback that lets the parting instrument exercise the same receiver.
+    let Some(player) = viewer
+        .at
+        .or_else(|| viewer_unit.single().ok().map(|t| t.translation))
+    else {
+        return;
+    };
+
+    frame.benders[0] = [player.x, player.y, player.z, 1.75];
+    frame.bender_count = 1;
+    // Fixed insertion list: this is a per-frame scan, so do not allocate and sort a Vec of every
+    // unit just to retain seven entries.
+    let mut nearby = [(f32::INFINITY, Vec3::ZERO, 1.5); 7];
+    for (transform, unit) in &units {
+        let at = transform.translation;
+        let d2 = (at.xz() - player.xz()).length_squared();
+        if d2 > 40.0 * 40.0 || d2 >= nearby[6].0 {
+            continue;
+        }
+        let mut slot = 6;
+        while slot > 0 && d2 < nearby[slot - 1].0 {
+            nearby[slot] = nearby[slot - 1];
+            slot -= 1;
+        }
+        nearby[slot] = (d2, at, (1.5 * unit.scale).clamp(1.5, 2.0));
+    }
+    for (slot, (_, at, radius)) in nearby
+        .into_iter()
+        .take_while(|(d2, _, _)| d2.is_finite())
+        .enumerate()
+    {
+        frame.benders[slot + 1] = [at.x, at.y, at.z, radius];
+        frame.bender_count += 1;
+    }
+}
+
 /// Installs the shared field after this frame's weather ramp has resolved.
 pub struct WindPlugin;
 
@@ -158,7 +210,7 @@ impl Plugin for WindPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<WindField>()
             .init_resource::<FoliageWind>()
-            .add_systems(Update, update_wind.after(WeatherTick));
+            .add_systems(Update, (update_wind, update_benders).after(WeatherTick));
     }
 }
 
