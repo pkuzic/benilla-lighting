@@ -1,7 +1,7 @@
 //! MONKEY (post): zone/day-night colour grading through a real 32³ GPU texture.
 //!
-//! Ported from WarcraftXL's `wxl-retail-grading` (Copyright (C) 2026 WarcraftXL, GPL-3.0-or-later).
-//! Its 1024×32 BLP strip/two-bilinear-tap cube lookup becomes the equivalent hardware-trilinear
+//! Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-grading, Grading.cpp, shaders/Grading.ps.hlsl.
+//! Used with the author's permission; attribution required. Its 1024×32 BLP strip/two-bilinear-tap cube lookup becomes the equivalent hardware-trilinear
 //! lookup after upload to a 3D texture. See `THIRD-PARTY.md`.
 
 use super::bloom::BloomLabel;

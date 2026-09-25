@@ -1,5 +1,5 @@
-// Colour grading ported from WarcraftXL wxl-retail-grading.
-// Copyright (C) 2026 WarcraftXL. GPL-3.0-or-later; see THIRD-PARTY.md.
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-grading, Grading.cpp, shaders/Grading.ps.hlsl.
+// Used with the author's permission; attribution required. See THIRD-PARTY.md.
 // MONKEY (post): real 32³ textures make the original 1024x32 strip's two bilinear taps plus
 // lerp(fract(b*31)) one hardware-trilinear lookup, for both the day and night cubes.
 

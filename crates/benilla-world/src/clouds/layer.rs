@@ -2,6 +2,9 @@
 //! `0x58ac70` upload): a 12-ring cap from the pole to the 45° rim, faded at the rim, drawn last in
 //! the sky pass so clouds blend over a setting sun. [`crate::sky_order::CLOUDS_BIAS`] holds that
 //! place; the shared far-depth pin puts it behind all terrain.
+//!
+//! The sun march feed (`update_cloud_fx`):
+//! Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-clouds, Clouds.cpp.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::Projection;
