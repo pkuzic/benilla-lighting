@@ -98,7 +98,12 @@ fn ao_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let pu = neighbour(f - vec2(0, 1), p);
     let dx = select(p - pl, pr - p, abs(pr.z - p.z) < abs(p.z - pl.z));
     let dy = select(p - pu, pd - p, abs(pd.z - p.z) < abs(p.z - pu.z));
-    var n = normalize(cross(dx, dy));
+    // MONKEY (reviewfix-a): sky on both sides of an axis makes the two steps parallel (a 1-px pole
+    // or rope against the sky); normalize(0) would be NaN and bloom would spread it. No AO there.
+    let c = cross(dx, dy);
+    let l2 = dot(c, c);
+    if (l2 < 1e-12) { return vec4(0.0, dist, protect, 1.0); }
+    var n = c * inverseSqrt(l2);
     if (dot(n, p) > 0.0) { n = -n; }
     // MONKEY (followups): cutout leaves scatter depth spikes through a canopy, and there the taps
     // are noise. The spike is the smaller of the two one-sided steps two pixels out, capped by the
