@@ -137,7 +137,10 @@ impl Plugin for SkyPlugin {
                 (
                     // Reads the resolved atmosphere: unordered, it would paint last frame's
                     // palette, the underwater one on a surfacing frame.
-                    update_sky_colors.in_set(crate::lighting::LightingConsumeSet),
+                    // MONKEY (fix-sky): after the cloud tile, so the glow reads this frame's cover.
+                    update_sky_colors
+                        .in_set(crate::lighting::LightingConsumeSet)
+                        .after(crate::clouds::CloudTick),
                     // The skybox and submersion gates must read their settled resolves.
                     apply_sky_visibility
                         .after(crate::skybox::SkyboxResolve)
