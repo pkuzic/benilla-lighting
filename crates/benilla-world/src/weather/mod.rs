@@ -16,6 +16,8 @@ use bevy::prelude::*;
 use crate::dev_state::DebugState;
 
 mod precip;
+mod wetness; // MONKEY (wet): surface wetness + the rain-ripple clock -> MonkeyFrame wet0
+pub use wetness::{RainSurfaces, Wetness};
 
 /// Rain's forced-fog window, read by the effect lane's `EffectFog::Rain` row.
 pub(crate) use precip::{RAIN_FOG_END, RAIN_FOG_START};
@@ -309,6 +311,7 @@ impl Plugin for WeatherPlugin {
             .add_message::<WeatherMessage>()
             .add_systems(Update, weather_tick.in_set(WeatherTick));
         precip::register(app);
+        wetness::register(app); // MONKEY (wet)
     }
 }
 

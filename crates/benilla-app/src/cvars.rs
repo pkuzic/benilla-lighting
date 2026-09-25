@@ -952,6 +952,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own: distance fog, 0 Classic (1.12 linear) / 1 Modern (soft, sun-coloured horizon)",
     ),
+    // MONKEY (wet): rain darkens and glosses sky-exposed surfaces and rings the water. Default 1
+    // (only visible while it rains or the ground dries); the Graphics preset's High sets 1.
+    ours(
+        "rainSurfaces",
+        "1",
+        "benilla's own: rain wets sky-exposed surfaces and rings the water, 0 Off / 1 On",
+    ),
     ours(
         "waterQuality",
         "1",
@@ -3791,6 +3798,9 @@ mod tests {
             app.init_resource::<benilla_world::ffx_glow::SkyDither>();
             // MONKEY (fog)
             app.init_resource::<benilla_world::lighting::FogModelSetting>();
+            // MONKEY (wind)
+            app.init_resource::<benilla_world::wind::FoliageWind>();
+            app.init_resource::<benilla_world::weather::RainSurfaces>(); // MONKEY (wet)
             app.add_observer(crate::monkey_gfx::on_cvar);
         },
         |app| {

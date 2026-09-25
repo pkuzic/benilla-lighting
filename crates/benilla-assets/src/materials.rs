@@ -38,6 +38,8 @@ pub fn register_shaders(app: &mut App) {
     load_shader_library!(app, "shaders/emissive_hook.wgsl");
     // MONKEY (wind): `benilla::wind_hook`, shared vertex displacement for grass and foliage.
     load_shader_library!(app, "shaders/wind_hook.wgsl");
+    // MONKEY (wet): `benilla::wet_hook`, the rain-on-surfaces look terrain/model/static_gx call.
+    load_shader_library!(app, "shaders/wet_hook.wgsl");
     // MONKEY (enhanced water): the optional water module, `benilla::enhanced_water` (WATER.md).
     load_shader_library!(app, "shaders/enhanced_water.wgsl");
 }

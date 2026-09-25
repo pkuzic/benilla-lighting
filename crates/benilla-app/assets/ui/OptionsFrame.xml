@@ -530,6 +530,8 @@
                 skyDither = "Sky Dithering",
                 -- MONKEY (fog)
                 fogModel = "Modern Fog",
+                -- MONKEY (wet)
+                rainSurfaces = "Wet Surfaces in Rain",
                 -- MONKEY (wind)
                 foliageWind = "Foliage Wind",
                 windGrass = "Grass",
@@ -657,6 +659,12 @@
                         .. "sky's colour in the distance, so the land melts into the horizon. Each zone "
                         .. "keeps its own fog distance; above the original view-distance limit the fog "
                         .. "recedes with it.\n\nOff is the original client's fog. Practically free.",
+                    -- MONKEY (wet)
+                    RAIN_SURFACES =
+                        "Rain slowly soaks the ground, stone and wood under the open sky: they darken, "
+                        .. "puddles gather on flat ground and wet tops catch the light; rain drops ring "
+                        .. "the water. It dries over a few minutes after the rain stops. Off is the "
+                        .. "original client's look. Nearly free, and only active while things are wet.",
                 -- MONKEY (wind)
                     FOLIAGE_WIND =
                         "Grass bends in two travelling wind waves and parts around nearby characters. "
@@ -705,6 +713,8 @@
                 skyDither = "Дизеринг неба",
                 -- MONKEY (fog)
                 fogModel = "Современный туман",
+                -- MONKEY (wet)
+                rainSurfaces = "Мокрые поверхности в дождь",
                 -- MONKEY (wind)
                 foliageWind = "Ветер листвы",
                 windGrass = "Трава",
@@ -842,6 +852,12 @@
                         .. "так что земля растворяется в горизонте. Дальность тумана в каждой зоне "
                         .. "прежняя; за пределом дальности обзора оригинала туман отступает вместе с ней."
                         .. "\n\nВыключено — туман оригинального клиента. Почти ничего не стоит.",
+                    -- MONKEY (wet)
+                    RAIN_SURFACES =
+                        "Дождь постепенно намачивает землю, камень и дерево под открытым небом: они темнеют, "
+                        .. "на ровной земле собираются лужи, мокрые поверхности блестят, а капли расходятся "
+                        .. "кругами по воде. После дождя всё высыхает за несколько минут. Выключено — вид "
+                        .. "оригинального клиента. Почти ничего не стоит и работает, только пока всё мокрое.",
                 -- MONKEY (wind)
                     FOLIAGE_WIND =
                         "Трава гнётся двумя бегущими волнами ветра и расступается вокруг персонажей. "
@@ -915,6 +931,8 @@
                 "RowSkyDither",
                 -- MONKEY (fog)
                 "RowFogModel",
+                -- MONKEY (wet)
+                "RowRainSurfaces",
                 -- MONKEY (wind): appended for conflict-free lane merges.
                 "RowFoliageWind",
             },
@@ -3037,11 +3055,23 @@
                                                     "BENILLA_TOOLTIP_FOG_MODEL")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <!-- MONKEY (wind): three foliage tiers; appended at the end of the page. -->
-                                        <Frame name="$parentRowFoliageWind" inherits="OptionsDropdownRowTemplate">
+                                        <!-- MONKEY (wet): wet surfaces + rain ripples. -->
+                                        <Frame name="$parentRowRainSurfaces" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowFogModel" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowFogModel" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "rainSurfaces",
+                                                    BENILLA_ADVGFX.rainSurfaces,
+                                                    "BENILLA_TOOLTIP_RAIN_SURFACES")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (wind): three foliage tiers; appended at the end of the page. -->
+                                        <Frame name="$parentRowFoliageWind" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowRainSurfaces" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowRainSurfaces" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "foliageWind",

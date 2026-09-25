@@ -245,8 +245,58 @@ fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
 
 // MONKEY (water): seam for the later wet-weather lane. Its result is a height-gradient
 // perturbation in world XZ; zero preserves today's image until that lane supplies rain data.
-fn rain_ripple_normal(world_xz: vec2<f32>, time: f32) -> vec2<f32> {
-    return vec2<f32>(0.0);
+// MONKEY (wet): rain rings. Each layer is a grid of cells, one drop per cell at a hashed spot and
+// phase; a drop lands when its cell hash is under the rain rate, and its ring expands and fades
+// over one period. The ring's slope profile is a Gaussian-windowed cosine across the front. The
+// clock is MonkeyFrame `wet_a.z` (wraps at 1000 s; the rates are multiples of 1/1000, so the wrap is
+// seamless). Dry (`wet_a.x == 0`), WMO interior pools, interior-fog rooms, and pixels too far or too
+// coarse to hold a ring return zero.
+fn ripple_hash2(p: vec2<f32>) -> vec2<f32> {
+    var q = fract(vec3<f32>(p.xyx) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.xx + q.yz) * q.zy);
+}
+fn rain_ripple_normal(world_xz: vec2<f32>, footprint: f32, distance: f32, room: bool) -> vec2<f32> {
+    let wet_row = water_monkey().wet_a;
+    let rain = clamp(wet_row.x, 0.0, 1.0);
+    if rain <= 0.0 || water.lane.x > 1.5 || room {
+        return vec2<f32>(0.0);
+    }
+    let reach = (1.0 - smoothstep(35.0, 60.0, distance)) * (1.0 - smoothstep(0.05, 0.14, footprint));
+    if reach <= 0.0 {
+        return vec2<f32>(0.0);
+    }
+    var grad = vec2<f32>(0.0);
+    for (var layer = 0; layer < 2; layer += 1) {
+        let c = select(0.9, 1.45, layer == 1);
+        let rate = select(0.8, 0.65, layer == 1);
+        let base = floor(world_xz / c);
+        for (var j = -1; j <= 1; j += 1) {
+            for (var i = -1; i <= 1; i += 1) {
+                let cell = base + vec2<f32>(f32(i), f32(j));
+                let seed = cell + vec2<f32>(f32(layer) * 57.0, f32(layer) * 113.0);
+                let h = ripple_hash2(seed);
+                let h2 = ripple_hash2(seed + 19.19);
+                // Each period re-rolls whether this cell rains, so the pattern does not repeat.
+                let cycle = wet_row.z * rate + h.x;
+                let roll = ripple_hash2(seed + floor(cycle) * 7.31).x;
+                if roll > rain * 0.85 {
+                    continue;
+                }
+                let phase = fract(cycle);
+                let centre = (cell + 0.5 + (h2 - 0.5) * 0.6) * c;
+                let to_p = world_xz - centre;
+                let d = length(to_p);
+                let radius = phase * 0.6 * c;
+                let x = d - radius;
+                let width = 0.05 + 0.07 * phase;
+                let fade = (1.0 - phase) * (1.0 - phase) * smoothstep(0.0, 0.08, phase);
+                let slope = fade * exp(-(x * x) / (width * width)) * cos(x * 3.1415927 / width);
+                grad += to_p / max(d, 1e-4) * slope;
+            }
+        }
+    }
+    return grad * (0.7 + 0.5 * rain) * reach;
 }
 
 fn foam_hash(p_in: vec2<f32>) -> f32 {
@@ -538,7 +588,8 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         open_sea_fold = water_gerstner(p, t, shore).w;
     }
     // One surface gradient: the procedural bands and the shore break.
-    let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xz, t);
+    let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xz, footprint,
+        length(eye_pos), in.room_fog != 0u && water.lane.w > 0.5);
     var n = normalize(vec3<f32>(-surf_grad.x, 1.0, -surf_grad.y));
     if dot(n, to_view) < 0.0 { n = -n; }
 

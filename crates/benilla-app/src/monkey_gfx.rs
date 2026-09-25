@@ -7,11 +7,13 @@
 //! | `skyDither` | 0 Off / 1 On | 0 | 1 | `benilla_world::ffx_glow::SkyDither` |
 //! | `foliageWind` | 0 Off / 1 Grass / 2 Grass + trees | 2 | 2 | `benilla_world::wind::FoliageWind` |
 //! | `fogModel` | 0 Classic / 1 Modern | 0 | 1 | `benilla_world::lighting::FogModelSetting` |
+//! | `rainSurfaces` | 0 Off / 1 On | 1 | 1 | `benilla_world::weather::RainSurfaces` |
 
 use benilla_world::ffx_glow::SkyDither;
 use benilla_world::lighting::FogModelSetting;
 use benilla_world::wind::FoliageWind;
 use bevy::prelude::*;
+use benilla_world::weather::RainSurfaces; // MONKEY (wet)
 
 /// The programme's cvar observer (registered by [`MonkeyGfxPlugin`]).
 pub(crate) fn on_cvar(
@@ -20,6 +22,7 @@ pub(crate) fn on_cvar(
     mut foliage_wind: ResMut<FoliageWind>,
     // MONKEY (fog)
     mut fog_model: ResMut<FogModelSetting>,
+    mut rain: ResMut<RainSurfaces>, // MONKEY (wet)
 ) {
     match ev.key().as_str() {
         "skydither" => {
@@ -43,6 +46,13 @@ pub(crate) fn on_cvar(
         }
         // MONKEY (fog): `WOW_FOGMODEL` still wins for the session (captures).
         "fogmodel" => fog_model.set_from_cvar(ev.num()),
+        // MONKEY (wet): wet surfaces + rain ripples.
+        "rainsurfaces" => {
+            let want = ev.num() >= 0.5;
+            if rain.0 != want {
+                rain.0 = want;
+            }
+        }
         _ => {}
     }
 }
@@ -56,6 +66,7 @@ impl Plugin for MonkeyGfxPlugin {
         app.init_resource::<SkyDither>()
             .init_resource::<FoliageWind>()
             .init_resource::<FogModelSetting>()
+            .init_resource::<RainSurfaces>() // MONKEY (wet)
             .add_observer(on_cvar);
     }
 }

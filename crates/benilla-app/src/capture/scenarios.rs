@@ -1627,6 +1627,23 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 1170,
         ui: None,
     },
+    // MONKEY (wet): rain on surfaces. Run with rain forced and the ground pre-soaked, e.g.
+    // `WOW_WEATHER=1,0.8 WOW_WETNESS=1 WOW_WET_T=3`, and A/B with `WOW_RAIN_SURFACES=0|1`.
+    // Goldshire's square: the road, the grass, the inn's roofs and walls.
+    Scenario {
+        name: "wet-goldshire", map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 59.5], look: [-9452.0, 30.0, 55.0], minute: 720, ui: None,
+    },
+    // The Elwynn river bank, close enough (< 25 yd) for the rain rings.
+    Scenario {
+        name: "wet-river", map: Some(MAP_AZEROTH),
+        eye: [-9514.0, -330.0, 64.0], look: [-9500.0, -352.0, 61.4], minute: 720, ui: None,
+    },
+    // A Stormwind Trade District street: exterior WMO paving, walls, eaves.
+    Scenario {
+        name: "wet-stormwind", map: Some(MAP_AZEROTH),
+        eye: [-8833.38, 628.63, 98.5], look: [-8815.0, 662.0, 93.5], minute: 720, ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking
