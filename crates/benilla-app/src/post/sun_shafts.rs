@@ -221,7 +221,14 @@ fn prepare_pipelines(
     pipeline: Res<ShaftPipeline>,
     mut specialized: ResMut<SpecializedRenderPipelines<ShaftPipeline>>,
     views: Query<(Entity, &ViewTarget, &Msaa), With<ShaftView>>,
+    all_views: Query<(&ViewTarget, &Msaa), With<Camera3d>>,
 ) {
+    // MONKEY (integration): warm every reachable key on every 3-D view, feature on or off, so the
+    // compile happens under the entry cover and never live when the player turns the row on.
+    // (Named in `pipe_warm/menagerie.rs`'s custom-lane census.)
+    for (target, msaa) in &all_views {
+        specialized.specialize(&cache, &pipeline, (target.main_texture_format(), msaa.samples() > 1));
+    }
     for (entity, target, msaa) in &views {
         let id = specialized.specialize(
             &cache,

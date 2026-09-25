@@ -292,8 +292,21 @@ fn prepare_pipelines(
     pipeline: Res<AoPipeline>,
     mut specialized: ResMut<SpecializedRenderPipelines<AoPipeline>>,
     views: Query<(Entity, &ViewTarget, &Msaa), With<AoView>>,
+    all_views: Query<(&ViewTarget, &Msaa), With<Camera3d>>,
 ) {
     let debug = debug_view();
+    // MONKEY (integration): warm every reachable key on every 3-D view, feature on or off, so the
+    // compile happens under the entry cover and never live when the player turns the row on.
+    // (Named in `pipe_warm/menagerie.rs`'s custom-lane census.)
+    for (target, msaa) in &all_views {
+        for stage in [Stage::Ao, Stage::Blur, Stage::Apply] {
+            specialized.specialize(
+                &cache,
+                &pipeline,
+                (stage, target.main_texture_format(), msaa.samples(), debug),
+            );
+        }
+    }
     for (entity, target, msaa) in &views {
         let format = target.main_texture_format();
         let samples = msaa.samples();

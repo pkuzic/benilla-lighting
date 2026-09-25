@@ -931,6 +931,12 @@ mod tests {
         //   also has its OWN pair, for the frames nothing claims it, and 2262 found it compiling
         //   live at app exit. `prepare_textures` now specialises that pair on every frame rather
         //   than only on the frame it first needs it.)
+        // - MONKEY (integration) ShaftPipeline (`post::sun_shafts`), FogPipeline
+        //   (`volumetric_fog`, incl. lamp fog) and AoPipeline (`ssao`): fullscreen passes keyed
+        //   only on the view's target format and MSAA (plus the AO stage/debug flag). Each lane's
+        //   `prepare_pipelines` specialises every such key for EVERY `Camera3d` view on every
+        //   frame, whether its cvar is on or not, so the variants compile behind the entry cover
+        //   and a player enabling the row later hits the cache, not a live compile.
         let exempt = ["UiGammaPipeline"];
         let own_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let warm_src = std::fs::read_to_string(own_src.join("pipe_warm/mod.rs")).unwrap()
