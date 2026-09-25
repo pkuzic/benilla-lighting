@@ -34,6 +34,7 @@ use bevy::{
         view::{Msaa, ViewDepthTexture, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
         Render, RenderApp, RenderStartup, RenderSystems,
     },
+    shader::ShaderDefVal,
 };
 
 pub(crate) struct AmbientOcclusionPlugin;
