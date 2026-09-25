@@ -34,6 +34,8 @@ pub fn register_shaders(app: &mut App) {
     load_shader_library!(app, "shaders/monkey_frame.wgsl");
     // MONKEY (p0 fog hook): `benilla::fog_hook`, the one distance-fog law all seven receivers call.
     load_shader_library!(app, "shaders/fog_hook.wgsl");
+    // MONKEY (wet): `benilla::wet_hook`, the rain-on-surfaces look terrain/model/static_gx call.
+    load_shader_library!(app, "shaders/wet_hook.wgsl");
     // MONKEY (enhanced water): the optional water module, `benilla::enhanced_water` (WATER.md).
     load_shader_library!(app, "shaders/enhanced_water.wgsl");
 }
