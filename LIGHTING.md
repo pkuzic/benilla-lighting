@@ -38,8 +38,52 @@ behind each constant.
 | Zone skyboxes | the painted sky a zone's `LightParams` names (clear-weather slot, storm slot lerped by the storm blend) for the living, fading in by the Light sphere falloff with the modern client's crossfade (ghost > WMO > zone); extended `LightSkybox.dbc` flags `0x1` day cycle, `0x2` keep sun/moon/stars/clouds, `0x4` fog-colour horizon cone, plus a celestial second model; every skybox now plays its bones, texture transforms, colour and alpha tracks (`benilla-world/src/skybox.rs`, `skybox_anim.rs`, `benilla-formats/src/light/skybox.rs`) | Advanced Graphics → Zone Skyboxes, cvar `zoneSkyboxes` (0 Off default, 1 On; High = 1), env `WOW_ZONE_SKYBOXES=0\|1` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
-Players reach all of it from **Options -> Advanced Graphics** (a Lighting Quality preset Off / Low / Medium / High plus the individual rows; Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
+Players reach all of it from **Options -> Advanced Graphics** (a Graphics Preset over everything, a Render Distance slider, a Lighting Quality preset Off / Low / Medium / High / Ultra plus the individual rows; Classic / Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
 Bright presets.
+
+## Graphics Preset
+
+MONKEY (presets). The top row of Advanced Graphics, cvar `graphicsQuality`: Classic / Low / Medium /
+High / Ultra, or Custom when the rows match none of them. The table is `GRAPHICS_PRESETS` in
+`benilla-app/src/cvars.rs` (one line per governed row); choosing a rung writes each row through
+the ordinary cvar path, and the label is re-derived every frame, so editing any governed row
+(or any Lighting Quality member) shows Custom. `lightingQuality` is itself a governed row, so
+every row the lighting ladder owns (`LIGHTING_PRESETS`: both sun lanes, shadow resolution, the
+room and torch lanes, moon shadows, `waterQuality`, `volumetricFog`, `bloom`, `sunShafts`,
+`colorGrading`, `foliageWind`, the fire/spell/lava gains, `nightGain`, `interiorGain`) follows it.
+
+| row | Classic | Low | Medium | High | Ultra |
+|---|---|---|---|---|---|
+| `lightingQuality` | Off | Low | Medium | High | Ultra |
+| `farclip` (Render Distance, yd) | 350 | 350 | 477 | 777 | 1497 |
+| `skyQuality` | 0 | 1 | 1 | 2 | 2 |
+| `skyDither` | 0 | 1 | 1 | 1 | 1 |
+| `fogModel` | 0 | 1 | 1 | 1 | 1 |
+| `rainSurfaces` | 0 | 1 | 1 | 1 | 1 |
+| `torchTerrainShadows` | 0 | 0 | 0 | 1 | 1 |
+| `daylightWindowSplit` | 0 | 1 | 1 | 1 | 1 |
+| `ambientOcclusion` | 0 | 0 | 1 | 2 | 2 |
+| `zoneSkyboxes` | 0 | 0 | 1 | 1 | 1 |
+| `lampFog` | 0 | 0 | 1 | 2 | 2 |
+
+What the lighting rungs set, beyond Off (everything off, gains 1.0) and High (the registered
+defaults): Low = character shadows only at a 1024 map, no torch or moon shadows, bloom Low;
+Medium = both sun lanes, indoor torch shadows (6 resident / 2 moving), moon shadows, bloom Low,
+no sun shafts or colour grading; Ultra = High with a 4096 sun map, 16 / 8 torch maps, High water
+and High volumetric fog. No rung decides `shadowDistance` or `interiorShadowSoft`.
+
+**Default: High.** A player whose `config.toml` names no `graphicsQuality` is seeded to the High
+column at startup (`Cvars::seed_graphics_preset`) on every row the file does not carry; the rows'
+registered defaults stay their per-lane ones (`farclip` the reference's 350), and captures and
+tests, which never seed, keep them. The Advanced page's Defaults button lands on High too.
+
+**Render Distance** is `farclip`, the same cvar as the Graphics page's Terrain Distance (which
+keeps the stock 177–777 slider). Its clamp (`view::FARCLIP_RANGE`) now reaches `FARCLIP_MAX` =
+1497 yd, the 1.12 grid of 60 carried on. Terrain residency (`terrain_stream/window.rs`), the
+model/WMO and particle walls (`view::within_farclip`) and the art-cache sweep radius (now 7 tiles,
+`art_scope.rs`) all follow it; at 1497 the residency window is at most 7×7 ADT tiles against
+777's 5×5, which is the memory bound. Past 777 only Modern fog (`fog_model::modern_fog_end`)
+stretches the fog end with it; under Classic fog the zone's fog end still hides the extra reach.
 
 The optional enhanced water (Water Quality, refraction, caustics, High reflections, lava glow)
 is its own module, documented in `WATER.md`.
