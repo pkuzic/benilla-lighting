@@ -41,6 +41,7 @@ the technique is listed in the table below. Do not remove either.
 | Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (= Enhanced + scenery reflections) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
 | Procedural waves | multi-band analytic waves with exact normals; the long swell moves ocean vertices | tier |
 | Open-sea whitecaps | High adds Gerstner crest gathering and fold-thresholded foam; calm canals remain clear | tier |
+| Near mesh refinement | High builds a transient 4x liquid lattice within 64 yd, with an 80 yd release ring | tier |
 | Ocean / inland profiles | the sea and lakes/rivers have their own colour, energy and reflectivity | tier |
 | WMO pools | exterior canals use a calm drifting profile with outdoor glints; interiors use their authored MOMT colour and room-fog reflection | tier |
 | Depth look | light fades per channel over the real path through the water; the bed is seen through it, bent by the waves; sunlit shallows carry a caustic web | tier |
@@ -67,6 +68,7 @@ request. If it ever returns it should read the authored MCLQ flow records, not d
 - **World** (`crates/benilla-world/src`): `liquid/scene_depth.rs` (copies the opaque depth AND colour after
   the main opaque pass), `liquid/waves.rs` (the CPU mirror of the vertex swell), `liquid/surface.rs`
   (per-kind material parameters and the opt-in `WOW_WATER_PROBE` WMO classification/depth log),
+  `liquid/lod.rs` (High-only 4x near-grid swap),
   `water_fx/bob.rs` (swimmer bob), `lighting/lava_light.rs`.
 - **App** (`crates/benilla-app/src`): the setting in `cvars.rs` / `video.rs`, the options rows in
   `assets/ui/OptionsFrame.xml`, the capture scenes `water-*` and `lava-*` in `capture/scenarios.rs`.

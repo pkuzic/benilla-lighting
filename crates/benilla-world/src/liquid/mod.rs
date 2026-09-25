@@ -31,6 +31,7 @@ use benilla_assets::materials::LiquidMaterial;
 use benilla_assets::AssetSet;
 
 mod drift;
+mod lod;
 mod scene_depth;
 pub use scene_depth::WaterDepthPlugin;
 mod query;
@@ -125,5 +126,6 @@ impl Plugin for LiquidPlugin {
             );
         }
         drift::register(app);
+        lod::register(app);
     }
 }

@@ -11,6 +11,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::ExtendedMaterial;
 use bevy::prelude::*;
 
+use super::lod::LiquidLod;
 use super::query::{wet_footprint, FoamPatch, LiquidSource, WmoPool};
 use crate::collision::liquid_layers;
 use crate::lighting::WATER_SHININESS;
@@ -181,7 +182,9 @@ pub(crate) fn spawn_liquids<'a>(
         if foam {
             commands
                 .entity(*entities.last().expect("just pushed"))
-                .insert(FoamPatch);
+                // MONKEY (water LOD): High may swap this coarse water grid for a transient 4x
+                // near copy; magma/slime remain on their authored topology.
+                .insert((FoamPatch, LiquidLod::new(mesh_handle, lq)));
         }
         // The waterline for the camera sweep under `cameraWaterCollision`; nothing else queries it.
         if let Some(collider) = liquid_collider(lq) {
@@ -308,9 +311,10 @@ pub(crate) fn spawn_wmo_liquids<'a>(
                 lq.kind, lq.sound_nibble
             );
         }
+        let mesh_handle = meshes.add(liquid_bevy_mesh(lq, body_color));
         let surface = commands
             .spawn((
-                Mesh3d(meshes.add(liquid_bevy_mesh(lq, body_color))),
+                Mesh3d(mesh_handle.clone()),
                 MeshMaterial3d(material),
                 transform,
                 LiquidSurface,
@@ -330,7 +334,10 @@ pub(crate) fn spawn_wmo_liquids<'a>(
             LiquidSource::WmoGroup(pool),
         ));
         if !lq.kind.is_fullbright() {
-            commands.entity(surface).insert(FoamPatch);
+            // MONKEY (water LOD): preserve the WMO grid boundary while refining its near interior.
+            commands
+                .entity(surface)
+                .insert((FoamPatch, LiquidLod::new(mesh_handle, lq)));
         }
         // The camera's waterline, model-local under the entity's placement `transform`.
         if let Some(collider) = liquid_collider(lq) {

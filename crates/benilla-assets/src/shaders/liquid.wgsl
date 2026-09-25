@@ -138,7 +138,7 @@ fn vertex(in: Vertex) -> LiquidVsOut {
     out.world_position =
         mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(in.position, 1.0));
     // MONKEY (enhanced water): ocean Gerstner displacement; zero on Classic/other surfaces.
-    out.world_position.xyz += water_swell(out.world_position.xz, in.uv_b.x);
+    out.world_position += vec4<f32>(water_swell(out.world_position.xz, in.uv_b.x), 0.0);
     out.clip_position = position_world_to_clip(out.world_position.xyz);
     out.world_normal = mesh_functions::mesh_normal_local_to_world(in.normal, in.instance_index);
     out.uv = in.uv;
