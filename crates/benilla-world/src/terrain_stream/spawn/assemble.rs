@@ -322,6 +322,7 @@ pub fn spawn_model_entities(
                         instance,
                         groups,
                         bounds,
+                        sky,
                     } if is_wmo && class.merges() =>
                     {
                         groups.get(batch_idx).map(|&g| {
@@ -346,7 +347,10 @@ pub fn spawn_model_entities(
                                     // in hand, and the answer rides to the shader as a record bit.
                                     enclosed: benilla_formats::room_claim::enclosed_by_building_shell(
                                         bounds, g,
-                                    ),
+                                    )
+                                        // MONKEY (daylight: district sky rooms): …or a city room
+                                        // the portal graph connects to the sky.
+                                        || sky.get(usize::from(g)).copied().unwrap_or(false),
                                     class: sub.wmo_batch,
                                     sidn: sub.sidn,
                                     window: sub.window,

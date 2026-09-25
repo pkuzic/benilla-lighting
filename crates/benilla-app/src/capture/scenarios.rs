@@ -1380,6 +1380,47 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         look: LAVA_RIVER_LOOK,
         minute: 0,
         ui: None,
+    },    // MONKEY (daylight): city interiors by day and terrain torch shadows at night. World coords
+    // from the census (`lighting::daylight::census`, Stormwind uid 10047, Ironforge uid 7706).
+    // The Gilded Rose ground floor (group g268, portal + aperture seeds).
+    Scenario {
+        name: "daylight-sw-inn", map: Some(MAP_AZEROTH),
+        eye: [-8871.0, 681.0, 99.8], look: [-8858.0, 668.0, 98.6], minute: 720, ui: None,
+    },
+    // The Cathedral of Light nave (groups g135/g146, lit only by two EXT-class window batches).
+    Scenario {
+        name: "daylight-sw-cathedral", map: Some(MAP_AZEROTH),
+        eye: [-8556.0, 826.0, 109.0], look: [-8515.0, 862.0, 112.0], minute: 720, ui: None,
+    },
+    // A Trade District house (group g68 NEH02, one exterior portal).
+    Scenario {
+        name: "daylight-sw-shop", map: Some(MAP_AZEROTH),
+        eye: [-8799.0, 696.0, 104.3], look: [-8786.0, 707.0, 103.0], minute: 720, ui: None,
+    },
+    // Ironforge: the Great Forge hall (g64, no opening to the sky) and the gate hall (g7, the
+    // city's one exterior portal).
+    Scenario {
+        name: "daylight-if-forge", map: Some(MAP_AZEROTH),
+        eye: [-4930.0, -945.0, 503.5], look: [-4890.0, -985.0, 503.0], minute: 720, ui: None,
+    },
+    Scenario {
+        name: "daylight-if-gate", map: Some(MAP_AZEROTH),
+        eye: [-4975.0, -895.0, 503.5], look: [-5005.0, -852.0, 506.0], minute: 720, ui: None,
+    },    // Goldshire's lamps at midnight: terrain receiving (and, with `torchTerrainShadows`, casting)
+    // torch cube shadows.
+    Scenario {
+        name: "daylight-torch-goldshire", map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0], look: [-9450.0, 20.0, 61.0], minute: 0, ui: None,
+    },    // Two Elwynn road lampposts whose own light the terrain blocks most (the census's
+    // `lamp_terrain_occlusion_scan`: 18 % and 16 % of the ground within 25 yd), at midnight, framed
+    // across the lamp toward the blocked side.
+    Scenario {
+        name: "daylight-torch-hill-a", map: Some(MAP_AZEROTH),
+        eye: [-9314.8, 134.1, 70.0], look: [-9320.4, 165.6, 64.0], minute: 0, ui: None,
+    },
+    Scenario {
+        name: "daylight-torch-hill-b", map: Some(MAP_AZEROTH),
+        eye: [-9163.1, 181.1, 77.0], look: [-9147.1, 153.4, 71.0], minute: 0, ui: None,
     },
     // MONKEY (post): lane-specific A/B and perf viewpoints. Kept at the end for merge isolation.
     Scenario {

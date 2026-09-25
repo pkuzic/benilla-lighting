@@ -28,6 +28,8 @@ pub use blob::LightBlob;
 pub use daylight::{
     daylight_claims, daylight_intensity, daylight_lane, daylight_point_light, daylight_reach,
     daylight_rooms, daylight_seeds, daylight_target, bleed_seeds, placement_openings, BleedFixture,
+    // MONKEY (daylight: district sky rooms)
+    district_sky_rooms,
     BleedSeed,
     DaylightFixture, DaylightHow, DaylightSeed, BLEED_K, MAX_DAYLIGHT_PER_PLACEMENT,
 };

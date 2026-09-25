@@ -519,6 +519,7 @@
                 interiorLight = "Dynamic Interior Lighting",
                 interiorShadows = "Indoor Torch Shadows",
                 exteriorShadows = "Outdoor Torch Shadows",
+                torchTerrainShadows = "Terrain Blocks Torchlight",
                 torchSoft = "Torch Shadow Softness",
                 fireLight = "Fire Light Brightness",
                 fireFlicker = "Fire Flicker",
@@ -599,6 +600,13 @@
                         "The same for fires out in the open: campfires, braziers and lampposts "
                         .. "cast real shadows after dark.\n\n"
                         .. "It does nothing by day and does not require Dynamic Interior Lighting.",
+                    TORCH_TERRAIN_SHADOWS =
+                        "Lets the ground itself take part in outdoor torch shadows: a hill or a "
+                        .. "bank between a fire and the slope behind it blocks the fire's light.
+
+"
+                        .. "Adds the nearby terrain to each outdoor fire's shadow map when it is "
+                        .. "rebuilt; the per-frame cost is small. Needs Outdoor Torch Shadows.",
                     TORCH_SOFT =
                         "How soft the edge of a torch shadow is where the object meets the "
                         .. "ground. Low is hard and crisp; high spreads the edge the way a real "
@@ -668,6 +676,7 @@
                 interiorLight = "Динамическое освещение помещений",
                 interiorShadows = "Тени факелов в помещениях",
                 exteriorShadows = "Тени огней под открытым небом",
+                torchTerrainShadows = "Рельеф заслоняет огни",
                 torchSoft = "Мягкость теней от огня",
                 fireLight = "Яркость огня",
                 fireFlicker = "Мерцание огня",
@@ -756,6 +765,14 @@
                         "То же для огней под открытым небом: костры, жаровни и фонари "
                         .. "отбрасывают настоящие тени после наступления темноты.\n\n"
                         .. "Днём не действует и не требует динамического освещения помещений.",
+                    TORCH_TERRAIN_SHADOWS =
+                        "Земля сама участвует в тенях от огней снаружи: холм или склон между "
+                        .. "костром и местностью за ним заслоняет свет огня.
+
+"
+                        .. "Добавляет ближний рельеф в карту теней каждого уличного огня при её "
+                        .. "перестройке; затраты на кадр невелики. Требует теней огней под "
+                        .. "открытым небом.",
                     TORCH_SOFT =
                         "Насколько мягок край тени от огня там, где предмет касается пола. "
                         .. "Низкое значение — резкий край, высокое — размытый, как от "
@@ -853,7 +870,9 @@
                 "RowBloom", "RowSunShafts", "RowColorGrading",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
-                "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
+                "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows",
+                -- MONKEY (daylight: terrain torch casters)
+                "RowTorchTerrainShadows", "RowTorchSoft",
                 "RowFireLight", "RowFireFlicker", "RowSpellLights", "RowLavaGlow",
                 "RowNightDarkness", "RowInteriorDarkness",
                 -- MONKEY (p0 skyDither)
@@ -1372,6 +1391,9 @@
                 local torch = (interior and GetCVar("interiorShadows") ~= "0")
                     or GetCVar("exteriorShadows") ~= "0"
                 OptionsRow_SetEnabled(getglobal(base .. "RowTorchSoft"), torch)
+                -- MONKEY (daylight: terrain torch casters): the ground only casts for outdoor fires.
+                OptionsRow_SetEnabled(getglobal(base .. "RowTorchTerrainShadows"),
+                    GetCVar("exteriorShadows") ~= "0")
                 return
             end
             if key == "Controls" then
@@ -2833,10 +2855,22 @@
                                                     "BENILLA_TOOLTIP_EXTERIOR_SHADOWS")
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowTorchSoft" inherits="OptionsSliderRowTemplate">
+                                        <!-- MONKEY (daylight: terrain torch casters) -->
+                                        <Frame name="$parentRowTorchTerrainShadows" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowExteriorShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowExteriorShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "torchTerrainShadows",
+                                                    BENILLA_ADVGFX.torchTerrainShadows,
+                                                    "BENILLA_TOOLTIP_TORCH_TERRAIN_SHADOWS")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowTorchSoft" inherits="OptionsSliderRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowTorchTerrainShadows" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowTorchTerrainShadows" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 -- 0.5..3, the CVar's own clamp verbatim: it is a

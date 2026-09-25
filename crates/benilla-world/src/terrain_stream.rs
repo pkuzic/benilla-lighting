@@ -34,6 +34,9 @@ mod queries;
 mod spawn;
 mod weld;
 pub(crate) mod window;
+// MONKEY (daylight: terrain torch casters): resident MCNK chunks as torch cube-map casters.
+mod torch_terrain;
+pub use torch_terrain::{append_terrain_torch_triangles, terrain_torch_generation};
 
 use collider::{finish_colliders, impassable_wall_data, terrain_collider_data};
 use furnish::furnish_tile_cells;

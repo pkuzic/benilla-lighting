@@ -300,6 +300,90 @@ pub fn daylight_budget(groups: &[WmoGroupInfo]) -> usize {
     }
 }
 
+/// MONKEY (daylight: district sky rooms): how many portal hops from an exterior-facing opening a
+/// DISTRICT room may sit and still count as lit by the day (see [`district_sky_rooms`]).
+const DISTRICT_SKY_HOPS: u8 = 1;
+
+/// MONKEY (daylight: district sky rooms): **which rooms of a CITY-scale placement take the
+/// enclosed day floor** (`interiorDaylight`), as one flag per group; empty for a building.
+///
+/// MEASURED (`daylight::census`, 2026-09-25): the floor's own test,
+/// [`benilla_formats::room_claim::enclosed_by_building_shell`], is false for EVERY interior group
+/// of Stormwind (190) and Ironforge (103), because a district shell is refused as a building by
+/// design. So `interiorDaylight` never reached a city room at any value, while 35 Stormwind rooms
+/// are reached by no daylight or bleed fixture at all and many more only by a fixture whose 6-20 yd
+/// pool dies half-way into a 40 yd hall.
+///
+/// The rule is the portal graph's, not a box test: a room is SKY-CONNECTED when it authors an
+/// exterior-facing portal (the relation the PORTAL seed stands the sun in) or an EXT-class batch (the
+/// APERTURE population: a window), or sits within
+/// [`DISTRICT_SKY_HOPS`] interior portals of such a room. That lights the shops, taverns and their
+/// back rooms and leaves what the data says is deep inside alone: the Stormwind canal tunnels,
+/// the Slaughtered Lamb's cellar, and all of Ironforge except the gate halls (the city's ONE
+/// exterior portal is `p0`, into `g7`).
+pub fn district_sky_rooms<'a, I>(
+    groups: &[WmoGroupInfo],
+    portals: PortalGraph<'_>,
+    batches: I,
+) -> Vec<bool>
+where
+    I: IntoIterator<Item = (u16, bool, &'a [[f32; 3]])>,
+{
+    if groups.iter().filter(|g| g.interior).count() <= DAYLIGHT_DISTRICT_ROOMS {
+        return Vec::new();
+    }
+    // Every portal's sides, as the PORTAL seed collects them.
+    let mut sides: HashMap<u16, Vec<u16>> = HashMap::new();
+    for (gi, (start, count)) in portals.slices.iter().enumerate() {
+        let (start, count) = (usize::from(*start), usize::from(*count));
+        for r in portals.refs.get(start..start + count).unwrap_or(&[]) {
+            for g in [gi as u16, r.group] {
+                let e = sides.entry(r.portal).or_default();
+                if !e.contains(&g) {
+                    e.push(g);
+                }
+            }
+        }
+    }
+    let interior = |g: u16| groups.get(usize::from(g)).is_some_and(|g| g.interior);
+    let mut hop: Vec<Option<u8>> = vec![None; groups.len()];
+    let mut edges: Vec<(u16, u16)> = Vec::new();
+    for gs in sides.values() {
+        let ins: Vec<u16> = gs.iter().copied().filter(|g| interior(*g)).collect();
+        match ins.as_slice() {
+            [g] if gs.len() == 1 || gs.iter().any(|o| !interior(*o)) => {
+                if let Some(h) = hop.get_mut(usize::from(*g)) {
+                    *h = Some(0);
+                }
+            }
+            [a, b] => edges.push((*a, *b)),
+            _ => {}
+        }
+    }
+    // …and a room with an EXT-class batch — a window or an open side (the APERTURE population).
+    for (g, ext_class, _) in batches {
+        if ext_class && interior(g) {
+            if let Some(h) = hop.get_mut(usize::from(g)) {
+                *h = Some(0);
+            }
+        }
+    }
+    for level in 0..DISTRICT_SKY_HOPS {
+        let mut next = Vec::new();
+        for &(a, b) in &edges {
+            for (from, to) in [(a, b), (b, a)] {
+                if hop[usize::from(from)] == Some(level) && hop[usize::from(to)].is_none() {
+                    next.push(to);
+                }
+            }
+        }
+        for g in next {
+            hop[usize::from(g)] = Some(level + 1);
+        }
+    }
+    hop.iter().map(Option::is_some).collect()
+}
+
 /// The EFFECTIVE reach (yd) of an opening `diag` yards across — the radius `R` the shader actually
 /// windows the pool with: `clamp(1.5*diag + 4, 6, 20)`. The linear term says a wide doorway throws
 /// light further in than an arrow slit; the `+4` floor keeps even a small window's pool bigger than
@@ -622,6 +706,9 @@ where
     let portal_seeds = out.len();
 
     // --- 2. APERTURE seeds: an EXT-class batch of an INTERIOR group (see the module doc).
+    // MONKEY (daylight: window split): on a DISTRICT placement an EXT batch wider than
+    // [`APERTURE_MAX_DIAG`] is split into its spatial clusters first ([`window_boxes`]).
+    let district = groups.iter().filter(|g| g.interior).count() > DAYLIGHT_DISTRICT_ROOMS;
     if want_apertures {
         for &(gi, ext_class, positions) in &batches {
             if !ext_class || interior_of(gi) != Some(true) {
@@ -630,35 +717,34 @@ where
             let Some(g) = groups.get(usize::from(gi)) else {
                 continue;
             };
-            let Some((lo, hi)) = bounds(positions.iter().copied()) else {
-                continue;
-            };
-            let diag = diagonal(lo, hi);
-            if !(APERTURE_MIN_DIAG..=APERTURE_MAX_DIAG).contains(&diag) {
-                continue;
+            for (lo, hi) in window_boxes(positions, district) {
+                let diag = diagonal(lo, hi);
+                if !(APERTURE_MIN_DIAG..=APERTURE_MAX_DIAG).contains(&diag) {
+                    continue;
+                }
+                let (c, hz) = seed_point(lo, hi);
+                let pos = nudge_inward(c, g, None);
+                // The authored portal wins a shared opening — see [`SEED_DEDUPE_YD`].
+                let dup = out[..portal_seeds].iter().any(|s| {
+                    (s.pos[0] - pos[0]).powi(2)
+                        + (s.pos[1] - pos[1]).powi(2)
+                        + (s.pos[2] - pos[2]).powi(2)
+                        < SEED_DEDUPE_YD * SEED_DEDUPE_YD
+                });
+                if dup {
+                    continue;
+                }
+                out.push(DaylightSeed {
+                    group: gi,
+                    portal: None,
+                    how: DaylightHow::Aperture,
+                    pos,
+                    diag,
+                    area: opening_area(lo, hi),
+                    hz,
+                    round: 0,
+                });
             }
-            let (c, hz) = seed_point(lo, hi);
-            let pos = nudge_inward(c, g, None);
-            // The authored portal wins a shared opening — see [`SEED_DEDUPE_YD`].
-            let dup = out[..portal_seeds].iter().any(|s| {
-                (s.pos[0] - pos[0]).powi(2)
-                    + (s.pos[1] - pos[1]).powi(2)
-                    + (s.pos[2] - pos[2]).powi(2)
-                    < SEED_DEDUPE_YD * SEED_DEDUPE_YD
-            });
-            if dup {
-                continue;
-            }
-            out.push(DaylightSeed {
-                group: gi,
-                portal: None,
-                how: DaylightHow::Aperture,
-                pos,
-                diag,
-                area: opening_area(lo, hi),
-                hz,
-                round: 0,
-            });
         }
     }
 
@@ -709,6 +795,108 @@ where
     out.sort_by(|a, b| b.area.total_cmp(&a.area));
     out
 }
+
+/// MONKEY (daylight: window split): the openings one EXT-class batch stands for, as boxes.
+///
+/// MEASURED (`benilla-extract wmolights` on Stormwind, 2026-09-25): the Cathedral of Light's nave
+/// authors ALL its stained-glass windows as ONE EXT batch per wall — `g135 b11` spans
+/// 15 x 44 x 20 yd (diag 51), `g146 b10` 30 x 44 x 10 yd (diag 54) — so [`APERTURE_MAX_DIAG`]
+/// refused the batch whole and the nave took no daylight through a single window. Its windows are
+/// separate panes between pillars, so the batch's vertices fall into separate clusters at the
+/// plan linkage of [`plan_clusters`], and each window-sized cluster is an aperture.
+///
+/// District placements only, and only for an oversized batch: every building (the inn, the abbey)
+/// keeps its calibrated seed list byte for byte, and a batch that is already window-sized is one
+/// box as before. At most [`WINDOW_SPLIT_MAX`] boxes per batch, largest first.
+fn window_boxes(positions: &[[f32; 3]], district: bool) -> Vec<([f32; 3], [f32; 3])> {
+    let Some((lo, hi)) = bounds(positions.iter().copied()) else {
+        return Vec::new();
+    };
+    if !district || diagonal(lo, hi) <= APERTURE_MAX_DIAG {
+        return vec![(lo, hi)];
+    }
+    let mut boxes: Vec<([f32; 3], [f32; 3])> = plan_clusters(positions)
+        .into_iter()
+        .filter(|(l, h)| (APERTURE_MIN_DIAG..=APERTURE_MAX_DIAG).contains(&diagonal(*l, *h)))
+        .collect();
+    // Stable: `cluster_boxes` is already sorted, and ties keep that order.
+    boxes.sort_by(|a, b| opening_area(b.0, b.1).total_cmp(&opening_area(a.0, a.1)));
+    boxes.truncate(WINDOW_SPLIT_MAX);
+    boxes
+}
+
+/// MONKEY (daylight: window split): single-link clustering of `points` in PLAN (x, y) at
+/// [`WINDOW_GAP_YD`], one 3-D `(lo, hi)` box per cluster. In plan because a pane's top and bottom
+/// corners share their plan position however tall it is (a stained-glass pane is often one quad,
+/// its vertices 8 yd apart vertically), while two panes of one wall are split by a pillar.
+fn plan_clusters(points: &[[f32; 3]]) -> Vec<([f32; 3], [f32; 3])> {
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let cell = |p: [f32; 3]| {
+        [
+            (p[0] / WINDOW_GAP_YD).floor() as i32,
+            (p[1] / WINDOW_GAP_YD).floor() as i32,
+        ]
+    };
+    let mut index: HashMap<[i32; 2], usize> = HashMap::new();
+    let mut cells: Vec<[i32; 2]> = Vec::new();
+    let of_point: Vec<usize> = points
+        .iter()
+        .map(|p| {
+            let c = cell(*p);
+            *index.entry(c).or_insert_with(|| {
+                cells.push(c);
+                cells.len() - 1
+            })
+        })
+        .collect();
+    let mut parent: Vec<usize> = (0..cells.len()).collect();
+    for (i, c) in cells.iter().enumerate() {
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                if let Some(&j) = index.get(&[c[0] + dx, c[1] + dy]) {
+                    let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                    if a != b {
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+    }
+    let mut boxes: HashMap<usize, ([f32; 3], [f32; 3])> = HashMap::new();
+    for (p, ci) in points.iter().zip(of_point.iter()) {
+        let root = find(&mut parent, *ci);
+        let e = boxes.entry(root).or_insert((*p, *p));
+        for a in 0..3 {
+            e.0[a] = e.0[a].min(p[a]);
+            e.1[a] = e.1[a].max(p[a]);
+        }
+    }
+    let mut out: Vec<([f32; 3], [f32; 3])> = boxes.into_values().collect();
+    // Deterministic: a `HashMap` walk is not.
+    out.sort_by(|a, b| {
+        a.0[0]
+            .total_cmp(&b.0[0])
+            .then(a.0[1].total_cmp(&b.0[1]))
+            .then(a.0[2].total_cmp(&b.0[2]))
+    });
+    out
+}
+
+/// MONKEY (daylight: window split): the plan-cell size (yd) that links one pane's vertices and no
+/// more: two points in neighbouring cells are at most ~4 yd apart, and a pillar between two panes
+/// is wider than the one-cell gap it takes to split them.
+const WINDOW_GAP_YD: f32 = 1.5;
+
+/// MONKEY (daylight: window split): the most apertures one EXT batch may become. A nave wall is
+/// three to five panes; the cap keeps a pathological batch (a lattice of posts) from flooding the
+/// placement's quota, which ranks one room's second opening after every room's first anyway.
+const WINDOW_SPLIT_MAX: usize = 6;
 
 /// MONKEY (daylight fixtures: boundary): every stitched interior<->exterior opening of one root, as
 /// `(interior group, cluster lo, cluster hi, inward unit direction)` in WMO model space.
@@ -2035,6 +2223,10 @@ pub(super) fn register(app: &mut App) {
     );
 }
 
+// MONKEY (daylight): the city census instrument.
+#[cfg(test)]
+mod census;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2047,6 +2239,64 @@ mod tests {
             bbox_min: lo,
             bbox_max: hi,
         }
+    }
+
+    /// MONKEY (daylight: district sky rooms): a building gets nothing; a district flags the room
+    /// with an exterior portal and its one-hop neighbour, and not the room two hops in.
+    #[test]
+    fn district_sky_rooms_follow_the_portal_graph() {
+        let lo = [0.0; 3];
+        let hi = [1.0; 3];
+        // g0 exterior shell, g1..=g3 a chain of rooms, padded with sealed rooms to district size.
+        let mut groups = vec![group(false, lo, hi)];
+        groups.extend((0..40).map(|_| group(true, lo, hi)));
+        let vertices = [[0.0f32; 3]; 4];
+        let infos: Vec<WmoPortalInfo> = (0..3)
+            .map(|_| WmoPortalInfo { start_vertex: 0, count: 4, plane: [1.0, 0.0, 0.0, 0.0] })
+            .collect();
+        // p0: g1<->g0 (exterior), p1: g1<->g2, p2: g2<->g3.
+        let refs = [
+            WmoPortalRef { portal: 0, group: 0, side: 1 },
+            WmoPortalRef { portal: 1, group: 2, side: 1 },
+            WmoPortalRef { portal: 1, group: 1, side: -1 },
+            WmoPortalRef { portal: 2, group: 3, side: 1 },
+            WmoPortalRef { portal: 2, group: 2, side: -1 },
+        ];
+        let mut slices = vec![(0u16, 0u16); groups.len()];
+        slices[1] = (0, 2);
+        slices[2] = (2, 2);
+        slices[3] = (4, 1);
+        let portals = PortalGraph { vertices: &vertices, infos: &infos, refs: &refs, slices: &slices };
+        let none: [(u16, bool, &[[f32; 3]]); 0] = [];
+        let sky = district_sky_rooms(&groups, portals, none);
+        assert!(sky[1] && sky[2], "the doorway room and its neighbour");
+        assert!(!sky[3], "two hops in stays dark");
+        assert!(!sky[0], "the shell is not a room");
+        assert!(district_sky_rooms(&groups[..5], portals, none).is_empty(), "a building is untouched");
+        // A window (EXT-class batch) makes g3 a sky room too.
+        let window = [[0.0f32; 3], [1.0, 1.0, 1.0]];
+        let sky = district_sky_rooms(&groups, portals, [(3u16, true, &window[..])]);
+        assert!(sky[3], "a room with a window");
+    }
+
+    /// MONKEY (daylight: window split): a district's wall-long EXT batch becomes its panes; a
+    /// building's stays one box (and is then refused as before).
+    #[test]
+    fn a_district_window_wall_splits_into_panes() {
+        // Three 2 x 0.2 x 4 yd panes, 10 yd apart along +Y: one batch, diag > 24.
+        let mut pts = Vec::new();
+        for i in 0..3 {
+            let y = i as f32 * 12.0;
+            for (dy, dz) in [(0.0, 0.0), (2.0, 0.0), (0.0, 4.0), (2.0, 4.0), (1.0, 2.0)] {
+                pts.push([0.0, y + dy, dz]);
+                pts.push([0.2, y + dy, dz]);
+            }
+        }
+        pts.push([0.0, 0.0, 0.0]);
+        assert_eq!(window_boxes(&pts, false).len(), 1, "a building keeps the whole batch");
+        let panes = window_boxes(&pts, true);
+        assert_eq!(panes.len(), 3, "a district splits it into its panes");
+        assert!(panes.iter().all(|(l, h)| diagonal(*l, *h) < 6.0));
     }
 
     /// The reach formula: linear in the opening's diagonal, floored at 6 and capped at 20.

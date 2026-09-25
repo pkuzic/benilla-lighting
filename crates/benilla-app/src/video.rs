@@ -322,6 +322,11 @@ pub(crate) struct VideoConfig {
     /// It shares `interior_shadow_casters`' sixteen resident cube slots, capped at half of them
     /// (`torch_shadow::exterior_budget`) so a village square cannot evict an inn's candles.
     pub(crate) exterior_shadows: bool,
+    /// MONKEY (daylight: terrain torch casters): whether the GROUND casts into an exterior torch's
+    /// cube map (`torchTerrainShadows`, default off; High = on) — a hill or bank between a fire and
+    /// the slope behind it blocks the fire. Only settled exterior slots gather it
+    /// (`torch_shadow`); `0` leaves the torch lane exactly as it was.
+    pub(crate) torch_terrain_shadows: bool,
     /// MONKEY (static torch cache): resident fixture budget (1..16, default 12). Static
     /// geometry renders only on promotion/residency changes; lowering this fades extra slots out.
     pub(crate) interior_shadow_casters: u32,
@@ -447,6 +452,7 @@ impl Default for VideoConfig {
             // MONKEY (outdoor torch shadows): on — a night campfire with no shadow is the thing
             // this lane exists to fix, and it costs nothing whenever the sun is up.
             exterior_shadows: true,
+            torch_terrain_shadows: false,
             // MONKEY (static torch cache): 12 resident maps, four moving-caster overlays.
             interior_shadow_casters: 12,
             interior_shadow_dynamic: 4,
@@ -622,6 +628,8 @@ pub(crate) fn on_cvar(
         // reads `VideoConfig` every frame, so `0` fades the outdoor shadows out (the slots evict
         // through the same cross-fade a walked-away fixture does) and `1` fades them back in.
         "exteriorshadows" => cfg.exterior_shadows = ev.flag(),
+        // MONKEY (daylight: terrain torch casters)
+        "torchterrainshadows" => cfg.torch_terrain_shadows = ev.flag(),
         // MONKEY (torch caster selection): the working-set size and the PCF radius, clamped at the
         // edge like every other numeric row. `casters` floors at 1, not 0 — `interiorShadows 0` is
         // already the off switch, and a 0 here would be a second, confusing one.
