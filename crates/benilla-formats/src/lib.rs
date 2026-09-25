@@ -127,7 +127,11 @@ pub use ground_effects::{
     GroundEffectCatalog, FRILL_DENSITY, FRILL_DENSITY_MAX,
 };
 mod light;
-pub use light::{Atmosphere, LightCatalog, Submersion, ZERO_KEY_COLOR, ZERO_KEY_SCALAR};
+// MONKEY (skybox): the skybox row and the zone walk's entries.
+pub use light::{
+    Atmosphere, LightCatalog, SkyboxDef, Submersion, ZoneSkybox, SKYBOX_FOG_BLEND, SKYBOX_FULL_DAY,
+    SKYBOX_KEEP_CELESTIAL, ZERO_KEY_COLOR, ZERO_KEY_SCALAR,
+};
 mod loading_screen;
 pub use loading_screen::{load_loading_screens, LoadingScreenCatalog};
 mod liquid;
