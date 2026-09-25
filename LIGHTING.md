@@ -65,13 +65,13 @@ is its own module, documented in `WATER.md`.
 
   | row | x | y | z | w |
   |---|---|---|---|---|
-  | `fog0` | height_fog_density | height_fog_height | height_fog_falloff | curve_blend |
-  | `fog1` | sun_fog r | g | b | sun_fog_strength |
-  | `fog2` | end_fog r | g | b | end_fog_distance |
-  | `fog3` | fog_model (0 classic, 1 modern) | sun_fog_angle | 0 | 0 |
-  | `wind0` | dir_x | dir_y | speed | gust |
-  | `wind1` | time_s | sway_strength | grass_strength | tree_strength |
-  | `wet0` | rain_rate | wetness | ripple_time_s | snow |
+  | `fog_a` | height_fog_density | height_fog_height | height_fog_falloff | curve_blend |
+  | `fog_b` | sun_fog r | g | b | sun_fog_strength |
+  | `fog_c` | end_fog r | g | b | end_fog_distance |
+  | `fog_d` | fog_model (0 classic, 1 modern) | sun_fog_angle | 0 | 0 |
+  | `wind_a` | dir_x | dir_y | speed | gust |
+  | `wind_b` | time_s | sway_strength | grass_strength | tree_strength |
+  | `wet_a` | rain_rate | wetness | ripple_time_s | snow |
   | `misc` | bender_count | time_of_day 0..1 | night 0..1 | 0 |
   | `benders[8]` | world x | world y | world z | radius |
 
