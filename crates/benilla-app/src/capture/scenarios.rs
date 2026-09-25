@@ -1567,9 +1567,10 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     Scenario {
         name: "wind-grass-elwynn",
         map: Some(MAP_AZEROTH),
-        // Inside the grassy hill that the earlier long shot put beyond clutter's 70 yd horizon.
-        eye: [-9460.0, 45.0, 60.5],
-        look: [-9442.0, 27.0, 57.5],
+        // MONKEY (integration): keep the lane's verified open-grass framing. The unverified closer
+        // handoff coordinates put the camera inside a Goldshire building and showed no grass.
+        eye: [-9505.0, 85.0, 64.0],
+        look: [-9460.0, 45.0, 57.0],
         minute: 720,
         ui: None,
     },
