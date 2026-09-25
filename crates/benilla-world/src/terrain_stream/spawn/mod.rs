@@ -340,6 +340,13 @@ pub(super) fn spawn_loaded_placements(
                             refs: &m.portal_refs,
                             slices: &sky_slices,
                         },
+                        m.submeshes.iter().zip(m.submesh_group.iter()).map(|(s, g)| {
+                            (
+                                *g,
+                                matches!(s.wmo_batch, Some(benilla_formats::WmoBatchClass::Ext)),
+                                &s.geometry.positions[..],
+                            )
+                        }),
                     );
                     let instance = (has_portals || m.wmo_id != 0).then(|| {
                         commands

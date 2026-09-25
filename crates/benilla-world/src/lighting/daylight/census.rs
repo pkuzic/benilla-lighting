@@ -15,7 +15,13 @@ struct Loaded {
     portals: benilla_formats::WmoPortals,
     slices: Vec<(u16, u16)>,
     /// `(group, class, window, sidn, positions)` per render batch.
-    batches: Vec<(u16, benilla_formats::WmoBatchClass, bool, bool, Vec<[f32; 3]>)>,
+    batches: Vec<(
+        u16,
+        benilla_formats::WmoBatchClass,
+        bool,
+        bool,
+        Vec<[f32; 3]>,
+    )>,
 }
 
 fn group_names(bytes: &[u8]) -> Vec<String> {
@@ -96,7 +102,11 @@ fn census(path: &str) {
         .collect();
     let verts: usize = feed.iter().map(|b| b.2.len()).sum();
     let rooms = l.groups.iter().filter(|g| g.interior).count();
-    println!("=== {path}: {} groups, {rooms} interior, {} batches, {verts} batch verts", l.groups.len(), feed.len());
+    println!(
+        "=== {path}: {} groups, {rooms} interior, {} batches, {verts} batch verts",
+        l.groups.len(),
+        feed.len()
+    );
 
     let t = std::time::Instant::now();
     let ranked = daylight_seeds_ranked(&l.groups, graph, feed.iter().copied());
@@ -125,10 +135,12 @@ fn census(path: &str) {
     let mut day_claim: HashMap<u16, Vec<String>> = HashMap::new();
     for s in &day {
         for c in daylight_claims(&l.groups, graph, s) {
-            day_claim
-                .entry(c.group)
-                .or_default()
-                .push(format!("{}@g{}{:?}", s.how.tag(), s.group, c.how));
+            day_claim.entry(c.group).or_default().push(format!(
+                "{}@g{}{:?}",
+                s.how.tag(),
+                s.group,
+                c.how
+            ));
         }
     }
     let mut bleed_claim: HashSet<u16> = HashSet::new();
@@ -157,8 +169,17 @@ fn census(path: &str) {
         };
         let (start, count) = l.slices[gi];
         let mut nb = Vec::new();
-        for r in l.portals.refs.iter().skip(start as usize).take(count as usize) {
-            let other = l.groups.get(r.group as usize).map_or('?', |o| if o.interior { 'i' } else { 'e' });
+        for r in l
+            .portals
+            .refs
+            .iter()
+            .skip(start as usize)
+            .take(count as usize)
+        {
+            let other =
+                l.groups
+                    .get(r.group as usize)
+                    .map_or('?', |o| if o.interior { 'i' } else { 'e' });
             let area = benilla_formats::room_claim::portal_area(&graph, r.portal).unwrap_or(0.0);
             nb.push(format!("p{}->g{}{}({:.0})", r.portal, r.group, other, area));
         }
@@ -191,8 +212,10 @@ fn census(path: &str) {
             day_claim.get(&gid).map(|v| v.iter().take(3).cloned().collect::<Vec<_>>().join(",")).unwrap_or_default(),
         );
     }
-    println!("interior rooms: {n_day} reached by daylight, {n_bleed} by bleed only, {n_none} by neither");
-    let sky = district_sky_rooms(&l.groups, graph);
+    println!(
+        "interior rooms: {n_day} reached by daylight, {n_bleed} by bleed only, {n_none} by neither"
+    );
+    let sky = district_sky_rooms(&l.groups, graph, feed.iter().copied());
     let enclosed = (0..l.groups.len() as u16)
         .filter(|g| benilla_formats::room_claim::enclosed_by_building_shell(&l.groups, *g))
         .count();
@@ -210,12 +233,20 @@ fn census(path: &str) {
 fn placement() -> Option<bevy::math::Affine3A> {
     let spec = std::env::var("WOW_CENSUS_PLACE").ok()?;
     let p: Vec<&str> = spec.split(',').collect();
-    let (map, tx, ty, uid) = (p[0], p[1].parse().ok()?, p[2].parse().ok()?, p[3].parse::<u32>().ok()?);
+    let (map, tx, ty, uid) = (
+        p[0],
+        p[1].parse().ok()?,
+        p[2].parse().ok()?,
+        p[3].parse::<u32>().ok()?,
+    );
     let data = benilla_formats::wow_data()?;
     let mut chain = open_chain(&data).ok()?;
     let tile = benilla_formats::load_tile_mesh(&mut chain, map, tx, ty).ok()?;
     let w = tile.wmos.iter().find(|w| w.unique_id == uid)?;
-    println!("placement uid {uid} pos {:?} rot {:?}", w.position, w.rotation);
+    println!(
+        "placement uid {uid} pos {:?} rot {:?}",
+        w.position, w.rotation
+    );
     Some(bevy::math::Affine3A::from_scale_rotation_translation(
         Vec3::ONE,
         benilla_assets::coords::placement_rotation(w.rotation),
@@ -232,5 +263,81 @@ fn city_daylight_census() {
             census(r"World\wmo\Azeroth\Buildings\Stormwind\Stormwind.wmo");
             census(r"World\wmo\KhazModan\Cities\Ironforge\ironforge.wmo");
         }
+    }
+}
+
+/// MONKEY (daylight: terrain torch casters): which lampposts have ground they cannot see — the
+/// share of terrain points within 25 yd whose line to the lamp head (3.5 yd up) is blocked by the
+/// terrain itself. Picks a vantage for the B1 capture. `WOW_LAMP_SCAN=map,x,y,radius,filter`.
+#[test]
+#[ignore = "instrument: needs WOW_DATA; run by hand with --ignored --nocapture"]
+fn lamp_terrain_occlusion_scan() {
+    let spec = std::env::var("WOW_LAMP_SCAN")
+        .unwrap_or_else(|_| "Azeroth,-9300,150,1,lamppost".into());
+    let p: Vec<&str> = spec.split(',').collect();
+    let (map, cx, cy, r, filter) = (
+        p[0],
+        p[1].parse::<f32>().unwrap(),
+        p[2].parse::<f32>().unwrap(),
+        p[3].parse::<i32>().unwrap(),
+        p[4].to_ascii_lowercase(),
+    );
+    let data = benilla_formats::wow_data().expect("WOW_DATA");
+    let mut chain = open_chain(&data).expect("chain");
+    let (tx, ty) = benilla_formats::world_to_tile(cx, cy);
+    let mut chunks = Vec::new();
+    let mut lamps = Vec::new();
+    for x in tx as i32 - r..=tx as i32 + r {
+        for y in ty as i32 - r..=ty as i32 + r {
+            let Ok(t) = benilla_formats::load_tile_mesh(&mut chain, map, x as u32, y as u32) else {
+                continue;
+            };
+            for d in &t.doodads {
+                if d.model.to_ascii_lowercase().contains(&filter) {
+                    lamps.push(d.position);
+                }
+            }
+            chunks.push(t.chunks);
+        }
+    }
+    let h = |x: f32, y: f32| {
+        chunks
+            .iter()
+            .find_map(|c| benilla_formats::terrain_height_at(c, [x, y, 1.0e4]))
+    };
+    let mut rows = Vec::new();
+    for l in lamps {
+        let head = Vec3::new(l[0], l[1], l[2] + 3.5);
+        let (mut total, mut blocked) = (0u32, 0u32);
+        let mut best = (0.0f32, 0.0f32);
+        for ring in 1..=10 {
+            let d = ring as f32 * 2.5;
+            for k in 0..36 {
+                let a = k as f32 * std::f32::consts::TAU / 36.0;
+                let (x, y) = (l[0] + d * a.cos(), l[1] + d * a.sin());
+                let Some(z) = h(x, y) else { continue };
+                total += 1;
+                let target = Vec3::new(x, y, z + 0.3);
+                let steps = (d / 0.5) as i32;
+                let hit = (1..steps).any(|s| {
+                    let q = head.lerp(target, s as f32 / steps as f32);
+                    h(q.x, q.y).is_some_and(|g| g > q.z + 0.05)
+                });
+                if hit {
+                    blocked += 1;
+                    best = (a.to_degrees(), d);
+                }
+            }
+        }
+        if total > 0 {
+            rows.push((blocked as f32 / total as f32, l, best));
+        }
+    }
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (f, l, (a, d)) in rows.iter().take(12) {
+        println!(
+            "lamp ({:8.1},{:7.1},{:6.1})  terrain-blocked {:5.1}%  e.g. bearing {a:5.0} deg at {d:4.1} yd",
+            l[0], l[1], l[2], f * 100.0
+        );
     }
 }

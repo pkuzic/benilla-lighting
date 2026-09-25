@@ -1390,10 +1390,10 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         name: "daylight-sw-cathedral", map: Some(MAP_AZEROTH),
         eye: [-8556.0, 826.0, 109.0], look: [-8515.0, 862.0, 112.0], minute: 720, ui: None,
     },
-    // A Trade District shop (group g123, one exterior portal).
+    // A Trade District house (group g68 NEH02, one exterior portal).
     Scenario {
         name: "daylight-sw-shop", map: Some(MAP_AZEROTH),
-        eye: [-8776.0, 722.0, 101.5], look: [-8764.0, 711.0, 100.2], minute: 720, ui: None,
+        eye: [-8799.0, 696.0, 104.3], look: [-8786.0, 707.0, 103.0], minute: 720, ui: None,
     },
     // Ironforge: the Great Forge hall (g64, no opening to the sky) and the gate hall (g7, the
     // city's one exterior portal).
@@ -1409,6 +1409,16 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     Scenario {
         name: "daylight-torch-goldshire", map: Some(MAP_AZEROTH),
         eye: [-9460.0, 70.0, 58.0], look: [-9450.0, 20.0, 61.0], minute: 0, ui: None,
+    },    // Two Elwynn road lampposts whose own light the terrain blocks most (the census's
+    // `lamp_terrain_occlusion_scan`: 18 % and 16 % of the ground within 25 yd), at midnight, framed
+    // across the lamp toward the blocked side.
+    Scenario {
+        name: "daylight-torch-hill-a", map: Some(MAP_AZEROTH),
+        eye: [-9314.8, 134.1, 70.0], look: [-9320.4, 165.6, 64.0], minute: 0, ui: None,
+    },
+    Scenario {
+        name: "daylight-torch-hill-b", map: Some(MAP_AZEROTH),
+        eye: [-9163.1, 181.1, 77.0], look: [-9147.1, 153.4, 71.0], minute: 0, ui: None,
     },
 ];
 
