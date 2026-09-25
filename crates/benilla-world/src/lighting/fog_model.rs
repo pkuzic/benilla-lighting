@@ -90,12 +90,12 @@ pub fn modern_fog_end(fog_end_raw: f32, fog_start_frac: f32, farclip: f32) -> (f
 }
 
 /// Sun-fog lobe defaults (no `LightFogBand` row): strength and the cosine the lobe starts at.
-pub const DERIVED_SUN_FOG_STRENGTH: f32 = 0.5;
-pub const DERIVED_SUN_FOG_ANGLE: f32 = 0.25;
+pub const DERIVED_SUN_FOG_STRENGTH: f32 = 0.25;
+pub const DERIVED_SUN_FOG_ANGLE: f32 = 0.4;
 /// How far the sun-fog colour leans from the fog colour toward the sun colour (IntBand 9).
-const DERIVED_SUN_FOG_LEAN: f32 = 0.6;
+const DERIVED_SUN_FOG_LEAN: f32 = 0.4;
 /// How far the end-fog colour leans from the fog colour toward the 1.8° sky ring.
-const DERIVED_END_FOG_LEAN: f32 = 0.5;
+const DERIVED_END_FOG_LEAN: f32 = 0.25;
 
 fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [

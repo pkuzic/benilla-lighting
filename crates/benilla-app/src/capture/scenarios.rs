@@ -1389,6 +1389,23 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 720,
         ui: None,
     },
+    // MONKEY (fog): a long Elwynn vista from the Northshire ridge south over Goldshire's forest.
+    Scenario {
+        name: "fog-vista-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-9000.0, -100.0, 200.0],
+        look: [-9500.0, -100.0, 90.0],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "fog-vista-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-9000.0, -100.0, 200.0],
+        look: [-9500.0, -100.0, 90.0],
+        minute: 1170,
+        ui: None,
+    },
     Scenario {
         name: "fog-duskwood-dusk",
         map: Some(MAP_AZEROTH),

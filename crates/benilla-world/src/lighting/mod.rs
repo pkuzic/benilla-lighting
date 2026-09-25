@@ -407,6 +407,11 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            // MONKEY (fog)
+            (
+                "lighting/fog_model.rs",
+                "update_fog_model: in the resolve set, .after(update_time_lighting)",
+            ),
             // MONKEY (daylight fixtures / portal bleed): both systems are PostUpdate,
             // chained before `global_light::classify_light_lanes`.
             (

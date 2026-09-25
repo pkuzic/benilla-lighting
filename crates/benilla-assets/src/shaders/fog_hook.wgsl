@@ -99,7 +99,8 @@ fn fog_modern_survival(span: vec2<f32>, d: f32, world_y: f32, height_row: vec4<f
 
 // MONKEY (fog): the sky dome's low band under Modern. `col` is the dome's own colour at `dir`,
 // `horizon_rgb` the colour it uses at 0° (the scene fog colour); the far fog colour along `dir`
-// replaces the horizon and eases into the dome's gradient over the first 12° of elevation.
+// replaces the horizon and eases into the dome's own gradient by 15° of elevation (a mix, never an
+// offset, so an already warm dusk ring is not pushed past itself).
 // Classic returns `col` untouched.
 fn fog_sky_horizon(
     col: vec3<f32>,
@@ -114,8 +115,8 @@ fn fog_sky_horizon(
     }
     let far = fog_modern_colour(horizon_rgb, dir, 1.0e9, sun_row, end_row, sel_row);
     let elev = asin(clamp(dir.y, -1.0, 1.0));
-    let w = 1.0 - smoothstep(0.0, 0.20943951, elev);
-    return clamp(col + (far - horizon_rgb) * w, vec3<f32>(0.0), vec3<f32>(1.0));
+    let w = 1.0 - smoothstep(0.0, 0.26179939, elev);
+    return mix(col, far, w);
 }
 
 // The fog a surface stands in: rgb = the fog colour, w = how much of the surface survives (1 = no
