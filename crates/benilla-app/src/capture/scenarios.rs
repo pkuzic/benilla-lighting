@@ -1409,7 +1409,7 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     // Redridge: Lake Everstill from above Lakeshire, a wider frame than `water-lake`.
     Scenario {
         name: "redridge-lake", map: Some(MAP_AZEROTH),
-        eye: [-9250.0, -2200.0, 110.0], look: [-9450.0, -2600.0, 55.0], minute: 720, ui: None,
+        eye: [-9350.0, -2340.0, 82.0], look: [-9500.0, -2650.0, 50.0], minute: 720, ui: None,
     },
     // Duskwood: the road into Darkshire, the zone's short dark fog.
     Scenario {
@@ -1443,18 +1443,22 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     },
 ];
 
-/// MONKEY (p0 baseline): the Elwynn programme view, east of Goldshire looking south-west.
-pub(super) const GFX_ELWYNN_EYE: [f32; 3] = [-9380.0, -30.0, 80.0];
-pub(super) const GFX_ELWYNN_LOOK: [f32; 3] = [-9600.0, -200.0, 62.0];
-/// MONKEY (p0 baseline): Mount Hyjal, Light.dbc sphere 270's centre (world yards).
-pub(super) const GFX_HYJAL_EYE: [f32; 3] = [4636.0, -4461.0, 900.0];
-pub(super) const GFX_HYJAL_LOOK: [f32; 3] = [4836.0, -4361.0, 870.0];
+/// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking
+/// south-west over the forest to the river and the hills (framed with the `vista` instrument).
+pub(super) const GFX_ELWYNN_EYE: [f32; 3] = [-9400.0, -100.0, 122.0];
+pub(super) const GFX_ELWYNN_LOOK: [f32; 3] = [-9477.6, -160.6, 104.6];
+/// MONKEY (p0 baseline): Mount Hyjal, over Light.dbc sphere 270's centre (world yards; the
+/// sphere's own z 873 is below the terrain), pitched a little up: its params-269 fog (end 278 yd,
+/// orange) fills the frame today, which is the subject the skybox and fog lanes change.
+pub(super) const GFX_HYJAL_EYE: [f32; 3] = [4636.0, -4461.0, 1152.0];
+pub(super) const GFX_HYJAL_LOOK: [f32; 3] = [4724.2, -4416.0, 1165.9];
 /// MONKEY (p0 baseline): the Cathedral of Light nave, standing over the floor.
 pub(super) const GFX_CATHEDRAL_EYE: [f32; 3] = [-8530.0, 845.0, 112.0];
 pub(super) const GFX_CATHEDRAL_LOOK: [f32; 3] = [-8500.0, 880.0, 110.0];
-/// MONKEY (p0 baseline): the Great Forge ring.
-pub(super) const GFX_FORGE_EYE: [f32; 3] = [-4870.0, -1010.0, 512.0];
-pub(super) const GFX_FORGE_LOOK: [f32; 3] = [-4920.0, -960.0, 502.0];
+/// MONKEY (p0 baseline): Ironforge's interior by the Great Forge ring (a lit WMO interior; the
+/// camera must stand over a floor face or the portal cull hides the city).
+pub(super) const GFX_FORGE_EYE: [f32; 3] = [-4880.0, -1000.0, 506.0];
+pub(super) const GFX_FORGE_LOOK: [f32; 3] = [-4950.4, -929.6, 497.3];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing
 /// 1.53 rad, Searing Gorge, map 0. The eye takes the standard [`VISTA_EYE_HEIGHT`]-ish lift off
