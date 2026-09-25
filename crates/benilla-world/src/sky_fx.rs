@@ -47,8 +47,8 @@ impl SkyQuality {
 ///
 /// MONKEY (fix-sky): it wrapped hourly in f32, and every star's twinkle jumped at the wrap. Now it
 /// accumulates in f64 and wraps at [`SKY_CLOCK_WRAP_S`]; the shader's twinkle rates are whole
-/// cycles per wrap (seamless). The High cloud-detail drift still re-patterns at the wrap, once
-/// per 24 h of continuous play.
+/// cycles per wrap (seamless). MONKEY (polish): the High cloud detail tiles and drifts whole
+/// tiles per wrap (`CLOUD_TILE`, `CLOUD_DRIFT_TILES`), so it is seamless there too.
 #[derive(Resource, Default)]
 pub struct SkyClock {
     pub secs: f32,
@@ -174,6 +174,39 @@ fn tick_sky_clock(time: Res<Time>, mut clock: ResMut<SkyClock>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `const NAME ... = <value>;` line of `sky_fx.wgsl`, as text.
+    fn wgsl_const(name: &str) -> String {
+        let src = include_str!("shaders/sky_fx.wgsl");
+        let line = src
+            .lines()
+            .find(|l| l.starts_with(&format!("const {name}:")))
+            .unwrap_or_else(|| panic!("no const {name}"));
+        let value = line.split('=').nth(1).unwrap().trim();
+        value.trim_end_matches(';').trim().to_string()
+    }
+
+    #[test]
+    fn the_shader_wrap_and_the_cloud_loop_match_the_clock() {
+        let wrap: f64 = wgsl_const("SKY_WRAP").parse().unwrap();
+        assert_eq!(wrap, SKY_CLOCK_WRAP_S);
+        // The loop needs an even tile (the half-rate warp tiles at half of it) and whole tiles of
+        // drift per wrap; the rates stay within 5% of WarcraftXL's 0.011 and 0.0043 cells/s.
+        let tile: i32 = wgsl_const("CLOUD_TILE").parse().unwrap();
+        assert!(tile > 0 && tile % 2 == 0);
+        let drift = wgsl_const("CLOUD_DRIFT_TILES");
+        let tiles: Vec<f64> = drift
+            .trim_start_matches("vec2<f32>(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|v| v.trim().parse().unwrap())
+            .collect();
+        for (n, rate) in tiles.iter().zip([0.011, 0.0043]) {
+            assert_eq!(n.fract(), 0.0, "whole tiles per wrap");
+            let actual = n * f64::from(tile) / SKY_CLOCK_WRAP_S;
+            assert!((actual / rate - 1.0).abs() < 0.05, "drift {actual} vs {rate}");
+        }
+    }
 
     #[test]
     fn glow_fades_out_below_the_horizon_and_under_cloud() {
