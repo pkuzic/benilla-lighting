@@ -21,7 +21,7 @@ struct SkyColors {
     sky4: vec4<f32>, // 1.8°
     fog: vec4<f32>,  // horizon (0°) and below: LightIntBand row 7
     warp: vec4<f32>, // x = dawn/dusk warp strength S (0 = off), y = sun azimuth (rad), zw reserved
-    // MONKEY (sky): x = skyQuality (0 Classic), y = sky clock (s), z = night-sky alpha, w = glow
+    // MONKEY (sky): x = skyQuality (0 Classic), y = reserved, z = night-sky alpha, w = glow
     // strength.
     fx: vec4<f32>,
     // MONKEY (sky): xyz = camera to the visible sun, w unused.
@@ -34,6 +34,8 @@ struct SkyColors {
     mf_fog_d: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky: SkyColors;
+// MONKEY (polish): x = the sky clock (s, wrapped at a day), written per frame outside the material.
+@group(#{MATERIAL_BIND_GROUP}) @binding(101) var<storage, read> sky_clock: vec4<f32>;
 
 // Glow `g` for a sun-relative azimuth phase, sampled linearly like `0x6d0f50` from the reference's
 // six-keyframe wrap-around table at `0xce9af8` (written by `0x6ce210`); 0.125 is the sun bearing.
@@ -137,7 +139,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let px = length(fwidth(dir)) * sky_fx::STAR_GRID * 0.5;
         if (night > 0.0 && dir.y > 0.0) {
             let band = sky_fx::galaxy_band(dir);
-            let stars = sky_fx::star_field(dir, sky.fx.y, max(px, 1e-4), band)
+            let stars = sky_fx::star_field(dir, sky_clock.x, max(px, 1e-4), band)
                 * smoothstep(0.0, 0.2, dir.y);
             let milky = sky_fx::milky_way(dir, band) * 0.05 * smoothstep(0.03, 0.35, dir.y);
             lin += (stars * 0.85 + milky) * night;

@@ -9,6 +9,12 @@
 //! Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-clouds, Clouds.cpp, Clouds.hpp.
 
 use bevy::prelude::*;
+use bevy::render::{
+    extract_resource::{ExtractResource, ExtractResourcePlugin},
+    render_resource::{Buffer, BufferDescriptor, BufferUsages},
+    renderer::{RenderDevice, RenderQueue},
+    Render, RenderApp, RenderSystems,
+};
 
 /// The sky tier: 0 Classic, 1 Enhanced, 2 High. Written by the app from the `skyQuality` cvar;
 /// `$WOW_SKY_QUALITY` pins it for the session (captures).
@@ -53,6 +59,25 @@ pub struct SkyClock {
 /// The sky clock's wrap in seconds; `sky_fx.wgsl`'s `SKY_WRAP` must match.
 pub const SKY_CLOCK_WRAP_S: f64 = 86_400.0;
 
+/// MONKEY (polish): the sky clock on the GPU, one `vec4` (`x` = [`SkyClock::secs`]) that the sky
+/// and cloud materials bind read-only. It is rewritten in place each frame in the render world,
+/// so the materials re-prepare only when a real input moves, not to advance the clock. Bevy's
+/// `globals.time` is not used: it wraps hourly, and the twinkle rates are whole cycles per day.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct SkyClockBuffer(pub Buffer);
+
+/// The clock value the render world uploads.
+#[derive(Resource, Clone, Copy)]
+struct SkyClockSecs(f32);
+
+impl ExtractResource for SkyClockSecs {
+    type Source = SkyClock;
+
+    fn extract_resource(source: &SkyClock) -> Self {
+        Self(source.secs)
+    }
+}
+
 /// How strongly the glow shows: a broad halo at `GLOW_GAIN` × the sun colour at the sun itself.
 pub(crate) const GLOW_GAIN: f32 = 0.22;
 
@@ -91,8 +116,48 @@ impl Plugin for SkyFxPlugin {
         });
         let quality = SkyQuality(SkyQuality::env_override().unwrap_or(0));
         app.insert_resource(quality)
-            .add_systems(Update, tick_sky_clock);
+            .add_systems(Update, tick_sky_clock)
+            // Beside the shared light buffer, ahead of the sky and cloud materials built after it.
+            .add_systems(
+                Startup,
+                init_sky_clock_buffer.in_set(benilla_assets::AssetSet::Open),
+            )
+            .add_plugins((
+                ExtractResourcePlugin::<SkyClockBuffer>::default(),
+                ExtractResourcePlugin::<SkyClockSecs>::default(),
+            ));
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                Render,
+                upload_sky_clock.in_set(RenderSystems::PrepareResources),
+            );
+        }
     }
+}
+
+/// A headless build has no device, and then no sky or cloud dome either.
+fn init_sky_clock_buffer(mut commands: Commands, device: Option<Res<RenderDevice>>) {
+    let Some(device) = device else {
+        return;
+    };
+    commands.insert_resource(SkyClockBuffer(device.create_buffer(&BufferDescriptor {
+        label: Some("sky_clock"),
+        size: 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })));
+}
+
+/// Render-world: the clock into the shared buffer before any sky draw reads it.
+fn upload_sky_clock(
+    queue: Res<RenderQueue>,
+    buffer: Option<Res<SkyClockBuffer>>,
+    secs: Option<Res<SkyClockSecs>>,
+) {
+    let (Some(buffer), Some(secs)) = (buffer, secs) else {
+        return;
+    };
+    queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&[secs.0, 0.0, 0.0, 0.0]));
 }
 
 fn tick_sky_clock(time: Res<Time>, mut clock: ResMut<SkyClock>) {
