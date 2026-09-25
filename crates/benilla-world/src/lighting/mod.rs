@@ -51,6 +51,8 @@ pub use global_light::WorldPointLight;
 // MONKEY (spellLightGain): the spell lane's marker + its live gain — the two-word world-side
 // shadow of benilla-app's own `SpellLight` lifecycle, and the dial the packer folds over it.
 pub use global_light::{SpellFxLight, SpellLightGain};
+// MONKEY (post): live 0/1/2 emissive tier packed without growing the shared light blob.
+pub use global_light::EmissiveTier;
 pub use global_light::{
     room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,
 };

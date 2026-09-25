@@ -29,6 +29,8 @@ pub fn register_shaders(app: &mut App) {
     // (loaded eagerly so `#import benilla::shadow_hook` resolves in terrain/model/static_gx). This is
     // the ONE place the realtime directional-shadow term lives; the receivers just call into it.
     load_shader_library!(app, "shaders/shadow_hook.wgsl");
+    // MONKEY (post): shared opt-in HDR multipliers; tier 0 is an exact identity.
+    load_shader_library!(app, "shaders/emissive_hook.wgsl");
     // MONKEY (enhanced water): the optional water module, `benilla::enhanced_water` (WATER.md).
     load_shader_library!(app, "shaders/enhanced_water.wgsl");
 }

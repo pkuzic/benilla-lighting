@@ -494,6 +494,8 @@
                 lightingQuality = "Lighting Quality",
                 -- MONKEY (volumetric fog): localised atmospheric quality row.
                 volumetricFog = "Volumetric Fog",
+                -- MONKEY (post): HDR excess + halo quality.
+                bloom = "Bloom",
                 fogOff = "Off",
                 waterQuality = "Water Quality",
                 waterClassic = "Classic",
@@ -532,6 +534,9 @@
                         .. "Low, Medium and High use Enhanced water; mirror reflections stay opt-in. "
                         .. "Changing a preset member shows Custom when no preset matches.",
                     -- MONKEY (volumetric fog): explain cost and the shadow-map dependency.
+                    -- MONKEY (post): Off guarantees the pre-HDR image.
+                    BLOOM =
+                        "Makes fire, lava, spells and lit windows carry a soft halo. Low uses a smaller blur chain; High is smoother. Off leaves the original image unchanged.",
                     VOLUMETRIC_FOG =
                         "Off disables volumetric fog. Low adds nearby haze and sun or moon shafts with fewer steps; High uses more steps for smoother shafts. Mist is heavier at dawn and in bad weather, and subtle indoors. Shafts require shadows; with shadows off only haze remains.",
                     WATER_QUALITY =
@@ -616,6 +621,8 @@
             ruRU = {
                 page = "Расширенная графика",
                 lightingQuality = "Качество освещения",
+                -- MONKEY (post): Russian HDR excess + halo quality row.
+                bloom = "Свечение",
                 -- MONKEY (volumetric fog): Russian atmospheric quality row.
                 volumetricFog = "Объёмный туман",
                 fogOff = "Выкл",
@@ -657,6 +664,9 @@
                         .. "сохраняют ваши значения. «Низкое», «Среднее» и «Высокое» используют улучшенную воду; "
                         .. "зеркальные отражения включаются отдельно. Изменение настройки набора показывает «Своё», "
                         .. "если ни один набор больше не совпадает.",
+                    -- MONKEY (post): localised bloom effect and Off contract.
+                    BLOOM =
+                        "Добавляет мягкое сияние огню, лаве, заклинаниям и освещённым окнам. Низкое качество использует короткое размытие, высокое — более плавное. Выключение сохраняет исходное изображение.",
                     -- MONKEY (volumetric fog): localised effect and cost explanation.
                     VOLUMETRIC_FOG =
                         "Выкл отключает объёмный туман. Низкое добавляет дымку вблизи и лучи солнца или луны с меньшим числом шагов; Высокое использует больше шагов для более плавных лучей. Туман гуще на рассвете и в непогоду, а в помещениях слабее. Для лучей нужны тени; без теней остаётся только дымка.",
@@ -795,7 +805,7 @@
             -- three of eighteen shadow settings and no hint that the other fifteen existed.
             AdvancedGraphics = {
                 -- MONKEY (volumetric fog): include in refresh, defaults and search.
-                "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog",
+                "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog", "RowBloom",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
@@ -2602,10 +2612,27 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- MONKEY (post): live HDR/bloom tier; Off is the baseline. -->
+                                        <Frame name="$parentRowBloom" inherits="OptionsDropdownRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "bloom", BENILLA_ADVGFX.bloom,
+                                                    "BENILLA_TOOLTIP_BLOOM")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.fogOff, value = "0" },
+                                                    { text = BENILLA_ADVGFX.qLow, value = "1" },
+                                                    { text = BENILLA_ADVGFX.qHigh, value = "2" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <!-- MONKEY (post): bloom is the new row immediately above this one. -->
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowBloom" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowBloom" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",

@@ -46,6 +46,7 @@ the technique is listed in the table below. Do not remove either.
 | Beach surf | a travelling wave front, a lace of foam that dissolves behind it, a swash sheet on the sand | tier |
 | Swimmers | wake foam, treading rings and a visual-only bob with the swell | tier |
 | Lava glow | magma surfaces emit warm point lights through the lighting module | Advanced Graphics → Lava Glow, `lavaLightGain` |
+| Lava HDR | magma partially resists distance fog and feeds the screen-space halo | Advanced Graphics → Bloom, `bloom` (Off/Low/High) |
 
 Rivers deliberately have NO flow effect: a derived current was tried and removed at the owner's
 request. If it ever returns it should read the authored MCLQ flow records, not derive one.

@@ -10,6 +10,8 @@
 }
 // MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
 #import benilla::shadow_hook
+// MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
+#import benilla::emissive_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -1979,6 +1981,12 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         let denom = max(fog_span.y - fog_span.x, 0.001);
         let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
         rgb = mix(fog_color.xyz, rgb, factor);
+    }
+    // MONKEY (post): SIDN/window batches cross 1.0 only at night and when bloom is armed.
+    if ((in.word & WORD_WINDOW) != 0u) {
+        rgb = emissive_hook::emissive_boost(
+            rgb, emissive_hook::EMISSIVE_WMO_WINDOW, wow_light.light_diffuse.w,
+            wow_light.grade.x);
     }
     // Gamma-space output; alpha pinned 1.0, every draw here is opaque.
     return vec4<f32>(rgb, 1.0);

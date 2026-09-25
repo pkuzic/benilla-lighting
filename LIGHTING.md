@@ -24,6 +24,7 @@ behind each constant.
 | Moon shadows | at night the same shadow rig re-aims at the moon and casts a faint shadow; dims only the night sky term, never point lights | `moonShadowStrength` |
 | Ground-effect spells | Flamestrike, Rain of Fire, Consecration, Flare and fire traps light the ground for their duration; frost and nature areas stay dark | `spellLightGain` |
 | Volumetric fog | near-field haze that converges on the zone fog colour (clear within 10 yd, full by 150 yd; mistier at dawn and in bad weather, faint indoors) and sun/moon light shafts through gaps, sampled from the shadow map; own fullscreen pass after the main pass (`benilla-app/src/volumetric_fog.rs`) | Advanced Graphics → Volumetric Fog (Off/Low/High), cvar `volumetricFog`, env `WOW_VOLFOG=0\|1\|2` |
+| HDR emission and bloom | lit WMO windows, additive models/particles and magma can exceed display white; a soft-capped fullscreen halo is added before the faithful FFX clamp | Advanced Graphics → Bloom (Off/Low/High), cvar `bloom`; Off is the unchanged reference image, suggested High preset value 2 |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
 Players reach all of it from **Options -> Advanced Graphics** (a Lighting Quality preset Off / Low / Medium / High plus the individual rows; Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
@@ -35,6 +36,7 @@ is its own module, documented in `WATER.md`.
 ## Where the code lives
 
 - **Shaders**: `crates/benilla-assets/src/shaders/shadow_hook.wgsl` (shared shadow sampling),
+  `crates/benilla-assets/src/shaders/emissive_hook.wgsl` (shared opt-in HDR multipliers),
   `crates/benilla-world/src/shaders/torch_depth.wgsl`, and the lighting lanes inside
   `static_gx.wgsl`, `wow_model.wgsl` and `terrain.wgsl`. The three receivers mirror each other; the
   comments say where.

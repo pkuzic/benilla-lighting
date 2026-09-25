@@ -30,6 +30,8 @@
 }
 // MONKEY (enhanced water): the optional water module - see enhanced_water.wgsl and WATER.md.
 #import benilla::enhanced_water::{water_active, water_swell, enhanced_water, WaterFragment}
+// MONKEY (post): shared tier-gated HDR emission and magma fog resistance.
+#import benilla::emissive_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var frames: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var frames_samp: sampler;
@@ -227,7 +229,12 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
     // Magma/slime: the sheet is the opaque body, unmodulated (the ADT vertex has no colour, the WMO
     // one is `0xffffffff`) and unlit (lighting off on both paths), but fogged.
     if (w.kind.x > 0.5) {
-        return vec4<f32>(apply_fog(detail.rgb, in.world_position.xyz, in.room_fog), 1.0);
+        // MONKEY (post): distant magma keeps some authored body and crosses 1.0 for bloom.
+        let fogged = apply_fog(detail.rgb, in.world_position.xyz, in.room_fog);
+        let hot = emissive_hook::emissive_boost(
+            detail.rgb, emissive_hook::EMISSIVE_MAGMA, wow_light.light_diffuse.w, 1.0);
+        return vec4<f32>(mix(fogged, hot,
+            emissive_hook::magma_fog_resist(wow_light.light_diffuse.w)), 1.0);
     }
 
     // V, from the authored depth byte CPU-side: clamp(byte/42) on river/lake (LUT `0xc81768`,

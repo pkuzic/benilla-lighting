@@ -12,6 +12,8 @@
 // - BLEND_MOD2X:    (rgb, 1) under (Dst, Src) = `2·src·dst`, rain's state; reads no alpha.
 
 #import bevy_render::view::View
+// MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
+#import benilla::emissive_hook
 
 // Prefix of `lighting::global_light`'s buffer; keep in sync with wow_model.wgsl's copy.
 struct WowLight {
@@ -160,7 +162,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 #ifdef BLEND_ADD
     // Premultiplied in gamma, so stacked quads sum like the reference's bytes.
-    return vec4<f32>(rgb * c.a, 0.0);
+    // MONKEY (post): boost before the additive framebuffer blend, never after the stack.
+    return vec4<f32>(emissive_hook::emissive_boost(
+        rgb * c.a, emissive_hook::EMISSIVE_PARTICLE_ADD, wow_light.light_diffuse.w, 1.0), 0.0);
 #else
 #ifdef BLEND_OPAQUE
     return vec4<f32>(rgb, 1.0);

@@ -921,6 +921,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (post): tier 0 leaves every emissive site and the frame byte-identical.
+    ours("bloom", "0", "benilla's own: HDR emissive bloom, 0 Off / 1 Low / 2 High"),
     ours(
         "waterQuality",
         "1",
@@ -2902,6 +2904,8 @@ mod tests {
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
+            // MONKEY (post): weld registry and renderer defaults.
+            ("bloom", shadows.bloom as f32),
             ("lavaLightGain", shadows.lava_light_gain),
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
@@ -3133,6 +3137,8 @@ mod tests {
                     "waterQuality" => video.water_quality as f32,
                     // MONKEY (volumetric fog): verify presets reach the renderer.
                     "volumetricFog" => video.volumetric_fog as f32,
+                    // MONKEY (post): the post lane's live tier.
+                    "bloom" => video.bloom as f32,
                     "lavaLightGain" => video.lava_light_gain,
                     "fireLightGain" => video.fire_light_gain,
                     "moonShadowStrength" => video.moon_shadow_strength,

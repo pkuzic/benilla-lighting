@@ -25,7 +25,9 @@
 //!
 //! Water quality and lava glow use the same guarded bridge into their renderer resources.
 use benilla_assets::WaterQuality;
-use benilla_world::lighting::{DynamicInteriors, FireLightGain, LavaLightGain, MoonShadowStrength, SpellLightGain};
+use benilla_world::lighting::{
+    DynamicInteriors, EmissiveTier, FireLightGain, LavaLightGain, MoonShadowStrength, SpellLightGain,
+};
 use bevy::prelude::*;
 
 use crate::video::VideoConfig;
@@ -60,12 +62,17 @@ fn bridge(
     mut moon: ResMut<MoonShadowStrength>,
     mut water: ResMut<WaterQuality>,
     mut lava: ResMut<LavaLightGain>,
+    // MONKEY (post): bloom also arms the HDR source hooks through the shared light blob.
+    mut emissive: ResMut<EmissiveTier>,
 ) {
     if water.0 != video.water_quality {
         water.0 = video.water_quality;
     }
     if lava.0 != video.lava_light_gain {
         lava.0 = video.lava_light_gain;
+    }
+    if emissive.0 != video.bloom {
+        emissive.0 = video.bloom;
     }
     if fire.0 != video.fire_light_gain {
         fire.0 = video.fire_light_gain;
@@ -130,6 +137,7 @@ mod tests {
             .init_resource::<MoonShadowStrength>()
             .init_resource::<WaterQuality>()
             .init_resource::<LavaLightGain>()
+            .init_resource::<EmissiveTier>()
             .add_plugins(DynamicInteriorPlugin);
         assert_eq!(app.world().resource::<WaterQuality>().0, VideoConfig::default().water_quality);
         assert_eq!(app.world().resource::<LavaLightGain>().0, VideoConfig::default().lava_light_gain);

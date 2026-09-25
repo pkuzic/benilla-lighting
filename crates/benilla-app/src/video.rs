@@ -222,6 +222,8 @@ pub(crate) struct VideoConfig {
     pub(crate) water_quality: u8,
     // MONKEY (volumetric fog): live camera raymarch tier: 0 Off, 1 Low, 2 High.
     pub(crate) volumetric_fog: u8,
+    // MONKEY (post): emissive HDR + bloom quality, 0 Off / 1 Low / 2 High.
+    pub(crate) bloom: u8,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -467,6 +469,8 @@ impl Default for VideoConfig {
             water_quality: 1,
             // MONKEY (volumetric fog): default to the inexpensive atmosphere.
             volumetric_fog: 1,
+            // MONKEY (post): opt-in; the future High graphics preset selects tier 2.
+            bloom: 0,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -547,6 +551,8 @@ pub(crate) fn on_cvar(
         "waterquality" => cfg.water_quality = v.clamp(0.0, 2.0) as u8,
         // MONKEY (volumetric fog): constrain UI/console writes to supported tiers.
         "volumetricfog" => cfg.volumetric_fog = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (post): constrain UI/console writes to the supported bloom tiers.
+        "bloom" => cfg.bloom = v.clamp(0.0, 2.0) as u8,
         "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),
