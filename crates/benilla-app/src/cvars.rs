@@ -921,6 +921,13 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
+    // Default 0 = the reference look; the Graphics preset's High sets 1.
+    ours(
+        "skyDither",
+        "0",
+        "benilla's own: faint screen dither against sky and fog banding, 0 Off / 1 On",
+    ),
     ours(
         "waterQuality",
         "1",
@@ -3701,6 +3708,11 @@ mod tests {
         },
         |app| {
             app.add_observer(crate::video::on_cvar);
+        },
+        // MONKEY (p0 graphics programme)
+        |app| {
+            app.init_resource::<benilla_world::ffx_glow::SkyDither>();
+            app.add_observer(crate::monkey_gfx::on_cvar);
         },
         |app| {
             app.add_observer(crate::player::camera::on_cvar);

@@ -519,6 +519,8 @@
                 spellLights = "Spell Lights",
                 nightDarkness = "Night Darkness",
                 interiorDarkness = "Interior Darkness",
+                -- MONKEY (p0 skyDither)
+                skyDither = "Sky Dithering",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
@@ -611,6 +613,10 @@
                         "Scales interior fixture light and room ambient, including the light from "
                         .. "lamps and candles. Lower values make both dimmer.\n\n"
                         .. "1.0 leaves these inputs unchanged. Free at any setting.",
+                    -- MONKEY (p0 skyDither)
+                    SKY_DITHER =
+                        "Adds a faint noise to the final image so smooth sky and fog gradients do not "
+                        .. "break into visible bands. Off is the original client's look. Practically free.",
                 },
             },
             ruRU = {
@@ -643,6 +649,8 @@
                 spellLights = "Свет от заклинаний",
                 nightDarkness = "Темнота ночи",
                 interiorDarkness = "Темнота помещений",
+                -- MONKEY (p0 skyDither)
+                skyDither = "Дизеринг неба",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -743,6 +751,11 @@
                         "Масштабирует свет светильников и фоновое освещение помещений, включая "
                         .. "свет ламп и свечей. Меньшие значения ослабляют и то и другое.\n\n"
                         .. "1.0 оставляет эти составляющие без изменений. Ничего не стоит при любом значении.",
+                    -- MONKEY (p0 skyDither)
+                    SKY_DITHER =
+                        "Добавляет едва заметный шум в итоговое изображение, чтобы плавные переходы цвета "
+                        .. "неба и тумана не распадались на полосы. Выключено — вид оригинального клиента. "
+                        .. "Почти ничего не стоит.",
                 },
             },
         }
@@ -801,6 +814,8 @@
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
                 "RowFireLight", "RowFireFlicker", "RowSpellLights", "RowLavaGlow",
                 "RowNightDarkness", "RowInteriorDarkness",
+                -- MONKEY (p0 skyDither)
+                "RowSkyDither",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -2825,6 +2840,18 @@
                                                     BENILLA_ADVGFX.interiorDarkness,
                                                     "BENILLA_TOOLTIP_INTERIOR_DARKNESS")
                                                 OptionsSliderRow_Setup(self, 0.2, 1.5, 0.05, "darkness")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (p0 skyDither): the combine's deband dither. -->
+                                        <Frame name="$parentRowSkyDither" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowInteriorDarkness" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowInteriorDarkness" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "skyDither",
+                                                    BENILLA_ADVGFX.skyDither,
+                                                    "BENILLA_TOOLTIP_SKY_DITHER")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>
