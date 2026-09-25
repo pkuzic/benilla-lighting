@@ -129,6 +129,8 @@ impl Plugin for AmbientOcclusionPlugin {
                 (
                     prepare_pipelines.in_set(RenderSystems::Prepare),
                     prepare_textures.in_set(RenderSystems::PrepareResources),
+                    // MONKEY (reviewfix-a): one uniform per view, rewritten, not allocated per frame.
+                    prepare_ao_uniforms.in_set(RenderSystems::PrepareResources),
                 ),
             )
             .add_render_graph_node::<ViewNodeRunner<AoNode>>(Core3d, AoLabel)
@@ -357,6 +359,31 @@ fn prepare_textures(
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 struct AoLabel;
 
+/// MONKEY (reviewfix-a): the view's AO uniform, created once and rewritten in prepare.
+#[derive(Component)]
+struct AoUniform(UniformBuffer<AoView>);
+
+fn prepare_ao_uniforms(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut views: Query<(Entity, &AoView, Option<&mut AoUniform>)>,
+) {
+    for (entity, settings, uniform) in &mut views {
+        match uniform {
+            Some(mut uniform) => {
+                uniform.0.set(*settings);
+                uniform.0.write_buffer(&device, &queue);
+            }
+            None => {
+                let mut uniform = UniformBuffer::from(*settings);
+                uniform.write_buffer(&device, &queue);
+                commands.entity(entity).insert(AoUniform(uniform));
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct AoNode;
 
@@ -365,7 +392,7 @@ impl ViewNode for AoNode {
         &'static ViewTarget,
         &'static ViewDepthTexture,
         &'static ViewUniformOffset,
-        &'static AoView,
+        &'static AoUniform,
         &'static ViewAoPipelines,
         &'static AoTextures,
     );
@@ -397,9 +424,7 @@ impl ViewNode for AoNode {
         let layouts = world.resource::<AoPipeline>();
         let ms = (depth.texture.sample_count() > 1) as usize;
         let device = context.render_device().clone();
-        let mut uniform = UniformBuffer::from(*settings);
-        uniform.write_buffer(&device, world.resource::<RenderQueue>());
-        let params = uniform.binding().unwrap();
+        let params = settings.0.binding().unwrap();
 
         // `main_texture_view` is the single-sample texture the opaque pass resolved into.
         let ao_bind = device.create_bind_group(

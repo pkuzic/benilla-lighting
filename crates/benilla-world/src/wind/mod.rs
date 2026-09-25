@@ -74,17 +74,29 @@ impl Default for WindField {
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FoliageWind(pub u8);
 
+impl FoliageWind {
+    /// The registered `foliageWind` default (grass + trees).
+    pub const REGISTERED: u8 = 2;
+
+    /// MONKEY (reviewfix-a): the capture-only A/B pin `WOW_FOLIAGE_WIND`, read only under
+    /// `WOW_CAPTURE` (like the other capture levers) so a player run always obeys the saved CVar.
+    /// The app adds the dev-build gate on top.
+    pub fn capture_override() -> Option<u8> {
+        std::env::var_os("WOW_CAPTURE")?;
+        std::env::var("WOW_FOLIAGE_WIND")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 2.0) as u8)
+    }
+}
+
 impl Default for FoliageWind {
     fn default() -> Self {
         // The resource exists before the CVar host. Its ordinary default therefore has to equal
-        // the registered default; a default-valued CVar emits no change event at boot. The env
-        // arm is capture-only and lets the A/B harness force the exact zero-displacement path.
-        let tier = std::env::var("WOW_FOLIAGE_WIND")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(2.0)
-            .clamp(0.0, 2.0) as u8;
-        Self(tier)
+        // the registered default; a default-valued CVar emits no change event at boot. The
+        // capture pin lets the A/B harness force the exact zero-displacement path.
+        Self(Self::capture_override().unwrap_or(Self::REGISTERED))
     }
 }
 

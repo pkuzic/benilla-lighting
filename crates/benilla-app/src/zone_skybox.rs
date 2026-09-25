@@ -6,7 +6,7 @@ use bevy::prelude::*;
 
 /// The session override, read once.
 #[derive(Resource, Clone, Copy)]
-struct ZoneSkyboxOverride(Option<bool>);
+pub(crate) struct ZoneSkyboxOverride(pub(crate) Option<bool>); // MONKEY (reviewfix-a): test census
 
 pub(crate) struct ZoneSkyboxPlugin;
 
@@ -31,7 +31,7 @@ fn apply_override(
     }
 }
 
-fn on_cvar(
+pub(crate) fn on_cvar(
     ev: On<crate::cvars::CvarChanged>,
     forced: Res<ZoneSkyboxOverride>,
     zone: Option<ResMut<benilla_world::skybox::ZoneSkyboxes>>,

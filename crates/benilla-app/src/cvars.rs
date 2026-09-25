@@ -955,7 +955,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours(
         "skyQuality",
         "0",
-        "benilla's own: sky quality, 0 Classic / 1 Enhanced (smooth gradient, sun glow, stars) / \n         2 High (+ detailed sun-lit clouds)",
+        "benilla's own: sky quality, 0 Classic / 1 Enhanced (smooth gradient, sun glow, stars) / \
+         2 High (+ detailed sun-lit clouds)",
     ),
     // MONKEY (wind): one tier controls the grass-only and grass-plus-tree receivers.
     ours(
@@ -984,7 +985,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours(
         "zoneSkyboxes",
         "0",
-        "benilla's own: draw the zone skybox LightParams names for the living, 0 Off / 1 On; the          reference draws a DBC skybox only for the ghost",
+        "benilla's own: draw the zone skybox LightParams names for the living, 0 Off / 1 On; the \
+         reference draws a DBC skybox only for the ghost",
     ),
     ours(
         "waterQuality",
@@ -1133,13 +1135,15 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours(
         "exteriorShadows",
         "1",
-        "benilla's own: outdoor fire lights (campfires, braziers, lampposts) cast real shadows at          night; no effect by day",
+        "benilla's own: outdoor fire lights (campfires, braziers, lampposts) cast real shadows at \
+         night; no effect by day",
     ),
     // MONKEY (daylight: terrain torch casters): the ground as a torch caster.
     ours(
         "torchTerrainShadows",
         "0",
-        "benilla's own: the ground casts into outdoor fire shadows (hills and banks block a fire's          light); needs exteriorShadows",
+        "benilla's own: the ground casts into outdoor fire shadows (hills and banks block a fire's \
+         light); needs exteriorShadows",
     ),
     // MONKEY (static torch cache): residency and per-frame work have separate live budgets.
     ours(
@@ -2334,8 +2338,11 @@ fn same_value(a: &str, b: &str) -> bool {
 /// allowed to say, which is what keeps the row from going stale behind a `/console` write.
 pub(crate) fn derive_lighting_quality(cvars: &Cvars) -> &'static str {
     for (name, members) in LIGHTING_PRESETS {
+        // MONKEY (reviewfix-a): a session-owned row (an env lever) is not the player's choice and
+        // must not turn the saved label Custom; it is skipped, as the seed skips it.
         let matched = members
             .iter()
+            .filter(|(k, _)| !cvars.is_session_owned(k))
             .all(|(k, v)| cvars.get(k).is_some_and(|live| same_value(live, v)));
         if matched {
             return name;
@@ -2379,6 +2386,21 @@ pub(crate) const GRAPHICS_PRESET_NAMES: [&str; 5] = ["Classic", "Low", "Medium",
 /// The rung a player with no saved preset boots into ([`Cvars::seed_graphics_preset`]).
 pub(crate) const GRAPHICS_DEFAULT: &str = "High";
 
+/// MONKEY (reviewfix-a): **the rows where the first-boot seed leaves the reference** — the
+/// [`GRAPHICS_DEFAULT`] column value a new player actually boots with, against the reference's
+/// own default. The registered row keeps its `same(...)` (the registry default IS the
+/// reference's; a capture or a test, which never seeds, runs at it), so this list is where the
+/// deviation of the *seeded* boot value is declared, `Deviates`-style: `(row, reference, why)`.
+/// `seeded_column_deviates_only_where_declared` walks the whole column against the reference
+/// rows, both ways.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const SEEDED_DEVIATIONS: &[(&str, &str, &str)] = &[(
+    "farclip",
+    "350",
+    "owner decision: the High preset is the first-boot default, and High's view distance is the \
+     reference's own slider maximum, 777 yd; Classic keeps 350",
+)];
+
 /// **The one place the Graphics Preset is written down**: one line per governed row, one column
 /// per rung of [`GRAPHICS_PRESET_NAMES`]. `lightingQuality` is itself a row — writing its rung
 /// writes [`LIGHTING_PRESETS`]' members — so every lighting, water, fog, post and wind row the
@@ -2421,8 +2443,10 @@ fn graphics_column(name: &str) -> Option<usize> {
 /// ladders show). Reads `lightingQuality`'s DERIVED label, so run it after that is mirrored.
 pub(crate) fn derive_graphics_quality(cvars: &Cvars) -> &'static str {
     for (col, name) in GRAPHICS_PRESET_NAMES.iter().enumerate() {
+        // MONKEY (reviewfix-a): session-owned rows are skipped, as in the lighting ladder above.
         let matched = GRAPHICS_PRESETS
             .iter()
+            .filter(|(k, _)| !cvars.is_session_owned(k))
             .all(|(k, v)| cvars.get(k).is_some_and(|live| same_value(live, v[col])));
         if matched {
             return name;
@@ -2636,14 +2660,14 @@ fn stored_config() -> StoredConfig {
     }
 }
 
-/// MONKEY (integration): a capture may opt into one explicit, read-only CVar fixture through
-/// `BENILLA_HOME`. All other local state stays hermetic and [`save_config`] still sees no path,
-/// so deterministic A/B homes can select graphics tiers without a capture writing anything back.
+/// MONKEY (integration): a capture may opt into one explicit, read-only CVar fixture.
+/// MONKEY (reviewfix-a): through its own variable, `WOW_CAPTURE_CVARS=<config.toml path>`, not
+/// `BENILLA_HOME` (the general local-state override a player shell may carry, which would load
+/// that player's settings into a baseline). Without it a capture reads no config at all. All
+/// other local state stays hermetic and [`save_config`] still sees no path.
 fn config_read_path() -> Option<std::path::PathBuf> {
     if std::env::var_os("WOW_CAPTURE").is_some() {
-        return std::env::var_os("BENILLA_HOME")
-            .map(std::path::PathBuf::from)
-            .map(|home| home.join("config.toml"));
+        return std::env::var_os("WOW_CAPTURE_CVARS").map(std::path::PathBuf::from);
     }
     crate::local_state::config_path()
 }
@@ -3740,19 +3764,36 @@ mod tests {
     /// row's rung values do too.
     #[test]
     fn graphics_rows_pass_their_observers_unclamped() {
+        // MONKEY (reviewfix-a): every governed row, every rung — not only `farclip`. Each value
+        // is driven through the real setter and read back off the resource its renderer reads.
         let mut app = cvar_app();
         for (col, name) in GRAPHICS_PRESET_NAMES.iter().enumerate() {
-            let farclip = GRAPHICS_PRESETS
-                .iter()
-                .find(|(k, _)| *k == "farclip")
-                .unwrap()
-                .1[col];
-            apply(&mut app, "farclip", farclip);
-            assert_eq!(
-                res::<ViewDistance>(&app).farclip,
-                farclip.parse::<f32>().unwrap(),
-                "{name}"
-            );
+            for (k, values) in GRAPHICS_PRESETS {
+                if *k == "lightingQuality" {
+                    continue; // its members are welded by the lighting-preset census test
+                }
+                let value = values[col];
+                apply(&mut app, k, "-1");
+                apply(&mut app, k, value);
+                let video = res::<VideoConfig>(&app);
+                let flag = |b: bool| if b { 1.0 } else { 0.0 };
+                let applied = match *k {
+                    "farclip" => res::<ViewDistance>(&app).farclip,
+                    "skyQuality" => video.sky_quality as f32,
+                    "skyDither" => flag(res::<benilla_world::ffx_glow::SkyDither>(&app).0),
+                    "fogModel" => {
+                        flag(res::<benilla_world::lighting::FogModelSetting>(&app).modern())
+                    }
+                    "rainSurfaces" => flag(res::<benilla_world::weather::RainSurfaces>(&app).0),
+                    "torchTerrainShadows" => flag(video.torch_terrain_shadows),
+                    "daylightWindowSplit" => flag(video.daylight_window_split),
+                    "ambientOcclusion" => video.ambient_occlusion as f32,
+                    "zoneSkyboxes" => flag(res::<benilla_world::skybox::ZoneSkyboxes>(&app).0),
+                    "lampFog" => video.lamp_fog as f32,
+                    _ => panic!("add the observer readback for {k}"),
+                };
+                assert_eq!(applied, value.parse::<f32>().unwrap(), "{name}/{k}");
+            }
         }
     }
 
@@ -4382,6 +4423,12 @@ mod tests {
             app.init_resource::<benilla_world::weather::RainSurfaces>(); // MONKEY (wet)
             app.add_observer(crate::monkey_gfx::on_cvar);
         },
+        // MONKEY (reviewfix-a): the zone-skybox bridge, so every governed row has its observer.
+        |app| {
+            app.insert_resource(crate::zone_skybox::ZoneSkyboxOverride(None));
+            app.init_resource::<benilla_world::skybox::ZoneSkyboxes>();
+            app.add_observer(crate::zone_skybox::on_cvar);
+        },
         |app| {
             app.add_observer(crate::player::camera::on_cvar);
         },
@@ -4957,6 +5004,8 @@ mod tests {
         )
         .unwrap();
         let _h = EnvGuard::set("BENILLA_HOME", tmp.to_str().unwrap());
+        // MONKEY (reviewfix-a): the fixture is named by its own variable, not BENILLA_HOME.
+        let _x = EnvGuard::set("WOW_CAPTURE_CVARS", tmp.join("config.toml").to_str().unwrap());
         let _c = EnvGuard::set("WOW_CAPTURE", "post-lava-searing");
 
         assert_eq!(boot_cvar("bloom").as_deref(), Some("0"));
@@ -5071,6 +5120,112 @@ mod tests {
                 "gxVSync",
                 "gxWindow",
             ]
+        );
+    }
+
+    // ─── MONKEY (reviewfix-a) ────────────────────────────────────────────────────────────────
+
+    /// The value the reference boots a row at, as its [`Reference`] column records it; `None`
+    /// for benilla's own rows (nothing to match).
+    fn reference_boot_value(row: &Registered) -> Option<&'static str> {
+        match &row.reference {
+            Reference::Same(v) => Some(v),
+            // The reference's own boot code lands where our default does.
+            Reference::Overridden { .. } => Some(row.default),
+            Reference::Deviates { value, .. } => Some(value),
+            Reference::Ours(_) => None,
+        }
+    }
+
+    /// **The seeded High column against every reference row** (review #6): a governed row a new
+    /// player boots off the reference's value must be declared in [`SEEDED_DEVIATIONS`] with
+    /// that reference value and a reason, and a declared row must really deviate.
+    #[test]
+    fn seeded_column_deviates_only_where_declared() {
+        let col = graphics_column(GRAPHICS_DEFAULT).unwrap();
+        for (k, values) in GRAPHICS_PRESETS {
+            if k.eq_ignore_ascii_case("lightingQuality") {
+                continue; // High on that ladder IS the registered defaults (its own test)
+            }
+            let row = REGISTERED.iter().find(|r| r.name == *k).expect("governed row registered");
+            let declared = SEEDED_DEVIATIONS.iter().find(|(n, _, _)| n == k);
+            match reference_boot_value(row) {
+                Some(reference) if !same_value(values[col], reference) => {
+                    let (_, value, why) = declared.unwrap_or_else(|| {
+                        panic!(
+                            "{k}: the seeded {GRAPHICS_DEFAULT} value {} leaves the reference's \
+                             {reference}; declare it in SEEDED_DEVIATIONS",
+                            values[col]
+                        )
+                    });
+                    assert!(same_value(value, reference), "{k}: declared reference is stale");
+                    assert!(!why.trim().is_empty(), "{k}: a deviation owes a reason");
+                }
+                _ => assert!(
+                    declared.is_none(),
+                    "{k}: declared in SEEDED_DEVIATIONS but the seed does not deviate"
+                ),
+            }
+        }
+        for (n, _, _) in SEEDED_DEVIATIONS {
+            assert!(
+                GRAPHICS_PRESETS.iter().any(|(k, _)| k == n),
+                "{n}: declared but not governed"
+            );
+        }
+    }
+
+    /// Review #14: an env lever owns a governed row for the session; the label must not derive
+    /// (and so persist) `Custom` because of it.
+    #[test]
+    fn a_session_owned_row_does_not_derive_custom() {
+        let mut cvars = fresh_registry();
+        apply_graphics_preset(&mut cvars, "High");
+        lighting_quality(&mut cvars);
+        assert_eq!(derive_graphics_quality(&cvars), "High");
+        cvars.own_for_session("farclip", Some("500"));
+        assert_eq!(cvars.get("farclip"), Some("500"));
+        assert_eq!(derive_graphics_quality(&cvars), "High");
+        // A lighting member owned by the session is skipped the same way.
+        cvars.own_for_session("waterQuality", Some("0"));
+        assert_eq!(derive_lighting_quality(&cvars), "High");
+    }
+
+    /// Review #15: help strings are one line — a lost `\` continuation leaves a literal `\n` or a
+    /// run of indentation spaces in the `/console` text.
+    #[test]
+    fn help_strings_have_no_broken_continuations() {
+        for row in REGISTERED {
+            let why = match &row.reference {
+                Reference::Ours(why)
+                | Reference::Deviates { why, .. }
+                | Reference::Overridden { why, .. } => *why,
+                Reference::Same(_) => continue,
+            };
+            assert!(
+                !why.contains('\n') && !why.contains("\\n") && !why.contains("   "),
+                "{}: broken line continuation in {why:?}",
+                row.name
+            );
+        }
+    }
+
+    /// Review #13: a capture reads CVars only from the dedicated `WOW_CAPTURE_CVARS` fixture,
+    /// never from a `BENILLA_HOME` the shell happens to carry.
+    #[test]
+    fn a_capture_reads_cvars_only_from_its_fixture() {
+        use crate::local_state::test_env::{EnvGuard, ENV_LOCK};
+        let _l = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _c = EnvGuard::set("WOW_CAPTURE", "overlook-noon");
+        let _h = EnvGuard::set("BENILLA_HOME", "player-home");
+        let _x = EnvGuard::unset("WOW_CAPTURE_CVARS");
+        assert_eq!(config_read_path(), None);
+        let _x = EnvGuard::set("WOW_CAPTURE_CVARS", "fixture/config.toml");
+        assert_eq!(
+            config_read_path(),
+            Some(std::path::PathBuf::from("fixture/config.toml"))
         );
     }
 }
