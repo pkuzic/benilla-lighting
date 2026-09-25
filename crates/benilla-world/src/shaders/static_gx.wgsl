@@ -1534,7 +1534,13 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
                 sidn_w = 0.0;
             }
         }
-        let sidn_e = sidn_rgb * (wow_light.grade.x * sidn_w);
+        var sidn_e = sidn_rgb * (wow_light.grade.x * sidn_w);
+        // MONKEY (fix-post): the bloom window gain lifts only this light term, before fog (it used
+        // to multiply the whole fogged batch, so fogged buildings glowed as fog x 2.35 at night).
+        if ((in.word & WORD_WINDOW) != 0u) {
+            sidn_e = emissive_hook::emissive_boost(
+                sidn_e, emissive_hook::EMISSIVE_WMO_WINDOW, wow_light.light_diffuse.w, 1.0);
+        }
         // MONKEY (ext-class night law): plenty of geometry INSIDE a building is authored
         // EXTERIOR-class — the Goldshire inn's whole 57.7 yd shell is one group (`upstairs`,
         // MOGP 0x0a09, and it holds the stair down to the cellar), its east stairwell annex is
@@ -2009,12 +2015,8 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         rgb = fog_hook::apply_fog(rgb, fog_color.xyz, fog_span, eye_z, in.world_position.xyz,
             view.world_position, true, wow_light.monkey);
     }
-    // MONKEY (post): SIDN/window batches cross 1.0 only at night and when bloom is armed.
-    if ((in.word & WORD_WINDOW) != 0u) {
-        rgb = emissive_hook::emissive_boost(
-            rgb, emissive_hook::EMISSIVE_WMO_WINDOW, wow_light.light_diffuse.w,
-            wow_light.grade.x);
-    }
+    // MONKEY (post): SIDN/window light crosses 1.0 only at night and when bloom is armed; the
+    // gain is applied to `sidn_e` above (MONKEY fix-post).
     // Gamma-space output; alpha pinned 1.0, every draw here is opaque.
     return vec4<f32>(rgb, 1.0);
 }

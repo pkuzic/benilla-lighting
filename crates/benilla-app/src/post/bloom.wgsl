@@ -21,20 +21,24 @@ fn tap(tex: texture_2d<f32>, uv: vec2<f32>, offset: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_extract(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     // 13-tap downfilter: a broad, stable footprint when Low uses a quarter-size target.
+    // MONKEY (fix-post): the footprint scales with the target divisor (Low = quarter size, so
+    // 2x offsets), else 16 source pixels fed each output from a 5x5 area and thin sparks shimmered.
+    let spread = select(1.0, 2.0, bloom.tier < 1.5);
     var c = tap(source_tex, in.uv, vec2(0.0)) * 0.20;
-    c += tap(source_tex, in.uv, vec2( 1.0,  0.0)) * 0.10;
-    c += tap(source_tex, in.uv, vec2(-1.0,  0.0)) * 0.10;
-    c += tap(source_tex, in.uv, vec2( 0.0,  1.0)) * 0.10;
-    c += tap(source_tex, in.uv, vec2( 0.0, -1.0)) * 0.10;
-    c += tap(source_tex, in.uv, vec2( 1.0,  1.0)) * 0.06;
-    c += tap(source_tex, in.uv, vec2(-1.0,  1.0)) * 0.06;
-    c += tap(source_tex, in.uv, vec2( 1.0, -1.0)) * 0.06;
-    c += tap(source_tex, in.uv, vec2(-1.0, -1.0)) * 0.06;
-    c += tap(source_tex, in.uv, vec2( 2.0,  0.0)) * 0.04;
-    c += tap(source_tex, in.uv, vec2(-2.0,  0.0)) * 0.04;
-    c += tap(source_tex, in.uv, vec2( 0.0,  2.0)) * 0.04;
-    c += tap(source_tex, in.uv, vec2( 0.0, -2.0)) * 0.04;
-    let excess = max(c.rgb - vec3(1.0), vec3(0.0));
+    c += tap(source_tex, in.uv, vec2( 1.0,  0.0) * spread) * 0.10;
+    c += tap(source_tex, in.uv, vec2(-1.0,  0.0) * spread) * 0.10;
+    c += tap(source_tex, in.uv, vec2( 0.0,  1.0) * spread) * 0.10;
+    c += tap(source_tex, in.uv, vec2( 0.0, -1.0) * spread) * 0.10;
+    c += tap(source_tex, in.uv, vec2( 1.0,  1.0) * spread) * 0.06;
+    c += tap(source_tex, in.uv, vec2(-1.0,  1.0) * spread) * 0.06;
+    c += tap(source_tex, in.uv, vec2( 1.0, -1.0) * spread) * 0.06;
+    c += tap(source_tex, in.uv, vec2(-1.0, -1.0) * spread) * 0.06;
+    c += tap(source_tex, in.uv, vec2( 2.0,  0.0) * spread) * 0.04;
+    c += tap(source_tex, in.uv, vec2(-2.0,  0.0) * spread) * 0.04;
+    c += tap(source_tex, in.uv, vec2( 0.0,  2.0) * spread) * 0.04;
+    c += tap(source_tex, in.uv, vec2( 0.0, -2.0) * spread) * 0.04;
+    // MONKEY (fix-post): cap the excess so a +inf pixel cannot become an inf/inf NaN halo.
+    let excess = min(max(c.rgb - vec3(1.0), vec3(0.0)), vec3(64.0));
     let knee = excess * excess / (excess + vec3(0.50));
     // Frost-Nova/firework stacks can reach 5-10x; compress them without hard clipping.
     let capped = vec3(5.0) * (vec3(1.0) - exp(-knee / vec3(5.0)));
