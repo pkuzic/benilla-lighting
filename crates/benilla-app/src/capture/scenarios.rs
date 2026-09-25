@@ -1379,6 +1379,24 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // MONKEY (fog): Duskwood's short zone fog (Light 15, LightParams 14) from above the canopy west
+    // of Darkshire toward the town, for the Classic/Modern fog A/B (`WOW_FOGMODEL=0|1`).
+    Scenario {
+        name: "fog-duskwood-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-10700.0, -900.0, 160.0],
+        look: [-10560.0, -1180.0, 60.0],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "fog-duskwood-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-10700.0, -900.0, 160.0],
+        look: [-10560.0, -1180.0, 60.0],
+        minute: 1170,
+        ui: None,
+    },
 ];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing

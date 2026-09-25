@@ -521,6 +521,8 @@
                 interiorDarkness = "Interior Darkness",
                 -- MONKEY (p0 skyDither)
                 skyDither = "Sky Dithering",
+                -- MONKEY (fog)
+                fogModel = "Modern Fog",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
@@ -617,6 +619,13 @@
                     SKY_DITHER =
                         "Adds a faint noise to the final image so smooth sky and fog gradients do not "
                         .. "break into visible bands. Off is the original client's look. Practically free.",
+                    -- MONKEY (fog)
+                    FOG_MODEL =
+                        "Softer distance fog in the style of the modern client: it thickens gradually "
+                        .. "instead of in a straight ramp, glows toward the sun by day and shifts to the "
+                        .. "sky's colour in the distance, so the land melts into the horizon. Each zone "
+                        .. "keeps its own fog distance; above the original view-distance limit the fog "
+                        .. "recedes with it.\n\nOff is the original client's fog. Practically free.",
                 },
             },
             ruRU = {
@@ -651,6 +660,8 @@
                 interiorDarkness = "Темнота помещений",
                 -- MONKEY (p0 skyDither)
                 skyDither = "Дизеринг неба",
+                -- MONKEY (fog)
+                fogModel = "Современный туман",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -756,6 +767,13 @@
                         "Добавляет едва заметный шум в итоговое изображение, чтобы плавные переходы цвета "
                         .. "неба и тумана не распадались на полосы. Выключено — вид оригинального клиента. "
                         .. "Почти ничего не стоит.",
+                    -- MONKEY (fog)
+                    FOG_MODEL =
+                        "Более мягкий туман в духе современного клиента: он сгущается постепенно, а не "
+                        .. "по прямой, днём светлеет в сторону солнца, а вдали принимает цвет неба, "
+                        .. "так что земля растворяется в горизонте. Дальность тумана в каждой зоне "
+                        .. "прежняя; за пределом дальности обзора оригинала туман отступает вместе с ней."
+                        .. "\n\nВыключено — туман оригинального клиента. Почти ничего не стоит.",
                 },
             },
         }
@@ -816,6 +834,8 @@
                 "RowNightDarkness", "RowInteriorDarkness",
                 -- MONKEY (p0 skyDither)
                 "RowSkyDither",
+                -- MONKEY (fog)
+                "RowFogModel",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -2852,6 +2872,18 @@
                                                 OptionsRow_OnLoad(self, "skyDither",
                                                     BENILLA_ADVGFX.skyDither,
                                                     "BENILLA_TOOLTIP_SKY_DITHER")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (fog): the distance-fog model. -->
+                                        <Frame name="$parentRowFogModel" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowSkyDither" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowSkyDither" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "fogModel",
+                                                    BENILLA_ADVGFX.fogModel,
+                                                    "BENILLA_TOOLTIP_FOG_MODEL")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>

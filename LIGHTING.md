@@ -25,6 +25,7 @@ behind each constant.
 | Ground-effect spells | Flamestrike, Rain of Fire, Consecration, Flare and fire traps light the ground for their duration; frost and nature areas stay dark | `spellLightGain` |
 | Volumetric fog | near-field haze that converges on the zone fog colour (clear within 10 yd, full by 150 yd; mistier at dawn and in bad weather, faint indoors) and sun/moon light shafts through gaps, sampled from the shadow map; own fullscreen pass after the main pass (`benilla-app/src/volumetric_fog.rs`) | Advanced Graphics → Volumetric Fog (Off/Low/High), cvar `volumetricFog`, env `WOW_VOLFOG=0\|1\|2` |
 | Sky dithering | a faint screen-space dither in the FFXGlow combine so smooth sky and fog gradients do not band (MONKEY p0; was env-only) | Advanced Graphics → Sky Dithering, cvar `skyDither` 0/1 (default 0, Graphics preset High = 1), env `WOW_DITHER=1` still forces it on; bridge in `benilla-app/src/monkey_gfx.rs` |
+| Modern fog | MONKEY (fog): distance fog in the style of the modern client. Radial distance; exponential from the zone's own start, fitted so 60 % survives mid-span and closed over the last stretch so the fog still ends where the zone authored it; a sun-fog lobe (the fog leans to the sun colour around the sun, fading out through dusk); the far fog shifts toward the sky's 1.8° ring so fogged land, the WDL hull and the sky dome's horizon meet in one colour; volumetric haze takes the same colour and no longer hazes sky pixels. The fog end stays the zone's up to farclip 777 and grows with farclip beyond it. Optional per-`LightParams` fields (height fog, sun/end fog, curve) from our `LightFogBand.dbc` (absent = derived from the 1.12 bands). Interior WMO fog stays classic | Advanced Graphics → Modern Fog, cvar `fogModel` 0 Classic (default, byte-identical) / 1 Modern (Graphics preset High = 1), env `WOW_FOGMODEL=0\|1`; `fog_hook.wgsl`, `benilla-world/src/lighting/fog_model.rs`, `benilla-formats/src/light/fog_band.rs` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
 Players reach all of it from **Options -> Advanced Graphics** (a Lighting Quality preset Off / Low / Medium / High plus the individual rows; Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
@@ -68,7 +69,7 @@ is its own module, documented in `WATER.md`.
   | `fog_a` | height_fog_density | height_fog_height | height_fog_falloff | curve_blend |
   | `fog_b` | sun_fog r | g | b | sun_fog_strength |
   | `fog_c` | end_fog r | g | b | end_fog_distance |
-  | `fog_d` | fog_model (0 classic, 1 modern) | sun_fog_angle | 0 | 0 |
+  | `fog_d` | fog_model (0 classic; Modern = the scene fog end, yd ≥ 1) | sun_fog_angle (cos) | sun dir octahedral x | y |
   | `wind_a` | dir_x | dir_y | speed | gust |
   | `wind_b` | time_s | sway_strength | grass_strength | tree_strength |
   | `wet_a` | rain_rate | wetness | ripple_time_s | snow |
