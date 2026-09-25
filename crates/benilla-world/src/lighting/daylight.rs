@@ -2035,6 +2035,10 @@ pub(super) fn register(app: &mut App) {
     );
 }
 
+// MONKEY (daylight): the city census instrument.
+#[cfg(test)]
+mod census;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1378,6 +1378,32 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         look: LAVA_RIVER_LOOK,
         minute: 0,
         ui: None,
+    },    // MONKEY (daylight): city interiors by day and terrain torch shadows at night. World coords
+    // from the census (`lighting::daylight::census`, Stormwind uid 10047, Ironforge uid 7706).
+    // The Gilded Rose ground floor (group g268, portal + aperture seeds).
+    Scenario {
+        name: "daylight-sw-inn", map: Some(MAP_AZEROTH),
+        eye: [-8871.0, 681.0, 99.8], look: [-8858.0, 668.0, 98.6], minute: 720, ui: None,
+    },
+    // The Cathedral of Light nave (groups g135/g146, lit only by two EXT-class window batches).
+    Scenario {
+        name: "daylight-sw-cathedral", map: Some(MAP_AZEROTH),
+        eye: [-8556.0, 826.0, 109.0], look: [-8515.0, 862.0, 112.0], minute: 720, ui: None,
+    },
+    // A Trade District shop (group g123, one exterior portal).
+    Scenario {
+        name: "daylight-sw-shop", map: Some(MAP_AZEROTH),
+        eye: [-8776.0, 722.0, 101.5], look: [-8764.0, 711.0, 100.2], minute: 720, ui: None,
+    },
+    // Ironforge: the Great Forge hall (g64, no opening to the sky) and the gate hall (g7, the
+    // city's one exterior portal).
+    Scenario {
+        name: "daylight-if-forge", map: Some(MAP_AZEROTH),
+        eye: [-4930.0, -945.0, 503.5], look: [-4890.0, -985.0, 503.0], minute: 720, ui: None,
+    },
+    Scenario {
+        name: "daylight-if-gate", map: Some(MAP_AZEROTH),
+        eye: [-4975.0, -895.0, 503.5], look: [-5005.0, -852.0, 506.0], minute: 720, ui: None,
     },
 ];
 
