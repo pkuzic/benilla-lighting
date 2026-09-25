@@ -714,7 +714,9 @@ fn animate_skyboxes(
         return;
     }
     let deterministic = crate::dev_state::deterministic_run();
-    let now = time.elapsed_secs();
+    // MONKEY (reviewfix): retain sub-frame precision for skybox loops across long sessions; only
+    // narrow the wrapped sequence clock that the f32 track sampler consumes.
+    let now = time.elapsed_secs_f64();
     let day = clock.minute.min(1439) as f32 / 1440.0;
     clocks.clear();
     for layer in want.0.iter().filter(|l| l.weight > 0.0) {
@@ -724,12 +726,17 @@ fn animate_skyboxes(
         // A capture poses at `t = 0`, not the bind pose: a converted skybox places its layers with
         // bone keys, and every row at `t = 0` is its seed.
         let (band_t, gseq, live) = if layer.flags & SKYBOX_FULL_DAY != 0 {
-            let g = if deterministic { 0.0 } else { f64::from(now) };
+            let g = if deterministic { 0.0 } else { now };
             (rig.duration * day, g, true)
         } else if deterministic {
             (capture_t(), f64::from(capture_t()), true)
         } else {
-            (now, f64::from(now), true)
+            let band_t = if rig.duration > 0.0 {
+                (now % f64::from(rig.duration)) as f32
+            } else {
+                0.0
+            };
+            (band_t, now, true)
         };
         let pose = if live && rig.animates() {
             rig.pose(rig.band_time(band_t), gseq)
