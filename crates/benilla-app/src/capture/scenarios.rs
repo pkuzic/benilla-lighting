@@ -1645,6 +1645,11 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         name: "wet-stormwind", map: Some(MAP_AZEROTH),
         eye: [-8833.38, 628.63, 98.5], look: [-8815.0, 662.0, 93.5], minute: 720, ui: None,
     },
+    // MONKEY (fix-wet): the wet-stormwind framing at midnight: lit windows must stay lit in rain.
+    Scenario {
+        name: "wet-stormwind-night", map: Some(MAP_AZEROTH),
+        eye: [-8833.38, 628.63, 98.5], look: [-8815.0, 662.0, 93.5], minute: 0, ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking
