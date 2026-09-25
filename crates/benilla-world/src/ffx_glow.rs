@@ -308,7 +308,8 @@ fn ensure_ffx_glow(
 // ---------------------------------------------------------------- render world
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-struct FfxGlowLabel;
+// MONKEY (post): world-only HDR passes explicitly order themselves before the legacy clamp.
+pub struct FfxGlowLabel;
 
 /// The layouts, samplers, wave LUT and pipelines, built once at startup.
 #[derive(Resource)]

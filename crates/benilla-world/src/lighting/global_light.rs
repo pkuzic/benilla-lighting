@@ -477,6 +477,11 @@ impl Default for FireLightGain {
     }
 }
 
+/// MONKEY (post): live `bloom` tier. The packer adds it to `light_diffuse.w`, whose old value 1
+/// was an unread clamp marker, so the 8528-byte shared buffer and every existing decode stay put.
+#[derive(Resource, Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct EmissiveTier(pub u8);
+
 /// MONKEY (spellLightGain): marks a `PointLight` that a SPELL EFFECT invented — a kit's aura glow,
 /// a missile's core, an impact flash, a firework shell's burst. The app's own
 /// `entities::spell_fx::SpellLight` carries the envelope, the mode and the budget; this is the
@@ -645,6 +650,8 @@ pub(super) fn register(app: &mut App) {
         .init_resource::<DynamicInteriors>()
         // MONKEY (fire GO lights): the live gain on synthesised fire lights.
         .init_resource::<FireLightGain>()
+        // MONKEY (post): opt-in HDR emission, packed into an existing float lane.
+        .init_resource::<EmissiveTier>()
         // MONKEY (spellLightGain): and the one on spell-effect lights, which overrides it.
         .init_resource::<SpellLightGain>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
@@ -1309,6 +1316,8 @@ fn build_light_data(
     shadow: ShadowLanes,
     // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
     dynamic_interiors: Res<DynamicInteriors>,
+    // MONKEY (post): the 0/1/2 tier rides the unused `light_diffuse.w` marker.
+    emissive: Res<EmissiveTier>,
     // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
     fire_gain: Res<FireLightGain>,
     // MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
@@ -1376,6 +1385,8 @@ fn build_light_data(
     // this packs (rows 0/1, the SH block, the sun's DC redistribution) is LINEAR in that triple, so
     // one multiply at the input dims all of them consistently and no derived row can be missed.
     pack_model_core_rows(rows, night_dim(l.ambient), night_dim(l.diffuse), l.sun_dir);
+    // MONKEY (post): old value 1 remains tier Off; no existing shader consumes this marker.
+    rows[1][3] = 1.0 + emissive.0.min(2) as f32;
     // MONKEY (world shadows): pack the world-shadow lane flag into the free `sh_c16.w` lane. The
     // MCSH terrain-shadow suppression in `terrain.wgsl` keys on THIS — not on the mere presence of
     // a shadow sun — so character-only shadows (sun present, world lane off) keep the baked MCSH.
@@ -2060,6 +2071,8 @@ mod tests {
             .init_resource::<ShadowHandover>()
             .init_resource::<DynamicInteriors>()
             .init_resource::<FireLightGain>()
+            // MONKEY (post): the packer reads the live HDR tier too.
+            .init_resource::<EmissiveTier>()
             .init_resource::<SpellLightGain>()
             .add_systems(Update, build_light_data);
         app.world_mut()

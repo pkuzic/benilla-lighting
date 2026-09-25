@@ -247,6 +247,8 @@ impl PluginGroup for GamePlugins {
             .add(crate::volumetric_fog::VolumetricFogPlugin)
             // MONKEY (p0 graphics programme): the programme's cvar bridges (skyDither, ...).
             .add(crate::monkey_gfx::MonkeyGfxPlugin)
+            // MONKEY (post): world-only HDR effects, before the legacy FFX clamp/UI composite.
+            .add(crate::post::PostPlugin)
             // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
             // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
             .add(crate::realmlist::RealmlistPlugin)

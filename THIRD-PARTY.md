@@ -31,8 +31,8 @@ where they stand. Do not remove either.
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (beach surf, `on_bed`) | `wxl-experimental-water` | `sea/Shore.hpp`, `shaders/Shore.hlsli` | Shore surf limited by the terrain column, so objects standing in the water never foam (principle) |
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (Gerstner crests, High) + `crates/benilla-world/src/liquid/waves.rs` | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `sea/Spectrum.*`, `sea/Ocean.*` | Gerstner displacement and fold-driven crest whitecaps; the CPU swimmer sample inverts the same displacement (ported) |
 | `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
+| `crates/benilla-app/src/post/grading.rs` + `crates/benilla-app/src/post/grading.wgsl` | `wxl-retail-grading` | `Grading.*`, `shaders/Grading.ps.hlsl` | 32³ LUT convention, strength control and strip lookup mathematics, with the strip uploaded as a native 3D texture (ported from the GPL-3.0-or-later source implementation, Copyright (C) 2026 WarcraftXL) |
 
 Planned (not yet in the tree): breaker index from `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
-(`field/Wind.*`, `grass/GrassWind.*`); colour grading from `wxl-retail-grading`
-(`Grading.*`, `shaders/Grading.ps.hlsl`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
+(`field/Wind.*`, `grass/GrassWind.*`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
 The lane that ports one adds its row here.

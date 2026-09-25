@@ -24,6 +24,8 @@
 #import benilla::monkey_frame
 // MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
 #import benilla::fog_hook
+// MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
+#import benilla::emissive_hook
 
 // bevy_pbr 0.18.1's `forward_io::FragmentOutput`. No depth output: a fragment depth write costs
 // the pipeline early-Z, so the sky lane pins its depth in the vertex stage.
@@ -1743,6 +1745,9 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     var out_rgb = rgb;
     if (is_additive) {
         out_rgb = out_rgb * faded_alpha;
+        // MONKEY (post): additive M2 cards become HDR before their framebuffer blend stacks them.
+        out_rgb = emissive_hook::emissive_boost(
+            out_rgb, emissive_hook::EMISSIVE_M2_ADD, wow_light.light_diffuse.w, 1.0);
     }
     // Mod (bit 7) and Mod2x (bit 8) read no source alpha, so the fade rides the colour as in the
     // reference: texenv preset 5, `mix(prev.rgb, tex.rgb, prev.a)`, with the primary colour forced
