@@ -13,7 +13,7 @@
 // `mix(fog_rgb, rgb, factor)`. The expressions below are the ones the receivers carried, in the
 // same order, so the classic result is bit-identical.
 //
-// Extension point for the FOG lane: `fog_sample` branches on `mf.fog3.x` (`MonkeyFrame.fog_model`,
+// Extension point for the FOG lane: `fog_sample` branches on `mf.fog_d.x` (`MonkeyFrame.fog_model`,
 // 0 classic / 1 modern). The modern arm currently returns the classic result.
 
 #import benilla::monkey_frame::MonkeyFrame
@@ -39,9 +39,9 @@ fn fog_sample(
     mf: MonkeyFrame,
 ) -> vec4<f32> {
     let classic = vec4<f32>(fog_rgb, fog_linear(eye_z, span));
-    if (mf.fog3.x > 0.5) {
+    if (mf.fog_d.x > 0.5) {
         // FOG lane: the modern model (height / sun / end-colour / curve fog) goes here, reading
-        // mf.fog0..fog3. Until it lands, the modern arm is the classic law.
+        // mf.fog_a..fog_d. Until it lands, the modern arm is the classic law.
         return classic;
     }
     return classic;

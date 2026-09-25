@@ -14,13 +14,13 @@
 //!
 //! | row | xyz / x,y,z | w |
 //! |---|---|---|
-//! | 0 `fog0` | height_fog_density, height_fog_height, height_fog_falloff | curve_blend |
-//! | 1 `fog1` | sun_fog_rgb | sun_fog_strength |
-//! | 2 `fog2` | end_fog_rgb | end_fog_distance |
-//! | 3 `fog3` | fog_model (0 classic, 1 modern), sun_fog_angle, 0 | 0 |
-//! | 4 `wind0` | dir_x, dir_y, speed | gust |
-//! | 5 `wind1` | time_s, sway_strength, grass_strength | tree_strength |
-//! | 6 `wet0` | rain_rate, wetness, ripple_time_s | snow |
+//! | 0 `fog_a` | height_fog_density, height_fog_height, height_fog_falloff | curve_blend |
+//! | 1 `fog_b` | sun_fog_rgb | sun_fog_strength |
+//! | 2 `fog_c` | end_fog_rgb | end_fog_distance |
+//! | 3 `fog_d` | fog_model (0 classic, 1 modern), sun_fog_angle, 0 | 0 |
+//! | 4 `wind_a` | dir_x, dir_y, speed | gust |
+//! | 5 `wind_b` | time_s, sway_strength, grass_strength | tree_strength |
+//! | 6 `wet_a` | rain_rate, wetness, ripple_time_s | snow |
 //! | 7 `misc` | bender_count, time_of_day 0..1, night 0..1 | 0 |
 //! | 8-15 `benders` | world x, y, z | radius |
 //!
@@ -38,7 +38,7 @@ pub const MONKEY_FRAME_ROWS: usize = 16;
 /// How many benders (grass/foliage pushers: the player and nearby units) the block carries.
 pub const MAX_BENDERS: usize = 8;
 
-/// The fog model selector, `fog3.x`.
+/// The fog model selector, `fog_d.x`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FogModel {
     /// Today's linear 1.12 fog, byte-identical.
