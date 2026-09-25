@@ -45,7 +45,7 @@ pub struct SkyClock {
 }
 
 /// How strongly the glow shows: a broad halo at `GLOW_GAIN` × the sun colour at the sun itself.
-pub(crate) const GLOW_GAIN: f32 = 0.32;
+pub(crate) const GLOW_GAIN: f32 = 0.22;
 
 /// The glow's day fade: full once the sun clears the horizon, gone a few degrees under it.
 pub(crate) fn glow_day_fade(sun_y: f32) -> f32 {
