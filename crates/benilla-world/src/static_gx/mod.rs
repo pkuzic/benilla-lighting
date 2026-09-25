@@ -76,6 +76,8 @@ const WORD_HAS_VC: u32 = 1 << 27;
 // `ShadeSel::Matte`, fixed 1.0: a map doodad never reaches the 2.5 site (`0x69e4ad`). Not
 // `WORD_SHADE_LIT`, so lifting the shader's `min(I, 1)` cap leaves this at 1.0.
 const WORD_MATTE: u32 = 1 << 28;
+// MONKEY (wind): classified alpha-tested tree/bush foliage; bits 30-31 remain free.
+const WORD_FOLIAGE_WIND: u32 = 1 << 29;
 // An interior M2 prop is WORD_INTERIOR with WORD_WMO clear, the entity shader's `interior_prop =
 // flags.z && !flags.x`: SH-probe light from its record slot, interior fog, no live point lights.
 
@@ -173,6 +175,8 @@ struct GxItem {
     prop: Option<GxItemProp>,
     /// `Some(uid)` on a fader item: the placement it exiles with.
     fader: Option<u32>,
+    /// MONKEY (wind): an alpha-tested leaf-card batch of a static tree/bush model.
+    foliage_wind: bool,
 }
 
 /// A WMO-prop item's referrer set (an index into [`GxCell::sets`]) and folded SH-probe slot;
@@ -357,6 +361,9 @@ pub enum GxSite<'a> {
         instance: Entity,
         groups: &'a [u16],
         bounds: &'a [benilla_formats::WmoGroupInfo],
+        /// MONKEY (daylight: district sky rooms): per ABSOLUTE group, a city room connected to
+        /// the sky by the portal graph (`lighting::district_sky_rooms`); empty for a building.
+        sky: &'a [bool],
     },
     /// A WMO doodad prop (B4, decision 1433 — 1418's lane 3, absorbed): the building's
     /// instance entity, the referrer set of rooms that name the prop, and the interior
@@ -478,6 +485,10 @@ impl StaticGx {
                 return false;
             }
         };
+        let foliage_wind = foliage_wind_batch(&b.object.label, b.blend, b.wmo.is_some());
+        if foliage_wind {
+            log_foliage_classification(&b.object.label);
+        }
         let wmo_key = b.wmo.as_ref().map(|w| w.instance);
         let wmo = b.wmo.map(|w| GxItemWmo {
             group: w.group,
@@ -591,6 +602,7 @@ impl StaticGx {
             wmo,
             prop,
             fader: fader_uid,
+            foliage_wind,
         });
         if !entry.dirty {
             entry.dirty_since = self.frame;
@@ -685,6 +697,44 @@ impl StaticGx {
         self.declined_changed = 0;
         self.declined_printed = 0;
         self.accepted = 0;
+    }
+}
+
+/// MONKEY (wind): conservative leaf classification. Alpha test excludes trunks/rocks even when a
+/// whole model path says tree; the name terms cover vanilla's tree/bush/plant families. Animated
+/// doodads never reach this function because `assemble.rs` excludes them before `StaticGx::divert`.
+pub(crate) fn foliage_wind_batch(path: &str, blend: ModelBlend, wmo_geometry: bool) -> bool {
+    if wmo_geometry || blend != ModelBlend::AlphaTest {
+        return false;
+    }
+    let p = path.to_ascii_lowercase();
+    // Substrings alone otherwise catch StreetLamp, tree huts, dead stumps/logs and painted tree
+    // facades. Those can carry alpha-tested cards, but moving the whole card is not foliage sway.
+    if ["street", "treehut", "stump", "log", "facade", "fallen"]
+        .iter()
+        .any(|term| p.contains(term))
+    {
+        return false;
+    }
+    [
+        "tree", "bush", "shrub", "foliage", "fern", "palm", "plant", "willow", "canopy", "hedge",
+        "thorn", "cactus", "vine", "reed", "kelp",
+    ]
+    .iter()
+    .any(|term| p.contains(term))
+}
+
+/// Log each classified model once so false positives can be audited from an ordinary scene load.
+fn log_foliage_classification(path: &str) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.insert(path.to_string()) {
+        info!("MONKEY wind: classified foliage leaf batches for {path}");
     }
 }
 
@@ -829,6 +879,45 @@ mod tests {
         );
         assert!(gx.divert(batch(&g, Vec3::ZERO, None, ModelBlend::Opaque)));
         assert_eq!(gx.cells.len(), 1);
+    }
+
+    #[test]
+    fn foliage_classifier_requires_a_leaf_batch_and_a_plant_name() {
+        assert!(foliage_wind_batch(
+            "World\\Azeroth\\Elwynn\\PassiveDoodads\\Trees\\ElwynnTree01.m2",
+            ModelBlend::AlphaTest,
+            false,
+        ));
+        assert!(foliage_wind_batch(
+            "World\\Generic\\PassiveDoodads\\Bush\\Bush01.mdx",
+            ModelBlend::AlphaTest,
+            false,
+        ));
+        assert!(!foliage_wind_batch(
+            "World\\Azeroth\\Elwynn\\PassiveDoodads\\Trees\\ElwynnTree01.m2",
+            ModelBlend::Opaque,
+            false,
+        ));
+        assert!(!foliage_wind_batch(
+            "World\\Stormwind\\StreetLamp01.m2",
+            ModelBlend::AlphaTest,
+            false,
+        ));
+        assert!(!foliage_wind_batch(
+            "World\\Azeroth\\SwampOfSorrow\\PassiveDoodads\\TreeHuts\\LostTreeHuts03.m2",
+            ModelBlend::AlphaTest,
+            false,
+        ));
+        assert!(!foliage_wind_batch(
+            "World\\Azeroth\\Elwynn\\PassiveDoodads\\Tree\\ElwynnLog02.m2",
+            ModelBlend::AlphaTest,
+            false,
+        ));
+        assert!(!foliage_wind_batch(
+            "World\\Wmo\\TreeHouse.wmo",
+            ModelBlend::AlphaTest,
+            true,
+        ));
     }
 
     #[test]

@@ -72,9 +72,19 @@ mod debug_panel;
 mod dev;
 mod doodad_events;
 /// MONKEY (dynamic interiors): the cvar → benilla-world bridge for the fixture-lit interior lane.
+mod dynamic_interior;
 // MONKEY (volumetric fog): optional near-field atmosphere plugin.
 mod volumetric_fog;
-mod dynamic_interior;
+// MONKEY (p0 graphics programme): the programme's cvar bridges (skyDither, ...).
+mod monkey_gfx;
+// MONKEY (post): optional world-only HDR post-processing.
+mod post;
+// MONKEY (sky): the skyQuality cvar bridge.
+mod sky_quality;
+// MONKEY (ao): optional screen-space ambient occlusion plugin.
+mod ssao;
+// MONKEY (skybox): the zoneSkyboxes cvar bridge.
+mod zone_skybox;
 mod entities;
 mod fishing_line;
 mod footprints;
@@ -309,12 +319,13 @@ pub fn run(build: BuildId) -> AppExit {
     // never fights the director's screen (decision 0703; `WOW_BG` overrides). See `bgwin`.
     let background = benilla_world::bgwin::background_run();
     if capturing {
-        // Ground clutter scatters with per-run randomness, so disable it for byte-stable baselines
-        // — clutter isn't what the lighting rework validates, and the regression diff must not be
-        // masked by grass wobble. Set before plugins build so `ClutterConfig::from_env` reads it.
-        // It is not the only source of per-run drift, though it was long documented as such: the
-        // other is the frame clock itself, frozen in `capture` (decision 0723).
-        std::env::set_var("WOW_CLUTTER_DENSITY", "0");
+        // Ordinary baselines omit clutter, but a feature-specific capture may explicitly ask for
+        // it (MONKEY wind does). Scatter is now chunk-seeded and deterministic; the default stays
+        // zero so unrelated lighting diffs are not masked by grass. Set before plugins build so
+        // `ClutterConfig::default` reads it.
+        if std::env::var_os("WOW_CLUTTER_DENSITY").is_none() {
+            std::env::set_var("WOW_CLUTTER_DENSITY", "0");
+        }
         // Third source of per-run drift, and the one the lighting matrix (decision 0746) hit: the
         // anim-LOD park/wake gate (`creature_anim::lod::gate_rig_animation`). Whether a rig is
         // parked, and which pose it wakes into, depends on when its model finished loading relative

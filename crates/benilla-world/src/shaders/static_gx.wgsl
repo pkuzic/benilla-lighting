@@ -10,6 +10,16 @@
 }
 // MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
 #import benilla::shadow_hook
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
+// MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
+#import benilla::emissive_hook
+// MONKEY (wind): shared foliage vertex displacement; tree shadows intentionally stay static.
+#import benilla::wind_hook
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -40,6 +50,13 @@ struct WowLight {
     // yards. wow_model.wgsl owns the full note.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
     // lighting::prop_probes: 8192 slots of 7 rows; the buffer's later regions are not mirrored.
     prop_probes: array<vec4<f32>, 57344>,
 }
@@ -97,6 +114,8 @@ const WORD_HAS_VC: u32 = 134217728u;   // 1 << 27: the batch authors vertex colo
 // INTERIOR without WMO is an interior M2 prop, the entity shader's `interior_prop =
 // flags.z && !flags.x`: probe lighting, interior fog, no point lights.
 const WORD_MATTE: u32 = 268435456u;    // 1 << 28: ShadeSel::Matte, fixed intensity 1.0
+// MONKEY (wind): alpha-tested leaf batch of a classified static tree/bush model.
+const WORD_FOLIAGE_WIND: u32 = 536870912u; // 1 << 29
 
 // MONKEY (room gate): record column `w` bits 15..=26 — this item's ROOM KEY, packed as
 // `group + 1`, so **0 means the item names no room** and takes every fixture (a terrain-cell item,
@@ -1276,8 +1295,15 @@ fn vertex(v: GxVertex) -> GxVsOut {
         return out;
     }
     // Camera-relative for f32 precision: the recentred vertex plus (cell origin - camera).
-    let p_cam = v.position + (cell.origin.xyz - view.world_position);
-    let world = v.position + cell.origin.xyz;
+    var p_cam = v.position + (cell.origin.xyz - view.world_position);
+    var world = v.position + cell.origin.xyz;
+    // MONKEY (wind): placement anchor is already baked per vertex. Only classified leaf-card
+    // batches carry the bit; animated doodads were rejected before this retained path.
+    if ((v.word & WORD_FOLIAGE_WIND) != 0u) {
+        let offset = wind_hook::tree_offset(world, v.anchor, view.world_position, wow_light.monkey);
+        world += offset;
+        p_cam += offset;
+    }
     out.world_position = vec4<f32>(world, 1.0);
     let view_rot = mat3x3<f32>(
         view.view_from_world[0].xyz,
@@ -1513,7 +1539,13 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
                 sidn_w = 0.0;
             }
         }
-        let sidn_e = sidn_rgb * (wow_light.grade.x * sidn_w);
+        var sidn_e = sidn_rgb * (wow_light.grade.x * sidn_w);
+        // MONKEY (fix-post): the bloom window gain lifts only this light term, before fog (it used
+        // to multiply the whole fogged batch, so fogged buildings glowed as fog x 2.35 at night).
+        if ((in.word & WORD_WINDOW) != 0u) {
+            sidn_e = emissive_hook::emissive_boost(
+                sidn_e, emissive_hook::EMISSIVE_WMO_WINDOW, wow_light.light_diffuse.w, 1.0);
+        }
         // MONKEY (ext-class night law): plenty of geometry INSIDE a building is authored
         // EXTERIOR-class — the Goldshire inn's whole 57.7 yd shell is one group (`upstairs`,
         // MOGP 0x0a09, and it holds the stair down to the cellar), its east stairwell annex is
@@ -1966,6 +1998,27 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     if ((in.word & WORD_UNLIT) != 0u) {
         rgb = folded;
     }
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
+    // MONKEY (wet): rain on sky-exposed surfaces (wet_hook.wgsl); interior, unlit and dry = untouched.
+    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
+        // MONKEY (fix-wet): lit WMO windows (WORD_WINDOW) are not darkened by rain either.
+        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT | WORD_WINDOW)) != 0u) * wet_open,
+        wow_light.monkey);
+    rgb = wet.albedo;
+    if (wet.boost > 0.0) {
+        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),
+            L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, world_shadow), vec3<f32>(1.0));
+    }
     // Planar eye-Z fog; other fog modes belong to blends never admitted here. The interior triple
     // keys on the per-frame record bit, not `WORD_INTERIOR`: the client sets it per group under
     // `[0xca7f00]` (`0x6b5190` for surfaces, `0x6b62e0` for the group's doodads).
@@ -1976,10 +2029,12 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         fog_span = wow_light.wmo_fog_params.xy;
     }
     if (fog_color.w > 0.5 && (in.word & WORD_FOG_OFF) == 0u) {
-        let denom = max(fog_span.y - fog_span.x, 0.001);
-        let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
-        rgb = mix(fog_color.xyz, rgb, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        rgb = fog_hook::apply_fog(rgb, fog_color.xyz, fog_span, eye_z, in.world_position.xyz,
+            view.world_position, true, wow_light.monkey);
     }
+    // MONKEY (post): SIDN/window light crosses 1.0 only at night and when bloom is armed; the
+    // gain is applied to `sidn_e` above (MONKEY fix-post).
     // Gamma-space output; alpha pinned 1.0, every draw here is opaque.
     return vec4<f32>(rgb, 1.0);
 }

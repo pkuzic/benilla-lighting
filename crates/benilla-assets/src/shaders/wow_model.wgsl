@@ -8,6 +8,8 @@
 // the tuft, which the reference writes onto the clutter vertex.
 // Not built: a specular term (the M2 per-material shininess is only inferred) and the WMO
 // per-group authored colour.
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module
+// wxl-experimental-wind, grass/GrassWind.cpp (grass vertex displacement seam).
 
 #import bevy_pbr::{
     pbr_fragment::pbr_input_from_standard_material,
@@ -20,6 +22,16 @@
 }
 // MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
 #import benilla::shadow_hook
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
+// MONKEY (post): shared tier-gated HDR emission; Off is an exact identity.
+#import benilla::emissive_hook
+// MONKEY (wind): WarcraftXL-derived grass motion and the matching tree fade-twin motion.
+#import benilla::wind_hook
 
 // bevy_pbr 0.18.1's `forward_io::FragmentOutput`. No depth output: a fragment depth write costs
 // the pipeline early-Z, so the sky lane pins its depth in the vertex stage.
@@ -47,8 +59,14 @@ struct ModelParams {
     // Rows of `wow_light.matanim`, 0 = identity: x = UV scroll, y = tint, z = texture-transform
     // affine, w = the UI tile's cell clip.
     anim_slots: vec4<f32>,
+    // MONKEY (skybox): stage 1 of a two-texture batch: x = 0 none / 1 Mod / 2 Mod2x, z/w = the
+    // matanim rows of its translation and affine.
+    stage1: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
+// MONKEY (skybox): stage 1's texture, the fallback image off `WOW_STAGE1`.
+@group(#{MATERIAL_BIND_GROUP}) @binding(94) var stage1_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(95) var stage1_sampler: sampler;
 
 // A fully covered character shadow retains 45% of the authored model lighting.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
@@ -112,6 +130,13 @@ struct WowLight {
     // packed reach is always ≥ 1 yd and can never be mistaken for the exterior 0.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
     // The interior-prop SH probes, 7 rows per slot (`MAX_PROP_PROBES` = 8192 slots). Only this
     // shader declares this tail; the other shaders bind the same buffer by its prefix.
     prop_probes: array<vec4<f32>, 57344>,
@@ -1069,8 +1094,28 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
     // Precision: camera-relative to clip space; `clip_from_world × p_world` cancels
     // catastrophically with camera and geometry near 9 k yd. `world_position` is absolute again:
     // lighting and fog need no such precision.
-    let p_cam = (frame_from_local * vec4<f32>(vertex.position, 1.0)).xyz
+    var p_cam = (frame_from_local * vec4<f32>(vertex.position, 1.0)).xyz
         + (frame_origin - view.world_position);
+    // MONKEY (wind): clutter UV_B is `(height-from-base, per-tuft phase)` authored by clutter.rs;
+    // UV_0 and vertex colour alpha retain their texture/cutout meanings.
+#ifdef VERTEX_UVS_B
+    if (m.clutter_fade.w > 0.5) {
+        let world = p_cam + view.world_position;
+        p_cam += wind_hook::grass_offset(
+            world, vertex.uv_b.x, vertex.uv_b.y, view.world_position, wow_light.monkey
+        );
+    }
+#endif
+    // MONKEY (wind): a retained tree inside its fade band renders here with the same anchor/field
+    // maths, to avoid a pop. MONKEY (fix-wind): the leaf-batch marker is material bit 14
+    // (`model_render::FOLIAGE_WIND_MARKER`), never a MeshTag bit (bit 18 aliases the lane weight
+    // and the interior probe slot, so doorway units and interior props swayed).
+    if ((u32(m.clutter_fade.z) & 16384u) != 0u && m.clutter_fade.w <= 0.5) {
+        let world = p_cam + view.world_position;
+        p_cam += wind_hook::tree_offset(
+            world, frame_origin, view.world_position, wow_light.monkey
+        );
+    }
     out.world_position = vec4<f32>(p_cam + view.world_position, 1.0);
     let view_rot = mat3x3<f32>(
         view.view_from_world[0].xyz,
@@ -1286,6 +1331,22 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         base_color.a = base_color.a * ramp;
     }
 
+    // MONKEY (skybox): stage 1 multiplies in on UV set B, moved by its own texture transform
+    // (the stage-0 law above): colour ×1 (Mod) or ×2 (Mod2x), alpha ×1.
+#ifdef WOW_STAGE1
+#ifdef VERTEX_UVS_B
+    {
+        let t1 = wow_light.matanim[u32(m.stage1.z)];
+        let a1 = wow_light.matanim[u32(m.stage1.w)];
+        let d1 = (in.uv_b + t1.xy - vec2<f32>(0.5, 0.5)) * vec2<f32>(1.0 + a1.z, 1.0 + a1.w);
+        let c1 = 1.0 + a1.x;
+        let uv1 = vec2<f32>(0.5 + d1.x * c1 - d1.y * a1.y, 0.5 + d1.x * a1.y + d1.y * c1);
+        let s1 = textureSampleBias(stage1_texture, stage1_sampler, uv1, view.mip_bias);
+        let k1 = select(1.0, 2.0, m.stage1.x > 1.5);
+        base_color = vec4<f32>(base_color.rgb * s1.rgb * k1, base_color.a * s1.a);
+    }
+#endif
+#endif
     // The MeshTag (mesh_tag.rs): bit 31 = highlight, bit 30 = interior fog; payload bits 0-5 = the
     // fade alpha (a zero payload is untagged, opaque), 19-29 = the rig slot, 6-13 = the ground
     // shade (0 lit, 255 MCSH-shadowed) or, on an interior-prop material, 6-18 = the SH-probe slot.
@@ -1702,6 +1763,29 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         rgb = base.rgb;
     }
 
+    // MONKEY (wet): rain on sky-exposed WMO/M2 surfaces (wet_hook.wgsl); interior, glue booth, unlit,
+    // Mod/Mod2x, additive and dry = untouched.
+    let wet_dry = is_interior || interior_fogged || is_rig || is_emissive || is_mod || is_mod2x
+        || (u32(m.clutter_fade.z) & 4u) != 0u;
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
+    let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
+        select(1.0, 0.0, wet_dry) * wet_open, wow_light.monkey);
+    rgb = wet.albedo;
+    if (wet.boost > 0.0) {
+        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),
+            L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, player_shadow), vec3<f32>(1.0));
+    }
+
     // Linear fog by planar eye depth, as in terrain.wgsl. Per-batch colour policy (`clutter_fade.z`
     // bits 4-6, the M2 state setter `0x70baf0`): 0 scene, 1 black (additive), 2 white (Mod),
     // 3 grey (Mod2x), 4 unfogged (render flag 0x02). Tag bit 30, not the static `model_flags.z`,
@@ -1716,13 +1800,13 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let fog_policy = (u32(m.clutter_fade.z) >> 4u) & 7u;
     if (fog_color.w > 0.5 && fog_policy != 4u) {
         let eye_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
-        let denom = max(fog_span.y - fog_span.x, 0.001);
-        let factor = clamp((fog_span.y - eye_z) / denom, 0.0, 1.0);
         var fog_rgb = fog_color.xyz;
         if (fog_policy == 1u) { fog_rgb = vec3<f32>(0.0); }
         else if (fog_policy == 2u) { fog_rgb = vec3<f32>(1.0); }
         else if (fog_policy == 3u) { fog_rgb = vec3<f32>(0.50196078); }
-        rgb = mix(fog_rgb, rgb, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        rgb = fog_hook::apply_fog(rgb, fog_rgb, fog_span, eye_z, in.world_position.xyz,
+            view.world_position, fog_policy == 0u, wow_light.monkey);
     }
 
 
@@ -1737,6 +1821,9 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     var out_rgb = rgb;
     if (is_additive) {
         out_rgb = out_rgb * faded_alpha;
+        // MONKEY (post): additive M2 cards become HDR before their framebuffer blend stacks them.
+        out_rgb = emissive_hook::emissive_boost(
+            out_rgb, emissive_hook::EMISSIVE_M2_ADD, wow_light.light_diffuse.w, 1.0);
     }
     // Mod (bit 7) and Mod2x (bit 8) read no source alpha, so the fade rides the colour as in the
     // reference: texenv preset 5, `mix(prev.rgb, tex.rgb, prev.a)`, with the primary colour forced

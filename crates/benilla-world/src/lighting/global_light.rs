@@ -66,6 +66,9 @@ use crate::view::WorldCamera;
 struct LightStd430 {
     rows: [[f32; 4]; LIGHT_HEADER_ROWS],
     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
+    // MONKEY (p0 MonkeyFrame): the programme block, appended AFTER the point table so no earlier
+    // offset moves (8528 -> 8784 B); packed by [`pack_monkey_frame`] from [`super::MonkeyFrame`].
+    monkey: [[f32; 4]; super::monkey_frame::MONKEY_FRAME_ROWS],
 }
 
 /// Header row count of the layout above (rows 0..=20), which every light blob sizes against.
@@ -474,6 +477,11 @@ impl Default for FireLightGain {
     }
 }
 
+/// MONKEY (post): live `bloom` tier. The packer adds it to `light_diffuse.w`, whose old value 1
+/// was an unread clamp marker, so the 8528-byte shared buffer and every existing decode stay put.
+#[derive(Resource, Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct EmissiveTier(pub u8);
+
 /// MONKEY (spellLightGain): marks a `PointLight` that a SPELL EFFECT invented — a kit's aura glow,
 /// a missile's core, an impact flash, a firework shell's burst. The app's own
 /// `entities::spell_fx::SpellLight` carries the envelope, the mode and the budget; this is the
@@ -606,6 +614,29 @@ pub struct WorldPointLight {
     pub range: f32,
 }
 
+/// MONKEY (lampfog): one live entry exactly as [`build_light_data`] resolved it for the shared
+/// point table. Colour is already `colour x intensity`, with the source's live gain and flame
+/// flicker folded in; position is Bevy world space and `lane` keeps the table's exterior/interior
+/// discriminator (an interior lane's value is also its effective reach).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResolvedPointLight {
+    pub position: Vec3,
+    pub range: f32,
+    pub color: Vec3,
+    pub lane: f32,
+}
+
+/// MONKEY (lampfog): read-only CPU view of the shared point table for post-process consumers.
+/// The GPU blob stays private and its pinned layout does not grow; readers get only the live rows.
+#[derive(Resource, Default)]
+pub struct ResolvedPointLights(Vec<ResolvedPointLight>);
+
+impl ResolvedPointLights {
+    pub fn as_slice(&self) -> &[ResolvedPointLight] {
+        &self.0
+    }
+}
+
 /// The packed light for this frame, extracted for [`upload_light`].
 #[derive(Resource, Clone, Copy, ExtractResource)]
 struct WowLightData(LightStd430);
@@ -615,6 +646,7 @@ impl Default for WowLightData {
         Self(LightStd430 {
             rows: [[0.0; 4]; 21],
             points: [[0.0; 4]; 2 * MAX_POINT_LIGHTS],
+            monkey: [[0.0; 4]; super::monkey_frame::MONKEY_FRAME_ROWS],
         })
     }
 }
@@ -627,6 +659,8 @@ pub struct SharedLightBuffer(pub Buffer);
 /// Registers the light pack, the probe publish, their extracts and the render-world uploads.
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
+        // MONKEY (lampfog): CPU mirror of only the live point rows; not extracted or GPU-bound.
+        .init_resource::<ResolvedPointLights>()
         // MONKEY (room gate): the per-fixture room claims, packed beside the point table.
         .init_resource::<RoomClaimTable>()
         .init_resource::<WorldShadowActive>()
@@ -641,9 +675,13 @@ pub(super) fn register(app: &mut App) {
         .init_resource::<DynamicInteriors>()
         // MONKEY (fire GO lights): the live gain on synthesised fire lights.
         .init_resource::<FireLightGain>()
+        // MONKEY (post): opt-in HDR emission, packed into an existing float lane.
+        .init_resource::<EmissiveTier>()
         // MONKEY (spellLightGain): and the one on spell-effect lights, which overrides it.
         .init_resource::<SpellLightGain>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
+        // MONKEY (p0 MonkeyFrame): the per-frame programme parameters any system may write.
+        .init_resource::<super::MonkeyFrame>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<RoomClaimTable>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
@@ -656,7 +694,8 @@ pub(super) fn register(app: &mut App) {
             // a light that has stood for a frame is packed on this frame's verdict. Its writes go
             // through `Commands`, so a NEWLY spawned light is still packed on the fail-safe
             // fallback for one frame — see that fallback's note in `build_light_data`.
-            (classify_light_lanes, build_light_data)
+            // MONKEY (p0 MonkeyFrame): the programme block is packed right after the table.
+            (classify_light_lanes, build_light_data, pack_monkey_frame)
                 .chain()
                 .after(bevy::transform::TransformSystems::Propagate)
                 .after(super::update_time_lighting),
@@ -690,13 +729,32 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
 /// whole layout at each draw.
 pub fn light_blob_bytes() -> u64 {
     per_frame_blob_bytes()
+        // MONKEY (rainshelter): the rain-occlusion grid region (`weather::shelter`).
+        + crate::weather::shelter::REGION_BYTES
         + (7 * MAX_PROP_PROBES * 16) as u64
         + crate::rig_palette::palette_regions_bytes()
 }
 
-/// The per-frame prefix's size, which is also the probe region's offset.
-pub(super) fn per_frame_blob_bytes() -> u64 {
+/// The per-frame prefix's size, which is also the rain-shelter region's offset (MONKEY
+/// (rainshelter); the probe region follows that).
+pub(crate) fn per_frame_blob_bytes() -> u64 {
     std::mem::size_of::<LightStd430>() as u64
+}
+
+/// MONKEY (p0 MonkeyFrame): copies [`super::MonkeyFrame`] into the block after the point table,
+/// plus the two clock fields the packer owns (`misc.y` time of day 0..1, `misc.z` night 0..1, the
+/// same dusk ramp `nightGain` uses). Writes through `ResMut` only when a row moved.
+fn pack_monkey_frame(
+    frame: Res<super::MonkeyFrame>,
+    clock: Res<super::GameClock>,
+    light: Res<WowLighting>,
+    mut data: ResMut<WowLightData>,
+) {
+    let night = 1.0 - sun_shadow_strength(light.celestial_dir.y);
+    let packed = frame.pack(clock.minute as f32 / 1440.0, night);
+    if data.0.monkey != packed {
+        data.0.monkey = packed;
+    }
 }
 
 /// Pack the resolved [`WowLighting`] (+ the global fog-disable toggle and the view farclip) into the
@@ -1278,6 +1336,8 @@ fn build_light_data(
     // The per-frame portal PVS, for the room term below ([`LightRooms`]).
     portals: Query<&crate::wmo_portal::WmoPortalInstance>,
     mut data: ResMut<WowLightData>,
+    // MONKEY (lampfog): publish the already-resolved live rows without exposing the GPU blob.
+    mut resolved_points: ResMut<ResolvedPointLights>,
     // MONKEY (room gate): packed in the same walk as the point table, so the two can never
     // disagree about which entry is which.
     mut claims: ResMut<RoomClaimTable>,
@@ -1286,10 +1346,11 @@ fn build_light_data(
     shadow: ShadowLanes,
     // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
     dynamic_interiors: Res<DynamicInteriors>,
-    // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
-    fire_gain: Res<FireLightGain>,
-    // MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
-    spell_gain: Res<SpellLightGain>,
+    // MONKEY (integration): one tuple param, so the system stays within Bevy's 16-param limit.
+    // - MONKEY (post): the 0/1/2 tier rides the unused `light_diffuse.w` marker.
+    // - MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
+    // - MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
+    (emissive, fire_gain, spell_gain): (Res<EmissiveTier>, Res<FireLightGain>, Res<SpellLightGain>),
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
@@ -1353,6 +1414,8 @@ fn build_light_data(
     // this packs (rows 0/1, the SH block, the sun's DC redistribution) is LINEAR in that triple, so
     // one multiply at the input dims all of them consistently and no derived row can be missed.
     pack_model_core_rows(rows, night_dim(l.ambient), night_dim(l.diffuse), l.sun_dir);
+    // MONKEY (post): old value 1 remains tier Off; no existing shader consumes this marker.
+    rows[1][3] = 1.0 + emissive.0.min(2) as f32;
     // MONKEY (world shadows): pack the world-shadow lane flag into the free `sh_c16.w` lane. The
     // MCSH terrain-shadow suppression in `terrain.wgsl` keys on THIS — not on the mere presence of
     // a shadow sun — so character-only shadows (sun present, world lane off) keep the baked MCSH.
@@ -1560,6 +1623,20 @@ fn build_light_data(
         fresh.points[2 * i] = [p.x, p.y, p.z, *range];
         fresh.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], *lane];
         claim.write(&mut claims.0[i * ROOM_CLAIM_STRIDE..][..ROOM_CLAIM_STRIDE]);
+    }
+    // MONKEY (lampfog): same order and values as the rows above. This is intentionally updated
+    // after the 255-entry truncate, so a CPU post effect can never see a light the shaders cannot.
+    let next_points: Vec<_> = pts
+        .iter()
+        .map(|(_, p, range, rgb, _, lane, _, _)| ResolvedPointLight {
+            position: *p,
+            range: *range,
+            color: Vec3::from_array(*rgb),
+            lane: *lane,
+        })
+        .collect();
+    if resolved_points.0 != next_points {
+        resolved_points.0 = next_points;
     }
     // Entries past the count are stale in the point table by design (the count row guards every
     // reader) — but the claim table is read at the SAME index, so a stale head there would gate a
@@ -2027,6 +2104,7 @@ mod tests {
             .init_resource::<crate::dev_state::DebugState>()
             .init_resource::<crate::view::ViewDistance>()
             .init_resource::<WowLightData>()
+            .init_resource::<ResolvedPointLights>()
             // MONKEY (room gate): the packer writes the claim table in the same walk.
             .init_resource::<RoomClaimTable>()
             .init_resource::<Time>()
@@ -2037,6 +2115,8 @@ mod tests {
             .init_resource::<ShadowHandover>()
             .init_resource::<DynamicInteriors>()
             .init_resource::<FireLightGain>()
+            // MONKEY (post): the packer reads the live HDR tier too.
+            .init_resource::<EmissiveTier>()
             .init_resource::<SpellLightGain>()
             .add_systems(Update, build_light_data);
         app.world_mut()
@@ -2257,6 +2337,12 @@ mod tests {
             (synthetic[0] - 1.0).abs() < 1e-4,
             "the synthesised light takes the gain: {synthetic:?}"
         );
+        // MONKEY (lampfog): the CPU accessor is the live table, not a second light calculation.
+        let resolved = app.world().resource::<ResolvedPointLights>();
+        assert_eq!(resolved.as_slice().len(), 2);
+        assert_eq!(resolved.as_slice()[0].position, Vec3::X);
+        assert!((resolved.as_slice()[0].color.x - authored[0]).abs() < 1e-4);
+        assert!((resolved.as_slice()[1].color.x - synthetic[0]).abs() < 1e-4);
 
         // Zero is the kill switch: the invented light commits black, the authored one is unmoved.
         app.world_mut().insert_resource(FireLightGain(0.0));
@@ -2264,6 +2350,11 @@ mod tests {
         let data = app.world().resource::<WowLightData>().0;
         assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "gain 0 = lane off");
         assert!((data.points[1][0] - 2.0).abs() < 1e-4, "authored unaffected");
+        assert_eq!(
+            app.world().resource::<ResolvedPointLights>().as_slice()[1].color,
+            Vec3::ZERO,
+            "the accessor carries the same live fire-gain fold"
+        );
     }
 
     /// GOLDEN — MONKEY (spellLightGain): a SPELL light takes `spellLightGain` **instead of**
@@ -2626,7 +2717,8 @@ mod tests {
         assert_eq!(MAX_LIVE_POINT_LIGHTS, 255, "255 is EXT_SEL_EMPTY in the three shaders");
         assert_eq!(MAX_LIVE_POINT_LIGHTS, MAX_POINT_LIGHTS - 1);
         // 21 header rows + 2 x 256 point rows, 16 B each.
-        assert_eq!(per_frame_blob_bytes(), 8528, "the mirrored blob must not change size");
+        // MONKEY (p0 MonkeyFrame): 8528 + the 256-byte programme block.
+        assert_eq!(per_frame_blob_bytes(), 8784, "the mirrored blob must not change size");
     }
 
     /// MONKEY (enclosed day floor): `interiorDaylight` rides the FRACTION of the interior lane's

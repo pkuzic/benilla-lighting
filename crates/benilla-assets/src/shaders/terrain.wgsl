@@ -18,6 +18,12 @@
 }
 // MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
 #import benilla::shadow_hook
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
+// MONKEY (p0 fog hook): the one distance-fog law every receiver calls.
+#import benilla::fog_hook
+// MONKEY (wet): rain on surfaces (wet_hook.wgsl).
+#import benilla::wet_hook
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var layer_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var alpha_array: texture_2d_array<f32>;
@@ -56,6 +62,13 @@ struct WowLight {
     // reach in yards) for an INTERIOR one. Terrain consumes only the exterior half.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
+    // MONKEY (rainshelter): the rain-occlusion grid (`weather/shelter.rs`): `[origin_x, origin_z,
+    // 1/cell, active]`, `[base_y, cells per side, 0, 0]`, then one packed word a cell (wet_hook.wgsl).
+    shelter_hdr: vec4<f32>,
+    shelter_cfg: vec4<f32>,
+    shelter: array<u32, 16384>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 
@@ -749,9 +762,30 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     //   specular = per-vertex sheen · gloss_mask · shadow → gated to ZERO in shadow (no sheen in shade)
     // (`tex·primary` is the MODULATE-1× diffuse; the sheen is added after, separate-specular.) Then
     // LDR-clamp; gamma/byte throughout; raw gamma out (GAMMA LANE, 0161).
+    // MONKEY (rainshelter): nothing gets wet under a roof, porch or bridge (the shelter grid).
+    var wet_open = 1.0;
+    if (wow_light.monkey.wet_a.y > 0.0) {
+        let wet_st = wet_hook::shelter_taps(in.world_position.xyz, wow_light.shelter_hdr,
+            wow_light.shelter_cfg);
+        if (wet_st.live > 0.0) {
+            wet_open = 1.0 - wet_hook::shelter_amount(wet_st, wow_light.shelter[wet_st.idx.x],
+                wow_light.shelter[wet_st.idx.y], wow_light.shelter[wet_st.idx.z],
+                wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
+        }
+    }
+    // MONKEY (wet): rain-darkened ground + puddles (wet_hook.wgsl); a dry frame returns `color`.
+    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_lit, in.world_position.xyz,
+        wet_open, wow_light.monkey), n_lit, in.world_position.xyz, wet_open, wow_light.monkey);
+    color = wet.albedo;
     let diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
     let spec_term = in.specular * specmask * spec_gate;
     var tuned = clamp(diffuse_term + spec_term, vec3<f32>(0.0), vec3<f32>(1.0));
+    // MONKEY (wet): the wet sheen, and the authored `_s` sheen brightens with it.
+    if (wet.boost > 0.0) {
+        tuned = clamp(tuned + spec_term * wet.boost + wet_hook::wet_sheen(wet.boost, n_lit,
+            normalize(view.world_position - in.world_position.xyz), -normalize(wow_light.light_sun.xyz),
+            wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, spec_gate), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
 
     // MONKEY (torch debug, interiorDebug 2 on TERRAIN): the ground's OWN cube-map sampling as
     // greyscale, the same instrument static_gx and wow_model already paint on walls and bodies. The
@@ -776,9 +810,9 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // the per-pixel form is what survives Bevy's mesh interpolators without a custom slot.
     if (wow_light.fog_color.w > 0.5) {
         let eye_z = -(view.view_from_world * vec4<f32>(in.world_position.xyz, 1.0)).z;
-        let denom = max(wow_light.fog_params.y - wow_light.fog_params.x, 0.001);
-        let factor = clamp((wow_light.fog_params.y - eye_z) / denom, 0.0, 1.0);
-        tuned = mix(wow_light.fog_color.xyz, tuned, factor);
+        // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
+        tuned = fog_hook::apply_fog(tuned, wow_light.fog_color.xyz, wow_light.fog_params.xy, eye_z,
+            in.world_position.xyz, view.world_position, true, wow_light.monkey);
     }
 
     // Raw gamma out: the framebuffer holds gamma bytes and blends in gamma like the reference's;

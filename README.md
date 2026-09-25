@@ -89,4 +89,5 @@ adapters and developer frames, not copies of it.
 World of Warcraft is a trademark of Blizzard Entertainment, Inc. Our own code is licensed under
 [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option. The two vendored components
 under `third_party/` — the kira audio engine, and a Lua 5.1 patched to the 1.12 client's dialect —
-keep their own upstream licenses, alongside each.
+keep their own upstream licenses, alongside each. Code and techniques ported from other projects
+(WarcraftXL, by iThorgrim) are credited file by file in [`THIRD-PARTY.md`](THIRD-PARTY.md).

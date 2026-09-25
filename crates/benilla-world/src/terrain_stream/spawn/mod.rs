@@ -330,6 +330,24 @@ pub(super) fn spawn_loaded_placements(
                     });
                     // The portal-cull instance, spawned before the batches: the retained pass keys
                     // its region on it, and the region lives as long as it does.
+                    // MONKEY (daylight: district sky rooms): which city rooms take the day floor.
+                    let sky_slices = fx::portal_slices(m);
+                    let sky = crate::lighting::district_sky_rooms(
+                        &m.group_bounds,
+                        benilla_formats::PortalGraph {
+                            vertices: &m.portal_vertices,
+                            infos: &m.portal_infos,
+                            refs: &m.portal_refs,
+                            slices: &sky_slices,
+                        },
+                        m.submeshes.iter().zip(m.submesh_group.iter()).map(|(s, g)| {
+                            (
+                                *g,
+                                matches!(s.wmo_batch, Some(benilla_formats::WmoBatchClass::Ext)),
+                                &s.geometry.positions[..],
+                            )
+                        }),
+                    );
                     let instance = (has_portals || m.wmo_id != 0).then(|| {
                         commands
                             .spawn(WmoPortalInstance {
@@ -405,6 +423,7 @@ pub(super) fn spawn_loaded_placements(
                                         // MONKEY (ext-class night law): the MOGI table, so the
                                         // assembler can read each batch's group CLASS + BOX.
                                         bounds: &m.group_bounds,
+                                        sky: &sky,
                                     },
                                 )
                             })

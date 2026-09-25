@@ -278,6 +278,7 @@ pub(super) fn spawn_menagerie(
     // doodad's trunk batch is Opaque, its canopy Blend, and the builder's untextured fallback is
     // Opaque + back-cull with the fade still armed — each its own key (0958's sweep; 0938 warmed
     // Mask only).
+    let mut clutter_mats: Vec<Handle<WowModelMaterial>> = Vec::new();
     for two_sided in [false, true] {
         for blend in [ModelBlend::Opaque, ModelBlend::AlphaTest, ModelBlend::Blend] {
             let plain = model_material(
@@ -316,6 +317,8 @@ pub(super) fn spawn_menagerie(
                 let mut m = m.clone();
                 m.extension.clutter_fade = Vec4::new(52.5, 70.0, 0.0, 1.0);
                 let clutter = materials.add(m);
+                // MONKEY (fix-wind): also on the clutter mesh layout (UV_1 = wind height/phase).
+                clutter_mats.push(clutter.clone());
                 mats.push(clutter);
             }
         }
@@ -496,6 +499,19 @@ pub(super) fn spawn_menagerie(
     let posuv = meshes.add(warm_pos_uv_mesh());
     let liquid_mesh = meshes.add(warm_liquid_mesh(false));
     let liquid_color_mesh = meshes.add(warm_liquid_mesh(true));
+    // MONKEY (fix-wind): clutter meshes carry POS + NORMAL + UV_0 + UV_1 (wind) + COLOR, a layout
+    // (and `VERTEX_UVS_B`) the model quads lack; the liquid colour quad has exactly that set.
+    for mat in &clutter_mats {
+        spawn_lane_rig(
+            commands,
+            cam,
+            None,
+            &liquid_color_mesh,
+            None,
+            mat.clone(),
+            &mut count,
+        );
+    }
     // Celestial discs + glares (`sun::setup` quads: position+normal+UV).
     for mat in lane_handles(&mut lanes.celestial) {
         spawn_lane_rig(
@@ -889,6 +905,7 @@ fn warm_quad(colors: bool, skinned: bool) -> RenderSubmesh {
         rgb_seq: None,
         wmo_batch: None,
         section: None,
+        stage1: None,
     }
 }
 
@@ -915,6 +932,12 @@ mod tests {
         //   also has its OWN pair, for the frames nothing claims it, and 2262 found it compiling
         //   live at app exit. `prepare_textures` now specialises that pair on every frame rather
         //   than only on the frame it first needs it.)
+        // - MONKEY (integration) ShaftPipeline (`post::sun_shafts`), FogPipeline
+        //   (`volumetric_fog`, incl. lamp fog) and AoPipeline (`ssao`): fullscreen passes keyed
+        //   only on the view's target format and MSAA (plus the AO stage/debug flag). Each lane's
+        //   `prepare_pipelines` specialises every such key for EVERY `Camera3d` view on every
+        //   frame, whether its cvar is on or not, so the variants compile behind the entry cover
+        //   and a player enabling the row later hits the cache, not a live compile.
         let exempt = ["UiGammaPipeline"];
         let own_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let warm_src = std::fs::read_to_string(own_src.join("pipe_warm/mod.rs")).unwrap()

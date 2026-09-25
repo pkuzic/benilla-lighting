@@ -222,6 +222,18 @@ pub(crate) struct VideoConfig {
     pub(crate) water_quality: u8,
     // MONKEY (volumetric fog): live camera raymarch tier: 0 Off, 1 Low, 2 High.
     pub(crate) volumetric_fog: u8,
+    // MONKEY (post): emissive HDR + bloom quality, 0 Off / 1 Low / 2 High.
+    pub(crate) bloom: u8,
+    // MONKEY (post): depth-occluded radial sun shafts.
+    pub(crate) sun_shafts: bool,
+    // MONKEY (post): zone/day-night LUT grading at the world-to-UI boundary.
+    pub(crate) color_grading: bool,
+    // MONKEY (sky): the sky tier: 0 Classic, 1 Enhanced, 2 High (`sky_quality::bridge`).
+    pub(crate) sky_quality: u8,
+    // MONKEY (ao): screen-space contact shadows: 0 Off, 1 Low, 2 High.
+    pub(crate) ambient_occlusion: u8,
+    // MONKEY (lampfog): point-light fog tier: 0 Off, 1 nearest 16, 2 nearest 32.
+    pub(crate) lamp_fog: u8,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -314,6 +326,11 @@ pub(crate) struct VideoConfig {
     /// It shares `interior_shadow_casters`' sixteen resident cube slots, capped at half of them
     /// (`torch_shadow::exterior_budget`) so a village square cannot evict an inn's candles.
     pub(crate) exterior_shadows: bool,
+    /// MONKEY (daylight: terrain torch casters): whether the GROUND casts into an exterior torch's
+    /// cube map (`torchTerrainShadows`, default off; High = on) — a hill or bank between a fire and
+    /// the slope behind it blocks the fire. Only settled exterior slots gather it
+    /// (`torch_shadow`); `0` leaves the torch lane exactly as it was.
+    pub(crate) torch_terrain_shadows: bool,
     /// MONKEY (static torch cache): resident fixture budget (1..16, default 12). Static
     /// geometry renders only on promotion/residency changes; lowering this fades extra slots out.
     pub(crate) interior_shadow_casters: u32,
@@ -381,6 +398,10 @@ pub(crate) struct VideoConfig {
     /// record table flags as enclosed. `0` restores the pre-feature look exactly; the night look is
     /// unaffected at any value (the term is scaled by the sun's own day envelope).
     pub(crate) interior_daylight: f32,
+    /// MONKEY (fix-daylight): split a district's oversized window batch into window-sized
+    /// daylight apertures (`daylightWindowSplit`, default on = the merged behaviour; a future
+    /// High-only preset member). Applies to WMOs loaded after a change.
+    pub(crate) daylight_window_split: bool,
     /// MONKEY (bake floor): the share of a WMO interior batch's OWN MOCV bake every interior-lane
     /// fragment keeps whether or not a fixture reaches it (`interiorBakeFloor`, 0..1, default
     /// **0.12**). Bridged to [`benilla_world::lighting::DynamicInteriors::bake_floor`], packed
@@ -439,6 +460,7 @@ impl Default for VideoConfig {
             // MONKEY (outdoor torch shadows): on — a night campfire with no shadow is the thing
             // this lane exists to fix, and it costs nothing whenever the sun is up.
             exterior_shadows: true,
+            torch_terrain_shadows: false,
             // MONKEY (static torch cache): 12 resident maps, four moving-caster overlays.
             interior_shadow_casters: 12,
             interior_shadow_dynamic: 4,
@@ -458,6 +480,7 @@ impl Default for VideoConfig {
             // MONKEY (enclosed day floor): calibrated so the Goldshire inn's entry floor reads
             // ~50 % of the sunlit threshold beside it — see `lighting::DAYLIGHT_LANE_SCALE`.
             interior_daylight: 0.0,
+            daylight_window_split: true,
             // MONKEY (bake floor): an eighth of the authored bake — measured to lift the inn's
             // black door band from 0.019 to 0.108 x tex while moving candle-lit surfaces by
             // under 10 % (see `lighting::DynamicInteriors::bake_floor`).
@@ -467,6 +490,17 @@ impl Default for VideoConfig {
             water_quality: 1,
             // MONKEY (volumetric fog): default to the inexpensive atmosphere.
             volumetric_fog: 1,
+            // MONKEY (post): the shipped High graphics preset uses the full-resolution tier.
+            bloom: 2,
+            // MONKEY (post): part of the shipped High graphics preset.
+            sun_shafts: true,
+            color_grading: true,
+            // MONKEY (sky): Classic until a preset or the player picks a tier.
+            sky_quality: 0,
+            // MONKEY (ao): opt-in; the future Graphics preset sets High = 2.
+            ambient_occlusion: 0,
+            // MONKEY (lampfog): opt-in; zero is exactly the pre-lane render.
+            lamp_fog: 0,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -527,7 +561,8 @@ pub(crate) fn on_cvar(
         // Display mode (1627) — the reference's own polarity: `1` is WINDOWED (the row is
         // "Windowed Mode"). `apply_window_mode` pushes it to the window when this moves.
         "gxwindow" => cfg.display = display_from_flag(v),
-        // ── MONKEY (lighting): the dynamic light + shadow system's 33 rows ────────────────────
+        // ── MONKEY (lighting): the dynamic light + shadow system's 34 rows ────────────────────
+        // MONKEY (lampfog): lampFog is one of these live VideoConfig rows too.
         // They live in THIS observer, and not in one of their own beside `shadow_core` /
         // `dynamic_interior`, because of the law the arm above states: *each arm writes only its
         // own resource*. Every one of these knobs IS a field of [`VideoConfig`] — the lanes read
@@ -543,10 +578,21 @@ pub(crate) fn on_cvar(
         //
         // Clamps are each row's own, stated beside it, exactly as for the reference rows above;
         // the `ours(...)` entries in `cvars::REGISTERED` carry the matching defaults, and
-        // MONKEY (volumetric fog): the atmospheric tier brings the defaults weld to 33 pairs.
+        // MONKEY (lampfog): the two atmospheric tiers bring the defaults weld to 34 pairs.
         "waterquality" => cfg.water_quality = v.clamp(0.0, 2.0) as u8,
         // MONKEY (volumetric fog): constrain UI/console writes to supported tiers.
         "volumetricfog" => cfg.volumetric_fog = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (post): constrain UI/console writes to the supported bloom tiers.
+        "bloom" => cfg.bloom = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (post): the shafts lane is binary.
+        "sunshafts" => cfg.sun_shafts = v != 0.0,
+        "colorgrading" => cfg.color_grading = v != 0.0,
+        // MONKEY (sky): the sky tier, clamped to Classic..High.
+        "skyquality" => cfg.sky_quality = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (ao): constrain UI/console writes to supported tiers.
+        "ambientocclusion" => cfg.ambient_occlusion = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (lampfog): 0 Off / 1 nearest 16 / 2 nearest 32.
+        "lampfog" => cfg.lamp_fog = v.clamp(0.0, 2.0) as u8,
         "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),
@@ -600,6 +646,8 @@ pub(crate) fn on_cvar(
         // reads `VideoConfig` every frame, so `0` fades the outdoor shadows out (the slots evict
         // through the same cross-fade a walked-away fixture does) and `1` fades them back in.
         "exteriorshadows" => cfg.exterior_shadows = ev.flag(),
+        // MONKEY (daylight: terrain torch casters)
+        "torchterrainshadows" => cfg.torch_terrain_shadows = ev.flag(),
         // MONKEY (torch caster selection): the working-set size and the PCF radius, clamped at the
         // edge like every other numeric row. `casters` floors at 1, not 0 — `interiorShadows 0` is
         // already the off switch, and a 0 here would be a second, confusing one.
@@ -629,6 +677,8 @@ pub(crate) fn on_cvar(
         // MONKEY (enclosed day floor): 0 IS meaningful here (it restores the pre-feature look
         // exactly), unlike the two dim dials above whose 0 would be a broken-looking world.
         "interiordaylight" => cfg.interior_daylight = v.clamp(0.0, 1.0),
+        // MONKEY (fix-daylight)
+        "daylightwindowsplit" => cfg.daylight_window_split = ev.flag(),
         // MONKEY (bake floor): 0 IS meaningful here too (it restores the pre-feature look exactly).
         // The upper clamp matters more than usual: the packer multiplies this by `interiorGain`
         // (up to 1.5) and rides the product in a lane fraction that must stay under 0.5 after

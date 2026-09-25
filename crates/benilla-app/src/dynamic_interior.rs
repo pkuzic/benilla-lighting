@@ -25,7 +25,9 @@
 //!
 //! Water quality and lava glow use the same guarded bridge into their renderer resources.
 use benilla_assets::WaterQuality;
-use benilla_world::lighting::{DynamicInteriors, FireLightGain, LavaLightGain, MoonShadowStrength, SpellLightGain};
+use benilla_world::lighting::{
+    DynamicInteriors, EmissiveTier, FireLightGain, LavaLightGain, MoonShadowStrength, SpellLightGain,
+};
 use bevy::prelude::*;
 
 use crate::video::VideoConfig;
@@ -60,12 +62,17 @@ fn bridge(
     mut moon: ResMut<MoonShadowStrength>,
     mut water: ResMut<WaterQuality>,
     mut lava: ResMut<LavaLightGain>,
+    // MONKEY (post): bloom also arms the HDR source hooks through the shared light blob.
+    mut emissive: ResMut<EmissiveTier>,
 ) {
     if water.0 != video.water_quality {
         water.0 = video.water_quality;
     }
     if lava.0 != video.lava_light_gain {
         lava.0 = video.lava_light_gain;
+    }
+    if emissive.0 != video.bloom {
+        emissive.0 = video.bloom;
     }
     if fire.0 != video.fire_light_gain {
         fire.0 = video.fire_light_gain;
@@ -76,6 +83,8 @@ fn bridge(
     if moon.0 != video.moon_shadow_strength {
         moon.0 = video.moon_shadow_strength;
     }
+    // MONKEY (fix-daylight): `daylightWindowSplit` (an atomic store; seeds read it at load).
+    benilla_world::lighting::set_window_split(video.daylight_window_split);
     let want = DynamicInteriors {
         enabled: video.interior_light,
         ambient: video.interior_ambient,
@@ -104,7 +113,9 @@ fn bridge(
         // MONKEY (enclosed day floor): the daylight floor rides the same bridge, but is consumed in
         // the SHADER (it rides the packed `wmo_fog_params.w` fraction) rather than folded on the
         // CPU — the packer's only job is to put it in the lane.
-        daylight: video.interior_daylight,
+        // MONKEY (daylight): `WOW_INTERIOR_DAYLIGHT=<0..1>` overrides it in a hermetic capture,
+        // which reads no config.toml (dev builds only; read once).
+        daylight: capture_daylight().unwrap_or(video.interior_daylight),
         // MONKEY (bake floor): the bake floor rides the same bridge. Half CPU, half shader: the
         // packer folds `interiorGain` in and puts the product in the `sh_c16.w` fraction, and the
         // two interior lanes read it from there — so `SetCVar("interiorBakeFloor", 0)` restores
@@ -114,6 +125,22 @@ fn bridge(
     if *out != want {
         *out = want;
     }
+}
+
+/// MONKEY (daylight): the capture-only `interiorDaylight` override (see the bridge above).
+fn capture_daylight() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        // MONKEY (integration): the dev door is `run_mode` (decision 1179).
+        if !crate::run_mode::dev_affordances() || std::env::var_os("WOW_CAPTURE").is_none() {
+            return None;
+        }
+        std::env::var("WOW_INTERIOR_DAYLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+    })
 }
 
 #[cfg(test)]
@@ -130,6 +157,7 @@ mod tests {
             .init_resource::<MoonShadowStrength>()
             .init_resource::<WaterQuality>()
             .init_resource::<LavaLightGain>()
+            .init_resource::<EmissiveTier>()
             .add_plugins(DynamicInteriorPlugin);
         assert_eq!(app.world().resource::<WaterQuality>().0, VideoConfig::default().water_quality);
         assert_eq!(app.world().resource::<LavaLightGain>().0, VideoConfig::default().lava_light_gain);

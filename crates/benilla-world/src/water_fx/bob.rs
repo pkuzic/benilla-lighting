@@ -1,6 +1,10 @@
 //! MONKEY (swim waves) — **bodies ride the swell**: the visual-only vertical bob (and the small
 //! lean into the wave slope) every swimming or floating unit takes on Enhanced water.
 //!
+//! Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-experimental-water, world/Ride.cpp.
+//! (The principle — the authoritative position never moves — implemented independently; listed in
+//! `THIRD-PARTY.md`.)
+//!
 //! The defect this closes is a mismatch, not a missing effect. Enhanced water heaves the ocean
 //! MESH in the vertex stage ([`crate::liquid::waves`] mirrors the exact band), while every body in
 //! it is placed at the height the CPU queries — the flat MCLQ heightfield, which knows nothing

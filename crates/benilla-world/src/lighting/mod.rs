@@ -11,6 +11,10 @@ mod daylight; // MONKEY (daylight fixtures): the sun as an interior-lane light i
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
 mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
+mod monkey_frame; // MONKEY (p0 MonkeyFrame): the programme's per-frame block after the point table
+pub use monkey_frame::{FogModel, MonkeyFrame, MAX_BENDERS, MONKEY_FRAME_ROWS};
+pub mod fog_model; // MONKEY (fog): the Modern fog model's CPU half (MonkeyFrame fog rows)
+pub use fog_model::FogModelSetting;
 mod lava_light; // MONKEY (lava light): magma surface fixtures and their independent gain
 pub use lava_light::{LavaLight, LavaLightGain};
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
@@ -23,9 +27,12 @@ pub use blob::LightBlob;
 // calls now -- daylight seeds and interior<->interior doorway seeds share the per-placement budget,
 // so neither can be ranked without the other. `BleedFixture`/`BleedSeed` are the doorway lane's own
 // two types; the fixture itself still wears `DaylightFixture`.
+pub use daylight::set_window_split; // MONKEY (fix-daylight)
 pub use daylight::{
     daylight_claims, daylight_intensity, daylight_lane, daylight_point_light, daylight_reach,
     daylight_rooms, daylight_seeds, daylight_target, bleed_seeds, placement_openings, BleedFixture,
+    // MONKEY (daylight: district sky rooms)
+    district_sky_rooms,
     BleedSeed,
     DaylightFixture, DaylightHow, DaylightSeed, BLEED_K, MAX_DAYLIGHT_PER_PLACEMENT,
 };
@@ -35,7 +42,7 @@ pub use flicker::{flame_kind_for, flicker_seed, FlameFlicker, FlameKind, Flicker
 pub use global_light::{
     interior_reach, m2_light_reach, new_shared_light_buffer, DynamicInteriors, FireLightGain,
     ClaimFade, LightLane, LightLitRooms, LightReach, LightRooms, RoomClaimTable,
-    SharedLightBuffer,
+    ResolvedPointLight, ResolvedPointLights, SharedLightBuffer,
     ShadowDistance, ShadowFilterGaussian, ShadowProxyLight, SyntheticFireLight,
     WorldShadowActive,
 };
@@ -51,12 +58,15 @@ pub use global_light::WorldPointLight;
 // MONKEY (spellLightGain): the spell lane's marker + its live gain — the two-word world-side
 // shadow of benilla-app's own `SpellLight` lifecycle, and the dial the packer folds over it.
 pub use global_light::{SpellFxLight, SpellLightGain};
+// MONKEY (post): live 0/1/2 emissive tier packed without growing the shared light blob.
+pub use global_light::EmissiveTier;
 pub use global_light::{
     room_claim_bytes, CLAIM_EXT_OK, LIT_ROOM_EXT_DENY, ROOM_CLAIM_MAX, ROOM_CLAIM_STRIDE,
 };
 pub use prop_probes::{PropProbeSlot, PropProbes, MAX_PROP_PROBES};
 // The std430 layout stays in the crate: off-world producers state values through `LightBlob`,
 // never a row index.
+pub(crate) use global_light::per_frame_blob_bytes; // MONKEY (rainshelter)
 pub(crate) use prop_probes::prop_probe_region_offset;
 pub use resolve::WmoCrossfade;
 use resolve::{apply_sky_backdrop, setup_lighting, update_time_lighting};
@@ -316,6 +326,16 @@ impl Plugin for LightingPlugin {
                     // This frame's submersion verdict, which the sky-pass suppression also reads.
                     .after(crate::liquid::SubmersionVerdict),
             );
+        // MONKEY (fog): the fog-model setting, LightFogBand.dbc and the per-frame fog rows.
+        app.init_resource::<fog_model::FogModelSetting>()
+            .init_resource::<fog_model::FogBandTable>()
+            .add_systems(Startup, fog_model::load_fog_bands.after(AssetSet::Open))
+            .add_systems(
+                Update,
+                fog_model::update_fog_model
+                    .after(update_time_lighting)
+                    .in_set(LightingResolveSet),
+            );
         // The shared light buffer, packed after the resolve and uploaded in the render world.
         global_light::register(app);
         // MONKEY (daylight fixtures): the per-frame re-aim, ordered before the packer's own set.
@@ -393,11 +413,20 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            // MONKEY (fog)
+            (
+                "lighting/fog_model.rs",
+                "update_fog_model: in the resolve set, .after(update_time_lighting)",
+            ),
             // MONKEY (daylight fixtures / portal bleed): both systems are PostUpdate,
             // chained before `global_light::classify_light_lanes`.
             (
                 "lighting/daylight.rs",
                 "update_daylight_fixtures + update_bleed_fixtures: PostUpdate",
+            ),
+            (
+                "clouds/layer.rs",
+                "update_cloud_fx is registered in CloudsPlugin with LightingConsumeSet",
             ),
         ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

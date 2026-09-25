@@ -31,8 +31,10 @@ use benilla_assets::materials::LiquidMaterial;
 use benilla_assets::AssetSet;
 
 mod drift;
+mod lod;
 mod scene_depth;
-pub use scene_depth::WaterDepthPlugin;
+// MONKEY (ao): the label orders the AO pass.
+pub use scene_depth::{WaterDepthLabel, WaterDepthPlugin};
 mod query;
 #[cfg(test)]
 mod real_data;
@@ -125,5 +127,6 @@ impl Plugin for LiquidPlugin {
             );
         }
         drift::register(app);
+        lod::register(app);
     }
 }

@@ -29,6 +29,10 @@ mod camera_shakes;
 mod cinematics;
 mod creatures;
 mod dbc;
+mod monkey_zone_grade;
+pub use monkey_zone_grade::{
+    load_monkey_zone_grades, parse_monkey_zone_grades, MonkeyZoneGrade, MonkeyZoneGrades,
+};
 mod unit_blood;
 pub use camera_shakes::{load_camera_shakes, CameraShake, CameraShakeCatalog, SpellShakeGroup};
 pub use cinematics::{
@@ -128,6 +132,10 @@ pub use ground_effects::{
 };
 mod light;
 pub use light::{Atmosphere, LightCatalog, Submersion, ZERO_KEY_COLOR, ZERO_KEY_SCALAR};
+// MONKEY (fog): `LightFogBand.dbc`.
+pub use light::{FogBand, FogBandCatalog, FOG_BANDS_PER_PARAM};
+// MONKEY (skybox): the skybox row and the zone walk's entries.
+pub use light::{SkyboxDef, ZoneSkybox, SKYBOX_FOG_BLEND, SKYBOX_FULL_DAY, SKYBOX_KEEP_CELESTIAL};
 mod loading_screen;
 pub use loading_screen::{load_loading_screens, LoadingScreenCatalog};
 mod liquid;
@@ -271,7 +279,7 @@ pub use models::{
     CoverageReader, EmitterBoneLink, EventMarker, FogPolicy, FootprintTris, GlobalSeqBone,
     GlobalSeqChannel, GroundQuad, KeyAnim, M2AnimSummary, M2Attachment, M2Bounds, M2CameraTracks,
     M2Light, M2PaneCamera, M2PortraitCamera, ModelAnimation, ModelBlend, ParentArm, ParentBasis,
-    PlayableAnim, RenderSubmesh, RgbAnim, ScalarAnim, SeqLoops, ShippedGlueScene, Skeleton,
+    PlayableAnim, RenderSubmesh, RgbAnim, StageTwo, ScalarAnim, SeqLoops, ShippedGlueScene, Skeleton,
     SkeletonBone, StringAnchors, UvAnim, UvRotAnim, WmoBatchClass, WmoDoodad, WmoDoodadSet, WmoFog,
     WmoGroupHeader, WmoGroupInfo, WmoLight, WmoPortalInfo, WmoPortalRef, WmoPortals, WmoRoot,
     ALPHA_KEY_REF, DEGENERATE_RING_FOOTPRINT, GLUE_AUTHORED_ASPECT, NO_GROUP_LIQUID,

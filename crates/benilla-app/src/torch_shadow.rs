@@ -645,6 +645,23 @@ struct EntityCasters<'w, 's> {
     /// bundle rather than being a 17th system param because `update_torch_shadows` already sits at
     /// Bevy's 16-param ceiling — the same reason `distance` is here.
     lighting: Res<'w, WowLighting>,
+    /// MONKEY (daylight: terrain torch casters): the resident ADT tiles, for the ground half of an
+    /// exterior slot's static caster mesh (`torchTerrainShadows`). `Option` so a scene with no
+    /// terrain streamer (the glue, a booth) is simply terrain-less.
+    terrain: Option<Res<'w, benilla_world::terrain_stream::TerrainStreamer>>,
+    adt_tiles: Option<Res<'w, Assets<benilla_assets::AdtTile>>>,
+}
+
+/// MONKEY (daylight: terrain torch casters): does an EXTERIOR slot's static map include the ground?
+/// The cvar `torchTerrainShadows`, or `WOW_TORCH_TERRAIN=0|1` (read once) for hermetic captures.
+fn terrain_casters_on(video: &VideoConfig) -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| match std::env::var("WOW_TORCH_TERRAIN").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    })
+    .unwrap_or(video.torch_terrain_shadows)
 }
 
 /// The INTERIOR lane is active when the dynamic-interior lane is on AND its shadow toggle is on.
@@ -1123,9 +1140,22 @@ fn update_torch_shadows(
     // While this pair is unchanged the fixture-local source set cannot have changed either, so the
     // slot's walk is skipped outright — which is what turns "a full scene scan every frame,
     // forever, in a room where nothing ever moves" into "a scan the frame something does".
+    // MONKEY (daylight: terrain torch casters): the resident terrain set joins the retained
+    // scene's stamp, so a tile streaming in re-checks the exterior slots near it; the switch itself
+    // is folded in so toggling the cvar re-keys every slot.
+    let terrain_on = terrain_casters_on(&video);
+    let terrain_gen = match (&ents.terrain, &ents.adt_tiles) {
+        (Some(t), Some(a)) if terrain_on => {
+            benilla_world::terrain_stream::terrain_torch_generation(t, a) ^ 0x7e44_a1d0
+        }
+        _ => 0,
+    };
     let census = (slot_count > 0)
         .then(|| PartCensus {
-            gx: gx.as_ref().map_or(0, |gx| gx.torch_residency_generation()),
+            gx: gx
+                .as_ref()
+                .map_or(0, |gx| gx.torch_residency_generation())
+                .wrapping_add(terrain_gen),
             parts: static_part_census(&ents),
         })
         .unwrap_or_default();
@@ -1210,6 +1240,19 @@ fn update_torch_shadows(
             entity_key = entity_key.wrapping_add(part_hash.finish());
         }
         entity_key.hash(&mut hash);
+        // MONKEY (daylight: terrain torch casters): settled EXTERIOR slots only. An interior
+        // fixture's room already occludes the ground, and a moving slot regathers every frame.
+        let with_terrain = terrain_gen != 0 && slot.exterior && !moving;
+        if with_terrain {
+            // MONKEY (fix-daylight): only the tiles near THIS slot key it; the global stamp
+            // re-rendered every exterior slot on any stream event anywhere.
+            if let (Some(t), Some(a)) = (&ents.terrain, &ents.adt_tiles) {
+                (benilla_world::terrain_stream::terrain_torch_generation_near(
+                    t, a, slot.pos, TORCH_RANGE,
+                ) ^ 0x7e44_a1d0)
+                    .hash(&mut hash);
+            }
+        }
         let key = hash.finish();
         let dirty = slot.geometry_key != Some(key);
         if !dirty {
@@ -1235,6 +1278,17 @@ fn update_torch_shadows(
             });
             let (_, part_excluded) =
                 collect_torch_entities(&ents, true, &gather, &mut positions, &mut indices);
+            if with_terrain {
+                if let (Some(t), Some(a)) = (&ents.terrain, &ents.adt_tiles) {
+                    let t0 = std::time::Instant::now();
+                    let tris = benilla_world::terrain_stream::append_terrain_torch_triangles(
+                        t, a, slot.pos, range, &mut positions, &mut indices);
+                    if std::env::var_os("WOW_TORCH_TRACE").is_some() {
+                        info!("torch-terrain: slot {i} +{tris} ground tris within {range:.0} yd in {:.3} ms",
+                            t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                }
+            }
             slot.trace_excluded = (gx_excluded, part_excluded);
             // MONKEY (moving fixture): a live slot MUTATES its mesh in place and keeps its asset
             // id; only a settled rebuild takes a fresh one. Two reasons. A new `Mesh` asset every

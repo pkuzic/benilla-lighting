@@ -639,7 +639,8 @@ mod tests {
         // The ONSET: a firework's fuse. Dark for the whole flight, up at the detonation.
         let fuse = || SpellLight::new(1.0, 1.5, SpellLightMode::Burst { span: 0.6 });
         assert_eq!(at(fuse(), 1.4), 0.0);
-        assert_eq!(at(fuse(), 1.5 + SPELL_LIGHT_RAMP), 1.0);
+        // MONKEY (integration): (1.5 + ramp) - 1.5 is not exactly `ramp` in f32.
+        assert!((at(fuse(), 1.5 + SPELL_LIGHT_RAMP) - 1.0).abs() < 1e-6);
 
         // The reap fade: a kit light goes dark on its instance's `FxDecay`, quicker than the
         // model's own Decay sequence — the aura is over the moment the server said so.
