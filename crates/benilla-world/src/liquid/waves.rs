@@ -31,10 +31,12 @@ use bevy::math::Vec2;
 ///
 /// Components 2..8 are the shader's fragment-only ripple band and are NOT here — see the module
 /// doc's `long_only` note. Adding them would be a second design, not a closer mirror.
-pub const LONG_SWELL: [[f32; 4]; 2] = [
-    [0.35, 18.0, 0.200, 0.0],
-    [0.80, 12.8, 0.140, 1.7],
-];
+pub const WATER_WIND_DIR: f32 = 0.35;
+pub const LONG_SWELL: [[f32; 4]; 2] =
+    [[WATER_WIND_DIR, 18.0, 0.200, 0.0], [0.80, 12.8, 0.140, 1.7]];
+
+/// Horizontal Gerstner gather, mirrored from `enhanced_water.wgsl::WATER_GERSTNER_CHOP`.
+pub const GERSTNER_CHOP: f32 = 2.4;
 
 /// Gravity in yd/s², `enhanced_water.wgsl` — deep-water dispersion, `c = sqrt(g/k)`.
 const GRAVITY_YD: f32 = 10.72;
@@ -44,8 +46,8 @@ const GRAVITY_YD: f32 = 10.72;
 const TWO_PI: f32 = 6.2831853;
 
 /// The ADT **ocean**'s wave energy — `liquid/surface.rs` packs `water.mode.y = 1.0` for
-/// `LiquidPath::Adt` + [`benilla_formats::LiquidKind::Ocean`] (river/lake 0.18, WMO pools 0.12,
-/// fullbright 0.0). The vertex swell arm only ever runs on that one combination
+/// `LiquidPath::Adt` + [`benilla_formats::LiquidKind::Ocean`] (river/lake 0.18, WMO exterior 0.26,
+/// WMO interior 0.08, fullbright 0.0). The vertex swell arm only ever runs on that combination
 /// (`enhanced_water.wgsl`), so this is the only energy a bob can ever be driven at — the parameter
 /// stays open because the function is the shader's, not the bob's.
 pub const OCEAN_WAVE_ENERGY: f32 = 1.0;
@@ -60,6 +62,8 @@ pub struct Swell {
     /// `(∂height/∂x, ∂height/∂z)` in BEVY world axes, the shader's `result.yz`. The shader builds
     /// its normal from exactly this as `normalize(vec3(-grad.x, 1, -grad.y))` (`enhanced_water.wgsl`).
     pub grad: Vec2,
+    /// Horizontal Gerstner displacement in BEVY XZ at the parameter-space point under this sample.
+    pub horizontal: Vec2,
 }
 
 /// `enhanced_water.wgsl`'s `swell_shore_fade`: the authored ocean depth `V` (byte/255, ≈148 yd at
@@ -84,23 +88,67 @@ pub fn swell_shore_fade(depth_v: f32) -> f32 {
 /// * `long_only = true` — components 0 and 1, which are also the two the shore fade multiplies.
 ///
 /// `world_xz` is BEVY world XZ. `shallow_fade` is the shore term (1 = open sea, 0 = beach).
-pub fn swell(world_xz: Vec2, time: f32, wave_energy: f32, shallow_fade: f32) -> Swell {
+#[derive(Clone, Copy, Debug, Default)]
+struct RawSwell {
+    height: f32,
+    grad: Vec2,
+    horizontal: Vec2,
+    jacobian: [f32; 4],
+}
+
+/// Evaluate the same parameter-space Gerstner surface the vertex shader receives. The public
+/// sampler below inverts its horizontal map because callers hold a displaced world position.
+fn raw_swell(parameter_xz: Vec2, time: f32, wave_energy: f32, shallow_fade: f32) -> RawSwell {
     let energy = wave_energy.clamp(0.0, 1.0);
     // `mix(0.4, 1.0, sqrt(energy))` — a calm inland sheet also swells SLOWER, not merely lower.
     let tempo = 0.4 + 0.6 * energy.sqrt();
     let shore = shallow_fade.clamp(0.0, 1.0);
-    let mut out = Swell::default();
+    let mut out = RawSwell {
+        jacobian: [1.0, 0.0, 0.0, 1.0],
+        ..RawSwell::default()
+    };
     for w in LONG_SWELL {
         let dir = Vec2::new(w[0].cos(), w[0].sin());
         let k = TWO_PI / w[1];
         let speed = (GRAVITY_YD / k).sqrt(); // phase speed, yd/s
-        let phase = k * (dir.dot(world_xz) - speed * tempo * time) + w[3];
+        let phase = k * (dir.dot(parameter_xz) - speed * tempo * time) + w[3];
         // `fade` is 1 at zero footprint; `i < 2` ⇒ both components take the shore term.
         let amplitude = w[2] * energy * shore;
         out.height += amplitude * phase.sin();
         out.grad += dir * (amplitude * k * phase.cos());
+        let horizontal = GERSTNER_CHOP * amplitude;
+        out.horizontal += dir * (horizontal * phase.cos());
+        let compression = horizontal * k * phase.sin();
+        out.jacobian[0] -= compression * dir.x * dir.x;
+        out.jacobian[1] -= compression * dir.x * dir.y;
+        out.jacobian[2] -= compression * dir.y * dir.x;
+        out.jacobian[3] -= compression * dir.y * dir.y;
     }
     out
+}
+
+/// The displaced Gerstner surface at a WORLD-space point. Four fixed-point steps find the original
+/// mesh coordinate under that point; the long-band Jacobian is contractive (worst compression
+/// below 0.34), so this converges without a branch or an allocation. The gradient is transformed
+/// through the same map, keeping swimmer lean consistent with the visibly pinched crest.
+pub fn swell(world_xz: Vec2, time: f32, wave_energy: f32, shallow_fade: f32) -> Swell {
+    let mut parameter_xz = world_xz;
+    for _ in 0..4 {
+        let raw = raw_swell(parameter_xz, time, wave_energy, shallow_fade);
+        parameter_xz = world_xz - raw.horizontal;
+    }
+    let raw = raw_swell(parameter_xz, time, wave_energy, shallow_fade);
+    let [j00, j01, j10, j11] = raw.jacobian;
+    let det = (j00 * j11 - j01 * j10).max(1.0e-4);
+    let grad = Vec2::new(
+        (j11 * raw.grad.x - j01 * raw.grad.y) / det,
+        (-j10 * raw.grad.x + j00 * raw.grad.y) / det,
+    );
+    Swell {
+        height: raw.height,
+        grad,
+        horizontal: raw.horizontal,
+    }
 }
 
 /// [`swell`]'s height alone — the shape the brief names, for callers that do not want the slope.
@@ -167,8 +215,19 @@ mod tests {
             "enhanced_water.wgsl WATER_WAVES[0..2]"
         );
         assert_eq!(GRAVITY_YD, 10.72, "enhanced_water.wgsl gravity");
-        assert_eq!(TWO_PI, 6.2831853, "enhanced_water.wgsl k = 6.2831853/wavelength");
-        assert_eq!(OCEAN_WAVE_ENERGY, 1.0, "surface.rs water.mode.y for ADT ocean");
+        assert_eq!(
+            TWO_PI, 6.2831853,
+            "enhanced_water.wgsl k = 6.2831853/wavelength"
+        );
+        assert_eq!(WATER_WIND_DIR, 0.35, "enhanced_water.wgsl WATER_WIND_DIR");
+        assert_eq!(
+            GERSTNER_CHOP, 2.4,
+            "enhanced_water.wgsl WATER_GERSTNER_CHOP"
+        );
+        assert_eq!(
+            OCEAN_WAVE_ENERGY, 1.0,
+            "surface.rs water.mode.y for ADT ocean"
+        );
         // The band's ceiling, stated in the shader's own comment ("at most 0.34 yd").
         let peak: f32 = LONG_SWELL.iter().map(|w| w[2]).sum();
         assert!((peak - 0.34).abs() < 1e-6, "amplitude sum {peak}");
@@ -183,11 +242,13 @@ mod tests {
             let s = swell(Vec2::new(-9016.0, 226.0), t, 0.0, 1.0);
             assert_eq!(s.height, 0.0, "height at t={t}");
             assert_eq!(s.grad, Vec2::ZERO, "grad at t={t}");
+            assert_eq!(s.horizontal, Vec2::ZERO, "horizontal at t={t}");
         }
         // The shore term is the other kill switch: a beached vertex does not move either.
         let beached = swell(Vec2::new(-9016.0, 226.0), 3.0, OCEAN_WAVE_ENERGY, 0.0);
         assert_eq!(beached.height, 0.0);
         assert_eq!(beached.grad, Vec2::ZERO);
+        assert_eq!(beached.horizontal, Vec2::ZERO);
     }
 
     /// The swell stays inside the band the shader advertises, and the gradient it reports really
@@ -220,12 +281,39 @@ mod tests {
         }
     }
 
+    /// The CPU query samples by displaced world position while the vertex shader starts in mesh
+    /// parameter space. Pin the inversion: adding the returned horizontal displacement to the
+    /// recovered parameter must land back under the swimmer, with the advertised hard bound.
+    #[test]
+    fn gerstner_inverse_lands_under_the_world_sample() {
+        let world = Vec2::new(-9016.0, 226.0);
+        for step in 0..40 {
+            let t = step as f32 * 0.37;
+            let s = swell(world, t, OCEAN_WAVE_ENERGY, 1.0);
+            let parameter = world - s.horizontal;
+            let raw = raw_swell(parameter, t, OCEAN_WAVE_ENERGY, 1.0);
+            let reprojection = parameter + raw.horizontal;
+            assert!(
+                (reprojection - world).length() < 2.0e-3,
+                "reprojection at t={t}"
+            );
+            assert!(
+                s.horizontal.length() <= 0.817,
+                "horizontal at t={t}: {:?}",
+                s.horizontal
+            );
+        }
+    }
+
     /// The shore fade's two ends, as the shader's `smoothstep(0.001, 0.025, depth)` places them.
     #[test]
     fn shore_fade_matches_the_shader_band() {
         assert_eq!(swell_shore_fade(0.0), 0.0);
         assert_eq!(swell_shore_fade(1.0), 1.0, "open sea (V = 1) is unfaded");
-        assert!((swell_shore_fade(0.013) - 0.5).abs() < 0.02, "band midpoint");
+        assert!(
+            (swell_shore_fade(0.013) - 0.5).abs() < 0.02,
+            "band midpoint"
+        );
     }
 
     /// The clock: a live run is the wrapped elapsed seconds verbatim (the GPU's `globals.time`),

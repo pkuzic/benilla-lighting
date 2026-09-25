@@ -145,8 +145,8 @@ fn vertex(in: Vertex) -> LiquidVsOut {
     let world_from_local = mesh_functions::get_world_from_local(in.instance_index);
     out.world_position =
         mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(in.position, 1.0));
-    // MONKEY (enhanced water): the ocean's long swell; 0 on Classic and on every other surface.
-    out.world_position.y += water_swell(out.world_position.xz, in.uv_b.x);
+    // MONKEY (enhanced water): ocean Gerstner displacement; zero on Classic/other surfaces.
+    out.world_position += vec4<f32>(water_swell(out.world_position.xz, in.uv_b.x), 0.0);
     out.clip_position = position_world_to_clip(out.world_position.xyz);
     out.world_normal = mesh_functions::mesh_normal_local_to_world(in.normal, in.instance_index);
     out.uv = in.uv;
@@ -217,7 +217,9 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         // Returned as-is: the module fogs its own surface terms (the scene it shows through is
         // already fogged).
         return enhanced_water(
-            WaterFragment(in.clip_position, in.world_position, in.depth, in.room_fog),
+            // MONKEY (water): the enhanced interior arm consumes the MOMT colour already carried
+            // by the reference fragment interface; exterior/ADT vertices supply white.
+            WaterFragment(in.clip_position, in.world_position, in.depth, in.vcolor, in.room_fog),
             shallow_enhanced, deep_enhanced);
     }
 

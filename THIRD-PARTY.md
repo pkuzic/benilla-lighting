@@ -29,10 +29,10 @@ where they stand. Do not remove either.
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (caustics) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `render/Noise.cpp` | Two caustic layers at incommensurate scales and rates, multiplied (ported; our layers are built from animated cell edges, not value noise) |
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (HIGH reflections) | `wxl-experimental-water` | `shaders/Surface.ps.hlsl` | Screen-space reflection of the scene copy along an almost-planar normal, masked by the screen edge and by rays turning back toward the eye (principle; ours is a bisected march against the scene depth, not a single probe) |
 | `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (beach surf, `on_bed`) | `wxl-experimental-water` | `sea/Shore.hpp`, `shaders/Shore.hlsli` | Shore surf limited by the terrain column, so objects standing in the water never foam (principle) |
+| `crates/benilla-assets/src/shaders/enhanced_water.wgsl` (Gerstner crests, High) + `crates/benilla-world/src/liquid/waves.rs` | `wxl-experimental-water` | `shaders/Surface.ps.hlsl`, `sea/Spectrum.*`, `sea/Ocean.*` | Gerstner displacement and fold-driven crest whitecaps; the CPU swimmer sample inverts the same displacement (ported) |
 | `crates/benilla-world/src/water_fx/bob.rs` | `wxl-experimental-water` | `world/Ride.cpp` | Visual-only wave riding for swimmers; the authoritative position never moves (principle, implemented independently) |
 
-Planned (not yet in the tree): Gerstner trains, breaker index and crest-fold foam from
-`sea/Spectrum.*`, `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
+Planned (not yet in the tree): breaker index from `sea/Shore.hpp`, `shaders/Wave.hlsli`; grass wind from `wxl-experimental-wind`
 (`field/Wind.*`, `grass/GrassWind.*`); colour grading from `wxl-retail-grading`
 (`Grading.*`, `shaders/Grading.ps.hlsl`); cloud sheets from `wxl-retail-clouds` (`Clouds.*`).
 The lane that ports one adds its row here.

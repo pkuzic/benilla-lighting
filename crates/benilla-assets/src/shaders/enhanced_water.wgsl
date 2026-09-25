@@ -1,5 +1,6 @@
 #define_import_path benilla::enhanced_water
 
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-experimental-water, shaders/Surface.ps.hlsl, sea/Spectrum.*, sea/Ocean.*.
 // ENHANCED WATER - the optional water module (Video options -> Water Quality; see WATER.md).
 //
 // Credits: original project WarcraftXL (`wxl-experimental-water`, https://github.com/WarcraftXL),
@@ -32,7 +33,7 @@
 
 struct WaterParams {
     // x = quality (0 Classic, 1 Enhanced, 2 High); y = wave energy (ocean 1.0, ADT inland 0.18,
-    // WMO pools 0.12); z = the pinned capture time (WOW_CAPTURE_WATER_T); w = clock enable.
+    // WMO exterior 0.26, WMO interior 0.08); z = pinned capture time; w = clock enable.
     mode: vec4<f32>,
     // x = which renderer (0 ADT MCLQ, 1 WMO exterior, 2 WMO interior); y = ocean; z = fullbright;
     // w = this surface may take the WMO INTERIOR fog block (upstream's kind.z).
@@ -43,28 +44,27 @@ struct WaterParams {
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var<uniform> water: WaterParams;
 
-// The shared global light (`lighting::global_light`), rows 0-20 + the point-light table. Mirrors
-// the buffer layout the terrain/model shaders read; keep it in step with theirs.
-struct WaterLight {
-    light_ambient: vec4<f32>,      // 0
-    light_diffuse: vec4<f32>,      // 1
-    light_sun: vec4<f32>,          // 2  xyz = sun TRAVEL dir (to-light = -xyz)
-    light_spec: vec4<f32>,         // 3
-    fog_color: vec4<f32>,          // 4
-    fog_params: vec4<f32>,         // 5
-    _sh: array<vec4<f32>, 6>,      // 6-11
-    _sh_c16: vec4<f32>,            // 12
-    water_river: array<vec4<f32>, 2>, // 13-14
-    water_ocean: array<vec4<f32>, 2>, // 15-16
-    _grade: vec4<f32>,             // 17
-    wmo_fog_color: vec4<f32>,      // 18
-    wmo_fog_params: vec4<f32>,     // 19
-    point_count: vec4<f32>,        // 20 live count + point-light controls
-    points: array<vec4<f32>, 512>, // 21+ position/range, colour/lane pairs
-    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
-    monkey: monkey_frame::MonkeyFrame,
-};
-@group(#{MATERIAL_BIND_GROUP}) @binding(105) var<storage, read> water_light: WaterLight;
+// MONKEY (water): the shared global light (`lighting::global_light`), rows 0-20 + the point-light
+// table, is deliberately a row view of the exact terrain/model ABI. Bevy's composable-module
+// writer rejects a second partial struct view because its unused members require substitution.
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var<storage, read> water_light: array<vec4<f32>>;
+
+// MONKEY (integration): the p0 MonkeyFrame block as seen through the water lane's row view — it
+// starts right after the 21 fixed rows + the 512-row point table (row 533; buffer 8528 -> 8784 B).
+const MONKEY_ROW: u32 = 533u;
+fn water_monkey() -> monkey_frame::MonkeyFrame {
+    var m: monkey_frame::MonkeyFrame;
+    m.fog0 = water_light[MONKEY_ROW + 0u];
+    m.fog1 = water_light[MONKEY_ROW + 1u];
+    m.fog2 = water_light[MONKEY_ROW + 2u];
+    m.fog3 = water_light[MONKEY_ROW + 3u];
+    m.wind0 = water_light[MONKEY_ROW + 4u];
+    m.wind1 = water_light[MONKEY_ROW + 5u];
+    m.wet0 = water_light[MONKEY_ROW + 6u];
+    m.misc = water_light[MONKEY_ROW + 7u];
+    for (var i = 0u; i < 8u; i++) { m.benders[i] = water_light[MONKEY_ROW + 8u + i]; }
+    return m;
+}
 
 // What the fragment stage hands over: the three varyings this module reads.
 struct WaterFragment {
@@ -72,6 +72,8 @@ struct WaterFragment {
     world_position: vec4<f32>,
     // The authored per-vertex swatch depth (UV1.x): ocean byte/255, about 148 yd at 1.0.
     depth: f32,
+    // MONKEY (water): an interior WMO pool's authored MOMT diffuse colour; white on other lanes.
+    colour: vec4<f32>,
     // Upstream's per-surface room-fog lane (MeshTag bit 30), to pick the same fog block it would.
     room_fog: u32,
 };
@@ -82,17 +84,17 @@ struct WaterFragment {
 // scenery come out of the scene copy, which the terrain and model shaders have already fogged
 // (fogging them again made shallow water foggier than the dry sand beside it).
 fn water_fog(world_pos: vec3<f32>, room_fog: u32) -> vec4<f32> {
-    var colour = water_light.fog_color;
-    var span = water_light.fog_params.xy;
+    var colour = water_light[4];
+    var span = water_light[5].xy;
     if water.lane.w > 0.5 && room_fog != 0u {
-        colour = water_light.wmo_fog_color;
-        span = water_light.wmo_fog_params.xy;
+        colour = water_light[18];
+        span = water_light[19].xy;
     }
     if colour.w <= 0.5 { return vec4<f32>(colour.rgb, 1.0); }
     let eye_z = -(view.view_from_world * vec4<f32>(world_pos, 1.0)).z;
     // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl), as a factor; classic is bit-identical.
     return fog_hook::fog_sample(colour.rgb, span, eye_z, world_pos, view.world_position, true,
-        water_light.monkey);
+        water_monkey());
 }
 
 // True where this surface takes the Enhanced path: water (not magma/slime), a tier above
@@ -107,21 +109,25 @@ fn water_time() -> f32 {
     return globals.time;
 }
 
-// Vertex lift for the ocean's long swell (0 everywhere else). `liquid/waves.rs` mirrors it on
-// the CPU for the swimmer bob; the two are one contract.
-fn water_swell(xz: vec2<f32>, authored_depth: f32) -> f32 {
+// Vertex Gerstner displacement for the ocean's long swell (zero everywhere else).
+// `liquid/waves.rs` mirrors it on the CPU for the swimmer bob; the two are one contract.
+fn water_swell(xz: vec2<f32>, authored_depth: f32) -> vec3<f32> {
     if water.lane.z < 0.5 && water.lane.y > 0.5 && water.lane.x < 0.5 && water.mode.x > 0.5 {
-        return water_waves(xz, water_time(), 0.0, 0.0, swell_shore_fade(authored_depth), true).x;
+        return water_gerstner(xz, water_time(), swell_shore_fade(authored_depth)).xyz;
     }
-    return 0.0;
+    return vec3<f32>(0.0);
 }
 
 // Enhanced is entirely analytic: height and its exact x/z derivatives, in yards.
 // Direction is radians from world +X toward +Z; phase speed follows deep-water dispersion.
 // Two mesh-resolvable long waves sum to at most 0.34 yd before energy/shore attenuation.
+// MONKEY (water): one temporary wind bearing until the weather lane supplies shared wind.
+// Every wind-aligned water term derives from this constant rather than owning a second heading.
+const WATER_WIND_DIR: f32 = 0.35;
+const WATER_GERSTNER_CHOP: f32 = 2.4;
 const WATER_WAVES: array<vec4<f32>, 8> = array<vec4<f32>, 8>(
     // direction, wavelength, amplitude, phase offset
-    vec4<f32>(0.35, 18.0, 0.200, 0.0),
+    vec4<f32>(WATER_WIND_DIR, 18.0, 0.200, 0.0),
     vec4<f32>(0.80, 12.8, 0.140, 1.7),
     vec4<f32>(-0.18, 9.5, 0.090, 3.1),
     vec4<f32>(0.52, 4.8, 0.055, 0.8),
@@ -160,7 +166,7 @@ const SHORE_PERIOD: f32 = 3.6;         // seconds between arrivals; the swash ru
 const SHORE_TILT: f32 = 0.09;          // peak crest steepness (tan of the tilt), slope-independent
 const SHORE_WARP_A: f32 = 0.22;        // yards of depth — coarse crest wander (never ruler-straight)
 const SHORE_WARP_B: f32 = 0.10;        // yards of depth — finer segmentation of the same crests
-const SHORE_WIND_DIR: f32 = 0.35;      // = WATER_WAVES[0].x, the primary swell bearing
+const SHORE_WIND_DIR: f32 = WATER_WIND_DIR;
 
 // Foam alphas. The owner rejected BOTH a thick icing sheet and straight stripes before this, so
 // every one of these is gated behind a noise breakup and a depth window; the numbers are the
@@ -168,6 +174,7 @@ const SHORE_WIND_DIR: f32 = 0.35;      // = WATER_WAVES[0].x, the primary swell 
 const FOAM_WET_EDGE: f32 = 0.35;       // the faint wet line where water meets anything solid
 const FOAM_SWASH: f32 = 0.62;          // the sheet running up the sand and fading
 const FOAM_CREST: f32 = 0.88;          // the white front of the last wave or two, and its lace
+const FOAM_WHITECAP: f32 = 0.68;       // High-only open-sea crest fold
 const FOAM_MAX: f32 = 0.90;            // hard ceiling on the sum
 
 fn swell_shore_fade(depth: f32) -> f32 {
@@ -180,10 +187,10 @@ fn water_waves(p: vec2<f32>, t: f32, distance: f32, footprint: f32,
     let energy = clamp(water.mode.y, 0.0, 1.0);
     let tempo = mix(0.4, 1.0, sqrt(energy));
     let inland = water.lane.y < 0.5 || water.lane.x > 0.5;
-    // Inland ADT water drifts gently (a constant vector: a rigid translation, never a shear).
-    // WMO pools have no drift at all.
+    // MONKEY (water): inland ADT and exterior WMO water drift gently (a constant vector: a rigid
+    // translation, never a shear). True interior pools stay still.
     var ripple_p = p;
-    if inland && water.lane.x < 0.5 {
+    if inland && water.lane.x < 1.5 {
         ripple_p -= t * vec2<f32>(0.06, 0.025);
     }
     var result = vec3<f32>(0.0);
@@ -203,6 +210,43 @@ fn water_waves(p: vec2<f32>, t: f32, distance: f32, footprint: f32,
         result += vec3<f32>(amplitude * sin(phase), amplitude * k * cos(phase) * direction);
     }
     return result;
+}
+
+// MONKEY (water): Ported from WarcraftXL's Gerstner displacement and fold-driven gFoam path.
+// xyz is horizontal/vertical/horizontal displacement; w is 1 - det(J), the amount the horizontal
+// map has compressed toward a fold. Only the two mesh-resolvable long bands move geometry.
+fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
+    let energy = clamp(water.mode.y, 0.0, 1.0);
+    let tempo = mix(0.4, 1.0, sqrt(energy));
+    var displacement = vec3<f32>(0.0);
+    var j00 = 1.0;
+    var j01 = 0.0;
+    var j10 = 0.0;
+    var j11 = 1.0;
+    for (var i = 0u; i < 2u; i += 1u) {
+        let wave = WATER_WAVES[i];
+        let direction = vec2<f32>(cos(wave.x), sin(wave.x));
+        let k = 6.2831853 / wave.y;
+        let speed = sqrt(10.72 / k);
+        let phase = k * (dot(direction, p) - speed * tempo * t) + wave.w;
+        let amplitude = wave.z * energy * shore;
+        let horizontal = WATER_GERSTNER_CHOP * amplitude;
+        displacement += vec3<f32>(direction.x * horizontal * cos(phase),
+            amplitude * sin(phase), direction.y * horizontal * cos(phase));
+        let compression = horizontal * k * sin(phase);
+        j00 -= compression * direction.x * direction.x;
+        j01 -= compression * direction.x * direction.y;
+        j10 -= compression * direction.y * direction.x;
+        j11 -= compression * direction.y * direction.y;
+    }
+    let fold = max(1.0 - (j00 * j11 - j01 * j10), 0.0);
+    return vec4<f32>(displacement, fold);
+}
+
+// MONKEY (water): seam for the later wet-weather lane. Its result is a height-gradient
+// perturbation in world XZ; zero preserves today's image until that lane supplies rain data.
+fn rain_ripple_normal(world_xz: vec2<f32>, time: f32) -> vec2<f32> {
+    return vec2<f32>(0.0);
 }
 
 fn foam_hash(p_in: vec2<f32>) -> f32 {
@@ -473,7 +517,11 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // 148 yd): where the bed lies well below what the pixel sees, the pixel is an OBJECT, and an
     // object gets the thin wet-edge line only. The byte is a FLOOR (1.72 per yd), so on a real beach the
     // authored bed is never deeper than the scene by more than interpolation error: allow 0.5 yd.
-    let bed_yd = clamp(in.depth, 0.0, 1.0) * 148.0;
+    // MONKEY (water): MLIQ carries an opacity-ramp byte, not ADT's authored bed-depth byte. For a
+    // WMO pool the only actual column measurement is the reconstructed scene depth, so never turn
+    // its opacity into 148 yards of fictitious water.
+    let bed_yd = select(vertical_depth, clamp(in.depth, 0.0, 1.0) * 148.0,
+        water.lane.x < 0.5);
     let on_bed = 1.0 - smoothstep(0.5, 1.0, bed_yd - vertical_depth);
     let shore_gain = select(0.0, shoal * shore_collapse * shore_offshore_fade * on_bed, ocean_mesh)
         * energy;
@@ -485,8 +533,12 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
 
     let shore = select(1.0, swell_shore_fade(in.depth), ocean_mesh);
     let wave = water_waves(p, t, length(eye_pos), footprint, shore, false);
+    var open_sea_fold = 0.0;
+    if water.mode.x > 1.5 && ocean_mesh {
+        open_sea_fold = water_gerstner(p, t, shore).w;
+    }
     // One surface gradient: the procedural bands and the shore break.
-    let surf_grad = wave.yz + shore_grad;
+    let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xz, t);
     var n = normalize(vec3<f32>(-surf_grad.x, 1.0, -surf_grad.y));
     if dot(n, to_view) < 0.0 { n = -n; }
 
@@ -516,14 +568,22 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
             clamp(inland_row.b, inland_row.g * 0.82, inland_row.g * 1.15));
         body = mix(clear_tint, inland_deep, smoothstep(0.0, 5.0, vertical_depth));
     }
-    let to_light = -normalize(water_light.light_sun.xyz);
+    // MONKEY (water): the reference interior renderer carries MOMT.diffColor on the pool vertex.
+    // Under a roof that authored colour replaces the outdoor Light.dbc/sky-derived body palette.
+    if water.lane.x > 1.5 {
+        body = in.colour.rgb;
+    }
+    let to_light = -normalize(water_light[2].xyz);
     // MONKEY (water body): water is lit by the light it SCATTERS, not only by N.L on its skin, so
     // the lit body keeps a high floor (ambient x 1.35, N.L floor 0.5). With the old 0.25 floor a
     // noon lake rendered near-black navy where the owner reference is a bright teal-blue; night
     // still darkens because both rows do.
-    let lighting = clamp(water_light.light_ambient.rgb * 1.35 + water_light.light_diffuse.rgb
+    let lighting = clamp(water_light[0].rgb * 1.35 + water_light[1].rgb
         * max(dot(n, to_light), 0.5), vec3<f32>(0.0), vec3<f32>(1.0));
     var rgb = body * lighting;
+    if water.lane.x > 1.5 {
+        rgb = body;
+    }
     // MONKEY (shore waves): the shore train is shown mainly as a CONTINUOUS crest brightening, not as
     // a normal tilt. Its direction comes from the screen-space gradient of the bed depth, and the
     // terrain is flat triangles, so that direction jumps at every triangle edge: at SHORE_TILT 0.30
@@ -546,9 +606,14 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     let reflected = reflect(-to_view, reflection_n);
     let sky_linear = mix(water.sky_horizon.rgb, water.sky_zenith.rgb, clamp(reflected.y * 1.4, 0.0, 1.0));
     // Linear reflection interpolation, then conversion to the world's gamma blend/fog lane.
-    let sky = select(12.92 * sky_linear,
+    var sky = select(12.92 * sky_linear,
         1.055 * pow(max(sky_linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055,
         sky_linear > vec3<f32>(0.0031308));
+    // MONKEY (water): an interior pool has no sky probe. High may still replace this fallback with
+    // a real SSR hit, while Enhanced reflects the room's own fog colour and keeps sun glints off.
+    if water.lane.x > 1.5 {
+        sky = fog.rgb;
+    }
     var reflectivity = mix(0.06, 0.88, pow(1.0 - max(dot(n, to_view), 0.0), 4.0));
     if !ocean_mesh { reflectivity = min(reflectivity, 0.55); }
 
@@ -581,7 +646,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         let web = caustic_web(bed_world.xz + n.xz * 0.35, t)
             * (1.0 - smoothstep(0.12, 0.40, footprint * CAUSTIC_SCALE * 4.0));
         behind *= 1.0 + web * CAUSTIC_GAIN * sun_focus * caustic_fade
-            * dot(water_light.light_diffuse.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+            * dot(water_light[1].rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     }
     // Light that reaches the eye through water has been scattered on the way, so it carries the
     // water's own tint as well as the colour extinction leaves: without this, yellow sand under a
@@ -625,7 +690,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
                     + 0.25 * pow(ndoth, 60.0 / sqrt(spread)) / sqrt(spread))
                 * smoothstep(0.0, 0.1391731, celestial_dir.y);
         } else {
-            rgb += water_light.light_diffuse.rgb
+            rgb += water_light[1].rgb
                 * (pow(ndoth, 400.0 / spread) / sqrt(spread)
                     + 0.25 * pow(ndoth, 60.0 / sqrt(spread)) / sqrt(spread))
                 * smoothstep(-0.02, 0.08, celestial_dir.y);
@@ -635,10 +700,13 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // Rank candidates by actual fragment distance, not table order. Only four lights are shaded.
     var nearest = array<u32, 4>(256u, 256u, 256u, 256u);
     var distances = array<f32, 4>(900.0, 900.0, 900.0, 900.0);
-    for (var i = 0u; i < min(u32(water_light.point_count.x), 256u); i += 1u) {
-        let colour = water_light.points[2u * i + 1u];
-        if colour.w >= 0.5 && water.lane.x < 1.5 { continue; }
-        let delta = water_light.points[2u * i].xyz - in.world_position.xyz;
+    for (var i = 0u; i < min(u32(water_light[20].x), 256u); i += 1u) {
+        let colour = water_light[21u + 2u * i + 1u];
+        // MONKEY (water): outside takes only exterior lights; a true interior pool takes only its
+        // room fixtures. This keeps street torches on canals and out of pools behind closed walls.
+        let interior_fixture = colour.w >= 0.5;
+        if interior_fixture != (water.lane.x > 1.5) { continue; }
+        let delta = water_light[21u + 2u * i].xyz - in.world_position.xyz;
         let d2 = dot(delta, delta);
         if d2 >= distances[3] { continue; }
         var slot = 3u;
@@ -654,8 +722,8 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     }
     for (var j = 0u; j < 4u; j += 1u) {
         if nearest[j] == 256u { continue; }
-        let pos = water_light.points[nearest[j] * 2u];
-        let colour = water_light.points[nearest[j] * 2u + 1u];
+        let pos = water_light[21u + nearest[j] * 2u];
+        let colour = water_light[21u + nearest[j] * 2u + 1u];
         let delta = pos.xyz - in.world_position.xyz;
         let distance = sqrt(max(distances[j], 0.0001));
         let light_dir = delta / distance;
@@ -669,6 +737,12 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     let noise = 0.7 * foam_noise(p * 0.6 + t * vec2<f32>(0.025, -0.018))
         + 0.3 * foam_noise(p * 1.7 - t * vec2<f32>(0.014, 0.021));
     let breakup = smoothstep(0.40, 0.72, noise);
+    // MONKEY (water): WarcraftXL's white belongs to a connected horizontal fold, not to every
+    // steep normal. Threshold jitter stops identical crests drawing identical white contours.
+    let fold_jitter = (noise - 0.5) * 0.04;
+    let breaking = smoothstep(0.13, 0.25, open_sea_fold + fold_jitter);
+    let whitecap_alpha = FOAM_WHITECAP * breaking * mix(0.55, 1.0, breakup)
+        * smoothstep(0.55, 1.0, energy);
     // The cached derivatives from the top of the function — same expression as before, one tap.
     let depth_gradient = length(vec2<f32>(ddx_depth, ddy_depth))
         / max(length(vec2<f32>(length(ddx_p), length(ddy_p))), 0.001);
@@ -718,8 +792,8 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         FOAM_SWASH * swash_life * swash_band * max(swash_lace, 0.8 * lip), ocean_mesh)
         * wall_suppression * energy;
 
-    let foam = min(FOAM_MAX, contact_alpha + arcs_alpha + crest_alpha);
-    let illumination = water_light.light_ambient.rgb + water_light.light_diffuse.rgb;
+    let foam = min(FOAM_MAX, contact_alpha + arcs_alpha + crest_alpha + whitecap_alpha);
+    let illumination = water_light[0].rgb + water_light[1].rgb;
     let foam_luma = clamp(dot(illumination, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.22, 1.0);
     // Matte foam composites on top of reflection with its own coverage.
     // The body now carries its own transmission (above), so the surface is opaque bar the very
