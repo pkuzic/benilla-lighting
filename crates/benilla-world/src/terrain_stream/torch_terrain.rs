@@ -102,6 +102,38 @@ pub fn terrain_torch_generation(streamer: &TerrainStreamer, adt_tiles: &Assets<A
     sum
 }
 
+/// MONKEY (fix-daylight): [`terrain_torch_generation`] over only the tiles whose footprint
+/// reaches the sphere (`center` in Bevy space), so a tile streaming far away does not re-key (and
+/// re-render) every settled exterior torch slot. Keys are `(tile_x, tile_y)`: tile_x from world y,
+/// tile_y from world x, both counted down from `32 * TILE_SIZE`.
+pub fn terrain_torch_generation_near(
+    streamer: &TerrainStreamer,
+    adt_tiles: &Assets<AdtTile>,
+    center: Vec3,
+    reach: f32,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let c = Vec3::from(benilla_assets::coords::bevy_to_wow(center));
+    let t = benilla_formats::TILE_SIZE;
+    let offset = 32.0 * t;
+    let mut sum = 0u64;
+    for (key, ts) in &streamer.tiles {
+        let (tx, ty) = (key.0 as f32, key.1 as f32);
+        let (x_hi, y_hi) = (offset - ty * t, offset - tx * t);
+        let lo = Vec3::new(x_hi - t, y_hi - t, c.z);
+        let hi = Vec3::new(x_hi, y_hi, c.z);
+        if box_sphere_d2(lo, hi, c) > reach * reach {
+            continue;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        ts.handle.id().hash(&mut h);
+        adt_tiles.contains(&ts.handle).hash(&mut h);
+        sum = sum.wrapping_add(h.finish());
+    }
+    sum
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

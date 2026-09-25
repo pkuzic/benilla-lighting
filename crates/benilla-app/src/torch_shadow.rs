@@ -1244,7 +1244,14 @@ fn update_torch_shadows(
         // fixture's room already occludes the ground, and a moving slot regathers every frame.
         let with_terrain = terrain_gen != 0 && slot.exterior && !moving;
         if with_terrain {
-            terrain_gen.hash(&mut hash);
+            // MONKEY (fix-daylight): only the tiles near THIS slot key it; the global stamp
+            // re-rendered every exterior slot on any stream event anywhere.
+            if let (Some(t), Some(a)) = (&ents.terrain, &ents.adt_tiles) {
+                (benilla_world::terrain_stream::terrain_torch_generation_near(
+                    t, a, slot.pos, TORCH_RANGE,
+                ) ^ 0x7e44_a1d0)
+                    .hash(&mut hash);
+            }
         }
         let key = hash.finish();
         let dirty = slot.geometry_key != Some(key);

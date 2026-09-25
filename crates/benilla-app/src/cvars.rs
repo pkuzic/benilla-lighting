@@ -1188,6 +1188,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.0",
         "benilla's own: daylight floor for rooms inside a building, 0..1 (0 = none, the old look)",
     ),
+    // MONKEY (fix-daylight): the district window split, gateable (default on = merged behaviour).
+    ours(
+        "daylightWindowSplit",
+        "1",
+        "benilla's own: split city window batches into window-sized daylight apertures (applies to newly loaded buildings)",
+    ),
     // MONKEY (bake floor): the share of an interior batch's own MOCV bake that survives the live-
     // fixture lane. The lane throws the bake away and lets the fixtures decide, which leaves a room
     // no fixture reaches (the Lion's Pride Inn's east vestibule: MOLR 0, no claims, one faded

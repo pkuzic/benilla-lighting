@@ -83,6 +83,8 @@ fn bridge(
     if moon.0 != video.moon_shadow_strength {
         moon.0 = video.moon_shadow_strength;
     }
+    // MONKEY (fix-daylight): `daylightWindowSplit` (an atomic store; seeds read it at load).
+    benilla_world::lighting::set_window_split(video.daylight_window_split);
     let want = DynamicInteriors {
         enabled: video.interior_light,
         ambient: video.interior_ambient,

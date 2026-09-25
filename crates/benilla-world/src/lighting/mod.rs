@@ -27,6 +27,7 @@ pub use blob::LightBlob;
 // calls now -- daylight seeds and interior<->interior doorway seeds share the per-placement budget,
 // so neither can be ranked without the other. `BleedFixture`/`BleedSeed` are the doorway lane's own
 // two types; the fixture itself still wears `DaylightFixture`.
+pub use daylight::set_window_split; // MONKEY (fix-daylight)
 pub use daylight::{
     daylight_claims, daylight_intensity, daylight_lane, daylight_point_light, daylight_reach,
     daylight_rooms, daylight_seeds, daylight_target, bleed_seeds, placement_openings, BleedFixture,

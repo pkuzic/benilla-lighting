@@ -394,6 +394,10 @@ pub(crate) struct VideoConfig {
     /// record table flags as enclosed. `0` restores the pre-feature look exactly; the night look is
     /// unaffected at any value (the term is scaled by the sun's own day envelope).
     pub(crate) interior_daylight: f32,
+    /// MONKEY (fix-daylight): split a district's oversized window batch into window-sized
+    /// daylight apertures (`daylightWindowSplit`, default on = the merged behaviour; a future
+    /// High-only preset member). Applies to WMOs loaded after a change.
+    pub(crate) daylight_window_split: bool,
     /// MONKEY (bake floor): the share of a WMO interior batch's OWN MOCV bake every interior-lane
     /// fragment keeps whether or not a fixture reaches it (`interiorBakeFloor`, 0..1, default
     /// **0.12**). Bridged to [`benilla_world::lighting::DynamicInteriors::bake_floor`], packed
@@ -472,6 +476,7 @@ impl Default for VideoConfig {
             // MONKEY (enclosed day floor): calibrated so the Goldshire inn's entry floor reads
             // ~50 % of the sunlit threshold beside it — see `lighting::DAYLIGHT_LANE_SCALE`.
             interior_daylight: 0.0,
+            daylight_window_split: true,
             // MONKEY (bake floor): an eighth of the authored bake — measured to lift the inn's
             // black door band from 0.019 to 0.108 x tex while moving candle-lit surfaces by
             // under 10 % (see `lighting::DynamicInteriors::bake_floor`).
@@ -659,6 +664,8 @@ pub(crate) fn on_cvar(
         // MONKEY (enclosed day floor): 0 IS meaningful here (it restores the pre-feature look
         // exactly), unlike the two dim dials above whose 0 would be a broken-looking world.
         "interiordaylight" => cfg.interior_daylight = v.clamp(0.0, 1.0),
+        // MONKEY (fix-daylight)
+        "daylightwindowsplit" => cfg.daylight_window_split = ev.flag(),
         // MONKEY (bake floor): 0 IS meaningful here too (it restores the pre-feature look exactly).
         // The upper clamp matters more than usual: the packer multiplies this by `interiorGain`
         // (up to 1.5) and rides the product in a lane fraction that must stay under 0.5 after

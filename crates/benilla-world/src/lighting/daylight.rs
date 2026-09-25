@@ -802,6 +802,15 @@ where
 /// authors ALL its stained-glass windows as ONE EXT batch per wall — `g135 b11` spans
 /// 15 x 44 x 20 yd (diag 51), `g146 b10` 30 x 44 x 10 yd (diag 54) — so [`APERTURE_MAX_DIAG`]
 /// refused the batch whole and the nave took no daylight through a single window. Its windows are
+/// MONKEY (fix-daylight): the district window split's gate (default on: the merged behaviour).
+static WINDOW_SPLIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// MONKEY (fix-daylight): `daylightWindowSplit`. Read when a placement's seeds are built, so a
+/// change applies to WMOs loaded afterwards.
+pub fn set_window_split(on: bool) {
+    WINDOW_SPLIT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// separate panes between pillars, so the batch's vertices fall into separate clusters at the
 /// plan linkage of [`plan_clusters`], and each window-sized cluster is an aperture.
 ///
@@ -812,6 +821,9 @@ fn window_boxes(positions: &[[f32; 3]], district: bool) -> Vec<([f32; 3], [f32; 
     let Some((lo, hi)) = bounds(positions.iter().copied()) else {
         return Vec::new();
     };
+    // MONKEY (fix-daylight): the split changes the default image (Stormwind 25 -> 33 apertures),
+    // so it has its own gate, the `daylightWindowSplit` cvar ([`set_window_split`]).
+    let district = district && WINDOW_SPLIT.load(std::sync::atomic::Ordering::Relaxed);
     if !district || diagonal(lo, hi) <= APERTURE_MAX_DIAG {
         return vec![(lo, hi)];
     }
