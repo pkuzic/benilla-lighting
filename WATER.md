@@ -40,6 +40,7 @@ the technique is listed in the table below. Do not remove either.
 |---|---|---|
 | Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (= Enhanced + scenery reflections) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
 | Procedural waves | multi-band analytic waves with exact normals; the long swell moves ocean vertices | tier |
+| Open-sea whitecaps | High adds Gerstner crest gathering and fold-thresholded foam; calm canals remain clear | tier |
 | Ocean / inland profiles | the sea and lakes/rivers have their own colour, energy and reflectivity | tier |
 | WMO pools | exterior canals use a calm drifting profile with outdoor glints; interiors use their authored MOMT colour and room-fog reflection | tier |
 | Depth look | light fades per channel over the real path through the water; the bed is seen through it, bent by the waves; sunlit shallows carry a caustic web | tier |
@@ -80,4 +81,6 @@ request. If it ever returns it should read the authored MCLQ flow records, not d
 - Every screen derivative in `enhanced_water()` is taken at the top of the function (WGSL
   uniformity); WGSL only fails at pipeline creation, so verify by running a `water-*` scene.
 - Never rotate a noise domain by a per-pixel angle at world coordinates (~1e4 yd): it shears.
+- The temporary water wind is `WATER_WIND_DIR`; all wind-aligned shader terms derive from it until
+  the weather lane supplies shared wind.
 - Run one GPU capture at a time, and run `cargo test` in a shell WITHOUT `WOW_DATA` exported.

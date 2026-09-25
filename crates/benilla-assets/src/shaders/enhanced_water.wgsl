@@ -1,5 +1,6 @@
 #define_import_path benilla::enhanced_water
 
+// Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-experimental-water, shaders/Surface.ps.hlsl, sea/Spectrum.*, sea/Ocean.*.
 // ENHANCED WATER - the optional water module (Video options -> Water Quality; see WATER.md).
 //
 // Credits: original project WarcraftXL (`wxl-experimental-water`, https://github.com/WarcraftXL),
@@ -84,21 +85,25 @@ fn water_time() -> f32 {
     return globals.time;
 }
 
-// Vertex lift for the ocean's long swell (0 everywhere else). `liquid/waves.rs` mirrors it on
-// the CPU for the swimmer bob; the two are one contract.
-fn water_swell(xz: vec2<f32>, authored_depth: f32) -> f32 {
+// Vertex Gerstner displacement for the ocean's long swell (zero everywhere else).
+// `liquid/waves.rs` mirrors it on the CPU for the swimmer bob; the two are one contract.
+fn water_swell(xz: vec2<f32>, authored_depth: f32) -> vec3<f32> {
     if water.lane.z < 0.5 && water.lane.y > 0.5 && water.lane.x < 0.5 && water.mode.x > 0.5 {
-        return water_waves(xz, water_time(), 0.0, 0.0, swell_shore_fade(authored_depth), true).x;
+        return water_gerstner(xz, water_time(), swell_shore_fade(authored_depth)).xyz;
     }
-    return 0.0;
+    return vec3<f32>(0.0);
 }
 
 // Enhanced is entirely analytic: height and its exact x/z derivatives, in yards.
 // Direction is radians from world +X toward +Z; phase speed follows deep-water dispersion.
 // Two mesh-resolvable long waves sum to at most 0.34 yd before energy/shore attenuation.
+// MONKEY (water): one temporary wind bearing until the weather lane supplies shared wind.
+// Every wind-aligned water term derives from this constant rather than owning a second heading.
+const WATER_WIND_DIR: f32 = 0.35;
+const WATER_GERSTNER_CHOP: f32 = 2.4;
 const WATER_WAVES: array<vec4<f32>, 8> = array<vec4<f32>, 8>(
     // direction, wavelength, amplitude, phase offset
-    vec4<f32>(0.35, 18.0, 0.200, 0.0),
+    vec4<f32>(WATER_WIND_DIR, 18.0, 0.200, 0.0),
     vec4<f32>(0.80, 12.8, 0.140, 1.7),
     vec4<f32>(-0.18, 9.5, 0.090, 3.1),
     vec4<f32>(0.52, 4.8, 0.055, 0.8),
@@ -137,7 +142,7 @@ const SHORE_PERIOD: f32 = 3.6;         // seconds between arrivals; the swash ru
 const SHORE_TILT: f32 = 0.09;          // peak crest steepness (tan of the tilt), slope-independent
 const SHORE_WARP_A: f32 = 0.22;        // yards of depth — coarse crest wander (never ruler-straight)
 const SHORE_WARP_B: f32 = 0.10;        // yards of depth — finer segmentation of the same crests
-const SHORE_WIND_DIR: f32 = 0.35;      // = WATER_WAVES[0].x, the primary swell bearing
+const SHORE_WIND_DIR: f32 = WATER_WIND_DIR;
 
 // Foam alphas. The owner rejected BOTH a thick icing sheet and straight stripes before this, so
 // every one of these is gated behind a noise breakup and a depth window; the numbers are the
@@ -145,6 +150,7 @@ const SHORE_WIND_DIR: f32 = 0.35;      // = WATER_WAVES[0].x, the primary swell 
 const FOAM_WET_EDGE: f32 = 0.35;       // the faint wet line where water meets anything solid
 const FOAM_SWASH: f32 = 0.62;          // the sheet running up the sand and fading
 const FOAM_CREST: f32 = 0.88;          // the white front of the last wave or two, and its lace
+const FOAM_WHITECAP: f32 = 0.68;       // High-only open-sea crest fold
 const FOAM_MAX: f32 = 0.90;            // hard ceiling on the sum
 
 fn swell_shore_fade(depth: f32) -> f32 {
@@ -180,6 +186,37 @@ fn water_waves(p: vec2<f32>, t: f32, distance: f32, footprint: f32,
         result += vec3<f32>(amplitude * sin(phase), amplitude * k * cos(phase) * direction);
     }
     return result;
+}
+
+// MONKEY (water): Ported from WarcraftXL's Gerstner displacement and fold-driven gFoam path.
+// xyz is horizontal/vertical/horizontal displacement; w is 1 - det(J), the amount the horizontal
+// map has compressed toward a fold. Only the two mesh-resolvable long bands move geometry.
+fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
+    let energy = clamp(water.mode.y, 0.0, 1.0);
+    let tempo = mix(0.4, 1.0, sqrt(energy));
+    var displacement = vec3<f32>(0.0);
+    var j00 = 1.0;
+    var j01 = 0.0;
+    var j10 = 0.0;
+    var j11 = 1.0;
+    for (var i = 0u; i < 2u; i += 1u) {
+        let wave = WATER_WAVES[i];
+        let direction = vec2<f32>(cos(wave.x), sin(wave.x));
+        let k = 6.2831853 / wave.y;
+        let speed = sqrt(10.72 / k);
+        let phase = k * (dot(direction, p) - speed * tempo * t) + wave.w;
+        let amplitude = wave.z * energy * shore;
+        let horizontal = WATER_GERSTNER_CHOP * amplitude;
+        displacement += vec3<f32>(direction.x * horizontal * cos(phase),
+            amplitude * sin(phase), direction.y * horizontal * cos(phase));
+        let compression = horizontal * k * sin(phase);
+        j00 -= compression * direction.x * direction.x;
+        j01 -= compression * direction.x * direction.y;
+        j10 -= compression * direction.y * direction.x;
+        j11 -= compression * direction.y * direction.y;
+    }
+    let fold = max(1.0 - (j00 * j11 - j01 * j10), 0.0);
+    return vec4<f32>(displacement, fold);
 }
 
 // MONKEY (water): seam for the later wet-weather lane. Its result is a height-gradient
@@ -472,6 +509,10 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
 
     let shore = select(1.0, swell_shore_fade(in.depth), ocean_mesh);
     let wave = water_waves(p, t, length(eye_pos), footprint, shore, false);
+    var open_sea_fold = 0.0;
+    if water.mode.x > 1.5 && ocean_mesh {
+        open_sea_fold = water_gerstner(p, t, shore).w;
+    }
     // One surface gradient: the procedural bands and the shore break.
     let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xz, t);
     var n = normalize(vec3<f32>(-surf_grad.x, 1.0, -surf_grad.y));
@@ -672,6 +713,12 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     let noise = 0.7 * foam_noise(p * 0.6 + t * vec2<f32>(0.025, -0.018))
         + 0.3 * foam_noise(p * 1.7 - t * vec2<f32>(0.014, 0.021));
     let breakup = smoothstep(0.40, 0.72, noise);
+    // MONKEY (water): WarcraftXL's white belongs to a connected horizontal fold, not to every
+    // steep normal. Threshold jitter stops identical crests drawing identical white contours.
+    let fold_jitter = (noise - 0.5) * 0.04;
+    let breaking = smoothstep(0.13, 0.25, open_sea_fold + fold_jitter);
+    let whitecap_alpha = FOAM_WHITECAP * breaking * mix(0.55, 1.0, breakup)
+        * smoothstep(0.55, 1.0, energy);
     // The cached derivatives from the top of the function — same expression as before, one tap.
     let depth_gradient = length(vec2<f32>(ddx_depth, ddy_depth))
         / max(length(vec2<f32>(length(ddx_p), length(ddy_p))), 0.001);
@@ -721,7 +768,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
         FOAM_SWASH * swash_life * swash_band * max(swash_lace, 0.8 * lip), ocean_mesh)
         * wall_suppression * energy;
 
-    let foam = min(FOAM_MAX, contact_alpha + arcs_alpha + crest_alpha);
+    let foam = min(FOAM_MAX, contact_alpha + arcs_alpha + crest_alpha + whitecap_alpha);
     let illumination = water_light[0].rgb + water_light[1].rgb;
     let foam_luma = clamp(dot(illumination, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.22, 1.0);
     // Matte foam composites on top of reflection with its own coverage.
