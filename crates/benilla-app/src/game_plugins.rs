@@ -251,6 +251,8 @@ impl PluginGroup for GamePlugins {
             .add(crate::post::PostPlugin)
             // MONKEY (sky): the sky tier bridge.
             .add(crate::sky_quality::SkyQualityPlugin)
+            // MONKEY (ao): contact shadows after the opaque pass, before the water copy.
+            .add(crate::ssao::AmbientOcclusionPlugin)
             // The realmlist (decision 1667) — the logon address the login screen edits. Same reason as
             // VideoPlugin above: it is a CVar knob, so its resource has to exist before `load_config`.
             .add(crate::realmlist::RealmlistPlugin)

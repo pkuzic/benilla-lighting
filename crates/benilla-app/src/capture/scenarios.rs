@@ -1650,6 +1650,21 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         name: "wet-stormwind-night", map: Some(MAP_AZEROTH),
         eye: [-8833.38, 628.63, 98.5], look: [-8815.0, 662.0, 93.5], minute: 0, ui: None,
     },
+    // MONKEY (ao): contact-shadow subjects. Goldshire's street (props against walls, eaves),
+    // an Elwynn forest floor (trunks, bushes, grass cutouts) and a close unit on open ground.
+    Scenario {
+        name: "ao-goldshire", map: Some(MAP_AZEROTH),
+        eye: [-9430.0, 50.0, 61.0], look: [-9462.0, 30.0, 57.5], minute: 720, ui: None,
+    },
+    Scenario {
+        name: "ao-forest", map: Some(MAP_AZEROTH),
+        eye: [-9560.0, 60.0, 62.0], look: [-9600.0, 90.0, 58.0], minute: 720, ui: None,
+    },
+    Scenario {
+        name: "ao-character", map: Some(MAP_AZEROTH),
+        eye: [-9495.2, 60.8, 59.0], look: [-9500.00, 56.00, 56.9], minute: 720,
+        ui: Some(UiFixture::Subject { kind: SubjectKind::Creature, at: SUBJECT_SUN }),
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking

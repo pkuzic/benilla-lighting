@@ -2055,6 +2055,42 @@ fn volumetric_fog_dropdown_is_localised_and_live() {
     }
 }
 
+// MONKEY (ao): the row's strings, tooltip and numeric writes, both locales.
+#[test]
+fn ambient_occlusion_dropdown_is_localised_and_live() {
+    benilla_formats::wow_data_or_skip!();
+    let xml = include_str!("../../assets/ui/OptionsFrame.xml");
+    let strings = &xml[xml.find("BENILLA_ADVGFX_STRINGS = {").unwrap()
+        ..xml.find("OPTIONS_PAGE_ROWS = {").unwrap()];
+    let row = xml.split("<Frame name=\"$parentRowAmbientOcclusion\"").nth(1).unwrap();
+    let on_load = row.split("<OnLoad>").nth(1).unwrap().split("</OnLoad>").next().unwrap();
+    for (locale, title, labels) in [
+        ("enUS", "Ambient Occlusion", ["Off", "Low", "High"]),
+        ("ruRU", "Затенение окружения", ["Выкл", "Низкое", "Высокое"]),
+    ] {
+        let mut s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end")).unwrap();
+        s.run(strings).unwrap();
+        s.run(r#"
+            self = {}
+            function OptionsRow_OnLoad(row, cvar, title, tip)
+                row.cvar, row.title, row.tip = cvar, title, tip
+            end
+            function OptionsDropdownRow_Setup(row, choices) row.choices = choices end
+        "#).unwrap();
+        s.run(on_load).unwrap();
+        assert_eq!(s.eval::<String>("return self.title").unwrap(), title);
+        assert!(s.eval::<bool>("return getglobal(self.tip) == BENILLA_ADVGFX.tips.AMBIENT_OCCLUSION and string.len(getglobal(self.tip)) > 80").unwrap());
+        // High first: the registered default is Off, and rewriting the same value is no change.
+        for (tier, label) in labels.iter().enumerate().rev() {
+            assert_eq!(s.eval::<String>(&format!("return self.choices[{}].text", tier + 1)).unwrap(), *label);
+            let _ = s.take_cvar_changes();
+            s.run(&format!("SetCVar(self.cvar, self.choices[{}].value)", tier + 1)).unwrap();
+            assert_eq!(s.take_cvar_changes(), vec![("ambientOcclusion".to_string(), tier.to_string())]);
+        }
+    }
+}
+
 #[test]
 fn water_quality_writes_numeric_tiers_with_localised_labels() {
     benilla_formats::wow_data_or_skip!();
@@ -2067,9 +2103,10 @@ fn water_quality_writes_numeric_tiers_with_localised_labels() {
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
         // MONKEY (volumetric fog): account for the atmosphere row after water.
-        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 18);
+        // MONKEY (integration): all programme rows (sky, post, dither, fog, wet, wind, ao) counted.
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 28);
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
-        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[16]").unwrap(), "RowLavaGlow");
+        assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[21]").unwrap(), "RowLavaGlow");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowLavaGlowLabel:GetText()")).unwrap(), lava_label);
         assert!(s.eval::<bool>("return BENILLA_TOOLTIP_WATER_QUALITY == BENILLA_ADVGFX.tips.WATER_QUALITY and BENILLA_TOOLTIP_LAVA_GLOW == BENILLA_ADVGFX.tips.LAVA_GLOW").unwrap());
@@ -3002,6 +3039,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ("BENILLA_TOOLTIP_VOLUMETRIC_FOG", "AdvancedGraphicsRowVolumetricFog"),
             // MONKEY (sky): the sky tier row owns its translated tooltip.
             ("BENILLA_TOOLTIP_SKY_QUALITY", "AdvancedGraphicsRowSkyQuality"),
+            // MONKEY (ao): the contact-shadow row's translated tooltip.
+            ("BENILLA_TOOLTIP_AMBIENT_OCCLUSION", "AdvancedGraphicsRowAmbientOcclusion"),
             ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
             ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),

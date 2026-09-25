@@ -959,6 +959,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own: rain wets sky-exposed surfaces and rings the water, 0 Off / 1 On",
     ),
+    // MONKEY (ao): opt-in contact shadows; the High graphics preset value is 2.
+    ours("ambientOcclusion", "0", "benilla's own: screen-space ambient occlusion, 0 Off / 1 Low / 2 High"),
     ours(
         "waterQuality",
         "1",
@@ -3067,6 +3069,9 @@ mod tests {
         assert_eq!(d["spellLightGain"], 1.0, "the spell lane ships neutral");
         assert_eq!(d["waterQuality"], 1.0, "mirror reflections stay opt-in");
         assert_eq!(d["lavaLightGain"], 1.0);
+        // MONKEY (ao): registry and renderer agree, and the lane ships Off.
+        assert_eq!(d["ambientOcclusion"], shadows.ambient_occlusion as f32);
+        assert_eq!(d["ambientOcclusion"], 0.0, "ambient occlusion is opt-in");
         // `lightingQuality` and MONKEY (wind) `foliageWind` deliberately are not in that census:
         // neither is a `VideoConfig` knob. The former names the rows above; its own weld is
         // `the_high_preset_is_the_registered_defaults`. The latter bridges directly to the

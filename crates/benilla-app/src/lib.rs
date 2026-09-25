@@ -81,6 +81,8 @@ mod monkey_gfx;
 mod post;
 // MONKEY (sky): the skyQuality cvar bridge.
 mod sky_quality;
+// MONKEY (ao): optional screen-space ambient occlusion plugin.
+mod ssao;
 mod entities;
 mod fishing_line;
 mod footprints;
