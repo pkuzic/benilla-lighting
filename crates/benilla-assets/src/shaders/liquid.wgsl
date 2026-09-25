@@ -209,7 +209,9 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         // Returned as-is: the module fogs its own surface terms (the scene it shows through is
         // already fogged).
         return enhanced_water(
-            WaterFragment(in.clip_position, in.world_position, in.depth, in.room_fog),
+            // MONKEY (water): the enhanced interior arm consumes the MOMT colour already carried
+            // by the reference fragment interface; exterior/ADT vertices supply white.
+            WaterFragment(in.clip_position, in.world_position, in.depth, in.vcolor, in.room_fog),
             shallow_enhanced, deep_enhanced);
     }
 

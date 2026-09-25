@@ -259,6 +259,36 @@ pub(crate) fn spawn_wmo_liquids<'a>(
     };
     let path = LiquidPath::wmo(interior);
     for lq in liquids {
+        // MONKEY (water): opt-in evidence for WMO-liquid classification and the raw MLIQ opacity
+        // contract. The byte is not a depth; logging it beside the group and world centre makes a
+        // deterministic capture sufficient to identify the exact canal/pool surface in question.
+        if std::env::var_os("WOW_WATER_PROBE").is_some() {
+            let (depth_min, depth_max, depth_sum) = lq.depths.iter().fold(
+                (f32::INFINITY, f32::NEG_INFINITY, 0.0),
+                |(lo, hi, sum), &v| (lo.min(v), hi.max(v), sum + v),
+            );
+            let local_center = lq
+                .positions
+                .iter()
+                .map(|&position| wow_to_bevy(position))
+                .sum::<Vec3>()
+                / lq.positions.len().max(1) as f32;
+            let world_center = transform.transform_point(local_center);
+            let depth_mean = depth_sum / lq.depths.len().max(1) as f32;
+            info!(
+                "water-probe: WMO group={:?} path={path:?} kind={:?} centre_bevy=({:.2},{:.2},{:.2}) opacity_byte=min:{:.0} mean:{:.1} max:{:.0} verts={} wet_cells={}",
+                pool.owner.map(|room| room.group),
+                lq.kind,
+                world_center.x,
+                world_center.y,
+                world_center.z,
+                depth_min.clamp(0.0, 1.0) * 255.0,
+                depth_mean.clamp(0.0, 1.0) * 255.0,
+                depth_max.clamp(0.0, 1.0) * 255.0,
+                lq.positions.len(),
+                lq.wet.iter().filter(|&&wet| wet).count(),
+            );
+        }
         // The one path that can scroll, decided by the nibble, not the kind (`scrolls`).
         let scroll = scrolls(lq.sound_nibble);
         // The interior arm's body colour via the pool's MLIQ `materialId`; none when fullbright.
@@ -421,10 +451,19 @@ pub(super) fn setup_liquid(
                     water: benilla_assets::WaterUniform {
                         mode: Vec4::new(
                             water_quality.0 as f32,
-                            if kind.is_fullbright() { 0.0 }
-                            else if path != LiquidPath::Adt { 0.12 }
-                            else if kind == LiquidKind::Ocean { 1.0 }
-                            else { 0.18 },
+                            if kind.is_fullbright() {
+                                0.0
+                                // MONKEY (water): exterior WMO canals need a calm but legible ripple
+                                // profile; true interior pools stay quieter under a roof.
+                            } else if path == LiquidPath::WmoExterior {
+                                0.26
+                            } else if path == LiquidPath::WmoInterior {
+                                0.08
+                            } else if kind == LiquidKind::Ocean {
+                                1.0
+                            } else {
+                                0.18
+                            },
                             capture_time,
                             if deterministic { 0.0 } else { 1.0 },
                         ),

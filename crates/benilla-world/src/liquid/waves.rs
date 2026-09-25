@@ -44,8 +44,8 @@ const GRAVITY_YD: f32 = 10.72;
 const TWO_PI: f32 = 6.2831853;
 
 /// The ADT **ocean**'s wave energy — `liquid/surface.rs` packs `water.mode.y = 1.0` for
-/// `LiquidPath::Adt` + [`benilla_formats::LiquidKind::Ocean`] (river/lake 0.18, WMO pools 0.12,
-/// fullbright 0.0). The vertex swell arm only ever runs on that one combination
+/// `LiquidPath::Adt` + [`benilla_formats::LiquidKind::Ocean`] (river/lake 0.18, WMO exterior 0.26,
+/// WMO interior 0.08, fullbright 0.0). The vertex swell arm only ever runs on that combination
 /// (`enhanced_water.wgsl`), so this is the only energy a bob can ever be driven at — the parameter
 /// stays open because the function is the shader's, not the bob's.
 pub const OCEAN_WAVE_ENERGY: f32 = 1.0;

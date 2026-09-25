@@ -2,7 +2,7 @@
 
 An optional enhanced water renderer for [benilla](https://github.com/samwhosung/benilla), the Rust +
 Bevy reimplementation of the 1.12.1 client. It needs no data changes: everything is derived from
-what a 1.12 install already carries (MCLQ / MLIQ liquid grids and their authored depth bytes, the
+what a 1.12 install already carries (MCLQ liquid depth and MLIQ opacity bytes, their liquid grids, the
 `Light.dbc` water and sky rows, the opaque scene depth).
 
 It is a **module on top of the reference water, not a replacement for it**. The reference path
@@ -12,7 +12,7 @@ player picks it, and every part of it can be switched off.
 ## Credits
 
 - **Original project: [WarcraftXL](https://github.com/WarcraftXL)** — the `wxl-experimental-water`
-  module for the 1.12 client.
+  3.3.5a client extension.
 - **Author: iThorgrim.**
 
 The WarcraftXL water module is the design reference for this one, and its author has given
@@ -41,6 +41,7 @@ the technique is listed in the table below. Do not remove either.
 | Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (= Enhanced + scenery reflections) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
 | Procedural waves | multi-band analytic waves with exact normals; the long swell moves ocean vertices | tier |
 | Ocean / inland profiles | the sea and lakes/rivers have their own colour, energy and reflectivity | tier |
+| WMO pools | exterior canals use a calm drifting profile with outdoor glints; interiors use their authored MOMT colour and room-fog reflection | tier |
 | Depth look | light fades per channel over the real path through the water; the bed is seen through it, bent by the waves; sunlit shallows carry a caustic web | tier |
 | Reflection and glints | Fresnel sky reflection from the zone's sky rows, sun path, moon path, point-light glints | tier |
 | Beach surf | a travelling wave front, a lace of foam that dissolves behind it, a swash sheet on the sand | tier |
@@ -64,7 +65,8 @@ request. If it ever returns it should read the authored MCLQ flow records, not d
   `materials.rs` (`LiquidExt` fields 103-106, shader registration), `lib.rs` (`WaterQuality`).
 - **World** (`crates/benilla-world/src`): `liquid/scene_depth.rs` (copies the opaque depth AND colour after
   the main opaque pass), `liquid/waves.rs` (the CPU mirror of the vertex swell), `liquid/surface.rs`
-  (per-kind material parameters), `water_fx/bob.rs` (swimmer bob), `lighting/lava_light.rs`.
+  (per-kind material parameters and the opt-in `WOW_WATER_PROBE` WMO classification/depth log),
+  `water_fx/bob.rs` (swimmer bob), `lighting/lava_light.rs`.
 - **App** (`crates/benilla-app/src`): the setting in `cvars.rs` / `video.rs`, the options rows in
   `assets/ui/OptionsFrame.xml`, the capture scenes `water-*` and `lava-*` in `capture/scenarios.rs`.
 
@@ -73,6 +75,8 @@ request. If it ever returns it should read the authored MCLQ flow records, not d
 - `Classic` must stay byte-identical: capture `water-noon` with `WOW_WATER=0` and compare with the
   baseline before and after any edit.
 - The CPU swell (`liquid/waves.rs`) and the shader's `WATER_WAVES` table are one contract.
+- MLIQ's per-vertex byte is an opacity-ramp coordinate, not water depth; enhanced WMO water uses
+  reconstructed scene depth for its column measurement.
 - Every screen derivative in `enhanced_water()` is taken at the top of the function (WGSL
   uniformity); WGSL only fails at pipeline creation, so verify by running a `water-*` scene.
 - Never rotate a noise domain by a per-pixel angle at world coordinates (~1e4 yd): it shears.
