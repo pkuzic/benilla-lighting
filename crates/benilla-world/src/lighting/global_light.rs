@@ -1343,12 +1343,11 @@ fn build_light_data(
     shadow: ShadowLanes,
     // MONKEY (dynamic interiors): the interior lane's on/off + live knobs, packed for `static_gx.wgsl`.
     dynamic_interiors: Res<DynamicInteriors>,
-    // MONKEY (post): the 0/1/2 tier rides the unused `light_diffuse.w` marker.
-    emissive: Res<EmissiveTier>,
-    // MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
-    fire_gain: Res<FireLightGain>,
-    // MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
-    spell_gain: Res<SpellLightGain>,
+    // MONKEY (integration): one tuple param, so the system stays within Bevy's 16-param limit.
+    // - MONKEY (post): the 0/1/2 tier rides the unused `light_diffuse.w` marker.
+    // - MONKEY (fire GO lights): the live gain on synthesised fire lights (0 = the lane off).
+    // - MONKEY (spellLightGain): and the spell lane's own, which overrides it on a spell row.
+    (emissive, fire_gain, spell_gain): (Res<EmissiveTier>, Res<FireLightGain>, Res<SpellLightGain>),
     mut last_dump: Local<f64>,
     mut last_rows_dump: Local<f64>,
 ) {
