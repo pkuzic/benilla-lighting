@@ -20,12 +20,9 @@ fn scene_depth(uv: vec2<f32>) -> f32 {
     let dims = textureDimensions(depth);
     let p = vec2<i32>(clamp(uv, vec2(0.0), vec2(0.999999)) * vec2<f32>(dims));
 #ifdef MULTISAMPLED
-    var d = 0.0;
-    for (var sample = 0u; sample < textureNumSamples(depth); sample++) {
-        // Reversed Z: any covered sample is enough to block the sky ray.
-        d = max(d, textureLoad(depth, p, i32(sample)));
-    }
-    return d;
+    // MONKEY (fix-post): one sample, not a max over all of them: the march is a blur, and the
+    // per-sample loop cost 28 x N loads per pixel (224 at 8x).
+    return textureLoad(depth, p, 0);
 #else
     return textureLoad(depth, p, 0);
 #endif
@@ -44,10 +41,18 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
         if (i >= count) { break; }
         uv += step_uv;
         decay *= 0.965;
-        let sky = 1.0 - smoothstep(0.000002, 0.00008, scene_depth(uv));
+        // MONKEY (fix-post): only the cleared / sky-pinned depth (exactly 0 on infinite reverse-Z)
+        // is sky. The old ramp read d = near / z, so it moved with the live `nearclip` cvar and
+        // let shafts pour through terrain beyond ~125 yd at nearclip 0.01.
+        let sky = select(0.0, 1.0, scene_depth(uv) <= 1.0e-7);
         light += sky * decay;
         norm += decay;
     }
-    let rays = light / max(norm, 0.0001);
+    // MONKEY (fix-post): the path mean is only the occlusion ratio; the shaft itself falls off
+    // radially from the sun (aspect-corrected), else every clear sky pixel got the same lift.
+    let dims = vec2<f32>(textureDimensions(scene));
+    let to_sun = (in.uv - shafts.sun.xy) * vec2<f32>(dims.x / dims.y, 1.0);
+    let radial = 1.0 - clamp(length(to_sun) / 0.9, 0.0, 1.0);
+    let rays = light / max(norm, 0.0001) * radial * radial;
     return vec4(base.rgb + shafts.color.rgb * rays * shafts.sun.z * 0.16, base.a);
 }
