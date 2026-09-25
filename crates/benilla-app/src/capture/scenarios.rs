@@ -1379,7 +1379,82 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // ---- MONKEY (p0 baseline): the graphics programme's baseline set ----
+    // Every lane diffs its work against captures of these (plus the water-*, volfog-* and canal
+    // scenes above). Raw WoW coords, map per scenario; noon = 720, dusk = 1170, night = 0.
+    // Elwynn from the Goldshire road toward the lake and the forest: sky, fog and trees.
+    Scenario {
+        name: "elwynn-noon", map: Some(MAP_AZEROTH),
+        eye: GFX_ELWYNN_EYE, look: GFX_ELWYNN_LOOK, minute: 720, ui: None,
+    },
+    Scenario {
+        name: "elwynn-dusk", map: Some(MAP_AZEROTH),
+        eye: GFX_ELWYNN_EYE, look: GFX_ELWYNN_LOOK, minute: 1170, ui: None,
+    },
+    Scenario {
+        name: "elwynn-night", map: Some(MAP_AZEROTH),
+        eye: GFX_ELWYNN_EYE, look: GFX_ELWYNN_LOOK, minute: 0, ui: None,
+    },
+    // The same Elwynn view for rain. Capture has no weather field: run it with
+    // `WOW_WEATHER=1,0.8` (kind 1 rain, grade 0.8; `weather::parse_env_script`).
+    Scenario {
+        name: "elwynn-rain", map: Some(MAP_AZEROTH),
+        eye: GFX_ELWYNN_EYE, look: GFX_ELWYNN_LOOK, minute: 720, ui: None,
+    },
+    // Westfall: a farmstead, fields and the dry palette.
+    Scenario {
+        name: "westfall-farm", map: Some(MAP_AZEROTH),
+        eye: [-10080.0, 1000.0, 58.0], look: [-10140.0, 1070.0, 38.0], minute: 720, ui: None,
+    },
+    // Redridge: Lake Everstill from above Lakeshire, a wider frame than `water-lake`.
+    Scenario {
+        name: "redridge-lake", map: Some(MAP_AZEROTH),
+        eye: [-9250.0, -2200.0, 110.0], look: [-9450.0, -2600.0, 55.0], minute: 720, ui: None,
+    },
+    // Duskwood: the road into Darkshire, the zone's short dark fog.
+    Scenario {
+        name: "duskwood-road", map: Some(MAP_AZEROTH),
+        eye: [-10560.0, -1000.0, 50.0], look: [-10570.0, -1200.0, 32.0], minute: 720, ui: None,
+    },
+    // Burning Steppes: the ash plain and the sky a skybox would replace.
+    Scenario {
+        name: "burning-steppes", map: Some(MAP_AZEROTH),
+        eye: [-7700.0, -2100.0, 200.0], look: [-7900.0, -1700.0, 150.0], minute: 720, ui: None,
+    },
+    // Blasted Lands: the Dark Portal from the north.
+    Scenario {
+        name: "blasted-lands-portal", map: Some(MAP_AZEROTH),
+        eye: [-11700.0, -3200.0, 20.0], look: [-11900.0, -3208.0, 0.0], minute: 720, ui: None,
+    },
+    // Mount Hyjal (Kalimdor), inside Light.dbc sphere 270.
+    Scenario {
+        name: "hyjal-mount", map: Some(MAP_KALIMDOR),
+        eye: GFX_HYJAL_EYE, look: GFX_HYJAL_LOOK, minute: 720, ui: None,
+    },
+    // Stormwind: the Cathedral of Light's nave (interior WMO lighting).
+    Scenario {
+        name: "stormwind-cathedral-interior", map: Some(MAP_AZEROTH),
+        eye: GFX_CATHEDRAL_EYE, look: GFX_CATHEDRAL_LOOK, minute: 720, ui: None,
+    },
+    // Ironforge: the Great Forge (lava, fire light, a huge interior).
+    Scenario {
+        name: "ironforge-forge", map: Some(MAP_AZEROTH),
+        eye: GFX_FORGE_EYE, look: GFX_FORGE_LOOK, minute: 720, ui: None,
+    },
 ];
+
+/// MONKEY (p0 baseline): the Elwynn programme view, east of Goldshire looking south-west.
+pub(super) const GFX_ELWYNN_EYE: [f32; 3] = [-9380.0, -30.0, 80.0];
+pub(super) const GFX_ELWYNN_LOOK: [f32; 3] = [-9600.0, -200.0, 62.0];
+/// MONKEY (p0 baseline): Mount Hyjal, Light.dbc sphere 270's centre (world yards).
+pub(super) const GFX_HYJAL_EYE: [f32; 3] = [4636.0, -4461.0, 900.0];
+pub(super) const GFX_HYJAL_LOOK: [f32; 3] = [4836.0, -4361.0, 870.0];
+/// MONKEY (p0 baseline): the Cathedral of Light nave, standing over the floor.
+pub(super) const GFX_CATHEDRAL_EYE: [f32; 3] = [-8530.0, 845.0, 112.0];
+pub(super) const GFX_CATHEDRAL_LOOK: [f32; 3] = [-8500.0, 880.0, 110.0];
+/// MONKEY (p0 baseline): the Great Forge ring.
+pub(super) const GFX_FORGE_EYE: [f32; 3] = [-4870.0, -1010.0, 512.0];
+pub(super) const GFX_FORGE_LOOK: [f32; 3] = [-4920.0, -960.0, 502.0];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing
 /// 1.53 rad, Searing Gorge, map 0. The eye takes the standard [`VISTA_EYE_HEIGHT`]-ish lift off
