@@ -226,6 +226,8 @@ pub(crate) struct VideoConfig {
     pub(crate) bloom: u8,
     // MONKEY (post): depth-occluded radial sun shafts.
     pub(crate) sun_shafts: bool,
+    // MONKEY (post): zone/day-night LUT grading at the world-to-UI boundary.
+    pub(crate) color_grading: bool,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -475,6 +477,7 @@ impl Default for VideoConfig {
             bloom: 2,
             // MONKEY (post): part of the shipped High graphics preset.
             sun_shafts: true,
+            color_grading: true,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -559,6 +562,7 @@ pub(crate) fn on_cvar(
         "bloom" => cfg.bloom = v.clamp(0.0, 2.0) as u8,
         // MONKEY (post): the shafts lane is binary.
         "sunshafts" => cfg.sun_shafts = v != 0.0,
+        "colorgrading" => cfg.color_grading = v != 0.0,
         "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),

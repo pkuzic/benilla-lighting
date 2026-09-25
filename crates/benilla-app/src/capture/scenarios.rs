@@ -1379,6 +1379,40 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // MONKEY (post): lane-specific A/B and perf viewpoints. Kept at the end for merge isolation.
+    Scenario {
+        name: "post-lava-searing",
+        map: Some(MAP_AZEROTH),
+        eye: LAVA_RIVER_EYE,
+        look: LAVA_RIVER_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "post-stormwind-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-8833.38, 628.63, 96.0],
+        look: [-8809.1, 672.3, 94.0],
+        minute: 0,
+        ui: None,
+    },
+    Scenario {
+        name: "post-sunshafts-noon",
+        map: Some(MAP_AZEROTH),
+        eye: WATER_EYE,
+        // Noon's 85-degree sun above the Goldshire trees (azimuth 45 degrees).
+        look: [-9508.5, -292.1, 369.7],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "post-duskwood-grade",
+        map: Some(MAP_AZEROTH),
+        eye: [-10580.0, -1200.0, 45.0],
+        look: [-10540.0, -1160.0, 30.0],
+        minute: 1260,
+        ui: None,
+    },
 ];
 
 /// The owner's reported vantage for the lava-glow report: `(-7048.8, -1000.6, 242.0)` facing

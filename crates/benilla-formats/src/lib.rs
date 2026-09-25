@@ -29,6 +29,10 @@ mod camera_shakes;
 mod cinematics;
 mod creatures;
 mod dbc;
+mod monkey_zone_grade;
+pub use monkey_zone_grade::{
+    load_monkey_zone_grades, parse_monkey_zone_grades, MonkeyZoneGrade, MonkeyZoneGrades,
+};
 mod unit_blood;
 pub use camera_shakes::{load_camera_shakes, CameraShake, CameraShakeCatalog, SpellShakeGroup};
 pub use cinematics::{
