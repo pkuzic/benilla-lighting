@@ -704,12 +704,15 @@ pub fn new_shared_light_buffer(device: &RenderDevice) -> SharedLightBuffer {
 /// whole layout at each draw.
 pub fn light_blob_bytes() -> u64 {
     per_frame_blob_bytes()
+        // MONKEY (rainshelter): the rain-occlusion grid region (`weather::shelter`).
+        + crate::weather::shelter::REGION_BYTES
         + (7 * MAX_PROP_PROBES * 16) as u64
         + crate::rig_palette::palette_regions_bytes()
 }
 
-/// The per-frame prefix's size, which is also the probe region's offset.
-pub(super) fn per_frame_blob_bytes() -> u64 {
+/// The per-frame prefix's size, which is also the rain-shelter region's offset (MONKEY
+/// (rainshelter); the probe region follows that).
+pub(crate) fn per_frame_blob_bytes() -> u64 {
     std::mem::size_of::<LightStd430>() as u64
 }
 
