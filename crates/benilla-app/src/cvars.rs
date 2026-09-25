@@ -923,6 +923,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
     // MONKEY (post): tier 0 leaves every emissive site and the frame byte-identical.
     ours("bloom", "2", "benilla's own: HDR emissive bloom, 0 Off / 1 Low / 2 High"),
+    ours("sunShafts", "1", "benilla's own: depth-occluded screen-space sun shafts"),
     ours(
         "waterQuality",
         "1",
@@ -2012,6 +2013,7 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("volumetricFog", "0"),
             // MONKEY (post): no HDR lift or post pass is the byte-identical baseline.
             ("bloom", "0"),
+            ("sunShafts", "0"),
             ("lavaLightGain", "0"),
             ("fireLightGain", "0"),
             ("nightGain", "1.0"),
@@ -2037,6 +2039,7 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("volumetricFog", "1"),
             // MONKEY (post): quarter-resolution halo.
             ("bloom", "1"),
+            ("sunShafts", "0"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2065,6 +2068,7 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("volumetricFog", "1"),
             // MONKEY (post): quarter-resolution halo.
             ("bloom", "1"),
+            ("sunShafts", "0"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2094,6 +2098,7 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("volumetricFog", "1"),
             // MONKEY (post): half-resolution halo.
             ("bloom", "2"),
+            ("sunShafts", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2908,12 +2913,13 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 33] = [
+        let lighting: [(&str, f32); 35] = [
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
             // MONKEY (post): weld registry and renderer defaults.
             ("bloom", shadows.bloom as f32),
+            ("sunShafts", flag(shadows.sun_shafts)),
             ("lavaLightGain", shadows.lava_light_gain),
             // The two sun lanes and the cascade they share.
             ("worldShadows", flag(shadows.world_shadows)),
@@ -2966,10 +2972,10 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census IS the row set. A name here that nothing registers would weld against a
-        // row the client does not have; the length is the other half — 33 rows, 33 welds.
+        // row the client does not have; the length is the other half — 35 rows, 35 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 33, "the lighting lane welds 33 distinct rows");
+        assert_eq!(welded.len(), 35, "the lighting lane welds 35 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -3147,6 +3153,7 @@ mod tests {
                     "volumetricFog" => video.volumetric_fog as f32,
                     // MONKEY (post): the post lane's live tier.
                     "bloom" => video.bloom as f32,
+                    "sunShafts" => video.sun_shafts as u32 as f32,
                     "lavaLightGain" => video.lava_light_gain,
                     "fireLightGain" => video.fire_light_gain,
                     "moonShadowStrength" => video.moon_shadow_strength,
@@ -3999,7 +4006,7 @@ mod tests {
         strings.sort_unstable(); // the list is the claim, not where the rows sit in the table
         assert_eq!(
             strings,
-            vec!["gxApi", "gxResolution", "realmList", "realmName"]
+            vec!["gxApi", "gxResolution", "lightingQuality", "realmList", "realmName"]
         );
         let default_of = |name: &str| {
             REGISTERED

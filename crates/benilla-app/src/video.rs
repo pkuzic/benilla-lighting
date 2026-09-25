@@ -224,6 +224,8 @@ pub(crate) struct VideoConfig {
     pub(crate) volumetric_fog: u8,
     // MONKEY (post): emissive HDR + bloom quality, 0 Off / 1 Low / 2 High.
     pub(crate) bloom: u8,
+    // MONKEY (post): depth-occluded radial sun shafts.
+    pub(crate) sun_shafts: bool,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -471,6 +473,8 @@ impl Default for VideoConfig {
             volumetric_fog: 1,
             // MONKEY (post): the shipped High graphics preset uses the full-resolution tier.
             bloom: 2,
+            // MONKEY (post): part of the shipped High graphics preset.
+            sun_shafts: true,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -553,6 +557,8 @@ pub(crate) fn on_cvar(
         "volumetricfog" => cfg.volumetric_fog = v.clamp(0.0, 2.0) as u8,
         // MONKEY (post): constrain UI/console writes to the supported bloom tiers.
         "bloom" => cfg.bloom = v.clamp(0.0, 2.0) as u8,
+        // MONKEY (post): the shafts lane is binary.
+        "sunshafts" => cfg.sun_shafts = v != 0.0,
         "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
         "worldshadows" => cfg.world_shadows = ev.flag(),
         "charactershadows" => cfg.character_shadows = ev.flag(),

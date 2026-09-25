@@ -496,6 +496,7 @@
                 volumetricFog = "Volumetric Fog",
                 -- MONKEY (post): HDR excess + halo quality.
                 bloom = "Bloom",
+                sunShafts = "Sun Shafts",
                 fogOff = "Off",
                 waterQuality = "Water Quality",
                 waterClassic = "Classic",
@@ -537,6 +538,8 @@
                     -- MONKEY (post): Off guarantees the pre-HDR image.
                     BLOOM =
                         "Makes fire, lava, spells and lit windows carry a soft halo. Low uses a smaller blur chain; High is smoother. Off leaves the original image unchanged.",
+                    SUN_SHAFTS =
+                        "Draws sunlight through gaps in trees and buildings. Scene depth blocks the rays; they fade at night, off-screen and indoors.",
                     VOLUMETRIC_FOG =
                         "Off disables volumetric fog. Low adds nearby haze and sun or moon shafts with fewer steps; High uses more steps for smoother shafts. Mist is heavier at dawn and in bad weather, and subtle indoors. Shafts require shadows; with shadows off only haze remains.",
                     WATER_QUALITY =
@@ -623,6 +626,7 @@
                 lightingQuality = "Качество освещения",
                 -- MONKEY (post): Russian HDR excess + halo quality row.
                 bloom = "Свечение",
+                sunShafts = "Солнечные лучи",
                 -- MONKEY (volumetric fog): Russian atmospheric quality row.
                 volumetricFog = "Объёмный туман",
                 fogOff = "Выкл",
@@ -667,6 +671,8 @@
                     -- MONKEY (post): localised bloom effect and Off contract.
                     BLOOM =
                         "Добавляет мягкое сияние огню, лаве, заклинаниям и освещённым окнам. Низкое качество использует короткое размытие, высокое — более плавное. Выключение сохраняет исходное изображение.",
+                    SUN_SHAFTS =
+                        "Показывает солнечные лучи сквозь деревья и здания. Рельеф и здания перекрывают свет; ночью и в помещениях эффект исчезает.",
                     -- MONKEY (volumetric fog): localised effect and cost explanation.
                     VOLUMETRIC_FOG =
                         "Выкл отключает объёмный туман. Низкое добавляет дымку вблизи и лучи солнца или луны с меньшим числом шагов; Высокое использует больше шагов для более плавных лучей. Туман гуще на рассвете и в непогоду, а в помещениях слабее. Для лучей нужны тени; без теней остаётся только дымка.",
@@ -805,7 +811,7 @@
             -- three of eighteen shadow settings and no hint that the other fifteen existed.
             AdvancedGraphics = {
                 -- MONKEY (volumetric fog): include in refresh, defaults and search.
-                "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog", "RowBloom",
+                "RowLightingQuality", "RowWaterQuality", "RowVolumetricFog", "RowBloom", "RowSunShafts",
                 "RowCharacterShadows", "RowWorldShadows", "RowShadowDistance",
                 "RowShadowResolution", "RowMoonShadows",
                 "RowInteriorLight", "RowInteriorShadows", "RowExteriorShadows", "RowTorchSoft",
@@ -2628,11 +2634,22 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- MONKEY (post): depth-occluded radial sunlight, world only. -->
+                                        <Frame name="$parentRowSunShafts" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
-                                                <!-- MONKEY (post): bloom is the new row immediately above this one. -->
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowBloom" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowBloom" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "sunShafts", BENILLA_ADVGFX.sunShafts,
+                                                    "BENILLA_TOOLTIP_SUN_SHAFTS")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <!-- MONKEY (post): screen effects sit immediately above this one. -->
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowSunShafts" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowSunShafts" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",
