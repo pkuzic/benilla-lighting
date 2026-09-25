@@ -104,7 +104,9 @@ fn bridge(
         // MONKEY (enclosed day floor): the daylight floor rides the same bridge, but is consumed in
         // the SHADER (it rides the packed `wmo_fog_params.w` fraction) rather than folded on the
         // CPU — the packer's only job is to put it in the lane.
-        daylight: video.interior_daylight,
+        // MONKEY (daylight): `WOW_INTERIOR_DAYLIGHT=<0..1>` overrides it in a hermetic capture,
+        // which reads no config.toml (dev builds only; read once).
+        daylight: capture_daylight().unwrap_or(video.interior_daylight),
         // MONKEY (bake floor): the bake floor rides the same bridge. Half CPU, half shader: the
         // packer folds `interiorGain` in and puts the product in the `sh_c16.w` fraction, and the
         // two interior lanes read it from there — so `SetCVar("interiorBakeFloor", 0)` restores
@@ -114,6 +116,21 @@ fn bridge(
     if *out != want {
         *out = want;
     }
+}
+
+/// MONKEY (daylight): the capture-only `interiorDaylight` override (see the bridge above).
+fn capture_daylight() -> Option<f32> {
+    static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        if !cfg!(feature = "dev") || std::env::var_os("WOW_CAPTURE").is_none() {
+            return None;
+        }
+        std::env::var("WOW_INTERIOR_DAYLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+    })
 }
 
 #[cfg(test)]

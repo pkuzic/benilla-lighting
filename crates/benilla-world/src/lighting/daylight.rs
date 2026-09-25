@@ -300,6 +300,74 @@ pub fn daylight_budget(groups: &[WmoGroupInfo]) -> usize {
     }
 }
 
+/// MONKEY (daylight: district sky rooms): how many portal hops from an exterior-facing opening a
+/// DISTRICT room may sit and still count as lit by the day (see [`district_sky_rooms`]).
+const DISTRICT_SKY_HOPS: u8 = 1;
+
+/// MONKEY (daylight: district sky rooms): **which rooms of a CITY-scale placement take the
+/// enclosed day floor** (`interiorDaylight`), as one flag per group; empty for a building.
+///
+/// MEASURED (`daylight::census`, 2026-09-25): the floor's own test,
+/// [`benilla_formats::room_claim::enclosed_by_building_shell`], is false for EVERY interior group
+/// of Stormwind (190) and Ironforge (103), because a district shell is refused as a building by
+/// design. So `interiorDaylight` never reached a city room at any value, while 35 Stormwind rooms
+/// are reached by no daylight or bleed fixture at all and many more only by a fixture whose 6-20 yd
+/// pool dies half-way into a 40 yd hall.
+///
+/// The rule is the portal graph's, not a box test: a room is SKY-CONNECTED when it authors an
+/// exterior-facing portal (the same relation the PORTAL seed stands the sun in) or sits within
+/// [`DISTRICT_SKY_HOPS`] interior portals of such a room. That lights the shops, taverns and their
+/// back rooms and leaves what the data says is deep inside alone: the Stormwind canal tunnels,
+/// the Slaughtered Lamb's cellar, and all of Ironforge except the gate halls (the city's ONE
+/// exterior portal is `p0`, into `g7`).
+pub fn district_sky_rooms(groups: &[WmoGroupInfo], portals: PortalGraph<'_>) -> Vec<bool> {
+    if groups.iter().filter(|g| g.interior).count() <= DAYLIGHT_DISTRICT_ROOMS {
+        return Vec::new();
+    }
+    // Every portal's sides, as the PORTAL seed collects them.
+    let mut sides: HashMap<u16, Vec<u16>> = HashMap::new();
+    for (gi, (start, count)) in portals.slices.iter().enumerate() {
+        let (start, count) = (usize::from(*start), usize::from(*count));
+        for r in portals.refs.get(start..start + count).unwrap_or(&[]) {
+            for g in [gi as u16, r.group] {
+                let e = sides.entry(r.portal).or_default();
+                if !e.contains(&g) {
+                    e.push(g);
+                }
+            }
+        }
+    }
+    let interior = |g: u16| groups.get(usize::from(g)).is_some_and(|g| g.interior);
+    let mut hop: Vec<Option<u8>> = vec![None; groups.len()];
+    let mut edges: Vec<(u16, u16)> = Vec::new();
+    for gs in sides.values() {
+        let ins: Vec<u16> = gs.iter().copied().filter(|g| interior(*g)).collect();
+        match ins.as_slice() {
+            [g] if gs.len() == 1 || gs.iter().any(|o| !interior(*o)) => {
+                if let Some(h) = hop.get_mut(usize::from(*g)) {
+                    *h = Some(0);
+                }
+            }
+            [a, b] => edges.push((*a, *b)),
+            _ => {}
+        }
+    }
+    for level in 0..DISTRICT_SKY_HOPS {
+        let mut next = Vec::new();
+        for &(a, b) in &edges {
+            for (from, to) in [(a, b), (b, a)] {
+                if hop[usize::from(from)] == Some(level) && hop[usize::from(to)].is_none() {
+                    next.push(to);
+                }
+            }
+        }
+        for g in next {
+            hop[usize::from(g)] = Some(level + 1);
+        }
+    }
+    hop.iter().map(Option::is_some).collect()
+}
+
 /// The EFFECTIVE reach (yd) of an opening `diag` yards across — the radius `R` the shader actually
 /// windows the pool with: `clamp(1.5*diag + 4, 6, 20)`. The linear term says a wide doorway throws
 /// light further in than an arrow slit; the `+4` floor keeps even a small window's pool bigger than
@@ -2051,6 +2119,39 @@ mod tests {
             bbox_min: lo,
             bbox_max: hi,
         }
+    }
+
+    /// MONKEY (daylight: district sky rooms): a building gets nothing; a district flags the room
+    /// with an exterior portal and its one-hop neighbour, and not the room two hops in.
+    #[test]
+    fn district_sky_rooms_follow_the_portal_graph() {
+        let lo = [0.0; 3];
+        let hi = [1.0; 3];
+        // g0 exterior shell, g1..=g3 a chain of rooms, padded with sealed rooms to district size.
+        let mut groups = vec![group(false, lo, hi)];
+        groups.extend((0..40).map(|_| group(true, lo, hi)));
+        let vertices = [[0.0f32; 3]; 4];
+        let infos: Vec<WmoPortalInfo> = (0..3)
+            .map(|_| WmoPortalInfo { start_vertex: 0, count: 4, plane: [1.0, 0.0, 0.0, 0.0] })
+            .collect();
+        // p0: g1<->g0 (exterior), p1: g1<->g2, p2: g2<->g3.
+        let refs = [
+            WmoPortalRef { portal: 0, group: 0, side: 1 },
+            WmoPortalRef { portal: 1, group: 2, side: 1 },
+            WmoPortalRef { portal: 1, group: 1, side: -1 },
+            WmoPortalRef { portal: 2, group: 3, side: 1 },
+            WmoPortalRef { portal: 2, group: 2, side: -1 },
+        ];
+        let mut slices = vec![(0u16, 0u16); groups.len()];
+        slices[1] = (0, 2);
+        slices[2] = (2, 2);
+        slices[3] = (4, 1);
+        let portals = PortalGraph { vertices: &vertices, infos: &infos, refs: &refs, slices: &slices };
+        let sky = district_sky_rooms(&groups, portals);
+        assert!(sky[1] && sky[2], "the doorway room and its neighbour");
+        assert!(!sky[3], "two hops in stays dark");
+        assert!(!sky[0], "the shell is not a room");
+        assert!(district_sky_rooms(&groups[..5], portals).is_empty(), "a building is untouched");
     }
 
     /// The reach formula: linear in the opening's diagonal, floored at 6 and capped at 20.

@@ -1404,6 +1404,11 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
     Scenario {
         name: "daylight-if-gate", map: Some(MAP_AZEROTH),
         eye: [-4975.0, -895.0, 503.5], look: [-5005.0, -852.0, 506.0], minute: 720, ui: None,
+    },    // Goldshire's lamps at midnight: terrain receiving (and, with `torchTerrainShadows`, casting)
+    // torch cube shadows.
+    Scenario {
+        name: "daylight-torch-goldshire", map: Some(MAP_AZEROTH),
+        eye: [-9460.0, 70.0, 58.0], look: [-9450.0, 20.0, 61.0], minute: 0, ui: None,
     },
 ];
 

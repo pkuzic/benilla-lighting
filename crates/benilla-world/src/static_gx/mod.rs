@@ -357,6 +357,9 @@ pub enum GxSite<'a> {
         instance: Entity,
         groups: &'a [u16],
         bounds: &'a [benilla_formats::WmoGroupInfo],
+        /// MONKEY (daylight: district sky rooms): per ABSOLUTE group, a city room connected to
+        /// the sky by the portal graph (`lighting::district_sky_rooms`); empty for a building.
+        sky: &'a [bool],
     },
     /// A WMO doodad prop (B4, decision 1433 — 1418's lane 3, absorbed): the building's
     /// instance entity, the referrer set of rooms that name the prop, and the interior

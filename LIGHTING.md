@@ -20,6 +20,8 @@ behind each constant.
 | Synthesised lights | torches, braziers, lanterns, campfires and lampposts emit a light in the colour of their flame, with flicker | `fireLightGain`, `fireFlicker` |
 | Torch shadows | cube-map shadows from point lights onto buildings, models and terrain, with a contact-hardening penumbra and a shadow floor | `interiorShadows`, `exteriorShadows`, `torchShadowStrength`, `interiorShadowSoft` |
 | Daylight and doorways | calibrated fixtures at doors, windows and open boundaries carry daylight into a room, and doorways between rooms bleed light | `interiorDaylight`, env `WOW_DAYLIGHT`, `WOW_BLEED` |
+| Terrain in torch shadows | the ground casts into an outdoor fire's cube map, so a hill or bank blocks the fire (settled exterior slots only; `torch_terrain.rs` gathers the resident MCNK chunks inside the cube's 48 yd) | `torchTerrainShadows` (default 0, High 1), env `WOW_TORCH_TERRAIN=0\|1` |
+| City day floor | `interiorDaylight`'s room floor also reaches Stormwind/Ironforge rooms that the portal graph connects to the sky (an exterior-facing portal, or one hop from one; `district_sky_rooms` in `daylight.rs`); before this no city room could take it | `interiorDaylight` (default 0, suggested High 0.10) |
 | Spell and firework lights | fire, holy and fel effects light their surroundings for their lifetime; frost, nature, arcane and shadow do not | `spellLightGain`, env `WOW_SPELL_LIGHT=0` |
 | Moon shadows | at night the same shadow rig re-aims at the moon and casts a faint shadow; dims only the night sky term, never point lights | `moonShadowStrength` |
 | Ground-effect spells | Flamestrike, Rain of Fire, Consecration, Flare and fire traps light the ground for their duration; frost and nature areas stay dark | `spellLightGain` |
@@ -47,6 +49,9 @@ is its own module, documented in `WATER.md`.
   `character_shadow.rs`, `world_shadow.rs`, `blob_shadow.rs`, `entities/carried_light.rs`,
   `entities/spell_fx/lifecycle.rs`, `dynamic_interior.rs`, `debug_panel/lighting_controls.rs`, and
   the cvars in `cvars.rs` / `video.rs`.
+- **Census**: `cargo test -p benilla-world --lib lighting::daylight::census -- --ignored --nocapture`
+  (`WOW_CENSUS_WMO`, `WOW_CENSUS_PLACE=map,tx,ty,uid`) prints, per interior room of a city WMO,
+  whether a daylight fixture, a bleed fixture or neither reaches it, and the sky-room count.
 - **Tools**: `benilla-extract <Data> wmolights <wmo> [--verts <group>]`, `wmolamps`, `m2firescan`
   print the inputs the system works from (groups, batch classes, portals, claims, flame emitters).
 

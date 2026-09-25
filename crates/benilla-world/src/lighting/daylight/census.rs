@@ -192,6 +192,18 @@ fn census(path: &str) {
         );
     }
     println!("interior rooms: {n_day} reached by daylight, {n_bleed} by bleed only, {n_none} by neither");
+    let sky = district_sky_rooms(&l.groups, graph);
+    let enclosed = (0..l.groups.len() as u16)
+        .filter(|g| benilla_formats::room_claim::enclosed_by_building_shell(&l.groups, *g))
+        .count();
+    let dark_sky = (0..l.groups.len())
+        .filter(|g| sky.get(*g).copied().unwrap_or(false))
+        .filter(|g| !day_claim.contains_key(&(*g as u16)))
+        .count();
+    println!(
+        "day floor: {enclosed} rooms enclosed by a building shell; {} district sky rooms ({dark_sky} of them reached by no daylight fixture)",
+        sky.iter().filter(|b| **b).count()
+    );
 }
 
 /// `WOW_CENSUS_PLACE=map,tx,ty,uid`: the MODF placement, for world coordinates in the table.
