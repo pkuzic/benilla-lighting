@@ -102,7 +102,8 @@ impl Plugin for VolumetricFogPlugin {
             .and_then(|v| v.parse::<u8>().ok())
             .filter(|v| *v <= 2);
         // Dev capture instrument: isolate shafts without changing surface shadows or haze.
-        let shaft_gain = if cfg!(feature = "dev") && std::env::var_os("WOW_CAPTURE").is_some() {
+        // MONKEY (integration): the dev door is `run_mode` (decision 1179).
+        let shaft_gain = if crate::run_mode::dev_affordances() && std::env::var_os("WOW_CAPTURE").is_some() {
             std::env::var("WOW_VOLFOG_SHAFT_GAIN")
                 .ok()
                 .and_then(|v| v.parse::<f32>().ok())
@@ -436,7 +437,14 @@ fn prepare_pipelines(
     pipeline: Res<FogPipeline>,
     mut specialized: ResMut<SpecializedRenderPipelines<FogPipeline>>,
     views: Query<(Entity, &ViewTarget, &Msaa), With<FogView>>,
+    all_views: Query<(&ViewTarget, &Msaa), With<Camera3d>>,
 ) {
+    // MONKEY (integration): warm every reachable key on every 3-D view, feature on or off, so the
+    // compile happens under the entry cover and never live when the player turns the row on.
+    // (Named in `pipe_warm/menagerie.rs`'s custom-lane census.)
+    for (target, msaa) in &all_views {
+        specialized.specialize(&cache, &pipeline, (target.main_texture_format(), msaa.samples() > 1));
+    }
     for (entity, target, msaa) in &views {
         let id = specialized.specialize(
             &cache,

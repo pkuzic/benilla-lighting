@@ -131,7 +131,8 @@ fn bridge(
 fn capture_daylight() -> Option<f32> {
     static V: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        if !cfg!(feature = "dev") || std::env::var_os("WOW_CAPTURE").is_none() {
+        // MONKEY (integration): the dev door is `run_mode` (decision 1179).
+        if !crate::run_mode::dev_affordances() || std::env::var_os("WOW_CAPTURE").is_none() {
             return None;
         }
         std::env::var("WOW_INTERIOR_DAYLIGHT")
