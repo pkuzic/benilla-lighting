@@ -922,7 +922,7 @@ pub(crate) const REGISTERED: &[Registered] = &[
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
     // MONKEY (post): tier 0 leaves every emissive site and the frame byte-identical.
-    ours("bloom", "0", "benilla's own: HDR emissive bloom, 0 Off / 1 Low / 2 High"),
+    ours("bloom", "2", "benilla's own: HDR emissive bloom, 0 Off / 1 Low / 2 High"),
     ours(
         "waterQuality",
         "1",
@@ -2010,6 +2010,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("waterQuality", "0"),
             // MONKEY (volumetric fog): Off preset restores the original atmosphere.
             ("volumetricFog", "0"),
+            // MONKEY (post): no HDR lift or post pass is the byte-identical baseline.
+            ("bloom", "0"),
             ("lavaLightGain", "0"),
             ("fireLightGain", "0"),
             ("nightGain", "1.0"),
@@ -2033,6 +2035,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("waterQuality", "1"),
             // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
             ("volumetricFog", "1"),
+            // MONKEY (post): quarter-resolution halo.
+            ("bloom", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2059,6 +2063,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("waterQuality", "1"),
             // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
             ("volumetricFog", "1"),
+            // MONKEY (post): quarter-resolution halo.
+            ("bloom", "1"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),
@@ -2086,6 +2092,8 @@ pub(crate) const LIGHTING_PRESETS: &[(&str, &[(&str, &str)])] = &[
             ("waterQuality", "1"),
             // MONKEY (volumetric fog): preset atmosphere uses the default cheap tier.
             ("volumetricFog", "1"),
+            // MONKEY (post): half-resolution halo.
+            ("bloom", "2"),
             ("lavaLightGain", "1"),
             ("fireLightGain", "1"),
             ("nightGain", "0.45"),

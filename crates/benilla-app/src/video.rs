@@ -469,8 +469,8 @@ impl Default for VideoConfig {
             water_quality: 1,
             // MONKEY (volumetric fog): default to the inexpensive atmosphere.
             volumetric_fog: 1,
-            // MONKEY (post): opt-in; the future High graphics preset selects tier 2.
-            bloom: 0,
+            // MONKEY (post): the shipped High graphics preset uses the full-resolution tier.
+            bloom: 2,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
