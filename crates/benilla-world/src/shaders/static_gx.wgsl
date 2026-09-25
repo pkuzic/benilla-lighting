@@ -10,6 +10,8 @@
 }
 // MONKEY (shadow hook): the realtime directional-shadow term (fetch + edge/night fade) lives here.
 #import benilla::shadow_hook
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
 
 // Group 0 is Bevy's standard mesh-view bind group (view matrices, directional-light records and
 // the shadow textures the retained pass reads).
@@ -40,6 +42,8 @@ struct WowLight {
     // yards. wow_model.wgsl owns the full note.
     point_count: vec4<f32>,
     points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
     // lighting::prop_probes: 8192 slots of 7 rows; the buffer's later regions are not mirrored.
     prop_probes: array<vec4<f32>, 57344>,
 }

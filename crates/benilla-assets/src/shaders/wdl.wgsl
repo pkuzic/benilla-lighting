@@ -17,6 +17,9 @@
     mesh_view_bindings::view,
 }
 
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
+
 /// How far the band reaches inside the far-clip wall: the reference's far-band near plane
 /// `farclip - 33.0` (`[0x8101b0]`, about one WDL outer cell).
 const WDL_OVERLAP: f32 = 33.0;
@@ -34,6 +37,11 @@ struct WowLight {
     _light_spec: vec4<f32>,    // 3
     fog_color: vec4<f32>,      // 4 rgb = Light.dbc row 7 (gamma 0..1); w = enable (>0.5 ⇒ blend)
     fog_params: vec4<f32>,     // 5 x/y = the SCENE fog start/end yd (unread here — the hull has its own pair); z = the signed directional-shadow weight (MONKEY moon shadows: +sun / -moon; unread here); w = farclip wall (0 ⇒ off)
+    // MONKEY (p0 MonkeyFrame): rows 6-20 and the point table, unread here, so the block lines up.
+    _rows_6_20: array<vec4<f32>, 15>,
+    _points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> w: WowLight;
 

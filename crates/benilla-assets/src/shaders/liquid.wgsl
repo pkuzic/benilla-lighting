@@ -30,6 +30,8 @@
 }
 // MONKEY (enhanced water): the optional water module - see enhanced_water.wgsl and WATER.md.
 #import benilla::enhanced_water::{water_active, water_swell, enhanced_water, WaterFragment}
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var frames: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var frames_samp: sampler;
@@ -60,6 +62,10 @@ struct WowLight {
     _grade: vec4<f32>,             // 17
     wmo_fog_color: vec4<f32>,      // 18 rgb = interior fog (block 2); w = enable
     wmo_fog_params: vec4<f32>,     // 19 x = start yd; y = end yd
+    _point_count: vec4<f32>,       // 20 point-light count, unread here
+    _points: array<vec4<f32>, 512>, // 21+ point-light table, unread here
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(90) var<storage, read> wow_light: WowLight;
 

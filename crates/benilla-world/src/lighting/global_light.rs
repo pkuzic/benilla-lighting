@@ -66,6 +66,9 @@ use crate::view::WorldCamera;
 struct LightStd430 {
     rows: [[f32; 4]; LIGHT_HEADER_ROWS],
     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
+    // MONKEY (p0 MonkeyFrame): the programme block, appended AFTER the point table so no earlier
+    // offset moves (8528 -> 8784 B); packed by [`pack_monkey_frame`] from [`super::MonkeyFrame`].
+    monkey: [[f32; 4]; super::monkey_frame::MONKEY_FRAME_ROWS],
 }
 
 /// Header row count of the layout above (rows 0..=20), which every light blob sizes against.
@@ -615,6 +618,7 @@ impl Default for WowLightData {
         Self(LightStd430 {
             rows: [[0.0; 4]; 21],
             points: [[0.0; 4]; 2 * MAX_POINT_LIGHTS],
+            monkey: [[0.0; 4]; super::monkey_frame::MONKEY_FRAME_ROWS],
         })
     }
 }
@@ -644,6 +648,8 @@ pub(super) fn register(app: &mut App) {
         // MONKEY (spellLightGain): and the one on spell-effect lights, which overrides it.
         .init_resource::<SpellLightGain>()
         .init_resource::<super::prop_probes::PropProbeExtract>()
+        // MONKEY (p0 MonkeyFrame): the per-frame programme parameters any system may write.
+        .init_resource::<super::MonkeyFrame>()
         .add_plugins(ExtractResourcePlugin::<WowLightData>::default())
         .add_plugins(ExtractResourcePlugin::<RoomClaimTable>::default())
         .add_plugins(ExtractResourcePlugin::<SharedLightBuffer>::default())
@@ -656,7 +662,8 @@ pub(super) fn register(app: &mut App) {
             // a light that has stood for a frame is packed on this frame's verdict. Its writes go
             // through `Commands`, so a NEWLY spawned light is still packed on the fail-safe
             // fallback for one frame — see that fallback's note in `build_light_data`.
-            (classify_light_lanes, build_light_data)
+            // MONKEY (p0 MonkeyFrame): the programme block is packed right after the table.
+            (classify_light_lanes, build_light_data, pack_monkey_frame)
                 .chain()
                 .after(bevy::transform::TransformSystems::Propagate)
                 .after(super::update_time_lighting),
@@ -697,6 +704,22 @@ pub fn light_blob_bytes() -> u64 {
 /// The per-frame prefix's size, which is also the probe region's offset.
 pub(super) fn per_frame_blob_bytes() -> u64 {
     std::mem::size_of::<LightStd430>() as u64
+}
+
+/// MONKEY (p0 MonkeyFrame): copies [`super::MonkeyFrame`] into the block after the point table,
+/// plus the two clock fields the packer owns (`misc.y` time of day 0..1, `misc.z` night 0..1, the
+/// same dusk ramp `nightGain` uses). Writes through `ResMut` only when a row moved.
+fn pack_monkey_frame(
+    frame: Res<super::MonkeyFrame>,
+    clock: Res<super::GameClock>,
+    light: Res<WowLighting>,
+    mut data: ResMut<WowLightData>,
+) {
+    let night = 1.0 - sun_shadow_strength(light.celestial_dir.y);
+    let packed = frame.pack(clock.minute as f32 / 1440.0, night);
+    if data.0.monkey != packed {
+        data.0.monkey = packed;
+    }
 }
 
 /// Pack the resolved [`WowLighting`] (+ the global fog-disable toggle and the view farclip) into the
@@ -2626,7 +2649,8 @@ mod tests {
         assert_eq!(MAX_LIVE_POINT_LIGHTS, 255, "255 is EXT_SEL_EMPTY in the three shaders");
         assert_eq!(MAX_LIVE_POINT_LIGHTS, MAX_POINT_LIGHTS - 1);
         // 21 header rows + 2 x 256 point rows, 16 B each.
-        assert_eq!(per_frame_blob_bytes(), 8528, "the mirrored blob must not change size");
+        // MONKEY (p0 MonkeyFrame): 8528 + the 256-byte programme block.
+        assert_eq!(per_frame_blob_bytes(), 8784, "the mirrored blob must not change size");
     }
 
     /// MONKEY (enclosed day floor): `interiorDaylight` rides the FRACTION of the interior lane's

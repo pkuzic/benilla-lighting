@@ -12,6 +12,8 @@
 // - BLEND_MOD2X:    (rgb, 1) under (Dst, Src) = `2·src·dst`, rain's state; reads no alpha.
 
 #import bevy_render::view::View
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
 
 // Prefix of `lighting::global_light`'s buffer; keep in sync with wow_model.wgsl's copy.
 struct WowLight {
@@ -33,6 +35,11 @@ struct WowLight {
     sh_c16: vec4<f32>,
     _water: array<vec4<f32>, 4>,
     grade: vec4<f32>,
+    // MONKEY (p0 MonkeyFrame): rows 18-20 and the point table, unread here, so the block lines up.
+    _rows_18_20: array<vec4<f32>, 3>,
+    _points: array<vec4<f32>, 512>,
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
 };
 
 @group(0) @binding(0) var<uniform> view: View;

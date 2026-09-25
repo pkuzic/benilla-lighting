@@ -52,8 +52,28 @@ is its own module, documented in `WATER.md`.
 
 ## Invariants worth knowing before editing
 
-- The shared light buffer stays 8528 bytes and the torch table 6416 bytes; both are mirrored in
-  three shaders and pinned by tests.
+- The shared light buffer's per-frame blob is 8784 bytes and the torch table 6416 bytes; both are
+  mirrored in the shaders and pinned by tests. The blob is 21 header rows (336 B), the 256-slot
+  point-light table (8192 B), then the MONKEY **MonkeyFrame** block (16 rows, 256 B; nothing before
+  it moves). Every `WowLight` mirror (terrain, wow_model, static_gx, liquid, enhanced_water,
+  wow_effect, wdl) declares it as `monkey: monkey_frame::MonkeyFrame` after `points`:
+
+  | row | x | y | z | w |
+  |---|---|---|---|---|
+  | `fog0` | height_fog_density | height_fog_height | height_fog_falloff | curve_blend |
+  | `fog1` | sun_fog r | g | b | sun_fog_strength |
+  | `fog2` | end_fog r | g | b | end_fog_distance |
+  | `fog3` | fog_model (0 classic, 1 modern) | sun_fog_angle | 0 | 0 |
+  | `wind0` | dir_x | dir_y | speed | gust |
+  | `wind1` | time_s | sway_strength | grass_strength | tree_strength |
+  | `wet0` | rain_rate | wetness | ripple_time_s | snow |
+  | `misc` | bender_count | time_of_day 0..1 | night 0..1 | 0 |
+  | `benders[8]` | world x | world y | world z | radius |
+
+  Positions are Bevy world space (Y up, yards; WoW `(x, y, z)` = Bevy `(-y, z, -x)`), the wind
+  direction is a unit vector in world XZ. Lanes write the `MonkeyFrame` resource
+  (`benilla-world/src/lighting/monkey_frame.rs`); `global_light::pack_monkey_frame` packs it after
+  the point table and fills `time_of_day` / `night` itself. All zero = no visual change.
 - World lights use upstream's `WorldPointLight`, never Bevy's `PointLight`.
 - WGSL only fails at pipeline creation, so a shader edit is verified by running a world scene, not
   by `cargo check`.

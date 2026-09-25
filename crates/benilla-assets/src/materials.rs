@@ -29,6 +29,9 @@ pub fn register_shaders(app: &mut App) {
     // (loaded eagerly so `#import benilla::shadow_hook` resolves in terrain/model/static_gx). This is
     // the ONE place the realtime directional-shadow term lives; the receivers just call into it.
     load_shader_library!(app, "shaders/shadow_hook.wgsl");
+    // MONKEY (p0 MonkeyFrame): `benilla::monkey_frame`, the struct every `WowLight` mirror declares
+    // after its point table (LIGHTING.md "Invariants").
+    load_shader_library!(app, "shaders/monkey_frame.wgsl");
     // MONKEY (enhanced water): the optional water module, `benilla::enhanced_water` (WATER.md).
     load_shader_library!(app, "shaders/enhanced_water.wgsl");
 }

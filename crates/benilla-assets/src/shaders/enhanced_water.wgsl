@@ -20,6 +20,8 @@
 //   106  the opaque scene COLOUR, copied beside the depth: what the refraction looks through
 
 #import bevy_pbr::mesh_view_bindings::{view, globals}
+// MONKEY (p0 MonkeyFrame): the programme block's struct, mirrored after the point table.
+#import benilla::monkey_frame
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var scene_depth: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var scene_colour: texture_2d<f32>;
@@ -55,6 +57,8 @@ struct WaterLight {
     wmo_fog_params: vec4<f32>,     // 19
     point_count: vec4<f32>,        // 20 live count + point-light controls
     points: array<vec4<f32>, 512>, // 21+ position/range, colour/lane pairs
+    // MONKEY (p0 MonkeyFrame): the programme block after the point table (monkey_frame.wgsl).
+    monkey: monkey_frame::MonkeyFrame,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var<storage, read> water_light: WaterLight;
 

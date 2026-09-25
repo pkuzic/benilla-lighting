@@ -11,6 +11,8 @@ mod daylight; // MONKEY (daylight fixtures): the sun as an interior-lane light i
 mod daynight; // the two sun directions + day/night interp + the dawn/dusk warp curve
 mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at pack time
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
+mod monkey_frame; // MONKEY (p0 MonkeyFrame): the programme's per-frame block after the point table
+pub use monkey_frame::{FogModel, MonkeyFrame, MAX_BENDERS, MONKEY_FRAME_ROWS};
 mod lava_light; // MONKEY (lava light): magma surface fixtures and their independent gain
 pub use lava_light::{LavaLight, LavaLightGain};
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
