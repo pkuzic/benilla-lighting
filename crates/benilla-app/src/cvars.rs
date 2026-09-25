@@ -1070,6 +1070,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "1",
         "benilla's own: outdoor fire lights (campfires, braziers, lampposts) cast real shadows at          night; no effect by day",
     ),
+    // MONKEY (daylight: terrain torch casters): the ground as a torch caster.
+    ours(
+        "torchTerrainShadows",
+        "0",
+        "benilla's own: the ground casts into outdoor fire shadows (hills and banks block a fire's          light); needs exteriorShadows",
+    ),
     // MONKEY (static torch cache): residency and per-frame work have separate live budgets.
     ours(
         "interiorShadowCasters",
@@ -2898,7 +2904,7 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 33] = [
+        let lighting: [(&str, f32); 34] = [
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
@@ -2926,6 +2932,8 @@ mod tests {
             // MONKEY (torch shadows): the cube-map lane, indoors and out.
             ("interiorShadows", flag(shadows.interior_shadows)),
             ("exteriorShadows", flag(shadows.exterior_shadows)),
+            // MONKEY (daylight: terrain torch casters)
+            ("torchTerrainShadows", flag(shadows.torch_terrain_shadows)),
             (
                 "interiorShadowCasters",
                 shadows.interior_shadow_casters as f32,
@@ -2957,7 +2965,7 @@ mod tests {
         // row the client does not have; the length is the other half — 33 rows, 33 welds.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 33, "the lighting lane welds 33 distinct rows");
+        assert_eq!(welded.len(), 34, "the lighting lane welds 34 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),

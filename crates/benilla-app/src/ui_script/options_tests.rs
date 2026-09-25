@@ -3051,6 +3051,11 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
                 "BENILLA_TOOLTIP_EXTERIOR_SHADOWS",
                 "AdvancedGraphicsRowExteriorShadows",
             ),
+            // MONKEY (daylight: terrain torch casters)
+            (
+                "BENILLA_TOOLTIP_TORCH_TERRAIN_SHADOWS",
+                "AdvancedGraphicsRowTorchTerrainShadows",
+            ),
             ("BENILLA_TOOLTIP_TORCH_SOFT", "AdvancedGraphicsRowTorchSoft"),
             ("BENILLA_TOOLTIP_FIRE_LIGHT", "AdvancedGraphicsRowFireLight"),
             (
