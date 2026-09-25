@@ -91,6 +91,8 @@ fn water_rain_open(world_pos: vec3<f32>) -> f32 {
 struct WaterFragment {
     clip_position: vec4<f32>,
     world_position: vec4<f32>,
+    // MONKEY (reviewfix): world XZ before `water_swell`, so fragment waves share its source domain.
+    source_xz: vec2<f32>,
     // The authored per-vertex swatch depth (UV1.x): ocean byte/255, about 148 yd at 1.0.
     depth: f32,
     // MONKEY (water): an interior WMO pool's authored MOMT diffuse colour; white on other lanes.
@@ -555,7 +557,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     }
     let t = water_time(); // WOW_CAPTURE_WATER_T pins the frozen water phase.
     let fog = water_fog(in.world_position.xyz, in.room_fog);
-    let p = in.world_position.xz;
+    let p = in.source_xz;
     let energy = clamp(water.mode.y, 0.0, 1.0);
     let ocean_mesh = water.lane.y > 0.5 && water.lane.x < 0.5;
 
