@@ -540,6 +540,8 @@
                 ambientOcclusion = "Ambient Occlusion",
                 -- MONKEY (lampfog)
                 lampFog = "Lamp Fog",
+                -- MONKEY (integration): the daylight lane's district window split.
+                daylightWindowSplit = "City Window Daylight",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
@@ -679,6 +681,14 @@
                         .. "High is smoother and reaches a little further.\n\n"
                         .. "Fades out with distance and spares the sky, water, lit windows and flames. "
                         .. "Off leaves the image unchanged.",
+                    -- MONKEY (integration): daylight window split.
+                    DAYLIGHT_WINDOW_SPLIT =
+                        "Large city buildings take daylight through each window on its own instead of "
+                        .. "treating a whole wall of windows as one opening, so halls like the cathedral "
+                        .. "catch the sun pane by pane.
+
+Applies to buildings loaded after the change. "
+                        .. "Off is the earlier look.",
                     -- MONKEY (lampfog)
                     LAMP_FOG =
                         "Makes nearby lamps and fires glow through the air after dark. Low uses the "
@@ -738,6 +748,8 @@
                 ambientOcclusion = "Затенение окружения",
                 -- MONKEY (lampfog)
                 lampFog = "Свечение фонарей в тумане",
+                -- MONKEY (integration): the daylight lane's district window split.
+                daylightWindowSplit = "Дневной свет через окна города",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -889,6 +901,14 @@
                         .. "«Высокое» — более плавное и захватывает чуть больше.\n\n"
                         .. "Ослабевает с расстоянием и не затрагивает небо, воду, освещённые окна и пламя. "
                         .. "«Выкл» оставляет изображение без изменений.",
+                    -- MONKEY (integration): daylight window split.
+                    DAYLIGHT_WINDOW_SPLIT =
+                        "Большие городские здания пропускают дневной свет через каждое окно отдельно, "
+                        .. "а не через всю стену окон как один проём, поэтому залы вроде собора "
+                        .. "освещаются солнцем окно за окном.
+
+Действует для зданий, загруженных после "
+                        .. "изменения. Выключено — прежний вид.",
                     -- MONKEY (lampfog)
                     LAMP_FOG =
                         "После заката ближайшие фонари и огни светятся сквозь воздух. Низкое "
@@ -971,6 +991,8 @@
                 "RowAmbientOcclusion",
                 -- MONKEY (lampfog)
                 "RowLampFog",
+                -- MONKEY (integration): daylight window split.
+                "RowDaylightWindowSplit",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -3150,6 +3172,18 @@
                                                     { text = BENILLA_ADVGFX.qLow, value = "1" },
                                                     { text = BENILLA_ADVGFX.qHigh, value = "2" },
                                                 })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (integration): the daylight lane's district window split (checkbox). -->
+                                        <Frame name="$parentRowDaylightWindowSplit" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowLampFog" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowLampFog" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "daylightWindowSplit",
+                                                    BENILLA_ADVGFX.daylightWindowSplit,
+                                                    "BENILLA_TOOLTIP_DAYLIGHT_WINDOW_SPLIT")
                                             </OnLoad></Scripts>
                                         </Frame>
                                     </Frames>
