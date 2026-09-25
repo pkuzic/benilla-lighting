@@ -921,6 +921,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (skybox): the living player's zone skybox from `LightParams`; High sets 1.
+    ours(
+        "zoneSkyboxes",
+        "0",
+        "benilla's own: draw the zone skybox LightParams names for the living, 0 Off / 1 On; the          reference draws a DBC skybox only for the ghost",
+    ),
     ours(
         "waterQuality",
         "1",

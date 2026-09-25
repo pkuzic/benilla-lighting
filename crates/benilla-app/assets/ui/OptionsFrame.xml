@@ -495,6 +495,8 @@
                 -- MONKEY (volumetric fog): localised atmospheric quality row.
                 volumetricFog = "Volumetric Fog",
                 fogOff = "Off",
+                -- MONKEY (skybox): the zone skybox row.
+                zoneSkyboxes = "Zone Skyboxes",
                 waterQuality = "Water Quality",
                 waterClassic = "Classic",
                 waterEnhanced = "Enhanced",
@@ -534,6 +536,12 @@
                     -- MONKEY (volumetric fog): explain cost and the shadow-map dependency.
                     VOLUMETRIC_FOG =
                         "Off disables volumetric fog. Low adds nearby haze and sun or moon shafts with fewer steps; High uses more steps for smoother shafts. Mist is heavier at dawn and in bad weather, and subtle indoors. Shafts require shadows; with shadows off only haze remains.",
+                    -- MONKEY (skybox): what the zone skybox row changes.
+                    ZONE_SKYBOXES =
+                        "Draws the painted sky a zone's lighting names, as later expansions do: "
+                        .. "the volcanic sky of the Burning Steppes, the alien sky of the Blasted Lands "
+                        .. "and the starry night over Mount Hyjal, fading in at the zone's edge. "
+                        .. "Off keeps the original client's sky everywhere but ghost and dungeon skies. Nearly free.",
                     WATER_QUALITY =
                         "Classic is the original client's water. Enhanced adds soft shorelines, "
                         .. "animated foam around shores and objects, moving wave highlights, sky reflection "
@@ -619,6 +627,8 @@
                 -- MONKEY (volumetric fog): Russian atmospheric quality row.
                 volumetricFog = "Объёмный туман",
                 fogOff = "Выкл",
+                -- MONKEY (skybox): the zone skybox row.
+                zoneSkyboxes = "Небосводы зон",
                 waterQuality = "Качество воды",
                 waterClassic = "Классическое",
                 waterEnhanced = "Улучшенное",
@@ -660,6 +670,12 @@
                     -- MONKEY (volumetric fog): localised effect and cost explanation.
                     VOLUMETRIC_FOG =
                         "Выкл отключает объёмный туман. Низкое добавляет дымку вблизи и лучи солнца или луны с меньшим числом шагов; Высокое использует больше шагов для более плавных лучей. Туман гуще на рассвете и в непогоду, а в помещениях слабее. Для лучей нужны тени; без теней остаётся только дымка.",
+                    -- MONKEY (skybox): what the zone skybox row changes.
+                    ZONE_SKYBOXES =
+                        "Рисует нарисованное небо, заданное освещением зоны, как в поздних дополнениях: "
+                        .. "вулканическое небо Пылающих степей, чужое небо Выжженных земель "
+                        .. "и звёздную ночь над горой Хиджал, с плавным появлением на границе зоны. "
+                        .. "«Выкл.» оставляет небо оригинального клиента везде, кроме неба призрака и подземелий. Почти бесплатно.",
                     WATER_QUALITY =
                         "«Классическое» — вода оригинального клиента. «Улучшенное» добавляет плавные переходы у берегов, "
                         .. "анимированную пену у берегов и вокруг объектов, подвижные блики на волнах, отражение неба "
@@ -2602,10 +2618,22 @@
                                                 })
                                             </OnLoad></Scripts>
                                         </Frame>
-                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                        <!-- MONKEY (skybox): the zone skybox switch. -->
+                                        <Frame name="$parentRowZoneSkyboxes" inherits="OptionsCheckboxRowTemplate">
                                             <Anchors>
                                                 <Anchor point="TOPLEFT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                                 <Anchor point="TOPRIGHT" relativeTo="$parentRowVolumetricFog" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "zoneSkyboxes",
+                                                    BENILLA_ADVGFX.zoneSkyboxes,
+                                                    "BENILLA_TOOLTIP_ZONE_SKYBOXES")
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <Frame name="$parentRowCharacterShadows" inherits="OptionsCheckboxRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowZoneSkyboxes" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowZoneSkyboxes" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
                                             </Anchors>
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "characterShadows",
