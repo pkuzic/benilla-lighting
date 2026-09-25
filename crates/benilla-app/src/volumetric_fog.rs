@@ -52,6 +52,11 @@ struct FogView {
     sun_strength: Vec4,
     // Actual celestial direction and raymarch step count.
     direction_steps: Vec4,
+    // MONKEY (fog): MonkeyFrame fog rows 1-3. Modern (fog3.x > 0) colours the haze with the shared
+    // fog colour function and keeps sky pixels (depth 0) out of the distance haze.
+    mf_fog1: Vec4,
+    mf_fog2: Vec4,
+    mf_fog3: Vec4,
 }
 
 impl Plugin for VolumetricFogPlugin {
@@ -138,6 +143,8 @@ fn update_fog(
     clock: Res<WorldTime>,
     weather: Res<WeatherState>,
     interior: Res<CameraInteriorClaim>,
+    // MONKEY (fog): the Modern fog rows (Option: absent in unit tests).
+    monkey: Option<Res<benilla_world::lighting::MonkeyFrame>>,
     mut cameras: Query<(Entity, &Camera, &mut Camera3d), With<WorldCamera>>,
     suns: Query<(Entity, &DirectionalLight), With<ShadowSun>>,
 ) {
@@ -161,7 +168,12 @@ fn update_fog(
         let sun = lighting.celestial_dir();
         let daylight = ((sun.y + 0.02) / 0.15).clamp(0.0, 1.0);
         let fog = Vec3::from_array(lighting.fog_color);
+        // MONKEY (fog): rows 1-3 as packed for the light buffer.
+        let rows = monkey.as_ref().map_or([[0.0; 4]; 16], |m| m.pack(0.0, 0.0));
         commands.entity(entity).insert(FogView {
+            mf_fog1: Vec4::from_array(rows[1]),
+            mf_fog2: Vec4::from_array(rows[2]),
+            mf_fog3: Vec4::from_array(rows[3]),
             color_density: fog.extend(
                 density(
                     clock.minute_f,
@@ -371,6 +383,7 @@ impl ViewNode for FogNode {
 const FOG_SHADER: &str = r#"
 #import bevy_render::view::View
 #import bevy_pbr::mesh_view_types::Lights
+#import benilla::fog_hook
 @group(0) @binding(0) var scene: texture_2d<f32>;
 #ifdef MULTISAMPLED
 @group(0) @binding(1) var depth: texture_depth_multisampled_2d;
@@ -381,7 +394,11 @@ const FOG_SHADER: &str = r#"
 @group(0) @binding(3) var<uniform> lights: Lights;
 @group(0) @binding(4) var shadows: texture_depth_2d_array;
 @group(0) @binding(5) var shadow_sampler: sampler_comparison;
-struct Fog { color_density: vec4<f32>, sun_strength: vec4<f32>, direction_steps: vec4<f32> }
+struct Fog {
+    color_density: vec4<f32>, sun_strength: vec4<f32>, direction_steps: vec4<f32>,
+    // MONKEY (fog): MonkeyFrame fog1..fog3.
+    mf_fog1: vec4<f32>, mf_fog2: vec4<f32>, mf_fog3: vec4<f32>,
+}
 @group(0) @binding(6) var<uniform> fog: Fog;
 
 // Integral of smoothstep(10, 30, distance): zero in the first ten yards,
@@ -420,9 +437,17 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     if (distance <= 10.0) { return source; }
     let ray = normalize(delta);
     let optical_depth = fog.color_density.w * fog_path(distance);
-    let opacity = 1.0 - exp(-optical_depth);
+    var opacity = 1.0 - exp(-optical_depth);
+    var haze_rgb = fog.color_density.rgb;
+    if (fog_hook::fog_is_modern(fog.mf_fog3)) {
+        // MONKEY (fog): the sky (depth 0, clamped to 150 yd above) already carries its own
+        // horizon fog, so it takes no distance haze; the haze colour is the shared fog colour.
+        if (z <= 0.0) { opacity = 0.0; }
+        haze_rgb = fog_hook::fog_modern_colour(fog.color_density.rgb, ray, length(delta),
+            fog.mf_fog1, fog.mf_fog2, fog.mf_fog3);
+    }
     let luma = vec3(0.2126, 0.7152, 0.0722);
-    var haze = mix(source.rgb, fog.color_density.rgb, opacity);
+    var haze = mix(source.rgb, haze_rgb, opacity);
     // A darker zone colour may change hue, never the pixel's luminance. Add
     // neutral headroom proportionally so saturated channels cannot clip dark.
     let missing = max(0.0, dot(source.rgb - haze, luma));

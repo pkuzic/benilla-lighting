@@ -944,6 +944,14 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "2",
         "benilla's own: foliage wind, 0 Off / 1 Grass / 2 Grass + trees",
     ),
+    // MONKEY (fog): the distance-fog model. 0 = the 1.12 linear fog (byte-identical), 1 = Modern
+    // (exponential, sun/horizon colour, end-fog shift, fog end decoupled from farclip past 777).
+    // Default 0; the Graphics preset's High sets 1.
+    ours(
+        "fogModel",
+        "0",
+        "benilla's own: distance fog, 0 Classic (1.12 linear) / 1 Modern (soft, sun-coloured horizon)",
+    ),
     ours(
         "waterQuality",
         "1",
@@ -3781,6 +3789,8 @@ mod tests {
         // MONKEY (p0 graphics programme)
         |app| {
             app.init_resource::<benilla_world::ffx_glow::SkyDither>();
+            // MONKEY (fog)
+            app.init_resource::<benilla_world::lighting::FogModelSetting>();
             app.add_observer(crate::monkey_gfx::on_cvar);
         },
         |app| {

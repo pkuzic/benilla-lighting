@@ -29,6 +29,7 @@ behind each constant.
 | Sky dithering | a faint screen-space dither in the FFXGlow combine so smooth sky and fog gradients do not band (MONKEY p0; was env-only) | Advanced Graphics → Sky Dithering, cvar `skyDither` 0/1 (default 0, Graphics preset High = 1), env `WOW_DITHER=1` still forces it on; bridge in `benilla-app/src/monkey_gfx.rs` |
 | HDR emission and bloom | lit WMO windows, additive models/particles and magma can exceed display white; a soft-capped fullscreen halo is added before the faithful FFX clamp | Advanced Graphics → Bloom (Off/Low/High), cvar `bloom`; Off is the unchanged reference image, suggested High preset value 2 |
 | Sky quality | Enhanced: the five Light.dbc sky stops through a smooth monotone curve in linear light (no bands at the rings), a soft sun glow tinted by sun and fog colour (fades at night and under cloud), a procedural star field with twinkle and a faint Milky Way over the stock `Stars.m2`. High adds domain-warped cloud detail and sun-lit clouds (self-shadow, silver lining; technique from WarcraftXL, see `THIRD-PARTY.md`). Classic is the reference sky unchanged | Advanced Graphics → Sky Quality, cvar `skyQuality` 0 Classic / 1 Enhanced / 2 High, env `WOW_SKY_QUALITY` |
+| Modern fog | MONKEY (fog): radial distance fog with a gradual exponential curve, a daylight sun lobe, and an end colour shared by the world, WDL hull, sky horizon and volumetric haze. Each zone keeps its authored fog end up to the reference view-distance limit; optional `LightFogBand.dbc` rows provide height, sun and end-fog controls. Interior WMO fog stays classic | Advanced Graphics → Modern Fog, cvar `fogModel` 0 Classic (default) / 1 Modern (High = 1), env `WOW_FOGMODEL=0\|1`; `fog_hook.wgsl`, `lighting/fog_model.rs`, `light/fog_band.rs` |
 | Foliage wind | one weather-fed gust/veer field drives grass and classified tree/bush foliage; grass also parts around the player and nearby units | Advanced Graphics → Foliage Wind, cvar `foliageWind` 0 Off / 1 Grass / 2 Grass + Trees (High = 2), capture override `WOW_FOLIAGE_WIND`; field and benders in `benilla-world/src/wind/` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
 
@@ -81,7 +82,7 @@ is its own module, documented in `WATER.md`.
   | `fog_a` | height_fog_density | height_fog_height | height_fog_falloff | curve_blend |
   | `fog_b` | sun_fog r | g | b | sun_fog_strength |
   | `fog_c` | end_fog r | g | b | end_fog_distance |
-  | `fog_d` | fog_model (0 classic, 1 modern) | sun_fog_angle | 0 | 0 |
+  | `fog_d` | fog_model (0 classic; Modern = scene fog end in yd) | sun_fog_angle | sun direction octahedral x | y |
   | `wind_a` | dir_x | dir_y | speed | gust |
   | `wind_b` | time_s | sway_strength | grass_strength | tree_strength |
   | `wet_a` | rain_rate | wetness | ripple_time_s | snow |

@@ -132,6 +132,8 @@ pub use ground_effects::{
 };
 mod light;
 pub use light::{Atmosphere, LightCatalog, Submersion, ZERO_KEY_COLOR, ZERO_KEY_SCALAR};
+// MONKEY (fog): `LightFogBand.dbc`.
+pub use light::{FogBand, FogBandCatalog, FOG_BANDS_PER_PARAM};
 mod loading_screen;
 pub use loading_screen::{load_loading_screens, LoadingScreenCatalog};
 mod liquid;

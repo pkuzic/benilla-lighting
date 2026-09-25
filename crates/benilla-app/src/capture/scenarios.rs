@@ -1592,6 +1592,41 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         // a world-image instrument, and UI script errors must not cover the grass it measures.
         ui: None,
     },
+    // MONKEY (fog): Duskwood's short zone fog (Light 15, LightParams 14) from above the canopy west
+    // of Darkshire toward the town, for the Classic/Modern fog A/B (`WOW_FOGMODEL=0|1`).
+    Scenario {
+        name: "fog-duskwood-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-10700.0, -900.0, 160.0],
+        look: [-10560.0, -1180.0, 60.0],
+        minute: 720,
+        ui: None,
+    },
+    // MONKEY (fog): a long Elwynn vista from the Northshire ridge south over Goldshire's forest.
+    Scenario {
+        name: "fog-vista-noon",
+        map: Some(MAP_AZEROTH),
+        eye: [-9000.0, -100.0, 200.0],
+        look: [-9500.0, -100.0, 90.0],
+        minute: 720,
+        ui: None,
+    },
+    Scenario {
+        name: "fog-vista-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-9000.0, -100.0, 200.0],
+        look: [-9500.0, -100.0, 90.0],
+        minute: 1170,
+        ui: None,
+    },
+    Scenario {
+        name: "fog-duskwood-dusk",
+        map: Some(MAP_AZEROTH),
+        eye: [-10700.0, -900.0, 160.0],
+        look: [-10560.0, -1180.0, 60.0],
+        minute: 1170,
+        ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking

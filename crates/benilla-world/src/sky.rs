@@ -66,6 +66,13 @@ pub struct SkyExt {
     /// MONKEY (sky): the glow colour, gamma (`rgb`).
     #[uniform(100)]
     pub(crate) glow: Vec4,
+    /// MONKEY (fog): MonkeyFrame fog rows B-D so the dome horizon uses the world's far colour.
+    #[uniform(100)]
+    pub(crate) mf_fog_b: Vec4,
+    #[uniform(100)]
+    pub(crate) mf_fog_c: Vec4,
+    #[uniform(100)]
+    pub(crate) mf_fog_d: Vec4,
 }
 
 /// MONKEY (sky): the pipeline key: Enhanced/High compile `SKY_FX` into `sky.wgsl`; Classic keeps
@@ -217,6 +224,10 @@ fn setup_sky(
             fx: Vec4::ZERO,
             sun: Vec4::Y,
             glow: Vec4::ZERO,
+            // MONKEY (fog): zero rows leave Classic unchanged.
+            mf_fog_b: Vec4::ZERO,
+            mf_fog_c: Vec4::ZERO,
+            mf_fog_d: Vec4::ZERO,
         },
     });
     commands.spawn((
@@ -283,6 +294,8 @@ fn update_sky_colors(
     quality: Res<crate::sky_fx::SkyQuality>,
     clock: Res<crate::sky_fx::SkyClock>,
     clouds: Res<crate::clouds::CloudCoverage>,
+    // MONKEY (fog): the Modern fog rows for the shared horizon colour.
+    monkey: Res<crate::lighting::MonkeyFrame>,
     dome: Query<&MeshMaterial3d<SkyMaterial>, With<Sky>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
 ) {
@@ -311,6 +324,13 @@ fn update_sky_colors(
     );
     // MONKEY (sky): the Enhanced/High inputs; all zero at Classic so the write gate stays quiet.
     let (fx, sun_v, glow) = sky_fx_inputs(&light, *quality, clock.secs, &clouds);
+    // MONKEY (fog): rows B-D as packed for the light buffer; clock lanes are not read here.
+    let rows = monkey.pack(0.0, 0.0);
+    let mf_fog = [
+        Vec4::from_array(rows[1]),
+        Vec4::from_array(rows[2]),
+        Vec4::from_array(rows[3]),
+    ];
     benilla_assets::write_gated(
         &mut materials,
         &handle.0,
@@ -318,6 +338,9 @@ fn update_sky_colors(
             m.extension.fx != fx
                 || m.extension.sun != sun_v
                 || m.extension.glow != glow
+                || m.extension.mf_fog_b != mf_fog[0]
+                || m.extension.mf_fog_c != mf_fog[1]
+                || m.extension.mf_fog_d != mf_fog[2]
                 || m.extension.sky0 != sky[0]
                 || m.extension.sky1 != sky[1]
                 || m.extension.sky2 != sky[2]
@@ -337,6 +360,9 @@ fn update_sky_colors(
             m.extension.fx = fx;
             m.extension.sun = sun_v;
             m.extension.glow = glow;
+            m.extension.mf_fog_b = mf_fog[0];
+            m.extension.mf_fog_c = mf_fog[1];
+            m.extension.mf_fog_d = mf_fog[2];
         },
     );
 }

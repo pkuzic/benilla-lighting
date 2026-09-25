@@ -10,6 +10,8 @@
 #ifdef SKY_FX
 #import benilla_world::sky_fx
 #endif
+// MONKEY (fog): the Modern fog colour at the horizon.
+#import benilla::fog_hook
 
 struct SkyColors {
     sky0: vec4<f32>, // zenith (90°)
@@ -26,6 +28,10 @@ struct SkyColors {
     sun: vec4<f32>,
     // MONKEY (sky): rgb = glow colour (gamma), w unused.
     glow: vec4<f32>,
+    // MONKEY (fog): MonkeyFrame rows B-D (all zero = Classic).
+    mf_fog_b: vec4<f32>,
+    mf_fog_c: vec4<f32>,
+    mf_fog_d: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> sky: SkyColors;
 
@@ -78,6 +84,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         s4 = mix(warp_one(sky.sky4.rgb, g0, warp_s), warp_one(sky.sky4.rgb, g1, warp_s), f);
     }
 
+    // Elevation gradient, linear between rings like the reference's Gouraud-shaded dome.
+    var col: vec3<f32>;
+    if (elev <= 0.0) {
+        col = sky.fog.rgb; // horizon and below = fog colour (row 7), unwarped
+    } else if (elev < 1.8) {
+        col = mix(sky.fog.rgb, s4, elev / 1.8);
+    } else if (elev < 3.7) {
+        col = mix(s4, s3, (elev - 1.8) / (3.7 - 1.8));
+    } else if (elev < 9.8) {
+        col = mix(s3, s2c, (elev - 3.7) / (9.8 - 3.7));
+    } else if (elev < 16.8) {
+        col = mix(s2c, s1, (elev - 9.8) / (16.8 - 9.8));
+    } else {
+        col = mix(s1, sky.sky0.rgb, (elev - 16.8) / (90.0 - 16.8));
+    }
+
     // MONKEY (sky): Enhanced/High. The same stops through a monotone cubic in linear light, then
     // the sun glow and the night sky added in linear light, back to gamma, dithered.
 #ifdef SKY_FX
@@ -111,27 +133,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             lin += (stars * 0.85 + milky) * night;
         }
         let out = sky_fx::linear_to_srgb(lin) + vec3<f32>(sky_fx::dither_tri(in.position.xy));
-        return vec4<f32>(clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+        col = clamp(out, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 #endif
 
-    // Elevation gradient, linear between rings like the reference's Gouraud-shaded dome.
-    var col: vec3<f32>;
-    if (elev <= 0.0) {
-        col = sky.fog.rgb; // horizon and below = fog colour (row 7), unwarped
-    } else if (elev < 1.8) {
-        col = mix(sky.fog.rgb, s4, elev / 1.8);
-    } else if (elev < 3.7) {
-        col = mix(s4, s3, (elev - 1.8) / (3.7 - 1.8));
-    } else if (elev < 9.8) {
-        col = mix(s3, s2c, (elev - 3.7) / (9.8 - 3.7));
-    } else if (elev < 16.8) {
-        col = mix(s2c, s1, (elev - 9.8) / (16.8 - 9.8));
-    } else {
-        col = mix(s1, sky.sky0.rgb, (elev - 16.8) / (90.0 - 16.8)); // warped ring1 to the raw apex
-    }
-
     // Raw gamma out: the reference draws the sky as raw DBC bytes, sRGB off (`0x6d4940`).
-    let rgb = col;
+    // MONKEY (fog): Modern eases the low band into the world's far fog colour after either the
+    // Classic or Enhanced/High gradient path; Classic returns `col` unchanged.
+    let rgb = fog_hook::fog_sky_horizon(
+        col, sky.fog.rgb, dir, sky.mf_fog_b, sky.mf_fog_c, sky.mf_fog_d,
+    );
     return vec4<f32>(rgb, 1.0);
 }

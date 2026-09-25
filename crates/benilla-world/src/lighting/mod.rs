@@ -13,6 +13,8 @@ mod flicker; // MONKEY (flame flicker): the per-light fire wobble folded in at p
 mod global_light; // the one shared global-light storage buffer (replaces the per-material push)
 mod monkey_frame; // MONKEY (p0 MonkeyFrame): the programme's per-frame block after the point table
 pub use monkey_frame::{FogModel, MonkeyFrame, MAX_BENDERS, MONKEY_FRAME_ROWS};
+pub mod fog_model; // MONKEY (fog): the Modern fog model's CPU half (MonkeyFrame fog rows)
+pub use fog_model::FogModelSetting;
 mod lava_light; // MONKEY (lava light): magma surface fixtures and their independent gain
 pub use lava_light::{LavaLight, LavaLightGain};
 mod prop_probes; // the per-instance interior-prop SH probe table (slot ↔ MeshTag payload)
@@ -322,6 +324,16 @@ impl Plugin for LightingPlugin {
                     // This frame's submersion verdict, which the sky-pass suppression also reads.
                     .after(crate::liquid::SubmersionVerdict),
             );
+        // MONKEY (fog): the fog-model setting, LightFogBand.dbc and the per-frame fog rows.
+        app.init_resource::<fog_model::FogModelSetting>()
+            .init_resource::<fog_model::FogBandTable>()
+            .add_systems(Startup, fog_model::load_fog_bands.after(AssetSet::Open))
+            .add_systems(
+                Update,
+                fog_model::update_fog_model
+                    .after(update_time_lighting)
+                    .in_set(LightingResolveSet),
+            );
         // The shared light buffer, packed after the resolve and uploaded in the render world.
         global_light::register(app);
         // MONKEY (daylight fixtures): the per-frame re-aim, ordered before the packer's own set.
@@ -399,6 +411,11 @@ mod ordering_tests {
                 "the celestial follows: PostUpdate, BillboardPlace",
             ),
             ("weather/precip/mod.rs", "push_precip: PostUpdate"),
+            // MONKEY (fog)
+            (
+                "lighting/fog_model.rs",
+                "update_fog_model: in the resolve set, .after(update_time_lighting)",
+            ),
             // MONKEY (daylight fixtures / portal bleed): both systems are PostUpdate,
             // chained before `global_light::classify_light_lanes`.
             (

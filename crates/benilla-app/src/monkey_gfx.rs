@@ -6,8 +6,10 @@
 //! |---|---|---|---|---|
 //! | `skyDither` | 0 Off / 1 On | 0 | 1 | `benilla_world::ffx_glow::SkyDither` |
 //! | `foliageWind` | 0 Off / 1 Grass / 2 Grass + trees | 2 | 2 | `benilla_world::wind::FoliageWind` |
+//! | `fogModel` | 0 Classic / 1 Modern | 0 | 1 | `benilla_world::lighting::FogModelSetting` |
 
 use benilla_world::ffx_glow::SkyDither;
+use benilla_world::lighting::FogModelSetting;
 use benilla_world::wind::FoliageWind;
 use bevy::prelude::*;
 
@@ -16,6 +18,8 @@ pub(crate) fn on_cvar(
     ev: On<crate::cvars::CvarChanged>,
     mut dither: ResMut<SkyDither>,
     mut foliage_wind: ResMut<FoliageWind>,
+    // MONKEY (fog)
+    mut fog_model: ResMut<FogModelSetting>,
 ) {
     match ev.key().as_str() {
         "skydither" => {
@@ -37,6 +41,8 @@ pub(crate) fn on_cvar(
                 foliage_wind.0 = want;
             }
         }
+        // MONKEY (fog): `WOW_FOGMODEL` still wins for the session (captures).
+        "fogmodel" => fog_model.set_from_cvar(ev.num()),
         _ => {}
     }
 }
@@ -49,6 +55,7 @@ impl Plugin for MonkeyGfxPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyDither>()
             .init_resource::<FoliageWind>()
+            .init_resource::<FogModelSetting>()
             .add_observer(on_cvar);
     }
 }
