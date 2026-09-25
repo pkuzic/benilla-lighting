@@ -53,7 +53,7 @@ struct WaterLight {
     fog_color: vec4<f32>,          // 4
     fog_params: vec4<f32>,         // 5
     _sh: array<vec4<f32>, 6>,      // 6-11
-    _sh_c16: vec4<f32>,            // 12
+    _sh_quad: vec4<f32>,           // 12 (MONKEY p0: was `_sh_c16`; a composable module member may not end in a digit once the struct embeds an imported type)
     water_river: array<vec4<f32>, 2>, // 13-14
     water_ocean: array<vec4<f32>, 2>, // 15-16
     _grade: vec4<f32>,             // 17
