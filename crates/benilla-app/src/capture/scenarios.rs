@@ -1567,8 +1567,8 @@ const SKYBOX_STEPPES_EYE: [f32; 3] = [-7979.0, -2571.0, 260.0];
 const SKYBOX_STEPPES_LOOK: [f32; 3] = [-7800.0, -2450.0, 320.0];
 const SKYBOX_BLASTED_EYE: [f32; 3] = [-11300.0, -3073.0, 30.0];
 const SKYBOX_BLASTED_LOOK: [f32; 3] = [-11120.0, -2960.0, 90.0];
-const SKYBOX_HYJAL_EYE: [f32; 3] = [4637.0, -4461.0, 1060.0];
-const SKYBOX_HYJAL_LOOK: [f32; 3] = [4800.0, -4350.0, 1120.0];
+const SKYBOX_HYJAL_EYE: [f32; 3] = [4637.0, -4461.0, 1130.0];
+const SKYBOX_HYJAL_LOOK: [f32; 3] = [4800.0, -4350.0, 1230.0];
 
 #[cfg(test)]
 mod ui_opt_in_tests {

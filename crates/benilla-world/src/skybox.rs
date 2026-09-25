@@ -646,8 +646,8 @@ struct ModelClock {
 }
 
 /// MONKEY (skybox): pose every shown skybox and run its material loops on the model's clock:
-/// sequence 0 at `duration × day fraction` under flag `0x1`, else the scene clock. A capture keeps
-/// the bind pose and the seeds, as the shared lanes freeze, unless the day drives the clock.
+/// sequence 0 at `duration × day fraction` under flag `0x1`, else the scene clock. A capture holds
+/// `t = 0` unless the day drives the clock.
 #[allow(clippy::too_many_arguments)]
 fn animate_skyboxes(
     time: Res<Time>,
@@ -670,11 +670,13 @@ fn animate_skyboxes(
         let Some(rig) = rigs.0.get(&layer.path) else {
             continue;
         };
+        // A capture poses at `t = 0`, not the bind pose: a converted skybox places its layers with
+        // bone keys, and every row at `t = 0` is its seed.
         let (band_t, gseq, live) = if layer.flags & SKYBOX_FULL_DAY != 0 {
             let g = if deterministic { 0.0 } else { f64::from(now) };
             (rig.duration * day, g, true)
         } else if deterministic {
-            (0.0, 0.0, false)
+            (0.0, 0.0, true)
         } else {
             (now, f64::from(now), true)
         };
