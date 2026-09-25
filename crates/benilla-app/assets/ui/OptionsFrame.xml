@@ -538,6 +538,8 @@
                 windTrees = "Grass + Trees",
                 -- MONKEY (ao): localised contact-shadow row.
                 ambientOcclusion = "Ambient Occlusion",
+                -- MONKEY (lampfog)
+                lampFog = "Lamp Fog",
                 yards = "%d yd",
                 tips = {
                     LIGHTING_QUALITY =
@@ -677,6 +679,12 @@
                         .. "High is smoother and reaches a little further.\n\n"
                         .. "Fades out with distance and spares the sky, water, lit windows and flames. "
                         .. "Off leaves the image unchanged.",
+                    -- MONKEY (lampfog)
+                    LAMP_FOG =
+                        "Makes nearby lamps and fires glow through the air after dark. Low uses the "
+                        .. "nearest 16 lights; High uses 32. Rain and fog strengthen the halos. "
+                        .. "The effect is unshadowed, but stops at visible scene depth.\n\n"
+                        .. "Off is unchanged, and daylight is unchanged at every setting.",
                 },
             },
             ruRU = {
@@ -728,6 +736,8 @@
                 windTrees = "Трава + деревья",
                 -- MONKEY (ao): Russian contact-shadow row.
                 ambientOcclusion = "Затенение окружения",
+                -- MONKEY (lampfog)
+                lampFog = "Свечение фонарей в тумане",
                 yards = "%d ярд.",
                 tips = {
                     LIGHTING_QUALITY =
@@ -879,6 +889,12 @@
                         .. "«Высокое» — более плавное и захватывает чуть больше.\n\n"
                         .. "Ослабевает с расстоянием и не затрагивает небо, воду, освещённые окна и пламя. "
                         .. "«Выкл» оставляет изображение без изменений.",
+                    -- MONKEY (lampfog)
+                    LAMP_FOG =
+                        "После заката ближайшие фонари и огни светятся сквозь воздух. Низкое "
+                        .. "качество использует 16 ближайших источников, высокое — 32. Дождь и туман усиливают ореолы. "
+                        .. "Эффект не рассчитывает тени, но обрывается на видимой глубине.\n\n"
+                        .. "Выключено — без изменений; днём изображение не меняется при любом значении.",
                 },
             },
         }
@@ -953,6 +969,8 @@
                 "RowFoliageWind",
                 -- MONKEY (ao): appended so the other rows keep their indices.
                 "RowAmbientOcclusion",
+                -- MONKEY (lampfog)
+                "RowLampFog",
             },
             -- Player Guild Names is a child of Player Names, as in 1.12 (l.702-708).
             Nameplates = {
@@ -3111,6 +3129,22 @@
                                             <Scripts><OnLoad>
                                                 OptionsRow_OnLoad(self, "ambientOcclusion", BENILLA_ADVGFX.ambientOcclusion,
                                                     "BENILLA_TOOLTIP_AMBIENT_OCCLUSION")
+                                                OptionsDropdownRow_Setup(self, {
+                                                    { text = BENILLA_ADVGFX.fogOff, value = "0" },
+                                                    { text = BENILLA_ADVGFX.qLow, value = "1" },
+                                                    { text = BENILLA_ADVGFX.qHigh, value = "2" },
+                                                })
+                                            </OnLoad></Scripts>
+                                        </Frame>
+                                        <!-- MONKEY (lampfog): night point-light airlight tiers. -->
+                                        <Frame name="$parentRowLampFog" inherits="OptionsDropdownRowTemplate">
+                                            <Anchors>
+                                                <Anchor point="TOPLEFT" relativeTo="$parentRowAmbientOcclusion" relativePoint="BOTTOMLEFT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                                <Anchor point="TOPRIGHT" relativeTo="$parentRowAmbientOcclusion" relativePoint="BOTTOMRIGHT"><Offset><AbsDimension x="0" y="-9"/></Offset></Anchor>
+                                            </Anchors>
+                                            <Scripts><OnLoad>
+                                                OptionsRow_OnLoad(self, "lampFog", BENILLA_ADVGFX.lampFog,
+                                                    "BENILLA_TOOLTIP_LAMP_FOG")
                                                 OptionsDropdownRow_Setup(self, {
                                                     { text = BENILLA_ADVGFX.fogOff, value = "0" },
                                                     { text = BENILLA_ADVGFX.qLow, value = "1" },

@@ -614,6 +614,29 @@ pub struct WorldPointLight {
     pub range: f32,
 }
 
+/// MONKEY (lampfog): one live entry exactly as [`build_light_data`] resolved it for the shared
+/// point table. Colour is already `colour x intensity`, with the source's live gain and flame
+/// flicker folded in; position is Bevy world space and `lane` keeps the table's exterior/interior
+/// discriminator (an interior lane's value is also its effective reach).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResolvedPointLight {
+    pub position: Vec3,
+    pub range: f32,
+    pub color: Vec3,
+    pub lane: f32,
+}
+
+/// MONKEY (lampfog): read-only CPU view of the shared point table for post-process consumers.
+/// The GPU blob stays private and its pinned layout does not grow; readers get only the live rows.
+#[derive(Resource, Default)]
+pub struct ResolvedPointLights(Vec<ResolvedPointLight>);
+
+impl ResolvedPointLights {
+    pub fn as_slice(&self) -> &[ResolvedPointLight] {
+        &self.0
+    }
+}
+
 /// The packed light for this frame, extracted for [`upload_light`].
 #[derive(Resource, Clone, Copy, ExtractResource)]
 struct WowLightData(LightStd430);
@@ -636,6 +659,8 @@ pub struct SharedLightBuffer(pub Buffer);
 /// Registers the light pack, the probe publish, their extracts and the render-world uploads.
 pub(super) fn register(app: &mut App) {
     app.init_resource::<WowLightData>()
+        // MONKEY (lampfog): CPU mirror of only the live point rows; not extracted or GPU-bound.
+        .init_resource::<ResolvedPointLights>()
         // MONKEY (room gate): the per-fixture room claims, packed beside the point table.
         .init_resource::<RoomClaimTable>()
         .init_resource::<WorldShadowActive>()
@@ -1308,6 +1333,8 @@ fn build_light_data(
     // The per-frame portal PVS, for the room term below ([`LightRooms`]).
     portals: Query<&crate::wmo_portal::WmoPortalInstance>,
     mut data: ResMut<WowLightData>,
+    // MONKEY (lampfog): publish the already-resolved live rows without exposing the GPU blob.
+    mut resolved_points: ResMut<ResolvedPointLights>,
     // MONKEY (room gate): packed in the same walk as the point table, so the two can never
     // disagree about which entry is which.
     mut claims: ResMut<RoomClaimTable>,
@@ -1594,6 +1621,20 @@ fn build_light_data(
         fresh.points[2 * i] = [p.x, p.y, p.z, *range];
         fresh.points[2 * i + 1] = [rgb[0], rgb[1], rgb[2], *lane];
         claim.write(&mut claims.0[i * ROOM_CLAIM_STRIDE..][..ROOM_CLAIM_STRIDE]);
+    }
+    // MONKEY (lampfog): same order and values as the rows above. This is intentionally updated
+    // after the 255-entry truncate, so a CPU post effect can never see a light the shaders cannot.
+    let next_points: Vec<_> = pts
+        .iter()
+        .map(|(_, p, range, rgb, _, lane, _, _)| ResolvedPointLight {
+            position: *p,
+            range: *range,
+            color: Vec3::from_array(*rgb),
+            lane: *lane,
+        })
+        .collect();
+    if resolved_points.0 != next_points {
+        resolved_points.0 = next_points;
     }
     // Entries past the count are stale in the point table by design (the count row guards every
     // reader) — but the claim table is read at the SAME index, so a stale head there would gate a
@@ -2061,6 +2102,7 @@ mod tests {
             .init_resource::<crate::dev_state::DebugState>()
             .init_resource::<crate::view::ViewDistance>()
             .init_resource::<WowLightData>()
+            .init_resource::<ResolvedPointLights>()
             // MONKEY (room gate): the packer writes the claim table in the same walk.
             .init_resource::<RoomClaimTable>()
             .init_resource::<Time>()
@@ -2293,6 +2335,12 @@ mod tests {
             (synthetic[0] - 1.0).abs() < 1e-4,
             "the synthesised light takes the gain: {synthetic:?}"
         );
+        // MONKEY (lampfog): the CPU accessor is the live table, not a second light calculation.
+        let resolved = app.world().resource::<ResolvedPointLights>();
+        assert_eq!(resolved.as_slice().len(), 2);
+        assert_eq!(resolved.as_slice()[0].position, Vec3::X);
+        assert!((resolved.as_slice()[0].color.x - authored[0]).abs() < 1e-4);
+        assert!((resolved.as_slice()[1].color.x - synthetic[0]).abs() < 1e-4);
 
         // Zero is the kill switch: the invented light commits black, the authored one is unmoved.
         app.world_mut().insert_resource(FireLightGain(0.0));
@@ -2300,6 +2348,11 @@ mod tests {
         let data = app.world().resource::<WowLightData>().0;
         assert_eq!(data.points[3], [0.0, 0.0, 0.0, 0.0], "gain 0 = lane off");
         assert!((data.points[1][0] - 2.0).abs() < 1e-4, "authored unaffected");
+        assert_eq!(
+            app.world().resource::<ResolvedPointLights>().as_slice()[1].color,
+            Vec3::ZERO,
+            "the accessor carries the same live fire-gain fold"
+        );
     }
 
     /// GOLDEN — MONKEY (spellLightGain): a SPELL light takes `spellLightGain` **instead of**

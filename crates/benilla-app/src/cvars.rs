@@ -921,6 +921,12 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     // MONKEY (volumetric fog): saved live tier; capture override stays session-only.
     ours("volumetricFog", "1", "benilla's own: near-field volumetric fog, 0 Off / 1 Low / 2 High"),
+    // MONKEY (lampfog): opt-in point-light halos; High graphics preset value is 2.
+    ours(
+        "lampFog",
+        "0",
+        "benilla's own: lamps scattering through night fog, 0 Off / 1 Low (16 lamps) / 2 High (32 lamps)",
+    ),
     // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
     // Default 0 = the reference look; the Graphics preset's High sets 1.
     ours(
@@ -2976,7 +2982,7 @@ mod tests {
         assert_eq!(d["gxVSync"] != 0.0, VideoConfig::default().vsync);
         // ── MONKEY (lighting): the weld for the dynamic light + shadow system's whole row set ──
         //
-        // **All 32, as one census, with the count asserted.** Every one of them lands on
+        // **All 34, as one census, with the count asserted.** Every one of them lands on
         // `VideoConfig` and is read from there per frame (`shadow_core::update_shadows`,
         // `dynamic_interior::bridge`, `torch_shadow`), so a registered default that drifts from
         // the struct's literal is a setting that reads one way in `config.toml` and renders
@@ -2986,10 +2992,12 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 37] = [
+        let lighting: [(&str, f32); 38] = [
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
+            // MONKEY (lampfog): opt-in point-light fog.
+            ("lampFog", shadows.lamp_fog as f32),
             // MONKEY (post): weld registry and renderer defaults.
             ("bloom", shadows.bloom as f32),
             ("sunShafts", flag(shadows.sun_shafts)),
@@ -3048,11 +3056,11 @@ mod tests {
             assert_eq!(d[name], want, "{name}: registered default left the knob");
         }
         // …and the census is the VideoConfig-backed row set. A name here that nothing registers
-        // would weld against a row the client does not have; the length is the other half — 37
-        // VideoConfig rows, 37 welds. MONKEY (wind): `foliageWind` is a world resource bridge.
+        // would weld against a row the client does not have; the length is the other half — 38
+        // VideoConfig rows, 38 welds (MONKEY lampfog: + lampFog). MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 37, "the lighting lane welds 37 distinct rows");
+        assert_eq!(welded.len(), 38, "the lighting lane welds 38 distinct rows");
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),

@@ -8,25 +8,27 @@ use crate::{
     world_shadow::WorldLane,
 };
 use benilla_world::{
-    lighting::{WorldTime, WowLighting},
+    lighting::{ResolvedPointLight, ResolvedPointLights, WorldTime, WowLighting},
     static_gx::StaticGx,
     view::WorldCamera,
     weather::WeatherState,
     wmo_portal::CameraInteriorClaim,
 };
 use bevy::{
+    camera::primitives::{Frustum, Sphere as CullSphere},
     core_pipeline::{
-        core_3d::graph::{Core3d, Node3d},
         FullscreenShader,
+        core_3d::graph::{Core3d, Node3d},
     },
     ecs::query::QueryItem,
     light::VolumetricLight,
     pbr::{
-        GpuLights, LightMeta, ViewLightsUniformOffset, ViewShadowBindings, MAX_CASCADES_PER_LIGHT,
-        MAX_DIRECTIONAL_LIGHTS,
+        GpuLights, LightMeta, MAX_CASCADES_PER_LIGHT, MAX_DIRECTIONAL_LIGHTS,
+        ViewLightsUniformOffset, ViewShadowBindings,
     },
     prelude::*,
     render::{
+        Render, RenderApp, RenderStartup, RenderSystems,
         diagnostic::RecordDiagnostics,
         extract_component::{ExtractComponent, ExtractComponentPlugin},
         render_graph::{
@@ -35,14 +37,38 @@ use bevy::{
         render_resource::{binding_types::*, *},
         renderer::{RenderContext, RenderDevice, RenderQueue},
         view::{Msaa, ViewDepthTexture, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms},
-        Render, RenderApp, RenderStartup, RenderSystems,
     },
     shader::ShaderDefVal,
 };
 
 pub(crate) struct VolumetricFogPlugin;
 #[derive(Resource)]
-struct FogOverride(Option<u8>, f32);
+struct FogOverride {
+    fog: Option<u8>,
+    lamp: Option<u8>,
+    shaft_gain: f32,
+}
+
+const MAX_FOG_LAMPS: usize = 32;
+const LOW_FOG_LAMPS: usize = 16;
+const FOG_LAMP_RADIUS: f32 = 100.0;
+
+#[derive(Clone, Copy)]
+struct FogLamps {
+    positions: [Vec4; MAX_FOG_LAMPS],
+    colors: [Vec4; MAX_FOG_LAMPS],
+    count: usize,
+}
+
+impl Default for FogLamps {
+    fn default() -> Self {
+        Self {
+            positions: [Vec4::ZERO; MAX_FOG_LAMPS],
+            colors: [Vec4::ZERO; MAX_FOG_LAMPS],
+            count: 0,
+        }
+    }
+}
 
 #[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
 struct FogView {
@@ -57,11 +83,21 @@ struct FogView {
     mf_fog1: Vec4,
     mf_fog2: Vec4,
     mf_fog3: Vec4,
+    // MONKEY (lampfog): count + strength, followed by 32 resolved point-table rows. Colour already
+    // includes intensity, flame flicker and (for synthesised fire) fireLightGain.
+    lamp_meta: Vec4,
+    lamp_positions: [Vec4; MAX_FOG_LAMPS],
+    lamp_colors: [Vec4; MAX_FOG_LAMPS],
 }
 
 impl Plugin for VolumetricFogPlugin {
     fn build(&self, app: &mut App) {
         let value = std::env::var("WOW_VOLFOG")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .filter(|v| *v <= 2);
+        // MONKEY (lampfog): session-only capture override; the persistent setting is `lampFog`.
+        let lamp = std::env::var("WOW_LAMPFOG")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .filter(|v| *v <= 2);
@@ -76,10 +112,14 @@ impl Plugin for VolumetricFogPlugin {
         } else {
             2.0
         };
-        app.insert_resource(FogOverride(value, shaft_gain))
-            .add_plugins(ExtractComponentPlugin::<FogView>::default())
-            .add_systems(Last, refresh_streamed_shadows.before(ShadowSet::Lanes))
-            .add_systems(Last, update_fog.after(ShadowSet::Lanes));
+        app.insert_resource(FogOverride {
+            fog: value,
+            lamp,
+            shaft_gain,
+        })
+        .add_plugins(ExtractComponentPlugin::<FogView>::default())
+        .add_systems(Last, refresh_streamed_shadows.before(ShadowSet::Lanes))
+        .add_systems(Last, update_fog.after(ShadowSet::Lanes));
         // Keep headless policy tests independent of the renderer.
         if !app.is_plugin_added::<AssetPlugin>() {
             return;
@@ -117,7 +157,7 @@ fn refresh_streamed_shadows(
     mut lane: ResMut<WorldLane>,
     mut seen: Local<Option<u64>>,
 ) {
-    if override_value.0.unwrap_or(video.volumetric_fog) == 0 || !video.world_shadows {
+    if override_value.fog.unwrap_or(video.volumetric_fog) == 0 || !video.world_shadows {
         *seen = None;
         return;
     }
@@ -135,6 +175,71 @@ fn density(minute: f32, weather: f32, indoors: bool) -> f32 {
     0.004 * (1.0 + dawn * 1.5 + weather.clamp(0.0, 1.0) * 2.0) * if indoors { 0.18 } else { 1.0 }
 }
 
+// MONKEY (lampfog): independent near-field haze floor. Full daylight is exactly zero; weather
+// only strengthens an already-night-time halo, and interiors keep a restrained local version.
+fn lamp_haze_strength(sun_height: f32, weather: f32, indoors: bool) -> f32 {
+    let daylight = ((sun_height + 0.02) / 0.15).clamp(0.0, 1.0);
+    (1.0 - daylight) * (0.8 + 1.2 * weather.clamp(0.0, 1.0)) * if indoors { 0.55 } else { 1.0 }
+}
+
+// MONKEY (lampfog): pick from the exact CPU mirror of the packed point table. A sphere test keeps
+// off-screen fixtures whose halo can still cross the view. Both exterior and interior rows are
+// eligible: a street camera can see facade/room fixtures, and scene depth—not a camera-lane guess—
+// cuts the view segment. This pass is deliberately unshadowed, so the remaining leakage is the
+// documented tradeoff until point-light cube shadowing exists.
+fn select_fog_lamps(
+    points: &[ResolvedPointLight],
+    camera_position: Vec3,
+    frustum: Option<&Frustum>,
+    limit: usize,
+) -> FogLamps {
+    let mut candidates: Vec<(f32, ResolvedPointLight)> = points
+        .iter()
+        .copied()
+        .filter_map(|point| {
+            let point_is_indoors = point.lane > 0.5;
+            if point.color.max_element() <= 0.0001 {
+                return None;
+            }
+            let distance_squared = point.position.distance_squared(camera_position);
+            if distance_squared > FOG_LAMP_RADIUS * FOG_LAMP_RADIUS {
+                return None;
+            }
+            let reach = if point_is_indoors {
+                point.lane
+            } else {
+                point.range
+            }
+            .clamp(1.0, 48.0);
+            let visible = frustum.is_none_or(|frustum| {
+                frustum.intersects_sphere(
+                    &CullSphere {
+                        center: point.position.into(),
+                        radius: reach,
+                    },
+                    false,
+                )
+            });
+            visible.then_some((distance_squared, point))
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+    let mut selected = FogLamps::default();
+    for (_, point) in candidates.into_iter().take(limit.min(MAX_FOG_LAMPS)) {
+        let reach = if point.lane > 0.5 {
+            point.lane
+        } else {
+            point.range
+        }
+        .clamp(1.0, 48.0);
+        selected.positions[selected.count] = point.position.extend(reach);
+        selected.colors[selected.count] = point.color.extend(0.0);
+        selected.count += 1;
+    }
+    selected
+}
+
 fn update_fog(
     mut commands: Commands,
     video: Res<VideoConfig>,
@@ -143,23 +248,36 @@ fn update_fog(
     clock: Res<WorldTime>,
     weather: Res<WeatherState>,
     interior: Res<CameraInteriorClaim>,
+    // MONKEY (lampfog): the resolved point-table view published by global_light's packer.
+    point_lights: Res<ResolvedPointLights>,
     // MONKEY (fog): the Modern fog rows (Option: absent in unit tests).
     monkey: Option<Res<benilla_world::lighting::MonkeyFrame>>,
-    mut cameras: Query<(Entity, &Camera, &mut Camera3d), With<WorldCamera>>,
+    mut cameras: Query<
+        (
+            Entity,
+            &Camera,
+            &mut Camera3d,
+            Option<&GlobalTransform>,
+            Option<&Frustum>,
+        ),
+        With<WorldCamera>,
+    >,
     suns: Query<(Entity, &DirectionalLight), With<ShadowSun>>,
 ) {
-    let tier = override_value.0.unwrap_or(video.volumetric_fog).min(2);
-    let enabled = tier != 0 && cameras.iter().any(|(_, c, _)| c.is_active);
+    let tier = override_value.fog.unwrap_or(video.volumetric_fog).min(2);
+    let lamp_tier = override_value.lamp.unwrap_or(video.lamp_fog).min(2);
+    let enabled = (tier != 0 || lamp_tier != 0)
+        && cameras.iter().any(|(_, camera, _, _, _)| camera.is_active);
     for (entity, sun) in &suns {
         // Only a tag for selecting this light in our shader. No Bevy VolumetricFog
         // camera/volume is created, and the rig's lux and surface lighting stay intact.
-        if enabled && sun.shadows_enabled {
+        if tier != 0 && enabled && sun.shadows_enabled {
             commands.entity(entity).insert(VolumetricLight);
         } else {
             commands.entity(entity).remove::<VolumetricLight>();
         }
     }
-    for (entity, camera, mut camera3d) in &mut cameras {
+    for (entity, camera, mut camera3d, camera_transform, frustum) in &mut cameras {
         if !enabled || !camera.is_active {
             commands.entity(entity).remove::<FogView>();
             continue;
@@ -167,6 +285,31 @@ fn update_fog(
         camera3d.depth_texture_usages.0 |= TextureUsages::TEXTURE_BINDING.bits();
         let sun = lighting.celestial_dir();
         let daylight = ((sun.y + 0.02) / 0.15).clamp(0.0, 1.0);
+        let weather_amount = weather
+            .sky_density
+            .max(weather.effect_density)
+            .clamp(0.0, 1.0);
+        // Exact zero by day is both the intended look and the A/B invariant. At night a constant
+        // floor makes nearby halos survive the zone haze's ten-yard dead zone; rain/fog raises it.
+        let lamp_strength = if lamp_tier == 0 {
+            0.0
+        } else {
+            lamp_haze_strength(sun.y, weather_amount, interior.0.is_some())
+        };
+        let lamps = if lamp_strength > 0.0 {
+            select_fog_lamps(
+                point_lights.as_slice(),
+                camera_transform.map_or(Vec3::ZERO, GlobalTransform::translation),
+                frustum,
+                if lamp_tier == 1 {
+                    LOW_FOG_LAMPS
+                } else {
+                    MAX_FOG_LAMPS
+                },
+            )
+        } else {
+            FogLamps::default()
+        };
         let fog = Vec3::from_array(lighting.fog_color);
         // MONKEY (fog): rows 1-3 as packed for the light buffer.
         let rows = monkey.as_ref().map_or([[0.0; 4]; 16], |m| m.pack(0.0, 0.0));
@@ -174,16 +317,26 @@ fn update_fog(
             mf_fog1: Vec4::from_array(rows[1]),
             mf_fog2: Vec4::from_array(rows[2]),
             mf_fog3: Vec4::from_array(rows[3]),
+            lamp_meta: Vec4::new(lamps.count as f32, lamp_strength, 0.0, 0.0),
+            lamp_positions: lamps.positions,
+            lamp_colors: lamps.colors,
             color_density: fog.extend(
-                density(
-                    clock.minute_f,
-                    weather.sky_density.max(weather.effect_density),
-                    interior.0.is_some(),
-                ) * if tier == 2 { 1.6 } else { 1.0 },
+                density(clock.minute_f, weather_amount, interior.0.is_some())
+                    * if tier == 0 {
+                        0.0
+                    } else if tier == 2 {
+                        1.6
+                    } else {
+                        1.0
+                    },
             ),
             sun_strength: Vec3::from_array(lighting.diffuse)
                 .lerp(Vec3::ONE, 0.5)
-                .extend(override_value.1 * daylight),
+                .extend(if tier == 0 {
+                    0.0
+                } else {
+                    override_value.shaft_gain * daylight
+                }),
             direction_steps: sun.extend(if tier == 1 { 24.0 } else { 64.0 }),
         });
     }
@@ -398,6 +551,10 @@ struct Fog {
     color_density: vec4<f32>, sun_strength: vec4<f32>, direction_steps: vec4<f32>,
     // MONKEY (fog): MonkeyFrame fog1..fog3.
     mf_fog1: vec4<f32>, mf_fog2: vec4<f32>, mf_fog3: vec4<f32>,
+    // MONKEY (lampfog): x=count, y=night/weather strength; packed point-table rows follow.
+    lamp_meta: vec4<f32>,
+    lamp_positions: array<vec4<f32>, 32>,
+    lamp_colors: array<vec4<f32>, 32>,
 }
 @group(0) @binding(6) var<uniform> fog: Fog;
 
@@ -425,6 +582,56 @@ fn visibility(light_index: u32, p: vec3<f32>) -> f32 {
     // Unknown outside caster coverage is not evidence of direct sunlight.
     return 0.0;
 }
+
+// MONKEY (lampfog): a mild Henyey-Greenstein lobe. The inverse-square term is integrated exactly;
+// evaluating this slow angular term at the closest admitted point keeps the closed form intact.
+fn lamp_phase(cosine: f32) -> f32 {
+    let anisotropy = 0.2;
+    let denom = 1.0 + anisotropy * anisotropy - 2.0 * anisotropy * cosine;
+    return 0.07957747 * (1.0 - anisotropy * anisotropy) / (denom * sqrt(denom));
+}
+
+// MONKEY (lampfog): analytic line integral of a softened inverse-square source over the visible
+// camera-to-depth segment. It is intentionally UNSHADOWED; scene depth cuts the segment, but no
+// point-light cube map is sampled. Range is a smooth screen-space gate around the exact sphere
+// intersection. The exponential soft cap plus destination headroom keeps halos below 1.0 so a
+// later bloom pass cannot turn a stacked row of lamps into white slabs.
+fn lamp_halos(ray: vec3<f32>, distance: f32) -> vec3<f32> {
+    var energy = vec3<f32>(0.0);
+    let lamp_count = u32(fog.lamp_meta.x);
+    for (var lamp_index = 0u; lamp_index < 32u; lamp_index += 1u) {
+        if (lamp_index >= lamp_count) { break; }
+        let position_range = fog.lamp_positions[lamp_index];
+        let to_lamp = position_range.xyz - view.world_position;
+        let projection = dot(to_lamp, ray);
+        let perpendicular = to_lamp - ray * projection;
+        let perpendicular_sq = dot(perpendicular, perpendicular);
+        let range_sq = position_range.w * position_range.w;
+        if (perpendicular_sq >= range_sq) { continue; }
+
+        let half_span = sqrt(max(range_sq - perpendicular_sq, 0.0));
+        let segment_start = max(0.0, projection - half_span);
+        let segment_end = min(distance, projection + half_span);
+        if (segment_end <= segment_start) { continue; }
+
+        // Integral dt / (core^2 + perpendicular^2 + (t - projection)^2).
+        let core_radius = 1.25;
+        let height = sqrt(perpendicular_sq + core_radius * core_radius);
+        let integral = (atan((segment_end - projection) / height)
+            - atan((segment_start - projection) / height)) / height;
+        let closest = clamp(projection, segment_start, segment_end);
+        let sample_to_lamp = view.world_position + ray * closest - position_range.xyz;
+        let light_path = sample_to_lamp / max(length(sample_to_lamp), 0.0001);
+        let phase = lamp_phase(dot(light_path, -ray));
+        let edge = 1.0 - smoothstep(position_range.w * 0.72, position_range.w,
+            sqrt(perpendicular_sq));
+        energy += max(fog.lamp_colors[lamp_index].rgb, vec3<f32>(0.0))
+            * (integral * phase * edge);
+    }
+    let capped = min(energy * fog.lamp_meta.y * 0.9, vec3<f32>(0.75));
+    return vec3<f32>(1.0) - exp(-capped);
+}
+
 @fragment
 fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     let xy = vec2<i32>(pixel.xy);
@@ -434,45 +641,52 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     let q = view.world_from_clip * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), max(z, 0.000001), 1.0);
     let delta = q.xyz / q.w - view.world_position;
     let distance = min(length(delta), 150.0);
-    if (distance <= 10.0) { return source; }
+    if (distance <= 10.0 && fog.lamp_meta.x < 0.5) { return source; }
     let ray = normalize(delta);
-    let optical_depth = fog.color_density.w * fog_path(distance);
-    var opacity = 1.0 - exp(-optical_depth);
-    var haze_rgb = fog.color_density.rgb;
-    if (fog_hook::fog_is_modern(fog.mf_fog3)) {
-        // MONKEY (fog): the sky (depth 0, clamped to 150 yd above) already carries its own
-        // horizon fog, so it takes no distance haze; the haze colour is the shared fog colour.
-        if (z <= 0.0) { opacity = 0.0; }
-        haze_rgb = fog_hook::fog_modern_colour(fog.color_density.rgb, ray, length(delta),
-            fog.mf_fog1, fog.mf_fog2, fog.mf_fog3);
-    }
     let luma = vec3(0.2126, 0.7152, 0.0722);
-    var haze = mix(source.rgb, haze_rgb, opacity);
-    // A darker zone colour may change hue, never the pixel's luminance. Add
-    // neutral headroom proportionally so saturated channels cannot clip dark.
-    let missing = max(0.0, dot(source.rgb - haze, luma));
-    let headroom = max(vec3(0.0), vec3(1.0) - haze);
-    haze += headroom * clamp(missing / max(dot(headroom, luma), 0.00001), 0.0, 1.0);
-    if (fog.sun_strength.w > 0.0) {
-        let g = 0.65;
-        let cosine = dot(ray, fog.direction_steps.xyz);
-        let denom = 1.0 + g*g - 2.0*g*cosine;
-        let phase = 0.07957747 * (1.0-g*g) / (denom * sqrt(denom));
-        let count = u32(fog.direction_steps.w);
-        let step_size = (distance - 10.0) / f32(count);
-        var scatter = 0.0;
-        for (var light_index = 0u; light_index < lights.n_directional_lights; light_index += 1u) {
-            if ((lights.directional_lights[light_index].flags & 3u) != 3u) { continue; }
-            for (var step = 0u; step < count; step += 1u) {
-                // Fixed midpoint samples: no temporal noise in this gamma lane.
-                let t = 10.0 + (f32(step) + 0.5) * step_size;
-                let density = fog.color_density.w * smoothstep(10.0, 30.0, t);
-                scatter += visibility(light_index, view.world_position + ray*t)
-                    * exp(-fog.color_density.w * fog_path(t)) * density * step_size;
-            }
+    var haze = source.rgb;
+    if (distance > 10.0) {
+        let optical_depth = fog.color_density.w * fog_path(distance);
+        var opacity = 1.0 - exp(-optical_depth);
+        var haze_rgb = fog.color_density.rgb;
+        if (fog_hook::fog_is_modern(fog.mf_fog3)) {
+            // MONKEY (fog): the sky (depth 0, clamped to 150 yd above) already carries its own
+            // horizon fog, so it takes no distance haze; the haze colour is the shared fog colour.
+            if (z <= 0.0) { opacity = 0.0; }
+            haze_rgb = fog_hook::fog_modern_colour(fog.color_density.rgb, ray, length(delta),
+                fog.mf_fog1, fog.mf_fog2, fog.mf_fog3);
         }
-        let shafts = fog.sun_strength.rgb * fog.sun_strength.w * phase * scatter;
-        haze += max(vec3(0.0), vec3(1.0) - haze) * (vec3(1.0) - exp(-shafts));
+        haze = mix(source.rgb, haze_rgb, opacity);
+        // A darker zone colour may change hue, never the pixel's luminance. Add
+        // neutral headroom proportionally so saturated channels cannot clip dark.
+        let missing = max(0.0, dot(source.rgb - haze, luma));
+        let headroom = max(vec3(0.0), vec3(1.0) - haze);
+        haze += headroom * clamp(missing / max(dot(headroom, luma), 0.00001), 0.0, 1.0);
+        if (fog.sun_strength.w > 0.0) {
+            let g = 0.65;
+            let cosine = dot(ray, fog.direction_steps.xyz);
+            let denom = 1.0 + g*g - 2.0*g*cosine;
+            let phase = 0.07957747 * (1.0-g*g) / (denom * sqrt(denom));
+            let count = u32(fog.direction_steps.w);
+            let step_size = (distance - 10.0) / f32(count);
+            var scatter = 0.0;
+            for (var light_index = 0u; light_index < lights.n_directional_lights; light_index += 1u) {
+                if ((lights.directional_lights[light_index].flags & 3u) != 3u) { continue; }
+                for (var step = 0u; step < count; step += 1u) {
+                    // Fixed midpoint samples: no temporal noise in this gamma lane.
+                    let t = 10.0 + (f32(step) + 0.5) * step_size;
+                    let density = fog.color_density.w * smoothstep(10.0, 30.0, t);
+                    scatter += visibility(light_index, view.world_position + ray*t)
+                        * exp(-fog.color_density.w * fog_path(t)) * density * step_size;
+                }
+            }
+            let shafts = fog.sun_strength.rgb * fog.sun_strength.w * phase * scatter;
+            haze += max(vec3(0.0), vec3(1.0) - haze) * (vec3(1.0) - exp(-shafts));
+        }
+    }
+    if (fog.lamp_meta.x > 0.5) {
+        let halo = lamp_halos(ray, distance);
+        haze += max(vec3(0.0), vec3(1.0) - haze) * halo;
     }
     return vec4(haze, source.a);
 }
@@ -487,12 +701,16 @@ mod tests {
         app.init_resource::<VideoConfig>()
             .init_resource::<StaticGx>()
             .init_resource::<WorldLane>()
-            .insert_resource(FogOverride(Some(0), 2.0))
+            .insert_resource(FogOverride {
+                fog: Some(0),
+                lamp: None,
+                shaft_gain: 2.0,
+            })
             .add_systems(Update, refresh_streamed_shadows);
         app.world_mut().clear_trackers();
         app.world_mut().run_schedule(Update);
         assert!(!app.world().resource_ref::<WorldLane>().is_changed());
-        app.world_mut().resource_mut::<FogOverride>().0 = Some(1);
+        app.world_mut().resource_mut::<FogOverride>().fog = Some(1);
         app.world_mut().run_schedule(Update);
         assert!(app.world().resource_ref::<WorldLane>().is_changed());
         app.world_mut().clear_trackers();
@@ -509,6 +727,45 @@ mod tests {
         assert!(density(390.0, 1.0, true) < noon);
     }
     #[test]
+    fn lamp_haze_is_exactly_off_by_day_and_weather_only_strengthens_night() {
+        assert_eq!(lamp_haze_strength(1.0, 1.0, false), 0.0);
+        let clear = lamp_haze_strength(-1.0, 0.0, false);
+        assert!(lamp_haze_strength(-1.0, 1.0, false) > clear * 2.0);
+        assert!(lamp_haze_strength(-1.0, 0.0, true) < clear);
+    }
+    #[test]
+    fn lamp_picker_keeps_the_nearest_across_both_lanes_and_tier_limit() {
+        let mut points: Vec<_> = (1..=40)
+            .rev()
+            .map(|distance| ResolvedPointLight {
+                position: Vec3::X * distance as f32,
+                range: 48.0,
+                color: Vec3::new(0.8, 0.4, 0.1),
+                lane: 0.0,
+            })
+            .collect();
+        // Interior and exterior table rows compete by distance; black rows never consume a slot.
+        points.push(ResolvedPointLight {
+            position: Vec3::X * 0.25,
+            range: 48.0,
+            color: Vec3::ONE,
+            lane: 8.0,
+        });
+        points.push(ResolvedPointLight {
+            position: Vec3::X * 0.5,
+            range: 48.0,
+            color: Vec3::ZERO,
+            lane: 0.0,
+        });
+        let low = select_fog_lamps(&points, Vec3::ZERO, None, LOW_FOG_LAMPS);
+        assert_eq!(low.count, LOW_FOG_LAMPS);
+        assert_eq!(low.positions[0], Vec4::new(0.25, 0.0, 0.0, 8.0));
+        assert_eq!(low.positions[1].x, 1.0);
+        assert_eq!(low.positions[LOW_FOG_LAMPS - 1].x, 15.0);
+        assert_eq!(low.colors[0].truncate(), Vec3::ONE);
+        assert_eq!(low.colors[1].truncate(), Vec3::new(0.8, 0.4, 0.1));
+    }
+    #[test]
     fn live_tiers_shadow_loss_inactive_camera_and_off() {
         let mut app = App::new();
         app.init_resource::<VideoConfig>()
@@ -516,7 +773,12 @@ mod tests {
             .init_resource::<WorldTime>()
             .init_resource::<WeatherState>()
             .init_resource::<CameraInteriorClaim>()
-            .insert_resource(FogOverride(None, 2.0))
+            .init_resource::<ResolvedPointLights>()
+            .insert_resource(FogOverride {
+                fog: None,
+                lamp: None,
+                shaft_gain: 2.0,
+            })
             .add_systems(Update, update_fog);
         let camera = app
             .world_mut()
@@ -563,10 +825,10 @@ mod tests {
         app.update();
         assert!(app.world().get::<FogView>(camera).is_none());
         app.world_mut().get_mut::<Camera>(camera).unwrap().is_active = true;
-        app.world_mut().resource_mut::<FogOverride>().0 = Some(0);
+        app.world_mut().resource_mut::<FogOverride>().fog = Some(0);
         app.update();
         assert!(app.world().get::<FogView>(camera).is_none());
-        app.world_mut().resource_mut::<FogOverride>().0 = None;
+        app.world_mut().resource_mut::<FogOverride>().fog = None;
         app.update();
         assert!(app.world().get::<FogView>(camera).is_some());
     }

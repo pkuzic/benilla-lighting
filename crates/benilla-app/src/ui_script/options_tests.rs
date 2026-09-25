@@ -2091,6 +2091,67 @@ fn ambient_occlusion_dropdown_is_localised_and_live() {
     }
 }
 
+// MONKEY (lampfog): the end-of-page quality row uses the same numeric tier contract as the pass.
+#[test]
+fn lamp_fog_dropdown_is_localised_and_live() {
+    let xml = include_str!("../../assets/ui/OptionsFrame.xml");
+    let strings = &xml[xml.find("BENILLA_ADVGFX_STRINGS = {").unwrap()
+        ..xml.find("OPTIONS_PAGE_ROWS = {").unwrap()];
+    let row = xml.split("<Frame name=\"$parentRowLampFog\"").nth(1).unwrap();
+    let on_load = row.split("<OnLoad>").nth(1).unwrap().split("</OnLoad>").next().unwrap();
+    for (locale, title, labels) in [
+        ("enUS", "Lamp Fog", ["Off", "Low", "High"]),
+        (
+            "ruRU",
+            "Свечение фонарей в тумане",
+            ["Выкл", "Низкое", "Высокое"],
+        ),
+    ] {
+        let mut s = audio_harness();
+        s.run(&format!("function GetLocale() return '{locale}' end"))
+            .unwrap();
+        s.run(strings).unwrap();
+        s.run(
+            r#"
+            self = {}
+            function OptionsRow_OnLoad(row, cvar, title, tip)
+                row.cvar, row.title, row.tip = cvar, title, tip
+            end
+            function OptionsDropdownRow_Setup(row, choices) row.choices = choices end
+        "#,
+        )
+        .unwrap();
+        s.run(on_load).unwrap();
+        assert_eq!(s.eval::<String>("return self.title").unwrap(), title);
+        assert!(s
+            .eval::<bool>(
+                "return getglobal(self.tip) == BENILLA_ADVGFX.tips.LAMP_FOG and string.len(getglobal(self.tip)) > 80",
+            )
+            .unwrap());
+        // `lampFog` registers at Off, so seed away from the first choice before asserting that
+        // every selection produces the expected live write (the CVar layer suppresses no-ops).
+        s.run("SetCVar(self.cvar, '2')").unwrap();
+        let _ = s.take_cvar_changes();
+        for (tier, label) in labels.iter().enumerate() {
+            assert_eq!(
+                s.eval::<String>(&format!("return self.choices[{}].text", tier + 1))
+                    .unwrap(),
+                *label
+            );
+            let _ = s.take_cvar_changes();
+            s.run(&format!(
+                "SetCVar(self.cvar, self.choices[{}].value)",
+                tier + 1
+            ))
+            .unwrap();
+            assert_eq!(
+                s.take_cvar_changes(),
+                vec![("lampFog".to_string(), tier.to_string())]
+            );
+        }
+    }
+}
+
 #[test]
 fn water_quality_writes_numeric_tiers_with_localised_labels() {
     benilla_formats::wow_data_or_skip!();
@@ -2103,8 +2164,8 @@ fn water_quality_writes_numeric_tiers_with_localised_labels() {
         let mut s = harness_on(s);
         s.run("ShowUIPanel(BenillaOptionsFrame) BenillaOptionsFrameCategoryListRowAdvancedGraphics:Click()").unwrap();
         // MONKEY (volumetric fog): account for the atmosphere row after water.
-        // MONKEY (integration): all programme rows (sky, post, dither, fog, wet, wind, ao) counted.
-        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 28);
+        // MONKEY (integration): all programme rows (sky, post, dither, fog, wet, wind, ao, lamp fog) counted.
+        assert_eq!(s.eval::<usize>("return table.getn(OPTIONS_PAGE_ROWS.AdvancedGraphics)").unwrap(), 29);
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[2]").unwrap(), "RowWaterQuality");
         assert_eq!(s.eval::<String>("return OPTIONS_PAGE_ROWS.AdvancedGraphics[21]").unwrap(), "RowLavaGlow");
         assert_eq!(s.eval::<String>(&format!("return {ADVGFX}RowWaterQualityDropdownText:GetText()")).unwrap(), labels[1]);
@@ -3041,6 +3102,8 @@ fn every_row_tooltip_key_resolves_in_the_real_global_strings() {
             ("BENILLA_TOOLTIP_SKY_QUALITY", "AdvancedGraphicsRowSkyQuality"),
             // MONKEY (ao): the contact-shadow row's translated tooltip.
             ("BENILLA_TOOLTIP_AMBIENT_OCCLUSION", "AdvancedGraphicsRowAmbientOcclusion"),
+            // MONKEY (lampfog): the quality row owns a translated tooltip too.
+            ("BENILLA_TOOLTIP_LAMP_FOG", "AdvancedGraphicsRowLampFog"),
             ("BENILLA_TOOLTIP_WATER_QUALITY", "AdvancedGraphicsRowWaterQuality"),
             ("BENILLA_TOOLTIP_LAVA_GLOW", "AdvancedGraphicsRowLavaGlow"),
             ("BENILLA_TOOLTIP_RENDER_SCALE", "GraphicsRowRenderScale"),
