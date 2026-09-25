@@ -43,8 +43,64 @@ struct GradeCatalog {
 struct GradeView {
     day: Handle<Image>,
     night: Handle<Image>,
-    // x = authored strength, y = night blend.
+    /// MONKEY (polish): the pair being faded out (identity once the fade is done).
+    prev_day: Handle<Image>,
+    prev_night: Handle<Image>,
+    // x = authored strength, y = night blend, z = crossfade weight of the current pair (1 = done),
+    // w = the previous pair's strength.
     control: Vec4,
+}
+
+/// MONKEY (polish): the zone crossfade's length; a border crossing no longer snaps the grade.
+const GRADE_FADE_S: f32 = 2.0;
+
+/// One zone's LUT pair at its authored strength; a zone with no row grades at strength 0.
+#[derive(Clone, PartialEq, Debug)]
+struct GradePair {
+    day: Handle<Image>,
+    night: Handle<Image>,
+    strength: f32,
+}
+
+/// MONKEY (polish): the crossfade from the previous zone's pair to the current one.
+#[derive(Resource, Default)]
+struct GradeBlend {
+    current: Option<GradePair>,
+    previous: Option<GradePair>,
+    /// The current pair's weight, 0..1.
+    fade: f32,
+    primed: bool,
+}
+
+impl GradeBlend {
+    /// Steps toward `target`. The first graded zone after login (or re-enabling) and a disabled
+    /// grade snap; a return to the
+    /// pair still fading out reverses the fade instead of restarting it.
+    fn step(&mut self, target: Option<GradePair>, dt: f32, snap: bool) {
+        if snap || !self.primed {
+            *self = Self {
+                primed: !snap && target.is_some(),
+                current: target,
+                previous: None,
+                fade: 1.0,
+            };
+            return;
+        }
+        if target != self.current {
+            if self.fade < 1.0 && target == self.previous {
+                std::mem::swap(&mut self.current, &mut self.previous);
+                self.fade = 1.0 - self.fade;
+            } else {
+                self.previous = self.current.take();
+                self.current = target;
+                self.fade = 0.0;
+            }
+        }
+        self.fade = (self.fade + dt / GRADE_FADE_S).min(1.0);
+        if self.fade >= 1.0 {
+            self.previous = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy, ShaderType)]
@@ -55,6 +111,7 @@ struct GradeUniform {
 impl Plugin for GradingPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ExtractComponentPlugin::<GradeView>::default())
+            .init_resource::<GradeBlend>()
             .add_systems(Last, update_views);
         if !app.is_plugin_added::<AssetPlugin>() {
             return;
@@ -219,6 +276,7 @@ fn volume_image(cube: Vec<u8>) -> Image {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_views(
     mut commands: Commands,
     video: Res<VideoConfig>,
@@ -226,6 +284,8 @@ fn update_views(
     area: Res<CurrentArea>,
     areas: Option<Res<crate::area::AreaTableRes>>,
     time: Res<WorldTime>,
+    clock: Res<Time>,
+    mut blend: ResMut<GradeBlend>,
     cameras: Query<(Entity, &Camera, Option<&GradeView>), With<WorldCamera>>,
 ) {
     let selected = catalog.as_ref().and_then(|catalog| {
@@ -238,7 +298,7 @@ fn update_views(
             .rows
             .for_area(leaf)
             .or_else(|| catalog.rows.for_area(zone))?;
-        (row.strength > 0.0).then(|| GradeView {
+        (row.strength > 0.0).then(|| GradePair {
             day: catalog
                 .luts
                 .get(&row.day_lut)
@@ -249,7 +309,33 @@ fn update_views(
                 .get(&row.night_lut)
                 .unwrap_or(&catalog.identity)
                 .clone(),
-            control: Vec4::new(row.strength, night_weight(time.minute_f), 0.0, 0.0),
+            strength: row.strength,
+        })
+    });
+    blend.step(selected, clock.delta_secs(), !video.color_grading);
+    let selected = catalog.as_ref().and_then(|catalog| {
+        if blend.current.is_none() && blend.previous.is_none() {
+            return None;
+        }
+        let pair = |p: &Option<GradePair>| {
+            p.as_ref().map_or_else(
+                || (catalog.identity.clone(), catalog.identity.clone(), 0.0),
+                |p| (p.day.clone(), p.night.clone(), p.strength),
+            )
+        };
+        let (day, night, strength) = pair(&blend.current);
+        let (prev_day, prev_night, prev_strength) = pair(&blend.previous);
+        Some(GradeView {
+            day,
+            night,
+            prev_day,
+            prev_night,
+            control: Vec4::new(
+                strength,
+                night_weight(time.minute_f),
+                blend.fade,
+                prev_strength,
+            ),
         })
     });
     for (entity, camera, old) in &cameras {
@@ -311,6 +397,9 @@ fn init_pipeline(
                 texture_3d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 uniform_buffer::<GradeUniform>(false),
+                // MONKEY (polish): the previous zone's pair, crossfaded out.
+                texture_3d(TextureSampleType::Float { filterable: true }),
+                texture_3d(TextureSampleType::Float { filterable: true }),
             ),
         ),
     );
@@ -397,7 +486,12 @@ impl ViewNode for GradeNode {
             return Ok(());
         };
         let images = world.resource::<RenderAssets<GpuImage>>();
-        let (Some(day), Some(night)) = (images.get(&grade.day), images.get(&grade.night)) else {
+        let (Some(day), Some(night), Some(prev_day), Some(prev_night)) = (
+            images.get(&grade.day),
+            images.get(&grade.night),
+            images.get(&grade.prev_day),
+            images.get(&grade.prev_night),
+        ) else {
             return Ok(());
         };
         let device = context.render_device();
@@ -412,6 +506,8 @@ impl ViewNode for GradeNode {
                 &night.texture_view,
                 &settings.lut_sampler,
                 uniform.0.as_entire_binding(),
+                &prev_day.texture_view,
+                &prev_night.texture_view,
             )),
         );
         let diagnostics = context.diagnostic_recorder();
@@ -450,6 +546,44 @@ mod tests {
         assert_eq!(at(31, 0, 0), &[255, 0, 0, 255]);
         assert_eq!(at(0, 31, 0), &[0, 255, 0, 255]);
         assert_eq!(at(0, 0, 31), &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn zone_change_crossfades_and_a_quick_return_reverses() {
+        let pair = |id: u128, strength| GradePair {
+            day: Handle::Uuid(bevy::asset::uuid::Uuid::from_u128(id), default()),
+            night: Handle::Uuid(bevy::asset::uuid::Uuid::from_u128(id + 1), default()),
+            strength,
+        };
+        let (a, b) = (pair(10, 1.0), pair(20, 0.5));
+        let mut blend = GradeBlend::default();
+        // No zone yet, then the first graded zone snaps in.
+        blend.step(None, 0.016, false);
+        blend.step(Some(a.clone()), 0.016, false);
+        assert_eq!((blend.current.clone(), blend.fade), (Some(a.clone()), 1.0));
+        // A border crossing fades over GRADE_FADE_S.
+        blend.step(Some(b.clone()), 0.5, false);
+        assert_eq!(blend.previous, Some(a.clone()));
+        assert!((blend.fade - 0.25).abs() < 1e-6);
+        // Stepping back mid-fade reverses from the same image.
+        blend.step(Some(a.clone()), 0.0, false);
+        assert_eq!(
+            (blend.current.clone(), blend.previous.clone()),
+            (Some(a.clone()), Some(b))
+        );
+        assert!((blend.fade - 0.75).abs() < 1e-6);
+        blend.step(Some(a.clone()), 1.0, false);
+        assert_eq!((blend.fade, blend.previous.is_none()), (1.0, true));
+        // An ungraded zone fades out to identity rather than cutting.
+        blend.step(None, 1.0, false);
+        assert_eq!(
+            (blend.current.is_none(), blend.previous.clone()),
+            (true, Some(a))
+        );
+        assert!((blend.fade - 0.5).abs() < 1e-6);
+        // Disabling snaps.
+        blend.step(None, 0.0, true);
+        assert!(blend.previous.is_none() && blend.current.is_none());
     }
 
     #[test]
