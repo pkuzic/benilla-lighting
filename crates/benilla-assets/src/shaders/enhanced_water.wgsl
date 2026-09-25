@@ -54,13 +54,13 @@ struct WaterParams {
 const MONKEY_ROW: u32 = 533u;
 fn water_monkey() -> monkey_frame::MonkeyFrame {
     var m: monkey_frame::MonkeyFrame;
-    m.fog0 = water_light[MONKEY_ROW + 0u];
-    m.fog1 = water_light[MONKEY_ROW + 1u];
-    m.fog2 = water_light[MONKEY_ROW + 2u];
-    m.fog3 = water_light[MONKEY_ROW + 3u];
-    m.wind0 = water_light[MONKEY_ROW + 4u];
-    m.wind1 = water_light[MONKEY_ROW + 5u];
-    m.wet0 = water_light[MONKEY_ROW + 6u];
+    m.fog_a = water_light[MONKEY_ROW + 0u];
+    m.fog_b = water_light[MONKEY_ROW + 1u];
+    m.fog_c = water_light[MONKEY_ROW + 2u];
+    m.fog_d = water_light[MONKEY_ROW + 3u];
+    m.wind_a = water_light[MONKEY_ROW + 4u];
+    m.wind_b = water_light[MONKEY_ROW + 5u];
+    m.wet_a = water_light[MONKEY_ROW + 6u];
     m.misc = water_light[MONKEY_ROW + 7u];
     for (var i = 0u; i < 8u; i++) { m.benders[i] = water_light[MONKEY_ROW + 8u + i]; }
     return m;
