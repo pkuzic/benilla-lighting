@@ -100,11 +100,8 @@ fn spawn_exile(commands: &mut Commands, f: &GxFader, alpha: f32, admitted: bool)
             },
             crate::model_render::EntityPathWhy("exile"),
             crate::interact::PickMesh(b.geometry.clone()),
-            // MONKEY (wind): bit 18 is the fade-twin leaf marker in exterior payload mode.
-            bevy::mesh::MeshTag(crate::mesh_tag::with_foliage_wind(
-                crate::mesh_tag::alpha_bits(alpha),
-                b.foliage_wind,
-            )),
+            // MONKEY (fix-wind): a leaf batch's sway marker rides its material (`FOLIAGE_WIND_MARKER`).
+            bevy::mesh::MeshTag(crate::mesh_tag::alpha_bits(alpha)),
             crate::model_fade::DoodadFade {
                 radius: f.radius,
                 local_center: f.local_center,

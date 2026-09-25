@@ -1095,10 +1095,11 @@ fn vertex(vertex: WowVertex) -> WowVsOut {
         );
     }
 #endif
-    // MONKEY (wind): a retained tree inside its fade band renders here. StaticGx marks only its
-    // alpha-tested leaf batches in MeshTag bit 18; use the same anchor/field maths to avoid a pop.
-    let wind_tag = mesh_functions::get_tag(vertex.instance_index);
-    if ((wind_tag & 262144u) != 0u && m.clutter_fade.w <= 0.5) {
+    // MONKEY (wind): a retained tree inside its fade band renders here with the same anchor/field
+    // maths, to avoid a pop. MONKEY (fix-wind): the leaf-batch marker is material bit 14
+    // (`model_render::FOLIAGE_WIND_MARKER`), never a MeshTag bit (bit 18 aliases the lane weight
+    // and the interior probe slot, so doorway units and interior props swayed).
+    if ((u32(m.clutter_fade.z) & 16384u) != 0u && m.clutter_fade.w <= 0.5) {
         let world = p_cam + view.world_position;
         p_cam += wind_hook::tree_offset(
             world, frame_origin, view.world_position, wow_light.monkey

@@ -90,10 +90,6 @@ const SHADE_SHIFT: u32 = 6;
 /// Sits in the exterior payload's reserved bits, so [`with_shade`]/[`with_alpha`]/[`with_rig`]
 /// carry it through and the shader's 8-bit shade decode never sees it.
 pub(crate) const MATTE_INDOOR_BIT: u32 = 0x0000_4000;
-/// MONKEY (wind): bit 18 on an exterior, non-Matte static doodad exile marks a classified
-/// tree/bush leaf batch. It aliases the top lane-weight bit safely: lane weight is read only with
-/// [`MATTE_INDOOR_BIT`], which these exterior fade twins never carry.
-const FOLIAGE_WIND_BIT: u32 = 0x0004_0000;
 /// Bits 15..=18 of the exterior payload (MONKEY, portal lane fade): the **lane weight**, a 4-bit
 /// crossfade `0` (fully exterior-lit) … [`LANE_MAX`] (fully room-lit) that the shader mixes the
 /// two lanes by. It rides beside [`MATTE_INDOOR_BIT`] — the bit says "this part is on the room
@@ -205,16 +201,6 @@ pub fn alpha_bits(alpha: f32) -> u32 {
         1u32
     } else {
         ((alpha.min(1.0) * ALPHA_MAX).round() as u32).max(1)
-    }
-}
-
-/// MONKEY (wind): marks or clears the fade-twin foliage receiver without disturbing its live
-/// alpha. Only exterior static doodad exiles use this payload convention.
-pub(crate) fn with_foliage_wind(tag: u32, on: bool) -> u32 {
-    if on {
-        tag | FOLIAGE_WIND_BIT
-    } else {
-        tag & !FOLIAGE_WIND_BIT
     }
 }
 
@@ -364,17 +350,6 @@ mod tests {
         let t = with_shade(t, 10, ext());
         assert_eq!(t & ALPHA_MASK, alpha_bits(0.25));
         assert_eq!(shade_of(t, ext()), 10);
-    }
-
-    // MONKEY (wind): the fade-twin marker is orthogonal to the live fade field.
-    #[test]
-    fn foliage_marker_survives_alpha_writes_and_clears_cleanly() {
-        let alpha = alpha_bits(0.5);
-        let marked = with_foliage_wind(alpha, true);
-        assert_eq!(marked & FOLIAGE_WIND_BIT, FOLIAGE_WIND_BIT);
-        assert_eq!(marked & ALPHA_MASK, alpha);
-        assert_eq!(with_alpha(marked, 0.25) & FOLIAGE_WIND_BIT, FOLIAGE_WIND_BIT);
-        assert_eq!(with_foliage_wind(marked, false), alpha);
     }
 
     #[test]
