@@ -15,8 +15,8 @@ struct MonkeyFrame {
     fog_b: vec4<f32>,  // sun_fog_rgb (gamma 0..1), sun_fog_strength
     fog_c: vec4<f32>,  // end_fog_rgb (gamma 0..1), end_fog_distance (yd)
     fog_d: vec4<f32>,  // 0 classic or scene fog end for Modern, sun_fog_angle, sun direction octahedral xy
-    wind_a: vec4<f32>, // dir_x, dir_y (unit, world XZ: .x = world x, .y = world z), speed (yd/s), gust 0..1
-    wind_b: vec4<f32>, // time_s, sway_strength, grass_strength, tree_strength
+    wind_a: vec4<f32>, // dir_x, dir_y (unit, world XZ: .x = world x, .y = world z), base_heading (rad, fixed profile heading), gust 0..1
+    wind_b: vec4<f32>, // travel (yd, integrated speed, wrapped at 4096), sway_strength, grass_strength, tree_strength
     wet_a: vec4<f32>,  // rain_rate 0..1, wetness 0..1, ripple_time_s, snow 0..1
     misc: vec4<f32>,  // bender_count, time_of_day 0..1 (packer), night 0..1 (packer), 0
     benders: array<vec4<f32>, 8>, // world xyz (Bevy space) + radius (yd); the first bender_count are live

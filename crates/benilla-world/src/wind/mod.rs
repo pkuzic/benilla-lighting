@@ -131,6 +131,43 @@ pub fn sample(profile: WindProfile, seconds: f64, storm: f32) -> WindSample {
     }
 }
 
+/// MONKEY (fix-wind): the wrap of the published wind travel, in yards. Every wave rate in
+/// `wind_hook.wgsl` is a whole number of cycles per wrap, so the wrap is invisible.
+pub const TRAVEL_WRAP: f64 = 4096.0;
+
+/// MONKEY (fix-wind): the integrated travel. The waves' phase must be the integral of the speed,
+/// not `speed(t) * t` (whose rate grows with session age and flickered after a few minutes).
+#[derive(Default)]
+struct WindClock {
+    travel: f64,
+    last: Option<f64>,
+}
+
+/// Capture-only clock offset (`$WOW_CAPTURE_WIND_T`, seconds): photographs the field as it is
+/// that long into a session. Ignored outside `WOW_CAPTURE`.
+fn capture_wind_offset() -> f64 {
+    if std::env::var_os("WOW_CAPTURE").is_none() {
+        return 0.0;
+    }
+    std::env::var("WOW_CAPTURE_WIND_T")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0)
+        .max(0.0)
+}
+
+/// Integrates the travel from `from` to `to` seconds at a fixed 1/60 s step.
+fn integrate_travel(profile: WindProfile, storm: f32, from: f64, to: f64) -> f64 {
+    let mut travel = 0.0;
+    let mut t = from;
+    while t < to {
+        let dt = (to - t).min(1.0 / 60.0);
+        travel += f64::from(sample(profile, t, storm).speed) * dt;
+        t += dt;
+    }
+    travel
+}
+
 /// MONKEY (wind): resolve once at the frame boundary, then publish the same sample and clock to
 /// Rust consumers and the appended MonkeyFrame block. A zero tier clears every visual strength.
 fn update_wind(
@@ -139,14 +176,27 @@ fn update_wind(
     quality: Res<FoliageWind>,
     mut wind: ResMut<WindField>,
     mut frame: ResMut<MonkeyFrame>,
+    mut clock: Local<WindClock>,
+    mut offset: Local<Option<f64>>,
 ) {
-    let seconds = time.elapsed_secs_f64();
-    wind.sample = sample(wind.profile, seconds, storm_blend(weather.sky_density));
+    let offset = *offset.get_or_insert_with(capture_wind_offset);
+    let seconds = time.elapsed_secs_f64() + offset;
+    let storm = storm_blend(weather.sky_density);
+    wind.sample = sample(wind.profile, seconds, storm);
+
+    // MONKEY (fix-wind): integrate the travel on the CPU in f64 and publish it wrapped.
+    let step = match clock.last {
+        // First frame: catch up from session start (only non-zero under a capture offset).
+        None => integrate_travel(wind.profile, storm, 0.0, seconds),
+        Some(last) => f64::from(wind.sample.speed) * (seconds - last).max(0.0),
+    };
+    clock.last = Some(seconds);
+    clock.travel = (clock.travel + step).rem_euclid(TRAVEL_WRAP);
 
     frame.wind_dir = wind.sample.dir.to_array();
-    frame.wind_speed = wind.sample.speed;
+    frame.wind_base_heading = wind.profile.heading_deg.to_radians();
     frame.wind_gust = wind.sample.gust;
-    frame.wind_time_s = seconds as f32;
+    frame.wind_travel = clock.travel as f32;
     frame.sway_strength = if quality.0 > 0 { 1.0 } else { 0.0 };
     frame.grass_strength = if quality.0 >= 1 { 1.0 } else { 0.0 };
     frame.tree_strength = if quality.0 >= 2 { 1.0 } else { 0.0 };
@@ -248,6 +298,16 @@ mod tests {
             assert!((s.dir.length() - 1.0).abs() < 1.0e-5);
             assert!((0.0..=1.0).contains(&s.gust));
             assert!(s.speed >= 0.0);
+        }
+    }
+
+    #[test]
+    fn travel_rate_stays_bounded_late_in_a_session() {
+        // MONKEY (fix-wind): the published travel advances at the wind speed, never speed x age.
+        let p = WindProfile::default();
+        for t0 in [10.0, 600.0, 36_000.0] {
+            let d = integrate_travel(p, 0.0, t0, t0 + 1.0);
+            assert!(d > 0.0 && d < 2.2 * f64::from(p.base_speed), "t0={t0} d={d}");
         }
     }
 }

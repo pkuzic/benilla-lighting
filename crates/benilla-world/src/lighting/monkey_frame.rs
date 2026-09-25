@@ -18,8 +18,8 @@
 //! | 1 `fog_b` | sun_fog_rgb | sun_fog_strength |
 //! | 2 `fog_c` | end_fog_rgb | end_fog_distance |
 //! | 3 `fog_d` | fog_model (0 classic; Modern = the scene fog end, yd, ≥ 1), sun_fog_angle, sun dir oct.x | sun dir oct.y |
-//! | 4 `wind_a` | dir_x, dir_y, speed | gust |
-//! | 5 `wind_b` | time_s, sway_strength, grass_strength | tree_strength |
+//! | 4 `wind_a` | dir_x, dir_y, base_heading (rad) | gust |
+//! | 5 `wind_b` | travel (yd, wrapped), sway_strength, grass_strength | tree_strength |
 //! | 6 `wet_a` | rain_rate, wetness, ripple_time_s | snow |
 //! | 7 `misc` | bender_count, time_of_day 0..1, night 0..1 | 0 |
 //! | 8-15 `benders` | world x, y, z | radius |
@@ -75,11 +75,13 @@ pub struct MonkeyFrame {
     // ── WIND lane (rows 4-5) ──
     /// Unit vector in the world XZ plane (`[x, z]`).
     pub wind_dir: [f32; 2],
-    /// Yards per second.
-    pub wind_speed: f32,
+    /// MONKEY (fix-wind): the profile's fixed heading in radians. The waves' spatial term uses
+    /// it, so the veer never rotates the phase field about the world origin.
+    pub wind_base_heading: f32,
     pub wind_gust: f32,
-    /// The wind clock in seconds (the lane owns it, so a capture can pin it).
-    pub wind_time_s: f32,
+    /// MONKEY (fix-wind): the integrated wind travel (speed integrated over time) in yards, wrapped
+    /// at `wind::TRAVEL_WRAP`; the shader's wave rates are whole cycles per wrap, so it is seamless.
+    pub wind_travel: f32,
     pub sway_strength: f32,
     pub grass_strength: f32,
     pub tree_strength: f32,
@@ -115,8 +117,8 @@ impl MonkeyFrame {
         let e = self.end_fog_rgb;
         rows[2] = [e[0], e[1], e[2], self.end_fog_distance];
         rows[3] = [model, self.sun_fog_angle, self.sun_fog_dir[0], self.sun_fog_dir[1]];
-        rows[4] = [self.wind_dir[0], self.wind_dir[1], self.wind_speed, self.wind_gust];
-        rows[5] = [self.wind_time_s, self.sway_strength, self.grass_strength, self.tree_strength];
+        rows[4] = [self.wind_dir[0], self.wind_dir[1], self.wind_base_heading, self.wind_gust];
+        rows[5] = [self.wind_travel, self.sway_strength, self.grass_strength, self.tree_strength];
         rows[6] = [self.rain_rate, self.wetness, self.ripple_time_s, self.snow];
         let n = (self.bender_count as usize).min(MAX_BENDERS);
         rows[7] = [n as f32, time_of_day, night, 0.0];
@@ -153,9 +155,9 @@ mod tests {
             sun_fog_dir: [0.5, -0.5],
             fog_scene_end: 444.0,
             wind_dir: [14.0, 15.0],
-            wind_speed: 16.0,
+            wind_base_heading: 16.0,
             wind_gust: 17.0,
-            wind_time_s: 18.0,
+            wind_travel: 18.0,
             sway_strength: 19.0,
             grass_strength: 20.0,
             tree_strength: 21.0,
