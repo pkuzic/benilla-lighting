@@ -86,7 +86,8 @@ fn wet_sheen(boost: f32, n: vec3<f32>, to_view: vec3<f32>, to_light: vec3<f32>,
     if (boost <= 0.0) {
         return vec3<f32>(0.0);
     }
-    let h = normalize(to_light + to_view);
+    // MONKEY (fix-wet): nudged so opposite light/view vectors never normalize a zero vector (NaN).
+    let h = normalize(to_light + to_view + vec3<f32>(0.0, 1.0e-4, 0.0));
     let nl = max(dot(n, to_light), 0.0);
     let spec = pow(max(dot(n, h), 0.0), 80.0) * smoothstep(0.0, 0.15, nl);
     let fres = 0.03 + 0.97 * pow(1.0 - clamp(dot(n, to_view), 0.0, 1.0), 5.0);

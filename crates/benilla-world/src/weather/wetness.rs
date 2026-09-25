@@ -104,7 +104,10 @@ fn wetness_tick(
         (
             rain,
             env.wetness.unwrap_or(wet.wetness),
-            env.ripple_t.unwrap_or(wet.ripple_time_s),
+            // MONKEY (fix-wet): the rings read the clock only while it rains; publishing it when
+            // dry rewrote the shared light buffer every frame in clear weather.
+            env.ripple_t
+                .unwrap_or(if rain > 0.0 { wet.ripple_time_s } else { 0.0 }),
         )
     } else {
         (0.0, 0.0, 0.0)

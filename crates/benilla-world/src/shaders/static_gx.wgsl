@@ -1995,7 +1995,9 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
     }
     // MONKEY (wet): rain on sky-exposed surfaces (wet_hook.wgsl); interior, unlit and dry = untouched.
     let wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz,
-        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT)) != 0u), wow_light.monkey);
+        // MONKEY (fix-wet): lit WMO windows (WORD_WINDOW) are not darkened by rain either.
+        select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT | WORD_WINDOW)) != 0u),
+        wow_light.monkey);
     rgb = wet.albedo;
     if (wet.boost > 0.0) {
         rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),

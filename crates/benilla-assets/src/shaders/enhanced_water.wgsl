@@ -279,7 +279,9 @@ fn rain_ripple_normal(world_xz: vec2<f32>, footprint: f32, distance: f32, room: 
                 let h_alt = ripple_hash(seed + 19.19);
                 // Each period re-rolls whether this cell rains, so the pattern does not repeat.
                 let cycle = wet_row.z * rate + h.x;
-                let roll = ripple_hash(seed + floor(cycle) * 7.31).x;
+                // MONKEY (fix-wet): `% 50` keeps the roll sequence continuous across the 1000 s
+                // clock wrap (cycle drops by 800 / 650, both multiples of 50).
+                let roll = ripple_hash(seed + (floor(cycle) % 50.0) * 7.31).x;
                 if roll > rain * 0.85 {
                     continue;
                 }
