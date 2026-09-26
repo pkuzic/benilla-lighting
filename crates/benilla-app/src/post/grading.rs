@@ -362,7 +362,7 @@ fn update_views(
 
 /// MONKEY (reviewfix-a): the server's fractional minute while it is the minute being rendered,
 /// else the rendered (manual or capture) minute.
-fn rendered_minute(time: &WorldTime, rendered: Option<&benilla_world::lighting::GameClock>) -> f32 {
+pub(crate) fn rendered_minute(time: &WorldTime, rendered: Option<&benilla_world::lighting::GameClock>) -> f32 {
     match rendered {
         Some(c) if time.minute_f.floor() as u32 != c.minute => c.minute as f32,
         _ => time.minute_f,

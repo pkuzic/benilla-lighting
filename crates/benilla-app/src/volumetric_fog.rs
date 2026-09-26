@@ -241,6 +241,8 @@ fn update_fog(
     interior: Res<CameraInteriorClaim>,
     // MONKEY (lampfog): the resolved point-table view published by global_light's packer.
     point_lights: Res<ResolvedPointLights>,
+    // MONKEY (visualfix): the minute the lighting rendered (manual / capture clock offline).
+    rendered: Option<Res<benilla_world::lighting::GameClock>>,
     // MONKEY (fog): the Modern fog rows (Option: absent in unit tests).
     monkey: Option<Res<benilla_world::lighting::MonkeyFrame>>,
     mut cameras: Query<
@@ -331,7 +333,11 @@ fn update_fog(
             lamp_positions: lamps.positions,
             lamp_colors: lamps.colors,
             color_density: fog.extend(
-                density(clock.minute_f, weather_amount, interior.0.is_some())
+                density(
+                    crate::post::grading::rendered_minute(&clock, rendered.as_deref()),
+                    weather_amount,
+                    interior.0.is_some(),
+                )
                     * if tier == 0 {
                         0.0
                     } else if tier == 2 {

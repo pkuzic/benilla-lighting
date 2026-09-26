@@ -1,7 +1,8 @@
 //! MONKEY (post): optional world-camera effects ahead of FFXGlow's gamma clamp.
 
 mod bloom;
-mod grading;
+// MONKEY (visualfix): crate-visible for `rendered_minute` (volumetric fog).
+pub(crate) mod grading;
 mod sun_shafts;
 
 pub(crate) struct PostPlugin;
