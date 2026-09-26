@@ -446,8 +446,7 @@ impl Plugin for TerrainPlugin {
                 update_current_area
                     .after(crate::wmo_portal::WmoPvsSet)
                     .in_set(AreaAuthoritySet),
-            )
-            .add_systems(Update, queries::update_capture_camera_area.in_set(AreaAuthoritySet));
+            );
     }
 }
 
