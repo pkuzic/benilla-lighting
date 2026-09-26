@@ -43,7 +43,7 @@ fork. Do not remove any of them.
 |---|---|---|
 | Quality tiers | `Classic` = the reference water, `Enhanced`, `High` (= Enhanced + scenery reflections) | Video options → Water Quality, cvar `waterQuality`, env `WOW_WATER=0\|1\|2` |
 | Procedural waves | multi-band analytic waves with exact normals; the long swell moves ocean vertices | tier |
-| Open-sea whitecaps | High adds Gerstner crest gathering and fold-thresholded foam; calm canals remain clear | tier |
+| Open-sea whitecaps | High adds Gerstner crest gathering and fold-thresholded foam; calm canals remain clear. The fold mask adds the next two wave bands, a slow domain-warped gust field moves the break threshold and calms patches, and ~6 yd segments break each crest into short runs, so the caps do not form a lattice (`whitecap_fold`, `enhanced_water.wgsl`) | tier |
 | Near mesh refinement | High builds a transient 4x liquid lattice within 64 yd, with an 80 yd release ring | tier |
 | Ocean / inland profiles | the sea and lakes/rivers have their own colour, energy and reflectivity | tier |
 | WMO pools | exterior canals use a calm drifting profile with outdoor glints; interiors use their authored MOMT colour and room-fog reflection | tier |
