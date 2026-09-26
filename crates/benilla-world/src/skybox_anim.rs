@@ -333,21 +333,38 @@ impl SkyMatLane {
         tint: Option<Arc<benilla_formats::RgbAnim>>,
         table: &mut crate::mat_anim_table::MatAnimTable,
         materials: &mut Assets<benilla_assets::materials::WowModelMaterial>,
-        mats: &[AssetId<benilla_assets::materials::WowModelMaterial>],
+        mats: &mut [Handle<benilla_assets::materials::WowModelMaterial>],
     ) -> Self {
-        let mut lane = SkyMatLane::default();
-        let write = |materials: &mut Assets<benilla_assets::materials::WowModelMaterial>,
-                     f: &dyn Fn(&mut benilla_assets::materials::WowModelMaterial)| {
-            for id in mats {
-                crate::model_render::lazy::with_material_mut(materials, *id, |m| f(m));
+        // MONKEY (reviewfix): `model_material` is a cache. Animation slots are per sky batch, so
+        // detach its handles before writing any slot (notably affine-only `.z`) into the material.
+        let originals = mats.to_vec();
+        for i in 0..mats.len() {
+            if let Some(prior) = (0..i).find(|&j| originals[j].id() == originals[i].id()) {
+                mats[i] = mats[prior].clone();
+                continue;
             }
-        };
+            if let Some(material) =
+                crate::model_render::lazy::with_material_mut(materials, originals[i].id(), |m| {
+                    m.clone()
+                })
+            {
+                mats[i] = materials.add(material);
+            }
+        }
+        let mut lane = SkyMatLane::default();
+        let write =
+            |materials: &mut Assets<benilla_assets::materials::WowModelMaterial>,
+             f: &dyn Fn(&mut benilla_assets::materials::WowModelMaterial)| {
+                for id in mats.iter() {
+                    crate::model_render::lazy::with_material_mut(materials, id.id(), |m| f(m));
+                }
+            };
         if let Some(uv) = uv.filter(|a| a.period > 0.0) {
             if let Some(slot) = table.alloc() {
                 let seed = mats
                     .first()
-                    .and_then(|id| {
-                        crate::model_render::lazy::with_material_mut(materials, *id, |m| {
+                    .and_then(|handle| {
+                        crate::model_render::lazy::with_material_mut(materials, handle.id(), |m| {
                             [m.extension.sun_scale.z, m.extension.sun_scale.w]
                         })
                     })
@@ -376,8 +393,8 @@ impl SkyMatLane {
             if let Some(slot) = table.alloc() {
                 let seed = mats
                     .first()
-                    .and_then(|id| {
-                        crate::model_render::lazy::with_material_mut(materials, *id, |m| {
+                    .and_then(|handle| {
+                        crate::model_render::lazy::with_material_mut(materials, handle.id(), |m| {
                             [m.extension.tint.x, m.extension.tint.y, m.extension.tint.z]
                         })
                     })

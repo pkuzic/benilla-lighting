@@ -492,16 +492,20 @@ pub fn parse_m2_render_submeshes(
                     .get(batch.texture_coord_combo_index as usize + 1)
                     .copied()
                     .unwrap_or(0);
-                let combo = batch.texture_transform_combo_index.wrapping_add(1);
+                // MONKEY (reviewfix): 0xffff is the no-transform sentinel. Advancing stage 1 must
+                // keep it absent rather than wrap it onto stage 0's transform at index zero.
+                let combo = batch.texture_transform_combo_index.checked_add(1);
                 Some((
                     resolve_texture(rec, dir, skins).0,
                     (rec.wrap_x, rec.wrap_y),
                     set == 1,
                     batch.shader_id & 0xf == 4,
-                    tex_anim::bake_uv_anim(model, combo, seq0_slot),
-                    tex_anim::bake_uv_rot_seqs(model, combo, &seq_slots)
+                    combo.and_then(|combo| tex_anim::bake_uv_anim(model, combo, seq0_slot)),
+                    combo
+                        .and_then(|combo| tex_anim::bake_uv_rot_seqs(model, combo, &seq_slots))
                         .and_then(|s| s.seq(None).cloned()),
-                    tex_anim::bake_uv_scale_seqs(model, combo, &seq_slots)
+                    combo
+                        .and_then(|combo| tex_anim::bake_uv_scale_seqs(model, combo, &seq_slots))
                         .and_then(|s| s.seq(None).cloned()),
                 ))
             })

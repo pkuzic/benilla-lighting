@@ -91,6 +91,8 @@ fn water_rain_open(world_pos: vec3<f32>) -> f32 {
 struct WaterFragment {
     clip_position: vec4<f32>,
     world_position: vec4<f32>,
+    // MONKEY (reviewfix): world XZ before `water_swell`, so fragment waves share its source domain.
+    source_xz: vec2<f32>,
     // The authored per-vertex swatch depth (UV1.x): ocean byte/255, about 148 yd at 1.0.
     depth: f32,
     // MONKEY (water): an interior WMO pool's authored MOMT diffuse colour; white on other lanes.
@@ -132,9 +134,25 @@ fn water_time() -> f32 {
 
 // Vertex Gerstner displacement for the ocean's long swell (zero everywhere else).
 // `liquid/waves.rs` mirrors it on the CPU for the swimmer bob; the two are one contract.
-fn water_swell(xz: vec2<f32>, authored_depth: f32) -> vec3<f32> {
+fn water_swell(xz: vec2<f32>, authored_depth: f32, stitch: f32) -> vec3<f32> {
     if water.lane.z < 0.5 && water.lane.y > 0.5 && water.lane.x < 0.5 && water.mode.x > 0.5 {
-        return water_gerstner(xz, water_time(), swell_shore_fade(authored_depth)).xyz;
+        let now = water_time();
+        let shore = swell_shore_fade(authored_depth);
+        // MONKEY (reviewfix): a tagged fine boundary vertex follows the straight edge between the
+        // two displaced coarse endpoints. That closes the T-junction against a coarse neighbour.
+        if stitch >= 1.0 {
+            let lane = u32(floor(stitch));
+            let along = fract(stitch);
+            var direction = vec2<f32>(1.0, 0.0);
+            if lane == 2u { direction = vec2<f32>(-1.0, 0.0); }
+            if lane == 3u { direction = vec2<f32>(0.0, 1.0); }
+            if lane == 4u { direction = vec2<f32>(0.0, -1.0); }
+            let lo = xz - direction * along * 4.1666665;
+            let hi = lo + direction * 4.1666665;
+            return mix(water_gerstner(lo, now, shore).xyz,
+                water_gerstner(hi, now, shore).xyz, along);
+        }
+        return water_gerstner(xz, now, shore).xyz;
     }
     return vec3<f32>(0.0);
 }
@@ -539,7 +557,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     }
     let t = water_time(); // WOW_CAPTURE_WATER_T pins the frozen water phase.
     let fog = water_fog(in.world_position.xyz, in.room_fog);
-    let p = in.world_position.xz;
+    let p = in.source_xz;
     let energy = clamp(water.mode.y, 0.0, 1.0);
     let ocean_mesh = water.lane.y > 0.5 && water.lane.x < 0.5;
 
