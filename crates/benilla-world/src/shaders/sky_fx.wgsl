@@ -291,9 +291,16 @@ fn cloud_detail(uv: vec2<f32>, t: f32, octaves: i32) -> f32 {
     return cloud_billow(p + w * 2.6, octaves);
 }
 
+// MONKEY (visualfix): the mean of `cloud_detail` (4 octaves; 0.573 measured over 1e6 samples of
+// the quintic value noise through `billow`). `cloud_erode` is centred on 0.5.
+const CLOUD_DETAIL_MEAN: f32 = 0.573;
+
 // Apply the detail to a base coverage: the edges (mid coverage) are pushed in and out by the
 // detail, solid cores and clear sky stay put, so the CPU tile still says where cloud is.
 fn cloud_erode(a: f32, n: f32) -> f32 {
-    let edge = 4.0 * a * (1.0 - a);
+    // MONKEY (visualfix): the weight peaks at a = 1/3 (thin edges) and is 0.43 at a = 0.7, where
+    // 4a(1-a) gave 0.84: one low base-octave cell (~5 degrees) punched a round hole in a dense
+    // mass, which read as a ring round the glow.
+    let edge = 6.75 * a * (1.0 - a) * (1.0 - a);
     return clamp(a + (n - 0.5) * 1.2 * edge, 0.0, 1.0);
 }
