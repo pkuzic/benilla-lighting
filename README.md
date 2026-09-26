@@ -1,3 +1,61 @@
+# benilla — Everwood graphics
+
+A graphics fork of [**benilla**](https://github.com/samwhosung/benilla), the from-scratch World of Warcraft
+1.12.1 client in Rust and Bevy by samwhosung. This repository adds an optional modern look on top of it.
+Every feature has its own switch under **Options → Advanced Graphics**, and the **Classic** preset keeps
+the original 1.12 image.
+
+**This repository is maintained and will stay open source. Contributions are welcome:** open an issue or a
+pull request.
+
+## Graphics features
+
+**Lighting and shadows**
+- Realtime sun shadows for characters and the world, including foliage; moon shadows at night
+- Dynamic building interiors lit by their own fixtures
+- Torches, braziers and lamps emit flickering light and cast cube-map shadows; terrain blocks torch light
+- Daylight through doors and windows (including Stormwind's rooms and cathedral windows)
+- Spell and ground-effect lights, lava glow
+- Screen-space ambient occlusion (soft contact shadows)
+
+**Sky**
+- Smooth sky gradient with dithering, soft sun glow
+- Procedural star field with a Milky Way
+- Sun-lit, detailed clouds
+- Zone skyboxes (Burning Steppes, Blasted Lands, Mount Hyjal) and the 1.12 `LightSkybox` clear-weather slot
+
+**Fog and atmosphere**
+- Modern fog model: the world fades into the horizon, sun-coloured toward the sun
+- Volumetric fog with sun and moon light shafts
+- Lamps glowing through fog at night
+- Screen-space sun shafts
+- Render distance up to 1497 yards
+
+**Post-processing**
+- HDR bloom for fire, lava, spells and lit windows
+- Per-zone colour grading (day/night LUTs)
+
+**Water**
+- Enhanced water: refraction, caustics, depth colour, screen-space reflections
+- Enhanced city and building water (Stormwind canals)
+- Gerstner waves with whitecaps, finer mesh up close
+
+**Weather and nature**
+- Rain: wet ground, puddles, glossy stone, rings on water, shelter under roofs and bridges
+- Wind: grass and tree sway with gusts, grass parts around characters
+
+**Settings**
+- One Graphics Preset: Classic / Low / Medium / High / Ultra / Custom (default High)
+- Every feature individually switchable on the Advanced Graphics page
+
+Details: [`LIGHTING.md`](LIGHTING.md), [`WATER.md`](WATER.md). Third-party credits, including code ported
+from [WarcraftXL](https://github.com/WarcraftXL) by iThorgrim: [`THIRD-PARTY.md`](THIRD-PARTY.md).
+Licence: same as upstream benilla, MIT OR Apache-2.0.
+
+---
+
+*The upstream benilla README follows.*
+
 <div align="center">
   <h1>benilla</h1>
   <p><b>A from-scratch World of Warcraft 1.12.1 client in Rust and <a href="https://bevy.org">Bevy</a></b></p>
