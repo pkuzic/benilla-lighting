@@ -282,14 +282,19 @@ fn update_views(
     video: Res<VideoConfig>,
     catalog: Option<Res<GradeCatalog>>,
     area: Res<CurrentArea>,
+    // MONKEY (reviewfix-a): a capture has no avatar; it grades by the area under the camera.
+    capture_area: Option<Res<benilla_world::terrain_stream::CaptureCameraArea>>,
     areas: Option<Res<crate::area::AreaTableRes>>,
     time: Res<WorldTime>,
+    // MONKEY (reviewfix-a): the minute the lighting actually rendered (server, or the manual /
+    // capture clock); `WorldTime` alone is the server's and stays at its noon default offline.
+    rendered: Option<Res<benilla_world::lighting::GameClock>>,
     clock: Res<Time>,
     mut blend: ResMut<GradeBlend>,
     cameras: Query<(Entity, &Camera, Option<&GradeView>), With<WorldCamera>>,
 ) {
     let selected = catalog.as_ref().and_then(|catalog| {
-        let leaf = area.0?;
+        let leaf = area.0.or_else(|| capture_area.as_ref().and_then(|a| a.0))?;
         let zone = areas
             .as_ref()
             .and_then(|areas| areas.0.top_zone(leaf))
@@ -313,6 +318,7 @@ fn update_views(
         })
     });
     blend.step(selected, clock.delta_secs(), !video.color_grading);
+    let minute = rendered_minute(&time, rendered.as_deref());
     let selected = catalog.as_ref().and_then(|catalog| {
         if blend.current.is_none() && blend.previous.is_none() {
             return None;
@@ -332,7 +338,7 @@ fn update_views(
             prev_night,
             control: Vec4::new(
                 strength,
-                night_weight(time.minute_f),
+                night_weight(minute),
                 blend.fade,
                 prev_strength,
             ),
@@ -351,6 +357,15 @@ fn update_views(
             }
             _ => {}
         }
+    }
+}
+
+/// MONKEY (reviewfix-a): the server's fractional minute while it is the minute being rendered,
+/// else the rendered (manual or capture) minute.
+fn rendered_minute(time: &WorldTime, rendered: Option<&benilla_world::lighting::GameClock>) -> f32 {
+    match rendered {
+        Some(c) if time.minute_f.floor() as u32 != c.minute => c.minute as f32,
+        _ => time.minute_f,
     }
 }
 
@@ -537,6 +552,25 @@ impl ViewNode for GradeNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MONKEY (reviewfix-a): offline (capture / manual clock) the grade follows the rendered
+    /// minute, not the server's noon default; live it keeps the server's fraction.
+    #[test]
+    fn grade_night_weight_follows_the_rendered_minute() {
+        let server = WorldTime::default();
+        let manual = benilla_world::lighting::GameClock {
+            minute: 1260,
+            ..Default::default()
+        };
+        assert_eq!(rendered_minute(&server, Some(&manual)), 1260.0);
+        assert_eq!(night_weight(rendered_minute(&server, Some(&manual))), 1.0);
+        let live = WorldTime {
+            minute_f: 1260.5,
+            ..Default::default()
+        };
+        assert_eq!(rendered_minute(&live, Some(&manual)), 1260.5);
+        assert_eq!(rendered_minute(&live, None), 1260.5);
+    }
 
     #[test]
     fn identity_volume_has_exact_axes() {

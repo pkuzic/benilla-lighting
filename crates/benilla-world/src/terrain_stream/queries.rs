@@ -14,6 +14,43 @@ use super::TerrainStreamer;
 #[derive(Resource, Default, PartialEq, Eq)]
 pub struct CurrentArea(pub Option<u32>);
 
+/// MONKEY (reviewfix-a): the area under the CAMERA, written only under `WOW_CAPTURE` while there
+/// is no avatar. A deterministic capture has no body, so [`CurrentArea`] stays `None`; area-keyed
+/// look lanes (zone grading) read this as their capture fallback. The area authority (music,
+/// channels, names) never reads it.
+#[derive(Resource, Default, PartialEq, Eq)]
+pub struct CaptureCameraArea(pub Option<u32>);
+
+/// MONKEY (reviewfix-a): see [`CaptureCameraArea`].
+pub(super) fn update_capture_camera_area(
+    mut out: ResMut<CaptureCameraArea>,
+    focus: Res<crate::terrain_stream::ViewFocus>,
+    streamer: Res<TerrainStreamer>,
+    adt_tiles: Res<Assets<AdtTile>>,
+    camera: Query<&GlobalTransform, With<crate::view::WorldCamera>>,
+    mut capture: Local<Option<bool>>,
+) {
+    if !*capture.get_or_insert_with(|| std::env::var_os("WOW_CAPTURE").is_some())
+        || focus.body_pos().is_some()
+    {
+        return;
+    }
+    let Some(eye) = camera.iter().next().map(GlobalTransform::translation) else {
+        return;
+    };
+    let wow = bevy_to_wow(eye);
+    let (tx, ty) = world_to_tile(wow[0], wow[1]);
+    let found = streamer
+        .tiles
+        .get(&(tx as i32, ty as i32))
+        .and_then(|ts| adt_tiles.get(&ts.handle))
+        .and_then(|adt| benilla_formats::area_id_at(&adt.chunks, wow))
+        .filter(|&id| id != 0);
+    if found.is_some() && out.0 != found {
+        out.0 = found;
+    }
+}
+
 /// The set of [`update_current_area`]. Every consumer that acts on the area orders after it, so
 /// leaf, indoor bit and names come from one frame (the reference resolves them in one pass).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
