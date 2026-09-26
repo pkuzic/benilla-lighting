@@ -1779,6 +1779,16 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // MONKEY (integration): the Westfall sea from 30 yd up, aimed ~72 yd out, so the enhanced
+    // water's 64-80 yd fine/coarse LOD ring crosses the frame centre (review #7, WOW_WATER=2).
+    Scenario {
+        name: "water-ocean-lodring",
+        map: Some(MAP_AZEROTH),
+        eye: [-10500.0, 2112.0, 30.0],
+        look: [-10449.0, 2163.0, 0.0],
+        minute: 720,
+        ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking
