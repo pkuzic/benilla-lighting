@@ -119,7 +119,7 @@ mod probes;
 mod scenarios;
 use crate::run_mode::CaptureMode;
 pub(crate) use depth_probe::DepthProbePlugin;
-use fixtures::{seed_ui_fixture, seed_wind_player};
+use fixtures::{seed_perf_crowd, seed_ui_fixture, seed_wind_player};
 pub(crate) use live_shot::LiveShotPlugin;
 pub(crate) use phase_probe::PhaseProbePlugin;
 pub(crate) use pick_probe::PickProbePlugin;
@@ -913,6 +913,8 @@ impl Plugin for CapturePlugin {
             })
             .add_systems(Update, pin_scene.in_set(WorldStage::Present))
             .add_systems(Update, seed_wind_player)
+            // MONKEY (perf): the probe crowd (`WOW_PERF_CROWD`).
+            .add_systems(Update, seed_perf_crowd)
             // Before the UnitFeed pass: the seed stands in for wire data that in live play
             // filled the app caches on EARLIER frames, so the same frame's feeds (item-template
             // / player-req pushes, then the merchant paint) must all see it. Unordered, the

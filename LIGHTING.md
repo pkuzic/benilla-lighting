@@ -178,6 +178,8 @@ is its own module, documented in `WATER.md`.
   by `cargo check`.
 - Exterior point lights are selected per draw unit (12 slots, ranked against the chunk's box); the
   cube-map occlusion is evaluated for the nearest three.
+- Portal bleed fixtures (`update_bleed_fixtures`, `daylight.rs`) are re-evaluated at 10 Hz, not per
+  frame; a new doorway or a dial change runs it at once. Sources are bucketed per placement.
 
 ## Build
 
@@ -187,6 +189,13 @@ cargo build --release -p benilla
 
 Debug tracing: `WOW_TORCH_TRACE=1`, `WOW_POINTS_DUMP=1`, `WOW_SHADOW_TRACE=1`, and the cvar
 `interiorDebug` 1..4.
+
+Performance: measure a `play`/release build, never `dev`. `WOW_CAPTURE=<scenario>
+WOW_FPS_PROBE=600 WOW_FPS_JOURNAL=<csv> WOW_GPU_PASSES=1 WOW_WIN=2560x1440` prints frame, CPU and
+per-pass GPU times; `BENILLA_HOME=<dir>` supplies the `config.toml` (a capture never seeds the
+Graphics Preset, so write the rows out). `WOW_PERF_CROWD=<n>` stands n players at the look point.
+Night fixtures: `perf-northshire-night`, `perf-abbey-night`. Per-system CPU: build with
+`--features benilla-app/trace_chrome`.
 
 ## Licence
 
