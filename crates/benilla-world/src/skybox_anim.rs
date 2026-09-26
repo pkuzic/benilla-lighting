@@ -240,15 +240,30 @@ impl SkyRig {
     }
 
     /// Every bone's model-space matrix at band time `band_t` and free clock `gseq_now` seconds.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn pose(&self, band_t: f32, gseq_now: f64) -> Vec<Affine3A> {
+        let mut out = Vec::new();
+        self.pose_into(band_t, gseq_now, &mut Vec::new(), &mut out);
+        out
+    }
+
+    /// MONKEY (visualfix): [`Self::pose`] into reused buffers (`scratch` is the resolve memo), so
+    /// the per-frame skybox animation allocates nothing once warm.
+    pub(crate) fn pose_into(
+        &self,
+        band_t: f32,
+        gseq_now: f64,
+        scratch: &mut Vec<Option<Affine3A>>,
+        out: &mut Vec<Affine3A>,
+    ) {
         let n = self.parents.len();
-        let mut out: Vec<Option<Affine3A>> = vec![None; n];
+        scratch.clear();
+        scratch.resize(n, None);
         for i in 0..n {
-            self.resolve(i, band_t, gseq_now, &mut out, 0);
+            self.resolve(i, band_t, gseq_now, scratch, 0);
         }
-        out.into_iter()
-            .map(|m| m.unwrap_or(Affine3A::IDENTITY))
-            .collect()
+        out.clear();
+        out.extend(scratch.iter().map(|m| m.unwrap_or(Affine3A::IDENTITY)));
     }
 
     fn resolve(

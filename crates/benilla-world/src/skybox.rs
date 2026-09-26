@@ -130,6 +130,9 @@ struct SkyboxPart {
     lane: SkyMatLane,
     /// MONKEY (skybox): how the rig moves the batch.
     pose: PartPose,
+    /// MONKEY (visualfix): the model-clock pose generation this skinned batch was last uploaded
+    /// at; an unchanged pose is not re-skinned or re-uploaded.
+    skinned_at: Option<u64>,
 }
 
 /// MONKEY (skybox): how a batch follows its model's rig.
@@ -226,6 +229,23 @@ fn norm(path: &str) -> String {
     }
 }
 
+/// MONKEY (visualfix): `norm(a) == norm(b)` without allocating (the per-frame resolver's test).
+fn norm_eq(a: &str, b: &str) -> bool {
+    fn split(p: &str) -> (&str, bool) {
+        for ext in [".mdx", ".mdl", ".m2"] {
+            let cut = p.len().saturating_sub(ext.len());
+            if let (Some(stem), Some(tail)) = (p.get(..cut), p.get(cut..)) {
+                if tail.eq_ignore_ascii_case(ext) {
+                    return (stem, true);
+                }
+            }
+        }
+        (p, false)
+    }
+    let ((sa, ma), (sb, mb)) = (split(a), split(b));
+    ma == mb && sa.eq_ignore_ascii_case(sb)
+}
+
 /// MONKEY (reviewfix): celestial batches occupy the low rungs and a main model starts immediately
 /// after the largest active celestial model. Oversized art compresses onto the last model rung but
 /// can never collide with the fog cone.
@@ -238,8 +258,7 @@ fn skybox_batch_order(celestial: bool, celestial_batches: u16, batch: usize) -> 
 /// MONKEY (skybox): the modern collector's step on layers (`addSkyBox`): the same model keeps the
 /// larger weight and every other layer is scaled by `1 − weight`.
 fn collect_layer(layers: &mut Vec<SkyboxLayer>, path: &str, weight: f32, flags: u32) {
-    let key = norm(path);
-    let at = match layers.iter().position(|l| norm(&l.path) == key) {
+    let at = match layers.iter().position(|l| norm_eq(&l.path, path)) {
         Some(i) => {
             layers[i].weight = layers[i].weight.max(weight);
             i
@@ -332,7 +351,7 @@ fn resolve_camera_skybox(
                     if w <= 0.0 {
                         continue;
                     }
-                    match layers.iter_mut().find(|l| norm(&l.path) == def.path) {
+                    match layers.iter_mut().find(|l| norm_eq(&l.path, &def.path)) {
                         Some(l) => l.weight = l.weight.max(w),
                         None => layers.push(SkyboxLayer {
                             path: def.path.clone(),
@@ -362,9 +381,11 @@ fn resolve_camera_skybox(
                         nav.flags & SHOW_SKYBOX != 0
                             && inst.visible.get(i).copied().unwrap_or(false)
                     })
-                    .then(|| sky.to_owned())
+                    .then_some(sky)
             })
-            .min();
+            .min()
+            // MONKEY (visualfix): one owned copy for the winner, not one per candidate.
+            .map(str::to_owned);
         // The WMO slot's weight is the interior crossfade `[0xce9bdc]`; a name seen through a
         // doorway at weight 0 fills the slot, which `0x6d4afe` declines to draw.
         if let Some(sky) = resolved {
@@ -372,7 +393,7 @@ fn resolve_camera_skybox(
             let flags = flags_of(&sky);
             if t > 0.0 {
                 collect_layer(&mut layers, &sky, t, flags);
-            } else if !layers.iter().any(|l| norm(&l.path) == norm(&sky)) {
+            } else if !layers.iter().any(|l| norm_eq(&l.path, &sky)) {
                 layers.push(SkyboxLayer {
                     path: sky,
                     weight: 0.0,
@@ -599,6 +620,7 @@ fn build_skybox(
                         anim_alpha: 1.0,
                         lane,
                         pose,
+                        skinned_at: None,
                     },
                 ))
                 .id();
@@ -705,11 +727,18 @@ fn sole_bone(sub: &benilla_formats::RenderSubmesh) -> Option<u16> {
 }
 
 /// MONKEY (skybox): one model's clock and pose this frame.
+#[derive(Default)]
 struct ModelClock {
     band_t: f32,
     gseq: f64,
     live: bool,
     pose: Vec<Affine3A>,
+    /// MONKEY (visualfix): bumped (from a system-wide counter) whenever `pose` changes.
+    generation: u64,
+    /// MONKEY (visualfix): the next pose, sampled here and swapped in when it differs.
+    next: Vec<Affine3A>,
+    /// MONKEY (visualfix): the resolve memo, reused.
+    scratch: Vec<Option<Affine3A>>,
 }
 
 /// MONKEY (skybox): `WOW_SKYBOX_T=<secs>` holds a capture's skybox clock there instead of 0, to
@@ -737,9 +766,13 @@ fn animate_skyboxes(
     mut table: ResMut<crate::mat_anim_table::MatAnimTable>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut parts: Query<(&mut SkyboxPart, &mut SkyboxLocal)>,
+    // MONKEY (visualfix): kept across frames (keys cloned only when a model first shows), with
+    // a pose generation counter so an unchanged skinned pose is not re-uploaded.
     mut clocks: Local<HashMap<String, ModelClock>>,
+    mut generation: Local<u64>,
 ) {
     if want.0.is_empty() {
+        clocks.clear();
         return;
     }
     let deterministic = crate::dev_state::deterministic_run();
@@ -747,9 +780,15 @@ fn animate_skyboxes(
     // narrow the wrapped sequence clock that the f32 track sampler consumes.
     let now = time.elapsed_secs_f64();
     let day = clock.minute.min(1439) as f32 / 1440.0;
-    clocks.clear();
+    clocks.retain(|path, _| want.0.iter().any(|l| l.weight > 0.0 && l.path == *path));
     for layer in want.0.iter().filter(|l| l.weight > 0.0) {
         let Some(rig) = rigs.0.get(&layer.path) else {
+            continue;
+        };
+        if !clocks.contains_key(&layer.path) {
+            clocks.insert(layer.path.clone(), ModelClock::default());
+        }
+        let Some(c) = clocks.get_mut(&layer.path) else {
             continue;
         };
         // A capture poses at `t = 0`, not the bind pose: a converted skybox places its layers with
@@ -767,20 +806,20 @@ fn animate_skyboxes(
             };
             (band_t, now, true)
         };
-        let pose = if live && rig.animates() {
-            rig.pose(rig.band_time(band_t), gseq)
+        if live && rig.animates() {
+            let (next, scratch) = (&mut c.next, &mut c.scratch);
+            rig.pose_into(rig.band_time(band_t), gseq, scratch, next);
         } else {
-            Vec::new()
-        };
-        clocks.insert(
-            layer.path.clone(),
-            ModelClock {
-                band_t,
-                gseq,
-                live,
-                pose,
-            },
-        );
+            c.next.clear();
+        }
+        if c.next != c.pose {
+            std::mem::swap(&mut c.pose, &mut c.next);
+            *generation += 1;
+            c.generation = *generation;
+        }
+        c.band_t = band_t;
+        c.gseq = gseq;
+        c.live = live;
     }
     for (mut part, mut local) in &mut parts {
         let Some(c) = clocks.get(&part.path) else {
@@ -803,6 +842,8 @@ fn animate_skyboxes(
                 .copied()
                 .unwrap_or(Affine3A::IDENTITY)
         };
+        let skinned_at = part.skinned_at;
+        let mut uploaded = false;
         match &part.pose {
             PartPose::Static => {}
             PartPose::Rigid(b) => {
@@ -817,7 +858,7 @@ fn animate_skyboxes(
                 joints,
                 weights,
             } => {
-                if c.pose.is_empty() {
+                if c.pose.is_empty() || skinned_at == Some(c.generation) {
                     continue;
                 }
                 let skinned: Vec<[f32; 3]> = base
@@ -836,7 +877,11 @@ fn animate_skyboxes(
                 if let Some(m) = meshes.get_mut(mesh) {
                     m.insert_attribute(Mesh::ATTRIBUTE_POSITION, skinned);
                 }
+                uploaded = true;
             }
+        }
+        if uploaded {
+            part.skinned_at = Some(c.generation);
         }
     }
 }
@@ -987,6 +1032,25 @@ mod tests {
             weight,
             flags: 0,
             celestial: false,
+        }
+    }
+
+    /// MONKEY (visualfix): the allocation-free comparison agrees with comparing `norm` strings.
+    #[test]
+    fn norm_eq_matches_norm() {
+        let paths = [
+            r"Environments\Stars\StratholmeSkybox.mdx",
+            r"environments\stars\stratholmeskybox.m2",
+            r"ENVIRONMENTS\STARS\STRATHOLMESKYBOX.MDL",
+            r"Environments\Stars\StratholmeSkybox.wmo",
+            r"Environments\Stars\Other.m2",
+            r"m2",
+            r"",
+        ];
+        for a in paths {
+            for b in paths {
+                assert_eq!(norm_eq(a, b), norm(a) == norm(b), "{a} vs {b}");
+            }
         }
     }
 

@@ -32,7 +32,9 @@ fn detailed_cover(uv: vec2<f32>, oct: i32) -> f32 {
     if (a <= 0.0) {
         return 0.0;
     }
-    return sky_fx::cloud_erode(a, sky_fx::cloud_detail(uv, sky_clock.x, oct));
+    // MONKEY (visualfix): centred like the pixel's own erosion.
+    return sky_fx::cloud_erode(a, sky_fx::cloud_detail(uv, sky_clock.x, oct) + 0.5
+        - sky_fx::CLOUD_DETAIL_MEAN);
 }
 #endif
 
@@ -46,7 +48,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 #ifdef SKY_FX_CLOUDS
     if (cfx.fx.x >= 1.5) {
         let n = sky_fx::cloud_detail(in.uv, sky_clock.x, 4);
-        a = sky_fx::cloud_erode(a, n);
+        // MONKEY (visualfix): erode about the detail's mean, so High does not add coverage; the
+        // bias lifted every mid-alpha plateau and drew a ring out of a soft hollow in the tile.
+        a = sky_fx::cloud_erode(a, n + 0.5 - sky_fx::CLOUD_DETAIL_MEAN);
         // A painterly tone inside the mass from the same detail.
         rgb = rgb * (0.93 + 0.14 * n);
         let strength = cfx.lit.w;
@@ -59,9 +63,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             let transmit = exp(-occl * 1.44 * strength);
             // WarcraftXL's ambient floor 0.55, softened toward the painted texel.
             let light = 0.62 + 0.38 * transmit;
-            let ahead = detailed_cover(in.uv + sd * stp * 1.5, 2);
-            let rim = max(ahead - a, 0.0) * (1.0 - a) * transmit * strength;
-            rgb = rgb * mix(1.0, light, strength) + cfx.lit.rgb * rim * 0.9;
+            // MONKEY (visualfix): the silver lining reads a wider footprint ahead and is capped,
+            // and thin cloud is not self-shadowed: thin cloud before the glow stays a diffuse
+            // brightening instead of a dark disc inside a bright, rimmed ring.
+            let ahead = 0.5 * (detailed_cover(in.uv + sd * stp * 1.5, 2)
+                + detailed_cover(in.uv + sd * stp * 3.0, 2));
+            let rim = min(max(ahead - a, 0.0) * (1.0 - a), 0.25) * transmit * strength;
+            let body = smoothstep(0.25, 0.85, a);
+            rgb = rgb * mix(1.0, light, strength * body) + cfx.lit.rgb * rim * 0.9;
             rgb = min(rgb, vec3<f32>(1.0));
         }
     }

@@ -282,6 +282,24 @@ fn water_gerstner(p: vec2<f32>, t: f32, shore: f32) -> vec4<f32> {
     return vec4<f32>(displacement, fold);
 }
 
+// MONKEY (visualfix): the whitecap fold. The two long bands alone cross in a regular diamond
+// lattice, so every crest broke at the same spots; the next two bands (non-integer length and
+// direction ratios to the first two) add their compression at a reduced weight. Mask only: the
+// displaced geometry still moves on the two long bands.
+fn whitecap_fold(p: vec2<f32>, t: f32, shore: f32) -> f32 {
+    var fold = water_gerstner(p, t, shore).w;
+    let energy = clamp(water.mode.y, 0.0, 1.0);
+    let tempo = mix(0.4, 1.0, sqrt(energy));
+    for (var i = 2u; i < 4u; i += 1u) {
+        let wave = WATER_WAVES[i];
+        let direction = vec2<f32>(cos(wave.x), sin(wave.x));
+        let k = 6.2831853 / wave.y;
+        let phase = k * (dot(direction, p) - sqrt(10.72 / k) * tempo * t) + wave.w;
+        fold += 0.55 * WATER_GERSTNER_CHOP * wave.z * energy * shore * k * sin(phase);
+    }
+    return max(fold, 0.0);
+}
+
 // MONKEY (water): seam for the later wet-weather lane. Its result is a height-gradient
 // perturbation in world XZ; zero preserves today's image until that lane supplies rain data.
 // MONKEY (wet): rain rings. Each layer is a grid of cells, one drop per cell at a hashed spot and
@@ -634,7 +652,7 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     let wave = water_waves(p, t, length(eye_pos), footprint, shore, false);
     var open_sea_fold = 0.0;
     if water.mode.x > 1.5 && ocean_mesh {
-        open_sea_fold = water_gerstner(p, t, shore).w;
+        open_sea_fold = whitecap_fold(p, t, shore);
     }
     // One surface gradient: the procedural bands and the shore break.
     let surf_grad = wave.yz + shore_grad + rain_ripple_normal(in.world_position.xyz, footprint,
@@ -840,7 +858,17 @@ fn enhanced_water(in: WaterFragment, shallow: vec4<f32>, deep: vec4<f32>) -> vec
     // MONKEY (water): WarcraftXL's white belongs to a connected horizontal fold, not to every
     // steep normal. Threshold jitter stops identical crests drawing identical white contours.
     let fold_jitter = (noise - 0.5) * 0.04;
-    let breaking = smoothstep(0.13, 0.25, open_sea_fold + fold_jitter);
+    // MONKEY (visualfix): a slow, domain-warped gust field (tens of yards, unrelated to the wave
+    // lengths) moves the break threshold and calms whole patches, so the caps do not repeat.
+    let gust_warp = vec2<f32>(foam_noise(p * 0.013 + vec2<f32>(t * 0.004, 7.3)),
+        foam_noise(p * 0.013 + vec2<f32>(-4.1, t * 0.003))) - vec2<f32>(0.5);
+    let gust = foam_noise(p * 0.037 + gust_warp * 2.3 + t * vec2<f32>(0.006, -0.005));
+    let cap_lo = 0.13 + (0.5 - gust) * 0.16;
+    // A crest breaks in short runs, not along its whole length: ~6 yd warped segments.
+    let segment = smoothstep(0.42, 0.62,
+        foam_noise(p * 0.16 + gust_warp * 1.7 + t * vec2<f32>(0.011, 0.007)));
+    let breaking = smoothstep(cap_lo, cap_lo + 0.14, open_sea_fold + fold_jitter)
+        * smoothstep(0.25, 0.6, gust) * segment;
     let whitecap_alpha = FOAM_WHITECAP * breaking * mix(0.55, 1.0, breakup)
         * smoothstep(0.55, 1.0, energy);
     // The cached derivatives from the top of the function — same expression as before, one tap.
