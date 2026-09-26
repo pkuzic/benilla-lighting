@@ -240,6 +240,16 @@ impl LiquidGrid {
 }
 
 impl WaterChunkInfo {
+    /// MONKEY (visualfix): an ocean surface (pinned to z = 0) whose footprint comes within `reach`
+    /// yards of the WoW XY, for the volumetric haze's sea-level plane.
+    pub fn ocean_within(&self, x: f32, y: f32, reach: f32) -> bool {
+        matches!(self.kind, LiquidKind::Ocean)
+            && x > self.min_x - reach
+            && x < self.max_x + reach
+            && y > self.min_y - reach
+            && y < self.max_y + reach
+    }
+
     /// The grid's highest wet vertex, which `super::real_data` shows is not the surface.
     #[cfg(test)]
     pub(super) fn chunk_max_z(&self) -> f32 {

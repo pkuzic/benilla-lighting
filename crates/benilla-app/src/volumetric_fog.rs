@@ -155,6 +155,11 @@ impl Plugin for VolumetricFogPlugin {
     }
 }
 
+/// MONKEY (visualfix): how near (yd, WoW XY) an ocean footprint must come to arm the sea plane.
+const SEA_PLANE_REACH: f32 = 400.0;
+/// MONKEY (visualfix): the eye must be this far above sea level (yd) for the plane to apply.
+const SEA_LEVEL_MIN_EYE: f32 = 0.25;
+
 fn density(minute: f32, weather: f32, indoors: bool) -> f32 {
     let dawn = (1.0 - ((minute - 390.0) / 90.0).abs()).clamp(0.0, 1.0);
     let dawn = dawn * dawn * (3.0 - 2.0 * dawn);
@@ -249,6 +254,8 @@ fn update_fog(
         With<WorldCamera>,
     >,
     suns: Query<(Entity, &DirectionalLight), With<ShadowSun>>,
+    // MONKEY (visualfix): ocean surfaces, for the haze's sea-level plane.
+    water: Query<&benilla_world::liquid::WaterChunkInfo>,
 ) {
     let tier = override_value.fog.unwrap_or(video.volumetric_fog).min(2);
     let lamp_tier = override_value.lamp.unwrap_or(video.lamp_fog).min(2);
@@ -303,13 +310,24 @@ fn update_fog(
             continue;
         }
         let fog = Vec3::from_array(lighting.fog_color);
+        // MONKEY (visualfix): 1 when the eye is above an ocean in reach. Water writes no depth, so
+        // without this the haze measured the SEABED behind it, and water over no seabed read as
+        // sky and took none: the underwater slope of an island drew a hard wedge across the sea.
+        let sea = camera_transform.map_or(0.0, |t| {
+            let eye = benilla_assets::coords::bevy_to_wow(t.translation());
+            let over = eye[2] > SEA_LEVEL_MIN_EYE
+                && water
+                    .iter()
+                    .any(|w| w.ocean_within(eye[0], eye[1], SEA_PLANE_REACH));
+            if over && tier != 0 { 1.0 } else { 0.0 }
+        });
         // MONKEY (fog): rows 1-3 as packed for the light buffer.
         let rows = monkey.as_ref().map_or([[0.0; 4]; 16], |m| m.pack(0.0, 0.0));
         commands.entity(entity).insert(FogView {
             mf_fog1: Vec4::from_array(rows[1]),
             mf_fog2: Vec4::from_array(rows[2]),
             mf_fog3: Vec4::from_array(rows[3]),
-            lamp_meta: Vec4::new(lamps.count as f32, lamp_strength, 0.0, 0.0),
+            lamp_meta: Vec4::new(lamps.count as f32, lamp_strength, 0.0, sea),
             lamp_positions: lamps.positions,
             lamp_colors: lamps.colors,
             color_density: fog.extend(
@@ -602,7 +620,8 @@ fn visibility(light_index: u32, p: vec3<f32>) -> f32 {
             i32((*light).depth_texture_base_index + cascade), ndc.z);
     }
     // Unknown outside caster coverage is not evidence of direct sunlight.
-    return 0.0;
+    // MONKEY (visualfix): -1 marks "unknown"; the march fills it from the ray's covered samples.
+    return -1.0;
 }
 
 // MONKEY (lampfog): a mild Henyey-Greenstein lobe. The inverse-square term is integrated exactly;
@@ -661,7 +680,21 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
     let z = textureLoad(depth, xy, 0);
     let uv = (pixel.xy - view.viewport.xy) / view.viewport.zw;
     let q = view.world_from_clip * vec4(uv * vec2(2.0, -2.0) + vec2(-1.0, 1.0), max(z, 0.000001), 1.0);
-    let delta = q.xyz / q.w - view.world_position;
+    var delta = q.xyz / q.w - view.world_position;
+    // MONKEY (visualfix): over an ocean, a point below sea level (seabed, or no depth at all under
+    // the horizon) is hazed at the ocean surface (Bevy y = 0), where the eye actually meets it.
+    var sea_surface = false;
+    if (fog.lamp_meta.w > 0.5 && view.world_position.y > 0.0) {
+        let down = normalize(delta);
+        let below = (view.world_position + delta).y < 0.0;
+        if (down.y < -0.0001 && (below || z <= 0.0)) {
+            let to_sea = view.world_position.y / -down.y;
+            if (to_sea < length(delta)) {
+                delta = down * to_sea;
+                sea_surface = true;
+            }
+        }
+    }
     let distance = min(length(delta), 150.0);
     if (distance <= 10.0 && fog.lamp_meta.x < 0.5) { return source; }
     let ray = normalize(delta);
@@ -674,7 +707,7 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
         if (fog_hook::fog_is_modern(fog.mf_fog3)) {
             // MONKEY (fog): the sky (depth 0, clamped to 150 yd above) already carries its own
             // horizon fog, so it takes no distance haze; the haze colour is the shared fog colour.
-            if (z <= 0.0) { opacity = 0.0; }
+            if (z <= 0.0 && !sea_surface) { opacity = 0.0; }
             haze_rgb = fog_hook::fog_modern_colour(fog.color_density.rgb, ray, length(delta),
                 fog.mf_fog1, fog.mf_fog2, fog.mf_fog3);
         }
@@ -694,12 +727,23 @@ fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
             var scatter = 0.0;
             for (var light_index = 0u; light_index < lights.n_directional_lights; light_index += 1u) {
                 if ((lights.directional_lights[light_index].flags & 3u) != 3u) { continue; }
+                // MONKEY (visualfix): a sample past the cascade (beyond shadowDistance) takes the
+                // mean of this ray's covered samples, not 0: a hard 0 cut the sun lobe into rings
+                // of the far-bound step. A ray that starts in a dark room stays dark.
+                var known = 0.0;
+                var known_count = 0.0;
                 for (var step = 0u; step < count; step += 1u) {
                     // Fixed midpoint samples: no temporal noise in this gamma lane.
                     let t = 10.0 + (f32(step) + 0.5) * step_size;
                     let density = fog.color_density.w * smoothstep(10.0, 30.0, t);
-                    scatter += visibility(light_index, view.world_position + ray*t)
-                        * exp(-fog.color_density.w * fog_path(t)) * density * step_size;
+                    var seen = visibility(light_index, view.world_position + ray*t);
+                    if (seen >= 0.0) {
+                        known += seen;
+                        known_count += 1.0;
+                    } else {
+                        seen = select(0.0, known / known_count, known_count > 0.0);
+                    }
+                    scatter += seen * exp(-fog.color_density.w * fog_path(t)) * density * step_size;
                 }
             }
             let shafts = fog.sun_strength.rgb * fog.sun_strength.w * phase * scatter;
