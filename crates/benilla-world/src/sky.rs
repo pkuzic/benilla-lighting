@@ -17,7 +17,7 @@ use bevy::pbr::{
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, Buffer, RenderPipelineDescriptor, SpecializedMeshPipelineError,
 };
 use bevy::shader::ShaderRef;
 
@@ -57,7 +57,8 @@ pub struct SkyExt {
     #[uniform(100)]
     pub(crate) warp: Vec4,
     /// MONKEY (sky): `x` the [`crate::sky_fx::SkyQuality`] tier (0 = Classic, the fields below
-    /// unused), `y` the sky clock in seconds, `z` the night-sky alpha, `w` the sun-glow strength.
+    /// unused), `y` reserved (0; the clock is [`Self::clock`]), `z` the night-sky alpha, `w` the
+    /// sun-glow strength.
     #[uniform(100)]
     pub(crate) fx: Vec4,
     /// MONKEY (sky): camera to the visible sun (`xyz`).
@@ -73,6 +74,10 @@ pub struct SkyExt {
     pub(crate) mf_fog_c: Vec4,
     #[uniform(100)]
     pub(crate) mf_fog_d: Vec4,
+    /// MONKEY (polish): the shared sky clock ([`crate::sky_fx::SkyClockBuffer`]), outside the
+    /// uniform so the clock never rewrites the material.
+    #[storage(101, read_only, buffer)]
+    pub(crate) clock: Buffer,
 }
 
 /// MONKEY (sky): the pipeline key: Enhanced/High compile `SKY_FX` into `sky.wgsl`; Classic keeps
@@ -206,7 +211,11 @@ fn setup_sky(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<SkyMaterial>>,
+    clock: Option<Res<crate::sky_fx::SkyClockBuffer>>,
 ) {
+    let Some(clock) = clock else {
+        return;
+    };
     let mesh = meshes.add(dome_mesh());
     // Seeded with the neutral-day fallback; `update_sky_colors` overwrites from Light.dbc each frame.
     let material = materials.add(SkyMaterial {
@@ -231,6 +240,7 @@ fn setup_sky(
             mf_fog_b: Vec4::ZERO,
             mf_fog_c: Vec4::ZERO,
             mf_fog_d: Vec4::ZERO,
+            clock: clock.0.clone(),
         },
     });
     commands.spawn((
@@ -293,9 +303,8 @@ fn apply_sky_visibility(
 #[allow(clippy::too_many_arguments)]
 fn update_sky_colors(
     light: Res<WowLighting>,
-    // MONKEY (sky): the tier, the sky clock and the cloud cover over the sun.
+    // MONKEY (sky): the tier and the cloud cover over the sun.
     quality: Res<crate::sky_fx::SkyQuality>,
-    clock: Res<crate::sky_fx::SkyClock>,
     clouds: Res<crate::clouds::CloudCoverage>,
     // MONKEY (fog): the Modern fog rows for the shared horizon colour.
     monkey: Res<crate::lighting::MonkeyFrame>,
@@ -326,7 +335,7 @@ fn update_sky_colors(
         0.0,
     );
     // MONKEY (sky): the Enhanced/High inputs; all zero at Classic so the write gate stays quiet.
-    let (fx, sun_v, glow) = sky_fx_inputs(&light, *quality, clock.secs, &clouds);
+    let (fx, sun_v, glow) = sky_fx_inputs(&light, *quality, &clouds);
     // MONKEY (fog): rows B-D as packed for the light buffer; clock lanes are not read here.
     let rows = monkey.pack(0.0, 0.0);
     let mf_fog = [
@@ -374,7 +383,6 @@ fn update_sky_colors(
 fn sky_fx_inputs(
     light: &WowLighting,
     quality: crate::sky_fx::SkyQuality,
-    secs: f32,
     clouds: &crate::clouds::CloudCoverage,
 ) -> (Vec4, Vec4, Vec4) {
     if !quality.enhanced() {
@@ -393,7 +401,7 @@ fn sky_fx_inputs(
     // Quantized like every other lane here, so an idle frame writes nothing.
     let q = |v: f32| benilla_assets::quantize(v, 4096.0);
     (
-        Vec4::new(f32::from(quality.0), secs, q(night), q(strength)),
+        Vec4::new(f32::from(quality.0), 0.0, q(night), q(strength)),
         Vec4::new(q(sun.x), q(sun.y), q(sun.z), 0.0),
         Vec4::new(q(glow.x), q(glow.y), q(glow.z), 0.0),
     )

@@ -24,8 +24,15 @@
 //! the game day, `0x2` keeps the celestial pass, `0x4` draws a fog-colour cone over the horizon;
 //! a celestial model draws as a layer under its main model. Every batch animates
 //! ([`crate::skybox_anim`]): bones, texture transforms, colour and alpha tracks.
+//!
+//! MONKEY (reviewfix): those M2-fidelity repairs deliberately also apply when `zoneSkyboxes` is
+//! off. The reference WMO and ghost slots animate their authored colour/alpha and texture tracks,
+//! use non-white M2 colours, and draw batches in authored order; deterministic captures pose those
+//! same tracks at their pinned time rather than substituting the bind pose. The batch-order layout
+//! leaves room for a celestial under-layer and the final fog cone. The cvar gates the added
+//! zone slot, not fixes to the two 1.12 slots.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy::asset::RenderAssetUsages;
@@ -47,11 +54,9 @@ use benilla_formats::{SKYBOX_FOG_BLEND, SKYBOX_FULL_DAY, SKYBOX_KEEP_CELESTIAL};
 /// `WmoGroupNav::flags`.
 const SHOW_SKYBOX: u32 = 0x40000;
 
-/// MONKEY (skybox): batch-order base of a main model's batches; a celestial layer takes `1..`, so
-/// it draws first, under the main model, and the fog cone takes [`FOG_CONE_ORDER`], last.
-const MAIN_ORDER_BASE: u16 = 24;
-/// MONKEY (skybox): the fog cone's batch order, the band's last distinct step.
-const FOG_CONE_ORDER: u16 = 56;
+/// MONKEY (reviewfix): the fog cone owns the skybox band's final distinct rung. Orders above this
+/// clamp onto it in [`crate::model_render::skybox_sort_bias`], so model batches stop one rung below.
+const FOG_CONE_ORDER: u16 = 58;
 
 /// MONKEY (skybox): cvar `zoneSkyboxes` (0/1, default 0): draw the living player's zone skybox
 /// from `LightParams`. Off leaves the reference's two slots only.
@@ -147,9 +152,10 @@ enum PartPose {
 #[derive(Component, Default)]
 struct SkyboxLocal(Affine3A);
 
-/// Skybox paths built this session, failed loads included, so a failure is not retried per frame.
+/// Skybox paths built this session в†’ their batch counts. Failed loads use zero, so a failure is not
+/// retried per frame; successful celestial counts set the main model's dynamic order base.
 #[derive(Resource, Default)]
-struct BuiltSkyboxes(HashSet<String>);
+struct BuiltSkyboxes(HashMap<String, u16>);
 
 /// MONKEY (skybox): each built model's rig, by path.
 #[derive(Resource, Default)]
@@ -218,6 +224,15 @@ fn norm(path: &str) -> String {
         Some(stem) => format!("{stem}.m2"),
         None => lower,
     }
+}
+
+/// MONKEY (reviewfix): celestial batches occupy the low rungs and a main model starts immediately
+/// after the largest active celestial model. Oversized art compresses onto the last model rung but
+/// can never collide with the fog cone.
+fn skybox_batch_order(celestial: bool, celestial_batches: u16, batch: usize) -> u16 {
+    let base = if celestial { 0 } else { celestial_batches };
+    base.saturating_add(u16::try_from(batch.saturating_add(1)).unwrap_or(u16::MAX))
+        .min(FOG_CONE_ORDER - 1)
 }
 
 /// MONKEY (skybox): the modern collector's step on layers (`addSkyBox`): the same model keeps the
@@ -423,9 +438,13 @@ fn build_skybox(
     if cone.entity.is_none() && want.0.iter().any(|l| l.flags & SKYBOX_FOG_BLEND != 0) {
         build_fog_cone(&mut commands, &mut cone, &mut meshes, &mut table, &mut mats);
     }
-    for layer in &want.0 {
+    // MONKEY (reviewfix): build celestial models first so main bases derive from their real batch
+    // counts instead of a fixed split that aliases sufficiently large models.
+    let mut pending: Vec<_> = want.0.iter().collect();
+    pending.sort_by_key(|layer| !layer.celestial);
+    for layer in pending {
         let path = layer.path.as_str();
-        if built.0.contains(path) {
+        if built.0.contains_key(path) {
             continue;
         }
         // MONKEY (skybox): the rig, off the same bytes the batches come from.
@@ -445,16 +464,22 @@ fn build_skybox(
             Ok(subs) if !subs.is_empty() => subs,
             Ok(_) => {
                 warn!("skybox '{path}' has no render batches — keeping the gradient dome");
-                built.0.insert(path.to_string());
+                built.0.insert(path.to_string(), 0);
                 continue;
             }
             Err(e) => {
                 warn!("skybox '{path}' failed to load, keeping the gradient dome: {e:#}");
-                built.0.insert(path.to_string());
+                built.0.insert(path.to_string(), 0);
                 continue;
             }
         };
-        let base = if layer.celestial { 0 } else { MAIN_ORDER_BASE };
+        let celestial_batches = want
+            .0
+            .iter()
+            .filter(|layer| layer.celestial)
+            .filter_map(|layer| built.0.get(&layer.path).copied())
+            .max()
+            .unwrap_or(0);
         for (i, sub) in subs.iter().enumerate() {
             let mut mesh = Mesh::new(
                 PrimitiveTopology::TriangleList,
@@ -498,7 +523,7 @@ fn build_skybox(
             let tint = sub.rgb_anim.clone().map(Arc::new);
             // The authored batch order after the layer's base (0 is unordered): every batch shares
             // one sort distance.
-            let order = base + u16::try_from(i + 1).unwrap_or(0);
+            let order = skybox_batch_order(layer.celestial, celestial_batches, i);
             let Some(mut pair) = mats.skybox(sub, texture, order, uv.as_ref(), tint.as_ref())
             else {
                 return; // light buffer vanished mid-build; `built` is unlatched, so we retry
@@ -534,14 +559,16 @@ fn build_skybox(
                     }
                 }
             }
+            let mut lane_materials = [pair.steady.clone(), pair.fade_blend.clone()];
             let lane = SkyMatLane::register(
                 sub,
                 uv,
                 tint,
                 &mut table,
                 mats.materials(),
-                &[pair.steady.id(), pair.fade_blend.id()],
+                &mut lane_materials,
             );
+            [pair.steady, pair.fade_blend] = lane_materials;
             let mesh = meshes.add(mesh);
             let pose = match sole_bone(sub) {
                 Some(b) if rig.bone_moves(b) => PartPose::Rigid(b),
@@ -581,7 +608,9 @@ fn build_skybox(
             }
         }
         rigs.0.insert(path.to_string(), rig);
-        built.0.insert(path.to_string());
+        built
+            .0
+            .insert(path.to_string(), u16::try_from(subs.len()).unwrap_or(u16::MAX));
     }
 }
 
@@ -714,7 +743,9 @@ fn animate_skyboxes(
         return;
     }
     let deterministic = crate::dev_state::deterministic_run();
-    let now = time.elapsed_secs();
+    // MONKEY (reviewfix): retain sub-frame precision for skybox loops across long sessions; only
+    // narrow the wrapped sequence clock that the f32 track sampler consumes.
+    let now = time.elapsed_secs_f64();
     let day = clock.minute.min(1439) as f32 / 1440.0;
     clocks.clear();
     for layer in want.0.iter().filter(|l| l.weight > 0.0) {
@@ -724,12 +755,17 @@ fn animate_skyboxes(
         // A capture poses at `t = 0`, not the bind pose: a converted skybox places its layers with
         // bone keys, and every row at `t = 0` is its seed.
         let (band_t, gseq, live) = if layer.flags & SKYBOX_FULL_DAY != 0 {
-            let g = if deterministic { 0.0 } else { f64::from(now) };
+            let g = if deterministic { 0.0 } else { now };
             (rig.duration * day, g, true)
         } else if deterministic {
             (capture_t(), f64::from(capture_t()), true)
         } else {
-            (now, f64::from(now), true)
+            let band_t = if rig.duration > 0.0 {
+                (now % f64::from(rig.duration)) as f32
+            } else {
+                0.0
+            };
+            (band_t, now, true)
         };
         let pose = if live && rig.animates() {
             rig.pose(rig.band_time(band_t), gseq)
@@ -952,6 +988,15 @@ mod tests {
             flags: 0,
             celestial: false,
         }
+    }
+
+    #[test]
+    fn skybox_order_bands_follow_batch_counts_and_reserve_the_cone() {
+        assert_eq!(skybox_batch_order(true, 0, 23), 24);
+        assert_eq!(skybox_batch_order(false, 24, 0), 25);
+        assert_eq!(skybox_batch_order(false, 0, 31), 32);
+        assert_eq!(skybox_batch_order(false, 40, usize::MAX), FOG_CONE_ORDER - 1);
+        assert_eq!(FOG_CONE_ORDER, 58);
     }
 
     #[test]

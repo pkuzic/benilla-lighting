@@ -9,6 +9,12 @@
 //! Ported from WarcraftXL (https://github.com/WarcraftXL) by iThorgrim — module wxl-retail-clouds, Clouds.cpp, Clouds.hpp.
 
 use bevy::prelude::*;
+use bevy::render::{
+    extract_resource::{ExtractResource, ExtractResourcePlugin},
+    render_resource::{Buffer, BufferDescriptor, BufferUsages},
+    renderer::{RenderDevice, RenderQueue},
+    Render, RenderApp, RenderSystems,
+};
 
 /// The sky tier: 0 Classic, 1 Enhanced, 2 High. Written by the app from the `skyQuality` cvar;
 /// `$WOW_SKY_QUALITY` pins it for the session (captures).
@@ -41,8 +47,8 @@ impl SkyQuality {
 ///
 /// MONKEY (fix-sky): it wrapped hourly in f32, and every star's twinkle jumped at the wrap. Now it
 /// accumulates in f64 and wraps at [`SKY_CLOCK_WRAP_S`]; the shader's twinkle rates are whole
-/// cycles per wrap (seamless). The High cloud-detail drift still re-patterns at the wrap, once
-/// per 24 h of continuous play.
+/// cycles per wrap (seamless). MONKEY (polish): the High cloud detail tiles and drifts whole
+/// tiles per wrap (`CLOUD_TILE`, `CLOUD_DRIFT_TILES`), so it is seamless there too.
 #[derive(Resource, Default)]
 pub struct SkyClock {
     pub secs: f32,
@@ -52,6 +58,25 @@ pub struct SkyClock {
 
 /// The sky clock's wrap in seconds; `sky_fx.wgsl`'s `SKY_WRAP` must match.
 pub const SKY_CLOCK_WRAP_S: f64 = 86_400.0;
+
+/// MONKEY (polish): the sky clock on the GPU, one `vec4` (`x` = [`SkyClock::secs`]) that the sky
+/// and cloud materials bind read-only. It is rewritten in place each frame in the render world,
+/// so the materials re-prepare only when a real input moves, not to advance the clock. Bevy's
+/// `globals.time` is not used: it wraps hourly, and the twinkle rates are whole cycles per day.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct SkyClockBuffer(pub Buffer);
+
+/// The clock value the render world uploads.
+#[derive(Resource, Clone, Copy)]
+struct SkyClockSecs(f32);
+
+impl ExtractResource for SkyClockSecs {
+    type Source = SkyClock;
+
+    fn extract_resource(source: &SkyClock) -> Self {
+        Self(source.secs)
+    }
+}
 
 /// How strongly the glow shows: a broad halo at `GLOW_GAIN` × the sun colour at the sun itself.
 pub(crate) const GLOW_GAIN: f32 = 0.22;
@@ -92,8 +117,48 @@ impl Plugin for SkyFxPlugin {
         let quality = SkyQuality(SkyQuality::env_override().unwrap_or(0));
         app.insert_resource(quality)
             // MONKEY (integration): the clock ticks before its readers (sky colours, cloud FX).
-            .add_systems(Update, tick_sky_clock.before(crate::lighting::LightingConsumeSet));
+            .add_systems(Update, tick_sky_clock.before(crate::lighting::LightingConsumeSet))
+            // Beside the shared light buffer, ahead of the sky and cloud materials built after it.
+            .add_systems(
+                Startup,
+                init_sky_clock_buffer.in_set(benilla_assets::AssetSet::Open),
+            )
+            .add_plugins((
+                ExtractResourcePlugin::<SkyClockBuffer>::default(),
+                ExtractResourcePlugin::<SkyClockSecs>::default(),
+            ));
+        if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
+            render_app.add_systems(
+                Render,
+                upload_sky_clock.in_set(RenderSystems::PrepareResources),
+            );
+        }
     }
+}
+
+/// A headless build has no device, and then no sky or cloud dome either.
+fn init_sky_clock_buffer(mut commands: Commands, device: Option<Res<RenderDevice>>) {
+    let Some(device) = device else {
+        return;
+    };
+    commands.insert_resource(SkyClockBuffer(device.create_buffer(&BufferDescriptor {
+        label: Some("sky_clock"),
+        size: 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })));
+}
+
+/// Render-world: the clock into the shared buffer before any sky draw reads it.
+fn upload_sky_clock(
+    queue: Res<RenderQueue>,
+    buffer: Option<Res<SkyClockBuffer>>,
+    secs: Option<Res<SkyClockSecs>>,
+) {
+    let (Some(buffer), Some(secs)) = (buffer, secs) else {
+        return;
+    };
+    queue.write_buffer(&buffer.0, 0, bytemuck::cast_slice(&[secs.0, 0.0, 0.0, 0.0]));
 }
 
 fn tick_sky_clock(time: Res<Time>, mut clock: ResMut<SkyClock>) {
@@ -110,6 +175,39 @@ fn tick_sky_clock(time: Res<Time>, mut clock: ResMut<SkyClock>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `const NAME ... = <value>;` line of `sky_fx.wgsl`, as text.
+    fn wgsl_const(name: &str) -> String {
+        let src = include_str!("shaders/sky_fx.wgsl");
+        let line = src
+            .lines()
+            .find(|l| l.starts_with(&format!("const {name}:")))
+            .unwrap_or_else(|| panic!("no const {name}"));
+        let value = line.split('=').nth(1).unwrap().trim();
+        value.trim_end_matches(';').trim().to_string()
+    }
+
+    #[test]
+    fn the_shader_wrap_and_the_cloud_loop_match_the_clock() {
+        let wrap: f64 = wgsl_const("SKY_WRAP").parse().unwrap();
+        assert_eq!(wrap, SKY_CLOCK_WRAP_S);
+        // The loop needs an even tile (the half-rate warp tiles at half of it) and whole tiles of
+        // drift per wrap; the rates stay within 5% of WarcraftXL's 0.011 and 0.0043 cells/s.
+        let tile: i32 = wgsl_const("CLOUD_TILE").parse().unwrap();
+        assert!(tile > 0 && tile % 2 == 0);
+        let drift = wgsl_const("CLOUD_DRIFT_TILES");
+        let tiles: Vec<f64> = drift
+            .trim_start_matches("vec2<f32>(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|v| v.trim().parse().unwrap())
+            .collect();
+        for (n, rate) in tiles.iter().zip([0.011, 0.0043]) {
+            assert_eq!(n.fract(), 0.0, "whole tiles per wrap");
+            let actual = n * f64::from(tile) / SKY_CLOCK_WRAP_S;
+            assert!((actual / rate - 1.0).abs() < 0.05, "drift {actual} vs {rate}");
+        }
+    }
 
     #[test]
     fn glow_fades_out_below_the_horizon_and_under_cloud() {

@@ -5732,3 +5732,29 @@ fn the_guild_line_greys_with_player_names_and_the_follow_speed_with_the_style() 
     assert!(speed_thumb(&mut s));
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
+
+/// MONKEY (reviewfix-a): the Advanced Graphics farclip slider's range is `view::FARCLIP_RANGE`,
+/// and its 60-yd grid lands exactly on the maximum (the 1.12 grid the page advertises).
+#[test]
+fn farclip_slider_range_is_the_view_range() {
+    let xml = include_str!("../../assets/ui/OptionsFrame.xml");
+    let row = xml
+        .split("<Frame name=\"$parentRowRenderDistance\"")
+        .nth(1)
+        .expect("the farclip row");
+    let args = row
+        .split("OptionsSliderRow_Setup(self, ")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .expect("the slider setup call");
+    let nums: Vec<f32> = args
+        .split(',')
+        .take(3)
+        .map(|v| v.trim().parse().expect("numeric slider bound"))
+        .collect();
+    let range = benilla_world::view::FARCLIP_RANGE;
+    assert_eq!(nums[0], *range.start(), "slider min");
+    assert_eq!(nums[1], benilla_world::view::FARCLIP_MAX, "slider max");
+    assert_eq!(nums[1], *range.end());
+    assert_eq!((nums[1] - nums[0]) % nums[2], 0.0, "the step lands on the maximum");
+}

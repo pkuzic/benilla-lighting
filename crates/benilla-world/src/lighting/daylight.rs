@@ -1811,9 +1811,14 @@ impl BleedSeed {
     }
 }
 
+/// MONKEY (perf): seconds between two bleed evaluations (see [`update_bleed_fixtures`]).
+const BLEED_EVAL_PERIOD: f64 = 0.1;
+
 /// One interior-lane source as the bleed evaluation needs it — the packer's own arithmetic, minus
 /// the flicker (a bleed must not breathe with the hearth it carries: the pool it feeds is a whole
 /// doorway, and a wobbling doorway is a wobbling building).
+// MONKEY (perf): Copy, so the per-placement buckets in `update_bleed_fixtures` can hold rows.
+#[derive(Clone, Copy)]
 struct BleedSource<'a> {
     pos: Vec3,
     /// Committed colour, NORMALISED like the shader's `c_norm`.
@@ -1981,7 +1986,22 @@ pub fn update_bleed_fixtures(
     >,
     time: Res<Time>,
     mut last_dump: Local<f64>,
+    // MONKEY (perf): the 10 Hz cadence below, and the arrivals that bypass it.
+    mut next_eval: Local<f64>,
+    added: Query<(), Added<BleedFixture>>,
 ) {
+    // MONKEY (perf): a doorway carries the time of day and its rooms' static fixtures, so it is
+    // re-evaluated at 10 Hz rather than every frame (~0.5 ms/frame of main thread in Northshire at
+    // High). A new doorway, a dial move or the lane switching runs it at once.
+    let now_s = time.elapsed_secs_f64();
+    let urgent = !added.is_empty()
+        || knobs.is_changed()
+        || fire_gain.is_changed()
+        || spell_gain.is_changed();
+    if !urgent && now_s < *next_eval && now_s >= *next_eval - BLEED_EVAL_PERIOD {
+        return;
+    }
+    *next_eval = now_s + BLEED_EVAL_PERIOD;
     // The room lane being off is the feature being off, exactly as for a daylight fixture.
     let on = knobs.enabled && bleed_enabled();
     // The packed fill gain — `interiorFill x interiorGain`, the same product `build_light_data`
@@ -2057,6 +2077,24 @@ pub fn update_bleed_fixtures(
     } else {
         Vec::new()
     };
+    // MONKEY (perf): bucket the sources per placement once. `claim_weight` gives a source that
+    // claims ANOTHER placement weight 0, so each doorway only needs its own placement's claimants
+    // plus the ungated ones — same rows, same order, same sums. Walking every interior source in
+    // the world four times per doorway measured ~1 ms/frame in Northshire at High.
+    let mut by_placement: HashMap<Entity, Vec<BleedSource<'_>>> =
+        live.iter().map(|i| (*i, Vec::new())).collect();
+    for s in &src {
+        match s.claims.filter(|c| !c.rooms.groups.is_empty()) {
+            Some(c) => {
+                if let Some(v) = by_placement.get_mut(&c.rooms.instance) {
+                    v.push(*s);
+                }
+            }
+            None => by_placement.values_mut().for_each(|v| v.push(*s)),
+        }
+    }
+    let empty: Vec<BleedSource<'_>> = Vec::new();
+    let placement_src = |instance: Entity| by_placement.get(&instance).unwrap_or(&empty).as_slice();
 
     /// One bleed fixture's per-frame working row — the two passes' shared scratch.
     struct Row {
@@ -2082,8 +2120,8 @@ pub fn update_bleed_fixtures(
         let r_eff = super::interior_reach(reach.map_or(fx.reach, |r| r.0), knobs.atten_scale);
         let lit = if on {
             brighter(
-                room_irradiance(&src, &[], bl.probe, fx.instance, bl.sides[0], k_fill),
-                room_irradiance(&src, &[], bl.probe, fx.instance, bl.sides[1], k_fill),
+                room_irradiance(placement_src(fx.instance), &[], bl.probe, fx.instance, bl.sides[0], k_fill),
+                room_irradiance(placement_src(fx.instance), &[], bl.probe, fx.instance, bl.sides[1], k_fill),
             )
         } else {
             [0.0; 3]
@@ -2133,7 +2171,7 @@ pub fn update_bleed_fixtures(
         let lit = if on {
             brighter(
                 room_irradiance(
-                    &src,
+                    placement_src(r.instance),
                     &side_extra(r.sides[0]),
                     r.probe,
                     r.instance,
@@ -2141,7 +2179,7 @@ pub fn update_bleed_fixtures(
                     k_fill,
                 ),
                 room_irradiance(
-                    &src,
+                    placement_src(r.instance),
                     &side_extra(r.sides[1]),
                     r.probe,
                     r.instance,
@@ -2164,8 +2202,12 @@ pub fn update_bleed_fixtures(
         };
         match pl {
             Some(mut pl) if *intensity > 1e-4 => {
-                pl.color = *hue;
-                pl.intensity = 4.0 * std::f32::consts::PI * intensity;
+                // MONKEY (perf): write only a real change, so the packer's change ticks stay quiet.
+                let packed = 4.0 * std::f32::consts::PI * intensity;
+                if pl.color != *hue || pl.intensity != packed {
+                    pl.color = *hue;
+                    pl.intensity = packed;
+                }
             }
             Some(_) => {
                 commands.entity(r.e).remove::<WorldPointLight>();

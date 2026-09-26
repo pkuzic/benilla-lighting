@@ -14,7 +14,7 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var cloud_tex: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var cloud_samp: sampler;
 
-// MONKEY (sky): `fx.x` the sky tier, `.y` the sky clock (s), `.zw` the unit direction toward the
+// MONKEY (sky): `fx.x` the sky tier, `.y` reserved, `.zw` the unit direction toward the
 // glow body on the sheet (u = world x, v = world z); `lit.rgb` the Light.dbc cloud sun colour
 // (gamma), `.w` the march strength (the body's flatness × the glow envelope).
 struct CloudFx {
@@ -22,6 +22,8 @@ struct CloudFx {
     lit: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> cfx: CloudFx;
+// MONKEY (polish): x = the sky clock (s, wrapped at a day), written per frame outside the material.
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var<storage, read> sky_clock: vec4<f32>;
 
 #ifdef SKY_FX_CLOUDS
 // MONKEY (sky): coverage with detail at a sheet point; `oct` detail octaves.
@@ -30,7 +32,7 @@ fn detailed_cover(uv: vec2<f32>, oct: i32) -> f32 {
     if (a <= 0.0) {
         return 0.0;
     }
-    return sky_fx::cloud_erode(a, sky_fx::cloud_detail(uv, cfx.fx.y, oct));
+    return sky_fx::cloud_erode(a, sky_fx::cloud_detail(uv, sky_clock.x, oct));
 }
 #endif
 
@@ -43,7 +45,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // kernel's texels as they are.
 #ifdef SKY_FX_CLOUDS
     if (cfx.fx.x >= 1.5) {
-        let n = sky_fx::cloud_detail(in.uv, cfx.fx.y, 4);
+        let n = sky_fx::cloud_detail(in.uv, sky_clock.x, 4);
         a = sky_fx::cloud_erode(a, n);
         // A painterly tone inside the mass from the same detail.
         rgb = rgb * (0.93 + 0.14 * n);

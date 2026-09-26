@@ -135,7 +135,14 @@ impl Plugin for VolumetricFogPlugin {
             .insert_resource(FogShader(shader))
             .init_resource::<SpecializedRenderPipelines<FogPipeline>>()
             .add_systems(RenderStartup, init_pipeline)
-            .add_systems(Render, prepare_pipelines.in_set(RenderSystems::Prepare))
+            .add_systems(
+                Render,
+                (
+                    prepare_pipelines.in_set(RenderSystems::Prepare),
+                    // MONKEY (reviewfix-a): one uniform per view, rewritten, not allocated per frame.
+                    prepare_fog_uniforms.in_set(RenderSystems::PrepareResources),
+                ),
+            )
             .add_render_graph_node::<ViewNodeRunner<FogNode>>(Core3d, FogLabel)
             .add_render_graph_edges(
                 Core3d,
@@ -289,6 +296,12 @@ fn update_fog(
         } else {
             FogLamps::default()
         };
+        // MONKEY (reviewfix-a): no haze tier and no lamp in range is an identity pass — skip the
+        // node (and its depth bind and ping-pong) rather than run it every frame.
+        if tier == 0 && lamps.count == 0 {
+            commands.entity(entity).remove::<FogView>();
+            continue;
+        }
         let fog = Vec3::from_array(lighting.fog_color);
         // MONKEY (fog): rows 1-3 as packed for the light buffer.
         let rows = monkey.as_ref().map_or([[0.0; 4]; 16], |m| m.pack(0.0, 0.0));
@@ -323,6 +336,31 @@ fn update_fog(
 
 #[derive(Resource)]
 struct FogShader(Handle<Shader>);
+
+/// MONKEY (reviewfix-a): the view's fog uniform, created once and rewritten in prepare.
+#[derive(Component)]
+struct FogUniform(UniformBuffer<FogView>);
+
+fn prepare_fog_uniforms(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut views: Query<(Entity, &FogView, Option<&mut FogUniform>)>,
+) {
+    for (entity, fog, uniform) in &mut views {
+        match uniform {
+            Some(mut uniform) => {
+                uniform.0.set(*fog);
+                uniform.0.write_buffer(&device, &queue);
+            }
+            None => {
+                let mut uniform = UniformBuffer::from(*fog);
+                uniform.write_buffer(&device, &queue);
+                commands.entity(entity).insert(FogUniform(uniform));
+            }
+        }
+    }
+}
 #[derive(Resource)]
 struct FogPipeline {
     layouts: [BindGroupLayoutDescriptor; 2],
@@ -441,7 +479,7 @@ impl ViewNode for FogNode {
         &'static ViewUniformOffset,
         &'static ViewLightsUniformOffset,
         &'static ViewShadowBindings,
-        &'static FogView,
+        &'static FogUniform,
         &'static ViewFogPipeline,
     );
     fn run<'w>(
@@ -474,8 +512,6 @@ impl ViewNode for FogNode {
         };
         let settings = world.resource::<FogPipeline>();
         let device = context.render_device();
-        let mut uniform = UniformBuffer::from(*fog);
-        uniform.write_buffer(device, world.resource::<RenderQueue>());
         let out = target.post_process_write();
         let bind = device.create_bind_group(
             "gamma_fog",
@@ -489,7 +525,7 @@ impl ViewNode for FogNode {
                 lights,
                 &shadows.directional_light_depth_texture_view,
                 &settings.comparison,
-                uniform.binding().unwrap(),
+                fog.0.binding().unwrap(),
             )),
         );
         let diagnostics = context.diagnostic_recorder();

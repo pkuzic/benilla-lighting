@@ -2,8 +2,10 @@
 //!
 //! Wgpu has no tessellation stage.  The coarse grid therefore remains the streamed source of
 //! truth, while a 4x bilinear copy is built only when the camera enters the surface's near ring.
-//! Every original edge vertex survives bit-for-bit, so a fine chunk and its coarse neighbour share
-//! the same boundary.  Hysteresis avoids rebuilding while the camera hovers at the threshold.
+//! Every original edge vertex survives bit-for-bit. Non-corner fine vertices on an outer edge carry
+//! a compact stitch tag in UV1.y, so the vertex shader lerps the displaced coarse endpoints instead
+//! of evaluating a new Gerstner point that can leave the neighbour's straight edge. Hysteresis
+//! avoids rebuilding while the camera hovers at the threshold.
 //! A full MCLQ copy is 1,089 vertices + 6,144 indices (about 68 KiB without allocator overhead);
 //! the 64 yd ring bounds ordinary terrain residency to roughly 3.5 MiB, and a per-surface ceiling
 //! refuses pathological MLIQ grids rather than allowing one pool to consume an unbounded copy.
@@ -135,6 +137,46 @@ fn bilerp<const N: usize>(
     out
 }
 
+/// MONKEY (reviewfix): encode an outer-edge fine vertex as `axis/sign + coarse-edge fraction`.
+/// UV1.y is otherwise zero. Coarse corners and interior fine vertices need no stitch.
+fn stitch_tag(
+    positions: &[[f32; 3]],
+    cols: usize,
+    rows: usize,
+    fine_cols: usize,
+    fine_rows: usize,
+    fx: usize,
+    fy: usize,
+    sx: usize,
+    sy: usize,
+    tx: f32,
+    ty: f32,
+) -> f32 {
+    let (a, b, t) = if (fy == 0 || fy + 1 == fine_rows) && fx % SUBDIVISIONS != 0 {
+        let y = if fy == 0 { 0 } else { rows - 1 };
+        (y * cols + sx, y * cols + sx + 1, tx)
+    } else if (fx == 0 || fx + 1 == fine_cols) && fy % SUBDIVISIONS != 0 {
+        let x = if fx == 0 { 0 } else { cols - 1 };
+        (sy * cols + x, (sy + 1) * cols + x, ty)
+    } else {
+        return 0.0;
+    };
+    let dx = positions[b][0] - positions[a][0];
+    let dz = positions[b][2] - positions[a][2];
+    let lane = if dx.abs() >= dz.abs() {
+        if dx >= 0.0 {
+            1.0
+        } else {
+            2.0
+        }
+    } else if dz >= 0.0 {
+        3.0
+    } else {
+        4.0
+    };
+    lane + t
+}
+
 /// Four-way subdivision of every source cell. The output is still one indexed regular grid: there
 /// are no duplicated cell-edge vertices, and dry source cells emit no triangles.
 fn subdivide(coarse: &Mesh, grid: [u32; 2], wet: &[bool]) -> Option<Mesh> {
@@ -185,7 +227,11 @@ fn subdivide(coarse: &Mesh, grid: [u32; 2], wet: &[bool]) -> Option<Mesh> {
             let tx = (fx - sx * SUBDIVISIONS) as f32 / SUBDIVISIONS as f32;
             fine_positions.push(bilerp(positions, cols, sx, sy, tx, ty));
             fine_uv0.push(bilerp(uv0, cols, sx, sy, tx, ty));
-            fine_uv1.push(bilerp(uv1, cols, sx, sy, tx, ty));
+            let mut uv1 = bilerp(uv1, cols, sx, sy, tx, ty);
+            uv1[1] = stitch_tag(
+                positions, cols, rows, fine_cols, fine_rows, fx, fy, sx, sy, tx, ty,
+            );
+            fine_uv1.push(uv1);
             if let (Some(source), Some(output)) = (colours, fine_colours.as_mut()) {
                 output.push(bilerp(source, cols, sx, sy, tx, ty));
             }
@@ -265,6 +311,14 @@ mod tests {
         assert_eq!(positions[20], [0.0, 0.0, 1.0]);
         assert_eq!(positions[24], [1.0, 1.0, 1.0]);
         assert_eq!(positions[12], [0.5, 0.25, 0.5]);
+        let Some(VertexAttributeValues::Float32x2(uv1)) = fine.attribute(Mesh::ATTRIBUTE_UV_1)
+        else {
+            panic!("uv1");
+        };
+        assert_eq!(uv1[0][1], 0.0, "coarse corner");
+        assert_eq!(uv1[2][1], 1.5, "top-edge midpoint, +x at t=0.5");
+        assert_eq!(uv1[10][1], 3.5, "left-edge midpoint, +z at t=0.5");
+        assert_eq!(uv1[12][1], 0.0, "interior fine vertex");
         assert_eq!(fine.indices().expect("indices").len(), 16 * 6);
     }
 

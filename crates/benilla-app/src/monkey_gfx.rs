@@ -33,12 +33,9 @@ pub(crate) fn on_cvar(
         }
         // MONKEY (wind): numeric tier, live; 0 is the exact no-displacement path.
         "foliagewind" => {
-            // Capture-only A/B override. Normal runs have no such environment variable and obey
-            // the live CVar exactly; the instrument can force Off without rewriting Config.wtf.
-            let requested = std::env::var("WOW_FOLIAGE_WIND")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or_else(|| ev.num());
+            // Capture-only A/B pin (MONKEY reviewfix-a: gated like `capture_daylight` — dev
+            // build AND `WOW_CAPTURE`). Player runs obey the live CVar exactly.
+            let requested = foliage_wind_pin().map(f32::from).unwrap_or_else(|| ev.num());
             let want = requested.clamp(0.0, 2.0) as u8;
             if foliage_wind.0 != want {
                 foliage_wind.0 = want;
@@ -57,6 +54,14 @@ pub(crate) fn on_cvar(
     }
 }
 
+/// MONKEY (reviewfix-a): the `WOW_FOLIAGE_WIND` capture pin, only in a dev build under `WOW_CAPTURE`.
+fn foliage_wind_pin() -> Option<u8> {
+    if !crate::run_mode::dev_affordances() {
+        return None;
+    }
+    FoliageWind::capture_override()
+}
+
 /// Registers the programme's cvar bridges. Must be added before `CvarPlugin` so the saved values
 /// applied at Startup reach it (the edge `game_plugins.rs` documents for every knob plugin).
 pub(crate) struct MonkeyGfxPlugin;
@@ -64,7 +69,11 @@ pub(crate) struct MonkeyGfxPlugin;
 impl Plugin for MonkeyGfxPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SkyDither>()
-            .init_resource::<FoliageWind>()
+            // MONKEY (reviewfix-a): the resource is seeded here so a player build never takes the
+            // capture pin (the world plugin's `init_resource` keeps whatever is already present).
+            .insert_resource(FoliageWind(
+                foliage_wind_pin().unwrap_or(FoliageWind::REGISTERED),
+            ))
             .init_resource::<FogModelSetting>()
             .init_resource::<RainSurfaces>() // MONKEY (wet)
             .add_observer(on_cvar);

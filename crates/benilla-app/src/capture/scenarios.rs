@@ -1779,6 +1779,35 @@ pub(super) const ON_DEMAND: &[Scenario] = &[
         minute: 0,
         ui: None,
     },
+    // MONKEY (integration): the Westfall sea from 30 yd up, aimed ~72 yd out, so the enhanced
+    // water's 64-80 yd fine/coarse LOD ring crosses the frame centre (review #7, WOW_WATER=2).
+    Scenario {
+        name: "water-ocean-lodring",
+        map: Some(MAP_AZEROTH),
+        eye: [-10500.0, 2112.0, 30.0],
+        look: [-10449.0, 2163.0, 0.0],
+        minute: 720,
+        ui: None,
+    },
+    // MONKEY (perf): Northshire at midnight from the ground — where the owner's night FPS drop is
+    // reported (torch lanes, lamp fog, bleed fixtures all live). Probe fixtures, not look fixtures.
+    Scenario {
+        name: "perf-northshire-night",
+        map: Some(MAP_AZEROTH),
+        eye: GROUND_EYE,
+        look: GROUND_LOOK,
+        minute: 0,
+        ui: None,
+    },
+    // MONKEY (perf): the abbey front at midnight, close to its lamps and candelabra.
+    Scenario {
+        name: "perf-abbey-night",
+        map: Some(MAP_AZEROTH),
+        eye: [-8935.0, -145.0, 86.0],
+        look: [-8905.0, -160.0, 85.0],
+        minute: 0,
+        ui: None,
+    },
 ];
 
 /// MONKEY (p0 baseline): the Elwynn programme view, above the canopy east of Goldshire looking

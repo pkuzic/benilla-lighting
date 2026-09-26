@@ -67,7 +67,7 @@ struct LightStd430 {
     rows: [[f32; 4]; LIGHT_HEADER_ROWS],
     points: [[f32; 4]; 2 * MAX_POINT_LIGHTS],
     // MONKEY (p0 MonkeyFrame): the programme block, appended AFTER the point table so no earlier
-    // offset moves (8528 -> 8784 B); packed by [`pack_monkey_frame`] from [`super::MonkeyFrame`].
+    // offset moves (the per-frame prefix is now 8784 B); packed by [`pack_monkey_frame`].
     monkey: [[f32; 4]; super::monkey_frame::MONKEY_FRAME_ROWS],
 }
 
@@ -123,8 +123,8 @@ pub fn commit_raw(rgb: [f32; 3]) -> [f32; 3] {
 /// interior set; [`build_light_data`] packs the nearest-to-camera first when over capacity.
 ///
 /// This is the BUFFER shape (`LightStd430` and [`RoomClaimTable`] size against it) and it must not
-/// move: the blob is 8528 B and is mirrored by three shaders plus the portrait booth. How many of
-/// those slots may actually hold a light is [`MAX_LIVE_POINT_LIGHTS`], which is one less.
+/// move: the per-frame blob is 8784 B and is mirrored by the shaders plus the portrait booth. How
+/// many of those slots may actually hold a light is [`MAX_LIVE_POINT_LIGHTS`], which is one less.
 pub(super) const MAX_POINT_LIGHTS: usize = 256;
 
 /// MONKEY (ext light k8): how many of [`MAX_POINT_LIGHTS`] slots may hold a LIVE entry — **255**,
@@ -140,7 +140,7 @@ pub(super) const MAX_POINT_LIGHTS: usize = 256;
 ///
 /// So the pack truncates one entry earlier. The lights are sorted nearest-camera-first before the
 /// truncation, so the one this drops is the farthest of a 256-strong set — sub-pixel and usually
-/// fogged at that density. The BUFFER keeps all 256 slots, so nothing about the layout, the 8528 B
+/// fogged at that density. The BUFFER keeps all 256 slots, so nothing about the layout, the 8784 B
 /// blob or the room-claim table changes.
 pub(super) const MAX_LIVE_POINT_LIGHTS: usize = MAX_POINT_LIGHTS - 1;
 
@@ -478,7 +478,7 @@ impl Default for FireLightGain {
 }
 
 /// MONKEY (post): live `bloom` tier. The packer adds it to `light_diffuse.w`, whose old value 1
-/// was an unread clamp marker, so the 8528-byte shared buffer and every existing decode stay put.
+/// was an unread clamp marker, so the 8784-byte per-frame prefix and every existing decode stay put.
 #[derive(Resource, Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct EmissiveTier(pub u8);
 
@@ -897,7 +897,7 @@ pub(super) struct ShadowLanes<'w> {
 /// MONKEY (moon shadows): the CPU half of the `fog_params.z` pack — ONE SIGNED lane carrying both
 /// directional-shadow weights.
 ///
-/// **There is still no free f32** ([`LightStd430`] is 8528 B, pinned by tests and mirrored by three
+/// **There is still no free f32** ([`LightStd430`] is 8784 B, pinned by tests and mirrored by three
 /// shaders plus the portrait booth — see [`DAYLIGHT_LANE_SCALE`] for the full accounting). The
 /// daylight floor took `wmo_fog_params.w`'s fraction and the bake floor took `sh_c16.w`'s, so the
 /// two lanes with spare RANGE are spent. This one needs neither: the hand-over law above guarantees
@@ -931,7 +931,7 @@ fn unpack_shadow_lane(w: f32) -> (f32, f32) {
 /// MONKEY (enclosed day floor): how [`DynamicInteriors::daylight`] rides to the shader — as the
 /// FRACTIONAL part of the packed `wmo_fog_params.w` lane, `w = 1 + debug + daylight * this`.
 ///
-/// **There was no free f32 left.** [`LightStd430`] is 8528 B, mirrored by three shaders plus the
+/// **There was no free f32 left.** [`LightStd430`] is 8784 B, mirrored by three shaders plus the
 /// portrait booth, and must not grow; every `.w` in rows 0..=20 is spoken for (the Mod2x/clamp/SH
 /// enables, terrain shininess, fog enable, farclip, the ambient DC lanes, `sh_c13_*.w` which the
 /// SH `dot(row, quad)` reads as a real band, the world-shadow flag, the shadow distance, the
@@ -963,7 +963,7 @@ pub const DAYLIGHT_LANE_SCALE: f32 = 0.49;
 /// MONKEY (bake floor): how [`DynamicInteriors::bake_floor`] rides to the shader — as the
 /// FRACTIONAL part of the packed `sh_c16.w` lane, `w = world_shadow_flag + bake × this`.
 ///
-/// **There is still no free f32.** [`LightStd430`] is 8528 B and mirrored by three shaders plus the
+/// **There is still no free f32.** [`LightStd430`] is 8784 B and mirrored by three shaders plus the
 /// portrait booth (see [`DAYLIGHT_LANE_SCALE`] for the full accounting of why it must not grow).
 /// `wmo_fog_params.w` — the lane the daylight floor rides — is now spent: its integer part is
 /// `1 + interiorDebug` and its fraction is `interiorDaylight × 0.49`, and two fractions cannot
@@ -1360,7 +1360,7 @@ fn build_light_data(
     // MONKEY (darkness gains): `nightGain` — one live dim over everything the EXTERIOR law lights
     // (terrain, models, WMO exteriors, and the ext-class night blend, all of which derive from the
     // ambient/diffuse/specular rows below). Folded CPU-side into those packed rows rather than
-    // added as a shader uniform because `LightStd430` has no free lane left (8528 B, mirrored by
+    // added as a shader uniform because `LightStd430` has no free lane left (8784 B, mirrored by
     // three WGSL structs) — and a pack-time fold costs the GPU exactly nothing anyway.
     //
     // The ramp is the DUSK CLOCK every other night feature already fades on: `sun_w` is
@@ -1437,7 +1437,7 @@ fn build_light_data(
     // the dim and the shadow fade can never drift onto two different dusk clocks.
     // MONKEY (moon shadows): pack the rig's ACKNOWLEDGED weight, not the clock's desired one.
     // The body may have changed abruptly this frame; the shared state holds zero until the new
-    // basis has propagated and then ramps. One signed float still keeps the buffer at 8528 bytes.
+    // basis has propagated and then ramps. One signed float still keeps the prefix at 8784 bytes.
     rows[5][2] = shadow.handover.weight;
     // MONKEY (distance slider): the realtime-shadow render distance (yd), packed into the free
     // `_wmo_fog[1].z` / `wmo_fog_params.z` lane (row 19). The receivers' edge fade reads it so the
@@ -2717,14 +2717,48 @@ mod tests {
         assert_eq!(MAX_LIVE_POINT_LIGHTS, 255, "255 is EXT_SEL_EMPTY in the three shaders");
         assert_eq!(MAX_LIVE_POINT_LIGHTS, MAX_POINT_LIGHTS - 1);
         // 21 header rows + 2 x 256 point rows, 16 B each.
-        // MONKEY (p0 MonkeyFrame): 8528 + the 256-byte programme block.
+        // MONKEY (p0 MonkeyFrame): the fixed rows plus the 256-byte programme block.
         assert_eq!(per_frame_blob_bytes(), 8784, "the mirrored blob must not change size");
+    }
+
+    /// MONKEY (reviewfix): the shader mirrors use literal storage-array lengths and water reads
+    /// the shared buffer as raw rows, so pin those literals to the Rust layout constants.
+    #[test]
+    fn programme_and_shelter_shader_literals_match_the_rust_layout() {
+        const WATER: &str = include_str!("../../../benilla-assets/src/shaders/enhanced_water.wgsl");
+        const TERRAIN: &str = include_str!("../../../benilla-assets/src/shaders/terrain.wgsl");
+        const MODEL: &str = include_str!("../../../benilla-assets/src/shaders/wow_model.wgsl");
+        const STATIC_GX: &str = include_str!("../shaders/static_gx.wgsl");
+
+        let monkey_row = LIGHT_HEADER_ROWS + 2 * MAX_POINT_LIGHTS;
+        let shelter_row = monkey_row + super::super::monkey_frame::MONKEY_FRAME_ROWS;
+        assert!(
+            WATER.contains(&format!("const MONKEY_ROW: u32 = {monkey_row}u;")),
+            "enhanced_water.wgsl MONKEY_ROW must follow the header and point table"
+        );
+        assert!(
+            WATER.contains(&format!("const SHELTER_ROW: u32 = {shelter_row}u;")),
+            "enhanced_water.wgsl SHELTER_ROW must follow MonkeyFrame"
+        );
+
+        let shelter_cells = crate::weather::shelter::GRID * crate::weather::shelter::GRID;
+        let declaration = format!("array<u32, {shelter_cells}>");
+        for (name, shader) in [
+            ("terrain.wgsl", TERRAIN),
+            ("wow_model.wgsl", MODEL),
+            ("static_gx.wgsl", STATIC_GX),
+        ] {
+            assert!(
+                shader.contains(&declaration),
+                "{name} shelter length must equal shelter::GRID squared"
+            );
+        }
     }
 
     /// MONKEY (enclosed day floor): `interiorDaylight` rides the FRACTION of the interior lane's
     /// on/off word, and every existing decode of that word must be blind to it.
     ///
-    /// This is the test the feature stands on: there was no free `f32` left in an 8528-byte layout
+    /// This is the test the feature stands on: there was no free `f32` left in the 8784-byte layout
     /// three shaders mirror, so the value shares a lane with two other facts. If the fraction ever
     /// grew past 0.5 — a wider `DAYLIGHT_LANE_SCALE`, a `daylight` that escaped its clamp — the
     /// debug decode `u32(max(w - 1, 0) + 0.5)` would round UP and every building in the frame would

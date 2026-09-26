@@ -31,12 +31,17 @@ behind each constant.
 | Sky quality | Enhanced: the five Light.dbc sky stops through a smooth monotone curve in linear light (no bands at the rings), a soft sun glow tinted by sun and fog colour (fades at night and under cloud), a procedural star field with twinkle and a faint Milky Way over the stock `Stars.m2`. High adds domain-warped cloud detail and sun-lit clouds (self-shadow, silver lining; technique from WarcraftXL, see `THIRD-PARTY.md`). Classic is the reference sky unchanged | Advanced Graphics → Sky Quality, cvar `skyQuality` 0 Classic / 1 Enhanced / 2 High, env `WOW_SKY_QUALITY` |
 | Modern fog | MONKEY (fog): radial distance fog with a gradual exponential curve, a daylight sun lobe, and an end colour shared by the world, WDL hull, sky horizon and volumetric haze. Each zone keeps its authored fog end up to the reference view-distance limit; optional `LightFogBand.dbc` rows provide height, sun and end-fog controls. Interior WMO fog stays classic | Advanced Graphics → Modern Fog, cvar `fogModel` 0 Classic (default) / 1 Modern (High = 1), env `WOW_FOGMODEL=0\|1`; `fog_hook.wgsl`, `lighting/fog_model.rs`, `light/fog_band.rs` |
 | Rain on surfaces | MONKEY (wet): rain gradually darkens and saturates exposed terrain and models, adds puddles and a sky/sun sheen, and produces rings on exterior Enhanced water. Wetness rises over roughly 90 seconds and dries over roughly four minutes; MONKEY (rainshelter): a camera-centred rain-occlusion map (128² cells of 0.75 yd, filled by vertical collision rays) keeps ground, walls and water under roofs, porches and bridges dry, with a ~1.5 yd drip margin and a soft edge; tree canopies without colliders do not shelter | Advanced Graphics → Wet Surfaces in Rain, cvar `rainSurfaces` 0/1 (default and High 1), env `WOW_RAIN_SURFACES`, `WOW_WETNESS`, `WOW_WET_T`; `weather/wetness.rs`, `weather/shelter.rs`, `wet_hook.wgsl` |
-| Foliage wind | one weather-fed gust/veer field drives grass and classified tree/bush foliage; grass also parts around the player and nearby units | Advanced Graphics → Foliage Wind, cvar `foliageWind` 0 Off / 1 Grass / 2 Grass + Trees (High = 2), capture override `WOW_FOLIAGE_WIND`; field and benders in `benilla-world/src/wind/`. The wave phase is the CPU-integrated travel (speed integrated over time, wrapped seamlessly), and the waves' spatial term uses the fixed profile heading; the veer turns only the bend. Tree exile copies sway through material marker bit 14 (`FOLIAGE_WIND_MARKER`). Capture offset `WOW_CAPTURE_WIND_T` (s). Known: shadow casters (world-shadow proxies, `torch_depth.wgsl`) do not apply the sway, so leaves sample a static shadow; a future world-camera DepthPrepass must call the same offsets |
+| Foliage wind | one weather-fed gust/veer field drives grass and classified tree/bush foliage; grass also parts around the player and nearby units | Advanced Graphics → Foliage Wind, cvar `foliageWind` 0 Off / 1 Grass / 2 Grass + Trees (High = 2), capture override `WOW_FOLIAGE_WIND` (dev build + `WOW_CAPTURE` only); field and benders in `benilla-world/src/wind/`. The wave phase is the CPU-integrated travel (speed integrated over time, wrapped seamlessly), and the waves' spatial term uses the fixed profile heading; the veer turns only the bend. Tree exile copies sway through material marker bit 14 (`FOLIAGE_WIND_MARKER`). Capture offset `WOW_CAPTURE_WIND_T` (s). Known: shadow casters (world-shadow proxies, `torch_depth.wgsl`) do not apply the sway, so leaves sample a static shadow; a future world-camera DepthPrepass must call the same offsets |
 | Ambient occlusion | soft contact shadows under props, in wall-floor corners and around feet; depth-only SSAO at half resolution (depth-reconstructed normals, 6/12 spiral taps, 4x4 depth-aware blur, bilateral upsample) multiplied into the opaque scene after the opaque pass and before the water copy, so water, particles and UI are untouched; fades out 45-90 yd (Low) / 60-120 yd (High), spares sky and bright pixels; on alpha-tested foliage (a dense window of two-sided depth spikes) the blur widens its depth tolerance and the AO drops 40 %, which removes the leaf grain while planes, silhouettes and contact creases keep full AO (`benilla-app/src/ssao.rs`, `benilla-app/src/shaders/ssao.wgsl`) | Advanced Graphics → Ambient Occlusion (Off/Low/High; default Off, High preset 2), cvar `ambientOcclusion`, env `WOW_AO=0\|1\|2`, `WOW_AO_DEBUG=1..5` diagnostic views (factor, protection, distance, raw occlusion, foliage mask), `WOW_AO_GAIN`/`_RADIUS`/`_BIAS`/`_STRENGTH` tuning |
 | Lamp fog | MONKEY (lampfog): the fog fullscreen pass selects the nearest resolved exterior and interior point-table sources and analytically integrates their softened inverse-square light over the camera-to-scene-depth ray. A near-field haze floor makes lamps visible inside the ordinary volumetric haze's 10 yd clear zone; it is zero by day, stronger in rain/fog, and deliberately unshadowed. The table colour already includes intensity, flame flicker and `fireLightGain`. Halo output uses destination headroom and stays below 1.0, so a later bloom pass cannot blow it out | Advanced Graphics → Lamp Fog, cvar `lampFog` 0 Off (default, unchanged) / 1 Low (16 lamps) / 2 High (32 lamps; Graphics preset High = 2), env `WOW_LAMPFOG=0\|1\|2`; `benilla-app/src/volumetric_fog.rs` |
 | City window daylight | MONKEY (fix-daylight/integration): a district WMO's oversized window batch (e.g. the Cathedral of Light's stained-glass walls) is split into window-sized daylight apertures, so the nave takes daylight pane by pane. Applies to WMOs loaded after a change | Advanced Graphics → City Window Daylight, cvar `daylightWindowSplit` 0/1 (default 1, the merged behaviour); `benilla-world/src/lighting/daylight.rs` (`set_window_split`), bridge `benilla-app/src/dynamic_interior.rs` |
 | Zone skyboxes | the painted sky a zone's `LightParams` names (clear-weather slot, storm slot lerped by the storm blend) for the living, fading in by the Light sphere falloff with the modern client's crossfade (ghost > WMO > zone); extended `LightSkybox.dbc` flags `0x1` day cycle, `0x2` keep sun/moon/stars/clouds, `0x4` fog-colour horizon cone, plus a celestial second model; every skybox now plays its bones, texture transforms, colour and alpha tracks (`benilla-world/src/skybox.rs`, `skybox_anim.rs`, `benilla-formats/src/light/skybox.rs`) | Advanced Graphics → Zone Skyboxes, cvar `zoneSkyboxes` (0 Off default, 1 On; High = 1), env `WOW_ZONE_SKYBOXES=0\|1` |
 | Night and interior level | global dimming of the night sky term and of interior ambient | `nightGain`, `interiorGain`, `interiorBakeFloor` |
+
+`zoneSkyboxes = 0` disables only the added living-player zone slot. WMO and ghost skyboxes are
+the reference 1.12 slots, so their fidelity fixes remain active in Classic: authored colour and
+alpha tracks affect the layer, non-white M2 colours reach the mesh, deterministic captures pose at
+their pinned time, and the batch-order base reserves the lower celestial band and final fog cone.
 
 Players reach all of it from **Options -> Advanced Graphics** (a Graphics Preset over everything, a Render Distance slider, a Lighting Quality preset Off / Low / Medium / High / Ultra plus the individual rows; Classic / Off is the original client look). The dev build has a panel for all of it: **Ctrl+Shift+D → Lighting & shadows**, with Dim / Default /
 Bright presets.
@@ -76,6 +81,16 @@ and High volumetric fog. No rung decides `shadowDistance` or `interiorShadowSoft
 column at startup (`Cvars::seed_graphics_preset`) on every row the file does not carry; the rows'
 registered defaults stay their per-lane ones (`farclip` the reference's 350), and captures and
 tests, which never seed, keep them. The Advanced page's Defaults button lands on High too.
+The seeded boot value that leaves the reference (`farclip` 777 against 350) is declared in
+`cvars::SEEDED_DEVIATIONS`, and a test walks the whole High column against the reference rows.
+Session-owned rows (env levers such as `WOW_FARCLIP`) are skipped when both labels are derived, so
+an env override never persists `Custom` (MONKEY (reviewfix-a)).
+
+**Capture fixtures** (MONKEY (reviewfix-a)). A capture reads CVars only from
+`WOW_CAPTURE_CVARS=<config.toml path>` (read-only; nothing is saved), never from `BENILLA_HOME`.
+`WOW_FOLIAGE_WIND` is honoured only in a dev build under `WOW_CAPTURE`. A capture has no avatar,
+so zone grading reads `terrain_stream::CaptureCameraArea` (the area under the camera, written only
+under `WOW_CAPTURE`) and the grade's day/night weight follows the rendered `GameClock` minute.
 
 **Saved presets and new rows** (MONKEY (followups)). On load, `Cvars::reapply_saved_presets`
 writes the saved `graphicsQuality` rung (and the saved `lightingQuality` rung, else the Graphics
@@ -163,6 +178,8 @@ is its own module, documented in `WATER.md`.
   by `cargo check`.
 - Exterior point lights are selected per draw unit (12 slots, ranked against the chunk's box); the
   cube-map occlusion is evaluated for the nearest three.
+- Portal bleed fixtures (`update_bleed_fixtures`, `daylight.rs`) are re-evaluated at 10 Hz, not per
+  frame; a new doorway or a dial change runs it at once. Sources are bucketed per placement.
 
 ## Build
 
@@ -172,6 +189,13 @@ cargo build --release -p benilla
 
 Debug tracing: `WOW_TORCH_TRACE=1`, `WOW_POINTS_DUMP=1`, `WOW_SHADOW_TRACE=1`, and the cvar
 `interiorDebug` 1..4.
+
+Performance: measure a `play`/release build, never `dev`. `WOW_CAPTURE=<scenario>
+WOW_FPS_PROBE=600 WOW_FPS_JOURNAL=<csv> WOW_GPU_PASSES=1 WOW_WIN=2560x1440` prints frame, CPU and
+per-pass GPU times; `BENILLA_HOME=<dir>` supplies the `config.toml` (a capture never seeds the
+Graphics Preset, so write the rows out). `WOW_PERF_CROWD=<n>` stands n players at the look point.
+Night fixtures: `perf-northshire-night`, `perf-abbey-night`. Per-system CPU: build with
+`--features benilla-app/trace_chrome`.
 
 ## Licence
 

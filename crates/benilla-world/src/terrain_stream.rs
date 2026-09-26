@@ -59,7 +59,7 @@ pub use spawn::{
 use queries::update_current_area;
 pub use queries::{
     area_id_under, doodad_ground_shade, ground_effect_under, terrain_height_under,
-    terrain_height_under_cached, AreaAuthoritySet, CurrentArea, ShadeResolve,
+    terrain_height_under_cached, AreaAuthoritySet, CaptureCameraArea, CurrentArea, ShadeResolve,
 };
 
 /// Wall-clock per frame for spawning streamed tiles and placements before the rest waits a frame;
@@ -389,6 +389,8 @@ impl Plugin for TerrainPlugin {
             .init_resource::<StaticMerge>()
             .init_resource::<crate::model_forms::ModelForms>()
             .init_resource::<CurrentArea>()
+            // MONKEY (reviewfix-a): the capture-only camera area (zone grading in captures).
+            .init_resource::<CaptureCameraArea>()
             // In `WorldStage::Stream`, between the teleport snap (Input) and the loading cover
             // (Present), so a swap never renders uncovered. `finish_colliders` heads the chain so
             // the collider queue read downstream is this frame's.

@@ -85,6 +85,8 @@ struct LiquidVsOut {
     @location(5) vcolor: vec4<f32>,
     // `MeshTag` bit 30: the room's per-frame interior-fog gate, the reference's `[0xca7f00]`.
     @location(6) @interpolate(flat) room_fog: u32,
+    // MONKEY (reviewfix): the analytic water domain before the ocean's vertex displacement.
+    @location(7) source_xz: vec2<f32>,
 }
 
 // Sun sheen (`secondary`): the Blinn highlight `light_spec.rgb · (N·H)^shininess`.
@@ -147,8 +149,9 @@ fn vertex(in: Vertex) -> LiquidVsOut {
     let world_from_local = mesh_functions::get_world_from_local(in.instance_index);
     out.world_position =
         mesh_functions::mesh_position_local_to_world(world_from_local, vec4<f32>(in.position, 1.0));
+    out.source_xz = out.world_position.xz;
     // MONKEY (enhanced water): ocean Gerstner displacement; zero on Classic/other surfaces.
-    out.world_position += vec4<f32>(water_swell(out.world_position.xz, in.uv_b.x), 0.0);
+    out.world_position += vec4<f32>(water_swell(out.source_xz, in.uv_b.x, in.uv_b.y), 0.0);
     out.clip_position = position_world_to_clip(out.world_position.xyz);
     out.world_normal = mesh_functions::mesh_normal_local_to_world(in.normal, in.instance_index);
     out.uv = in.uv;
@@ -221,7 +224,8 @@ fn fragment(in: LiquidVsOut) -> @location(0) vec4<f32> {
         return enhanced_water(
             // MONKEY (water): the enhanced interior arm consumes the MOMT colour already carried
             // by the reference fragment interface; exterior/ADT vertices supply white.
-            WaterFragment(in.clip_position, in.world_position, in.depth, in.vcolor, in.room_fog),
+            WaterFragment(in.clip_position, in.world_position, in.source_xz, in.depth, in.vcolor,
+                in.room_fog),
             shallow_enhanced, deep_enhanced);
     }
 
